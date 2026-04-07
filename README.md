@@ -31,13 +31,14 @@ This repo does not yet include:
 
 The intended long-term shape is:
 
-1. Phase 1: canonical request preparation
+1. Phase 1: prompt preparation
 2. Phase 2: transformer state transition
 3. Phase 3: logits-to-token decode
 
 Only phase 1 is implemented now. It stops at:
 
-- canonicalized request
+- decoded prompt text
+- Gemma 4 message context
 - rendered prompt string
 - prompt token IDs
 - deterministic phase-1 commitment

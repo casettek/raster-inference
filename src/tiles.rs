@@ -3,7 +3,9 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use crate::types::{CanonicalRequest, InferenceRequest, ModelSpec, TextMessage};
+use crate::types::{
+    Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage,
+};
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct TemplateMessage {
@@ -20,36 +22,31 @@ impl From<&TextMessage> for TemplateMessage {
     }
 }
 
-pub fn canonicalize_request(request: &InferenceRequest) -> Result<CanonicalRequest> {
-    if request.messages.is_empty() {
-        bail!("phase 1 requires at least one message");
+pub fn decode_prompt_bytes(prompt_bytes: &[u8], policy: TextDecodingPolicy) -> Result<String> {
+    match policy {
+        TextDecodingPolicy::Utf8 => String::from_utf8(prompt_bytes.to_vec())
+            .context("failed to decode prompt bytes as utf-8"),
+    }
+}
+
+pub fn build_gemma4_messages(
+    prompt_text: &str,
+    add_generation_prompt: bool,
+) -> Result<Gemma4Prompt> {
+    if prompt_text.is_empty() {
+        bail!("phase 1 requires a non-empty prompt");
     }
 
-    let messages = request
-        .messages
-        .iter()
-        .map(|message| {
-            let content = message.content.trim().to_string();
-            if content.is_empty() {
-                bail!("messages must contain non-empty content");
-            }
-
-            Ok(TextMessage {
-                role: message.role.clone(),
-                content,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(CanonicalRequest {
-        messages,
-        add_generation_prompt: request.add_generation_prompt,
-        add_special_tokens: request.add_special_tokens,
-        sampling: request.sampling.clone(),
+    Ok(Gemma4Prompt {
+        messages: vec![TextMessage {
+            role: MessageRole::User,
+            content: prompt_text.to_string(),
+        }],
+        add_generation_prompt,
     })
 }
 
-pub fn render_prompt(request: &CanonicalRequest, model: &ModelSpec) -> Result<String> {
+pub fn render_prompt(prompt: &Gemma4Prompt, model: &ModelSpec) -> Result<String> {
     let mut environment = Environment::new();
     environment
         .add_template("chat", &model.chat_template)
@@ -59,7 +56,7 @@ pub fn render_prompt(request: &CanonicalRequest, model: &ModelSpec) -> Result<St
         .get_template("chat")
         .context("failed to load chat template")?;
 
-    let messages = request
+    let messages = prompt
         .messages
         .iter()
         .map(TemplateMessage::from)
@@ -68,7 +65,7 @@ pub fn render_prompt(request: &CanonicalRequest, model: &ModelSpec) -> Result<St
     template
         .render(context! {
             messages => messages,
-            add_generation_prompt => request.add_generation_prompt,
+            add_generation_prompt => prompt.add_generation_prompt,
             bos_token => model.bos_token.clone(),
             eos_token => model.eos_token.clone(),
             unk_token => model.unk_token.clone(),
@@ -91,14 +88,18 @@ pub fn tokenize_prompt(
 
 pub fn build_phase1_commitment(
     model: &ModelSpec,
-    request: &CanonicalRequest,
-    prompt: &str,
+    request: &InferenceRequest,
+    prompt_text: &str,
+    gemma4_prompt: &Gemma4Prompt,
+    rendered_prompt: &str,
     prompt_tokens: &[u32],
 ) -> Result<String> {
     let payload = serde_json::to_vec(&serde_json::json!({
         "model_id": model.model_id,
         "request": request,
-        "prompt": prompt,
+        "prompt_text": prompt_text,
+        "gemma4_prompt": gemma4_prompt,
+        "rendered_prompt": rendered_prompt,
         "prompt_tokens": prompt_tokens,
     }))
     .context("failed to serialize phase 1 commitment payload")?;
@@ -109,24 +110,33 @@ pub fn build_phase1_commitment(
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_request, render_prompt};
-    use crate::types::{InferenceRequest, MessageRole, ModelSpec, SamplingConfig, TextMessage};
+    use super::{build_gemma4_messages, decode_prompt_bytes, render_prompt};
+    use crate::types::{MessageRole, ModelSpec, TextDecodingPolicy};
 
     #[test]
-    fn canonicalize_trims_message_content() {
-        let request = InferenceRequest {
-            messages: vec![TextMessage {
-                role: MessageRole::User,
-                content: "  hello world  ".to_string(),
-            }],
-            add_generation_prompt: true,
-            add_special_tokens: true,
-            sampling: SamplingConfig::default(),
-        };
+    fn decode_prompt_bytes_preserves_prompt_text() {
+        let prompt = decode_prompt_bytes(b"  hello world  ", TextDecodingPolicy::Utf8)
+            .expect("prompt should decode");
 
-        let canonical = canonicalize_request(&request).expect("request should canonicalize");
+        assert_eq!(prompt, "  hello world  ");
+    }
 
-        assert_eq!(canonical.messages[0].content, "hello world");
+    #[test]
+    fn decode_prompt_bytes_rejects_invalid_utf8() {
+        let error = decode_prompt_bytes(&[0xFF], TextDecodingPolicy::Utf8)
+            .expect_err("invalid utf-8 should fail");
+
+        assert!(error.to_string().contains("utf-8"));
+    }
+
+    #[test]
+    fn build_gemma4_messages_wraps_prompt_as_single_user_message() {
+        let prompt = build_gemma4_messages("hello", true).expect("messages should build");
+
+        assert_eq!(prompt.messages.len(), 1);
+        assert_eq!(prompt.messages[0].role, MessageRole::User);
+        assert_eq!(prompt.messages[0].content, "hello");
+        assert!(prompt.add_generation_prompt);
     }
 
     #[test]
@@ -139,18 +149,8 @@ mod tests {
             eos_token: None,
             unk_token: None,
         };
-        let request = InferenceRequest {
-            messages: vec![TextMessage {
-                role: MessageRole::User,
-                content: "hello".to_string(),
-            }],
-            add_generation_prompt: true,
-            add_special_tokens: true,
-            sampling: SamplingConfig::default(),
-        };
-
-        let canonical = canonicalize_request(&request).expect("request should canonicalize");
-        let prompt = render_prompt(&canonical, &model).expect("prompt should render");
+        let prompt = build_gemma4_messages("hello", true).expect("phase-1 messages should build");
+        let prompt = render_prompt(&prompt, &model).expect("prompt should render");
 
         assert_eq!(prompt, "<bos>[user] hello[assistant]");
     }

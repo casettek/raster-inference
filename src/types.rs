@@ -26,6 +26,13 @@ pub struct TextMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TextDecodingPolicy {
+    #[default]
+    Utf8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SamplingConfig {
     pub max_new_tokens: Option<usize>,
@@ -57,25 +64,26 @@ pub struct ModelSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferenceRequest {
-    pub messages: Vec<TextMessage>,
+    pub prompt_bytes: Vec<u8>,
+    pub text_decoding_policy: TextDecodingPolicy,
     pub add_generation_prompt: bool,
     pub add_special_tokens: bool,
     pub sampling: SamplingConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CanonicalRequest {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Gemma4Prompt {
     pub messages: Vec<TextMessage>,
     pub add_generation_prompt: bool,
-    pub add_special_tokens: bool,
-    pub sampling: SamplingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Phase1State {
     pub model: ModelSpec,
-    pub request: CanonicalRequest,
-    pub prompt: String,
+    pub request: InferenceRequest,
+    pub prompt_text: String,
+    pub gemma4_prompt: Gemma4Prompt,
+    pub rendered_prompt: String,
     pub prompt_tokens: Vec<u32>,
     pub commitment: Option<String>,
 }
