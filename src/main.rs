@@ -1,8 +1,8 @@
 use std::{env, path::PathBuf, process};
 
 use raster_inference::{
-    load_chat_template, load_tokenizer_from_path, run_phase1, InferenceRequest, MessageRole,
-    ModelSpec, SamplingConfig, TextMessage,
+    load_chat_template, load_tokenizer_from_path, run_phase1, InferenceRequest, ModelSpec,
+    SamplingConfig, TextDecodingPolicy,
 };
 
 fn print_usage() {
@@ -43,10 +43,8 @@ fn run() -> anyhow::Result<()> {
     };
 
     let request = InferenceRequest {
-        messages: vec![TextMessage {
-            role: MessageRole::User,
-            content: prompt,
-        }],
+        prompt_bytes: prompt.into_bytes(),
+        text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: true,
         add_special_tokens: true,
         sampling: SamplingConfig::default(),

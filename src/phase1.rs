@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 
 use crate::{
-    tiles::{build_phase1_commitment, canonicalize_request, render_prompt, tokenize_prompt},
+    tiles::{
+        build_gemma4_messages, build_phase1_commitment, decode_prompt_bytes, render_prompt,
+        tokenize_prompt,
+    },
     types::{InferenceRequest, ModelSpec, Phase1State},
 };
 
@@ -29,20 +32,25 @@ pub fn run_phase1(
     model: &ModelSpec,
     tokenizer: &Tokenizer,
 ) -> Result<Phase1State> {
-    let request = canonicalize_request(request)?;
-    let prompt = render_prompt(&request, model)?;
-    let prompt_tokens = tokenize_prompt(&prompt, tokenizer, request.add_special_tokens)?;
+    let prompt_text = decode_prompt_bytes(&request.prompt_bytes, request.text_decoding_policy)?;
+    let gemma4_prompt = build_gemma4_messages(&prompt_text, request.add_generation_prompt)?;
+    let rendered_prompt = render_prompt(&gemma4_prompt, model)?;
+    let prompt_tokens = tokenize_prompt(&rendered_prompt, tokenizer, request.add_special_tokens)?;
     let commitment = Some(build_phase1_commitment(
         model,
-        &request,
-        &prompt,
+        request,
+        &prompt_text,
+        &gemma4_prompt,
+        &rendered_prompt,
         &prompt_tokens,
     )?);
 
     Ok(Phase1State {
         model: model.clone(),
-        request,
-        prompt,
+        request: request.clone(),
+        prompt_text,
+        gemma4_prompt,
+        rendered_prompt,
         prompt_tokens,
         commitment,
     })
