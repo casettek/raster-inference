@@ -37,16 +37,11 @@ The intended long-term shape is:
 
 Only phase 1 is implemented now. It stops at:
 
-- decoded prompt text
-- Gemma 4 message context
-- rendered prompt string
 - prompt token IDs
-- deterministic phase-1 commitment
+- SHA-256 of the prompt token IDs
 
 ## File Layout
 
-- `src/types.rs`: plain data structures
-- `src/tiles.rs`: pure phase-1 tile functions
 - `src/io.rs`: thin disk-loading helpers for local assets
 - `src/phase1/`: phase-1 composition, types, and tiles
 - `src/lib.rs`: public API and future phase placeholders
@@ -81,7 +76,7 @@ cargo run -- \
   "Hello from phase one"
 ```
 
-It prints the resulting `Phase1State` as formatted JSON.
+It prints the resulting `Phase1State` as formatted JSON with the prompt token IDs and their SHA-256 digest.
 
 ```bash
 cargo run -- \

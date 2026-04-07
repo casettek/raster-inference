@@ -79,11 +79,6 @@ pub struct Gemma4Prompt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Phase1State {
-    pub model: ModelSpec,
-    pub request: InferenceRequest,
-    pub prompt_text: String,
-    pub gemma4_prompt: Gemma4Prompt,
-    pub rendered_prompt: String,
-    pub prompt_tokens: Vec<u32>,
-    pub commitment: Option<String>,
+    pub prompt_token_ids: Vec<u32>,
+    pub prompt_token_ids_sha256: String,
 }
