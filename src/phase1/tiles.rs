@@ -3,7 +3,7 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use crate::types::{
+use super::types::{
     Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage,
 };
 
@@ -111,7 +111,7 @@ pub fn build_phase1_commitment(
 #[cfg(test)]
 mod tests {
     use super::{build_gemma4_messages, decode_prompt_bytes, render_prompt};
-    use crate::types::{MessageRole, ModelSpec, TextDecodingPolicy};
+    use crate::phase1::types::{MessageRole, ModelSpec, TextDecodingPolicy};
 
     #[test]
     fn decode_prompt_bytes_preserves_prompt_text() {
