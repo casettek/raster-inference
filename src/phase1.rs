@@ -44,14 +44,15 @@ pub fn run_phase1(
         &rendered_prompt,
         &prompt_tokens,
     )?);
+    Ok(prompt_text, prompt_tokens, commitment)
 
-    Ok(Phase1State {
-        model: model.clone(),
-        request: request.clone(),
-        prompt_text,
-        gemma4_prompt,
-        rendered_prompt,
-        prompt_tokens,
-        commitment,
-    })
+    // Ok(Phase1State {
+    //     model: model.clone(),
+    //     request: request.clone(),
+    //     prompt_text,
+    //     gemma4_prompt,
+    //     rendered_prompt,
+    //     prompt_tokens,
+    //     commitment,
+    // })
 }
