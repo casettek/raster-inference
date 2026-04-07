@@ -1,0 +1,8 @@
+/target
+
+# macOS
+.DS_Store
+
+# Editor settings
+.idea/
+.vscode/
