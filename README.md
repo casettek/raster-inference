@@ -47,7 +47,8 @@ Only phase 1 is implemented now. It stops at:
 
 - `src/types.rs`: plain data structures
 - `src/tiles.rs`: pure phase-1 tile functions
-- `src/phase1.rs`: phase-1 composition and asset-loading edge helpers
+- `src/io.rs`: thin disk-loading helpers for local assets
+- `src/phase1/`: phase-1 composition, types, and tiles
 - `src/lib.rs`: public API and future phase placeholders
 - `src/main.rs`: tiny CLI for local smoke tests
 
@@ -81,3 +82,11 @@ cargo run -- \
 ```
 
 It prints the resulting `Phase1State` as formatted JSON.
+
+```bash
+cargo run -- \
+  google/gemma-4-E4B-it \
+  assets/gemma-4-E4B-it/tokenizer.json \
+  assets/gemma-4-E4B-it/chat_template.jinja \
+  "Hello from phase one"
+```
