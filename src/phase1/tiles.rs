@@ -3,9 +3,7 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use super::types::{
-    Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage,
-};
+use super::types::{Gemma4Prompt, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage};
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct TemplateMessage {
@@ -86,23 +84,9 @@ pub fn tokenize_prompt(
     Ok(encoding.get_ids().to_vec())
 }
 
-pub fn build_phase1_commitment(
-    model: &ModelSpec,
-    request: &InferenceRequest,
-    prompt_text: &str,
-    gemma4_prompt: &Gemma4Prompt,
-    rendered_prompt: &str,
-    prompt_tokens: &[u32],
-) -> Result<String> {
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "model_id": model.model_id,
-        "request": request,
-        "prompt_text": prompt_text,
-        "gemma4_prompt": gemma4_prompt,
-        "rendered_prompt": rendered_prompt,
-        "prompt_tokens": prompt_tokens,
-    }))
-    .context("failed to serialize phase 1 commitment payload")?;
+pub fn build_phase1_commitment(prompt_token_ids: &[u32]) -> Result<String> {
+    let payload = serde_json::to_vec(prompt_token_ids)
+        .context("failed to serialize phase 1 prompt token ids")?;
 
     let digest = Sha256::digest(payload);
     Ok(format!("{digest:x}"))
@@ -110,7 +94,9 @@ pub fn build_phase1_commitment(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_gemma4_messages, decode_prompt_bytes, render_prompt};
+    use super::{
+        build_gemma4_messages, build_phase1_commitment, decode_prompt_bytes, render_prompt,
+    };
     use crate::phase1::types::{MessageRole, ModelSpec, TextDecodingPolicy};
 
     #[test]
@@ -153,5 +139,15 @@ mod tests {
         let prompt = render_prompt(&prompt, &model).expect("prompt should render");
 
         assert_eq!(prompt, "<bos>[user] hello[assistant]");
+    }
+
+    #[test]
+    fn build_phase1_commitment_hashes_prompt_token_ids_only() {
+        let digest = build_phase1_commitment(&[1, 2, 3]).expect("commitment should build");
+
+        assert_eq!(
+            digest,
+            "a615eeaee21de5179de080de8c3052c8da901138406ba71c38c032845f7d54f4"
+        );
     }
 }
