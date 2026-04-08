@@ -1,13 +1,13 @@
 use std::{env, path::PathBuf, process};
 
 use raster_inference::{
-    load_chat_template, load_tokenizer_from_path, run_phase1, InferenceRequest, ModelSpec,
-    SamplingConfig, TextDecodingPolicy,
+    load_chat_template, load_embedding_table_from_gemma_model_path, load_tokenizer_from_path,
+    run_inference, InferenceRequest, ModelSpec, SamplingConfig, TextDecodingPolicy,
 };
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference <model-id> <tokenizer.json> <chat-template.jinja> <prompt...>"
+        "Usage: raster-inference <model-id> <tokenizer.json> <chat-template.jinja> <gemma-model-path> <prompt...>"
     );
 }
 
@@ -20,7 +20,7 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let args = env::args().collect::<Vec<_>>();
-    if args.len() < 5 {
+    if args.len() < 6 {
         print_usage();
         process::exit(1);
     }
@@ -28,10 +28,12 @@ fn run() -> anyhow::Result<()> {
     let model_id = args[1].clone();
     let tokenizer_path = PathBuf::from(&args[2]);
     let template_path = PathBuf::from(&args[3]);
-    let prompt = args[4..].join(" ");
+    let gemma_model_path = PathBuf::from(&args[4]);
+    let prompt = args[5..].join(" ");
 
     let chat_template = load_chat_template(&template_path)?;
     let tokenizer = load_tokenizer_from_path(&tokenizer_path)?;
+    let embedding_table = load_embedding_table_from_gemma_model_path(&gemma_model_path)?;
 
     let model = ModelSpec {
         model_id,
@@ -50,8 +52,8 @@ fn run() -> anyhow::Result<()> {
         sampling: SamplingConfig::default(),
     };
 
-    let phase1_state = run_phase1(&request, &model, &tokenizer)?;
-    println!("{}", serde_json::to_string_pretty(&phase1_state)?);
+    let inference_state = run_inference(&request, &model, &tokenizer, &embedding_table)?;
+    println!("{}", serde_json::to_string_pretty(&inference_state)?);
 
     Ok(())
 }

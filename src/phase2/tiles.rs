@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use sha2::{Digest, Sha256};
 
 use super::types::{EmbeddedTokenSequence, EmbeddingTable};
 
@@ -37,10 +38,31 @@ pub fn embed_input_tokens(
         let row = embedding_table.rows.get(row_idx).ok_or_else(|| {
             anyhow::anyhow!("token id {token_id} is out of bounds for embedding table")
         })?;
-        activations.push(row.clone());
+        let mut activation = row.clone();
+        if embedding_table.scale != 1.0 {
+            for value in &mut activation {
+                *value *= embedding_table.scale;
+            }
+        }
+        activations.push(activation);
     }
 
-    Ok(EmbeddedTokenSequence { activations })
+    let activations_sha256 = build_phase2_commitment(&activations);
+
+    Ok(EmbeddedTokenSequence {
+        activations,
+        activations_sha256,
+    })
+}
+
+fn build_phase2_commitment(activations: &[Vec<f32>]) -> String {
+    let mut hasher = Sha256::new();
+    for row in activations {
+        for value in row {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -52,18 +74,24 @@ mod tests {
     fn embed_input_tokens_looks_up_rows_in_order() {
         let embedding_table = EmbeddingTable {
             rows: vec![vec![0.0, 0.5], vec![1.0, 1.5], vec![2.0, 2.5]],
+            scale: 1.0,
         };
 
         let embedded =
             embed_input_tokens(&[2, 0], &embedding_table).expect("embedding should succeed");
 
         assert_eq!(embedded.activations, vec![vec![2.0, 2.5], vec![0.0, 0.5]]);
+        assert_eq!(
+            embedded.activations_sha256,
+            "ba27ccacfb427e2f44f9a6d875abe24e064893a5ea6a76d8f6c00a29ec10be6f"
+        );
     }
 
     #[test]
     fn embed_input_tokens_rejects_out_of_bounds_token_ids() {
         let embedding_table = EmbeddingTable {
             rows: vec![vec![0.0, 0.5]],
+            scale: 1.0,
         };
 
         let error = embed_input_tokens(&[1], &embedding_table)
@@ -76,11 +104,29 @@ mod tests {
     fn embed_input_tokens_rejects_ragged_embedding_tables() {
         let embedding_table = EmbeddingTable {
             rows: vec![vec![0.0, 0.5], vec![1.0]],
+            scale: 1.0,
         };
 
         let error =
             embed_input_tokens(&[0], &embedding_table).expect_err("ragged table should fail");
 
         assert!(error.to_string().contains("expected 2"));
+    }
+
+    #[test]
+    fn embed_input_tokens_applies_embedding_scale() {
+        let embedding_table = EmbeddingTable {
+            rows: vec![vec![1.0, 2.0]],
+            scale: 3.0,
+        };
+
+        let embedded =
+            embed_input_tokens(&[0], &embedding_table).expect("embedding should succeed");
+
+        assert_eq!(embedded.activations, vec![vec![3.0, 6.0]]);
+        assert_eq!(
+            embedded.activations_sha256,
+            "209a39e983bfd5b06df628da8981625bd58c1342e1543c3641d9873380b9d310"
+        );
     }
 }
