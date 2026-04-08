@@ -16,11 +16,12 @@ This repo only targets:
 - text-only Gemma 4 usage
 - one Rust crate
 - one function-first phase-1 pipeline
+- one first phase-2 embedding tile
 - no scheduler, server, cache manager, or framework abstraction
 
 This repo does not yet include:
 
-- phase 2 transformer execution
+- the rest of phase 2 transformer execution beyond token embedding
 - phase 3 logits-to-token decode
 - multimodal support
 - KV cache
@@ -44,6 +45,7 @@ Only phase 1 is implemented now. It stops at:
 
 - `src/io.rs`: thin disk-loading helpers for local assets
 - `src/phase1/`: phase-1 composition, types, and tiles
+- `src/phase2/`: phase-2 composition, types, and tiles
 - `src/lib.rs`: public API and future phase placeholders
 - `src/main.rs`: tiny CLI for local smoke tests
 
