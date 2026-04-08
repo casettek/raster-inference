@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 half = "2"
+memmap2 = "0.9.10"
 minijinja = "2"
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }

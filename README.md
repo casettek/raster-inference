@@ -18,6 +18,7 @@ This repo only targets:
 - one function-first phase-1 pipeline
 - one serial phase-1-to-phase-2 path
 - one first phase-2 embedding tile
+- one first Gemma 4 text layer over those embeddings
 - no scheduler, server, cache manager, or framework abstraction
 
 This repo does not yet include:
@@ -39,9 +40,9 @@ The intended long-term shape is:
 
 Today the implemented serial path stops at:
 
-- prompt token IDs
 - SHA-256 of the prompt token IDs
 - SHA-256 of the token embedding activations for those prompt token IDs
+- SHA-256 of the first Gemma 4 layer output over those token embeddings
 
 ## File Layout
 
@@ -81,7 +82,7 @@ cargo run -- \
   "Hello from phase one"
 ```
 
-It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2 token embedding. For phase 2 it reads `model.language_model.embed_tokens.weight` from the Gemma safetensors and applies Gemma's embedding scale automatically. The model path can be:
+It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2. For phase 2 it reads `model.language_model.embed_tokens.weight` and the first text-layer weights from the Gemma safetensors, applies Gemma's embedding scale automatically, and computes one full layer-0 state transition. The model path can be:
 
 - a Gemma model directory containing `model.safetensors.index.json`
 - a Gemma model directory containing a single `model.safetensors` or `consolidated.safetensors`
@@ -90,7 +91,8 @@ It runs phase 1 first, then immediately feeds the resulting prompt token IDs int
 The CLI prints the resulting `InferenceState` as formatted JSON with both:
 
 - `phase1`: SHA-256 digest of the prompt token IDs
-- `phase2`: SHA-256 digest of the embedding activations for those prompt token IDs
+- `phase2.token_embeddings`: SHA-256 digest of the embedding activations for those prompt token IDs
+- `phase2.layer0_output`: SHA-256 digest of the first Gemma 4 layer output
 
 ```bash
 cargo run -- \
