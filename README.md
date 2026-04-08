@@ -7,7 +7,7 @@ The design goal is to keep the architecture extremely simple:
 - tiles are plain side-effect-free functions
 - sequences are explicit compositions of those functions
 - inference is modeled as three isolated phases
-- phase 1 is the only implemented phase right now
+- the CLI now runs phase 1 and the first phase-2 embedding step in serial
 
 ## Current Scope
 
@@ -16,6 +16,7 @@ This repo only targets:
 - text-only Gemma 4 usage
 - one Rust crate
 - one function-first phase-1 pipeline
+- one serial phase-1-to-phase-2 path
 - one first phase-2 embedding tile
 - no scheduler, server, cache manager, or framework abstraction
 
@@ -36,10 +37,11 @@ The intended long-term shape is:
 2. Phase 2: transformer state transition
 3. Phase 3: logits-to-token decode
 
-Only phase 1 is implemented now. It stops at:
+Today the implemented serial path stops at:
 
 - prompt token IDs
 - SHA-256 of the prompt token IDs
+- SHA-256 of the token embedding activations for those prompt token IDs
 
 ## File Layout
 
@@ -68,22 +70,33 @@ For the working porting method and the first-batch tile plan, see
 
 ## CLI Smoke Test
 
-The current CLI expects local tokenizer and template artifacts:
+The current CLI expects local tokenizer and template artifacts plus a Gemma model path for the embedding weights:
 
 ```bash
 cargo run -- \
   google/gemma-4-test \
   /path/to/tokenizer.json \
   /path/to/chat_template.jinja \
+  /path/to/gemma-model \
   "Hello from phase one"
 ```
 
-It prints the resulting `Phase1State` as formatted JSON with the prompt token IDs and their SHA-256 digest.
+It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2 token embedding. For phase 2 it reads `model.language_model.embed_tokens.weight` from the Gemma safetensors and applies Gemma's embedding scale automatically. The model path can be:
+
+- a Gemma model directory containing `model.safetensors.index.json`
+- a Gemma model directory containing a single `model.safetensors` or `consolidated.safetensors`
+- a direct path to a `.safetensors` file or `model.safetensors.index.json`
+
+The CLI prints the resulting `InferenceState` as formatted JSON with both:
+
+- `phase1`: SHA-256 digest of the prompt token IDs
+- `phase2`: SHA-256 digest of the embedding activations for those prompt token IDs
 
 ```bash
 cargo run -- \
   google/gemma-4-E4B-it \
   assets/gemma-4-E4B-it/tokenizer.json \
   assets/gemma-4-E4B-it/chat_template.jinja \
+  /path/to/gemma-4-model \
   "Hello from phase one"
 ```
