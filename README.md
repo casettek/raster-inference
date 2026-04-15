@@ -18,16 +18,15 @@ This repo only targets:
 - one function-first phase-1 pipeline
 - one serial phase-1-to-phase-2 path
 - one prompt-prefill Gemma 4 text path through all decoder layers
-- one final-norm and final-position logits seam for phase 3 handoff
+- one minimal phase-3 greedy decode loop built on final-position logits
 - no scheduler, server, cache manager, or framework abstraction
 
 This repo does not yet include:
 
-- the rest of phase 2 transformer execution beyond token embedding
-- phase 3 logits-to-token decode
+- KV cache or incremental decode-state transition
+- stochastic sampling logic (`temperature`, `top_k`, `top_p`, repetition penalties)
 - multimodal support
-- KV cache
-- sampling logic
+- streaming or partial token deltas
 - Raster DSL integration
 
 ## Phase Model
@@ -38,12 +37,13 @@ The intended long-term shape is:
 2. Phase 2: transformer state transition
 3. Phase 3: logits-to-token decode
 
-Today the implemented serial path stops at:
+Today the implemented serial path produces:
 
 - SHA-256 of the prompt token IDs
 - SHA-256 of the token embedding activations for those prompt token IDs
 - SHA-256 of the final Gemma 4 prefill hidden states
 - SHA-256 of the final-position logits
+- deterministic greedy output text for up to `sampling.max_new_tokens`
 
 ## File Layout
 
@@ -83,7 +83,7 @@ cargo run -- \
   "Hello from phase one"
 ```
 
-It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2. For phase 2 it reads `model.language_model.embed_tokens.weight`, all Gemma text-layer weights, the final text norm, and the output projection path from the Gemma safetensors. It applies Gemma's embedding scale automatically, runs the full text prefill path, and produces final-position logits. The model path can be:
+It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2. For phase 2 it reads `model.language_model.embed_tokens.weight`, all Gemma text-layer weights, the final text norm, and the output projection path from the Gemma safetensors. It applies Gemma's embedding scale automatically, runs the full text prefill path, and produces final-position logits. Phase 3 then performs deterministic greedy decode by selecting one token at a time, appending it to the explicit token sequence, and rerunning the full prefill path for the extended sequence. This is intentionally slow but simple: there is no KV cache yet, and `temperature`/`top_k`/`top_p` remain unsupported beyond accepting the current deterministic default configuration. The model path can be:
 
 - a Gemma model directory containing `model.safetensors.index.json`
 - a Gemma model directory containing a single `model.safetensors` or `consolidated.safetensors`
@@ -95,6 +95,9 @@ The CLI prints the resulting `InferenceState` as formatted JSON with both:
 - `phase2.token_embeddings`: SHA-256 digest of the embedding activations for those prompt token IDs
 - `phase2.final_hidden_states`: SHA-256 digest of the final Gemma 4 prefill hidden states
 - `phase2.prefill_logits.final_logits_sha256`: SHA-256 digest of the final-position logits
+- `phase3.generated_text`: detokenized text for the generated tokens only
+- `phase3.generated_token_ids_sha256`: SHA-256 digest of the generated token IDs
+- `phase3.stop_reason`: currently `max_new_tokens`
 
 To trace long Gemma runs tile-by-tile, set `RASTER_TRACE_TILES=1`. Trace logs go to stderr and include start/end timing for model loading, major phase-2 tiles, and each decoder layer.
 
