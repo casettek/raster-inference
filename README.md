@@ -17,8 +17,8 @@ This repo only targets:
 - one Rust crate
 - one function-first phase-1 pipeline
 - one serial phase-1-to-phase-2 path
-- one first phase-2 embedding tile
-- one first Gemma 4 text layer over those embeddings
+- one prompt-prefill Gemma 4 text path through all decoder layers
+- one final-norm and final-position logits seam for phase 3 handoff
 - no scheduler, server, cache manager, or framework abstraction
 
 This repo does not yet include:
@@ -42,7 +42,8 @@ Today the implemented serial path stops at:
 
 - SHA-256 of the prompt token IDs
 - SHA-256 of the token embedding activations for those prompt token IDs
-- SHA-256 of the first Gemma 4 layer output over those token embeddings
+- SHA-256 of the final Gemma 4 prefill hidden states
+- SHA-256 of the final-position logits
 
 ## File Layout
 
@@ -71,7 +72,7 @@ For the working porting method and the first-batch tile plan, see
 
 ## CLI Smoke Test
 
-The current CLI expects local tokenizer and template artifacts plus a Gemma model path for the embedding weights:
+The current CLI expects local tokenizer and template artifacts plus a Gemma model path for the Gemma text weights:
 
 ```bash
 cargo run -- \
@@ -82,7 +83,7 @@ cargo run -- \
   "Hello from phase one"
 ```
 
-It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2. For phase 2 it reads `model.language_model.embed_tokens.weight` and the first text-layer weights from the Gemma safetensors, applies Gemma's embedding scale automatically, and computes one full layer-0 state transition. The model path can be:
+It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2. For phase 2 it reads `model.language_model.embed_tokens.weight`, all Gemma text-layer weights, the final text norm, and the output projection path from the Gemma safetensors. It applies Gemma's embedding scale automatically, runs the full text prefill path, and produces final-position logits. The model path can be:
 
 - a Gemma model directory containing `model.safetensors.index.json`
 - a Gemma model directory containing a single `model.safetensors` or `consolidated.safetensors`
@@ -92,7 +93,10 @@ The CLI prints the resulting `InferenceState` as formatted JSON with both:
 
 - `phase1`: SHA-256 digest of the prompt token IDs
 - `phase2.token_embeddings`: SHA-256 digest of the embedding activations for those prompt token IDs
-- `phase2.layer0_output`: SHA-256 digest of the first Gemma 4 layer output
+- `phase2.final_hidden_states`: SHA-256 digest of the final Gemma 4 prefill hidden states
+- `phase2.prefill_logits.final_logits_sha256`: SHA-256 digest of the final-position logits
+
+To trace long Gemma runs tile-by-tile, set `RASTER_TRACE_TILES=1`. Trace logs go to stderr and include start/end timing for model loading, major phase-2 tiles, and each decoder layer.
 
 ```bash
 cargo run -- \

@@ -32,33 +32,48 @@ pub type EmbeddedTokenSequence = ActivationSequence;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Phase2State {
     pub token_embeddings: ActivationSequence,
-    pub layer0_output: ActivationSequence,
+    pub final_hidden_states: ActivationSequence,
+    pub prefill_logits: PrefillLogits,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Gemma4PleLayerWeights {
-    pub token_embedding: MatrixF32,
-    pub model_projection: MatrixF32,
+pub struct Gemma4PleGlobalWeights {
+    pub token_embeddings: Vec<MatrixF32>,
+    pub model_projections: Vec<MatrixF32>,
     pub projection_norm_weight: Vec<f32>,
-    pub input_gate: MatrixF32,
-    pub layer_projection: MatrixF32,
-    pub post_input_norm_weight: Vec<f32>,
     pub embedding_scale: f32,
     pub projection_scalar: f32,
     pub input_scale: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Gemma4Layer0Weights {
+pub struct Gemma4PleLayerWeights {
+    pub input_gate: MatrixF32,
+    pub layer_projection: MatrixF32,
+    pub post_input_norm_weight: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4AttentionKind {
+    Sliding,
+    Full,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gemma4LayerWeights {
+    pub attention_kind: Gemma4AttentionKind,
     pub hidden_size: usize,
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
-    pub sliding_window: usize,
+    pub sliding_window: Option<usize>,
     pub rms_norm_eps: f32,
+    pub rope_base: f32,
+    pub partial_rotary_dim: usize,
+    pub attention_k_eq_v: bool,
     pub q_proj: MatrixF32,
     pub k_proj: MatrixF32,
-    pub v_proj: MatrixF32,
+    pub v_proj: Option<MatrixF32>,
     pub o_proj: MatrixF32,
     pub q_norm_weight: Vec<f32>,
     pub k_norm_weight: Vec<f32>,
@@ -71,6 +86,24 @@ pub struct Gemma4Layer0Weights {
     pub down_proj: MatrixF32,
     pub ple: Option<Gemma4PleLayerWeights>,
     pub layer_scalar: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gemma4PrefillPleInputs {
+    pub per_layer_inputs: Vec<Option<Vec<Vec<f32>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Gemma4LogitsProjection {
+    UntiedLmHead(MatrixF32),
+    TiedEmbedding(MatrixF32),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrefillLogits {
+    #[serde(skip_serializing, default)]
+    pub logits: Vec<f32>,
+    pub final_logits_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,5 +141,10 @@ impl GemmaEmbeddingTensorSource {
 pub struct Gemma4Phase2Model {
     pub embedding_table: Option<EmbeddingTable>,
     pub embedding_source: Option<GemmaEmbeddingTensorSource>,
-    pub layer0: Gemma4Layer0Weights,
+    pub layers: Vec<Gemma4LayerWeights>,
+    pub ple_global: Option<Gemma4PleGlobalWeights>,
+    pub final_norm_weight: Vec<f32>,
+    pub logits_projection: Gemma4LogitsProjection,
+    pub final_logit_softcapping: Option<f32>,
+    pub rms_norm_eps: f32,
 }

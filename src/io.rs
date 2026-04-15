@@ -13,9 +13,11 @@ use sha2::Digest;
 use tokenizers::Tokenizer;
 
 use crate::phase2::{
-    ActivationSequence, EmbeddingTable, Gemma4Layer0Weights, Gemma4Phase2Model,
-    Gemma4PleLayerWeights, GemmaEmbeddingTensorSource, MatrixF32,
+    ActivationSequence, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
+    Gemma4LogitsProjection, Gemma4Phase2Model, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+    GemmaEmbeddingTensorSource, MatrixF32,
 };
+use crate::trace::{trace_event, trace_scope};
 
 const GEMMA_EMBED_TENSOR_NAMES: &[&str] = &[
     "model.language_model.embed_tokens.weight",
@@ -36,17 +38,92 @@ struct GemmaConfigFile {
 #[derive(serde::Deserialize)]
 struct GemmaTextConfigFile {
     enable_moe_block: bool,
+    final_logit_softcapping: Option<f32>,
+    global_head_dim: Option<usize>,
     head_dim: usize,
     hidden_activation: String,
     hidden_size: usize,
     hidden_size_per_layer_input: Option<usize>,
     layer_types: Vec<String>,
+    num_global_key_value_heads: Option<usize>,
     num_attention_heads: usize,
+    num_hidden_layers: usize,
     num_key_value_heads: usize,
     rms_norm_eps: f32,
+    rope_parameters: Option<Gemma4RopeParametersFile>,
     sliding_window: usize,
+    tie_word_embeddings: Option<bool>,
     vocab_size: usize,
     vocab_size_per_layer_input: Option<usize>,
+    attention_k_eq_v: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct Gemma4RopeParametersFile {
+    full_attention: Option<Gemma4RopeLayerParamsFile>,
+    sliding_attention: Option<Gemma4RopeLayerParamsFile>,
+    rope_theta: Option<f32>,
+}
+
+#[derive(serde::Deserialize)]
+struct Gemma4RopeLayerParamsFile {
+    partial_rotary_factor: Option<f32>,
+    rope_theta: Option<f32>,
+}
+
+impl GemmaTextConfigFile {
+    fn attention_kind_for_layer(&self, layer_idx: usize) -> Result<Gemma4AttentionKind> {
+        let layer_type = self
+            .layer_types
+            .get(layer_idx)
+            .ok_or_else(|| anyhow!("missing Gemma layer type for layer {layer_idx}"))?;
+        if layer_type == "sliding_attention" {
+            Ok(Gemma4AttentionKind::Sliding)
+        } else {
+            Ok(Gemma4AttentionKind::Full)
+        }
+    }
+
+    fn global_head_dim(&self) -> usize {
+        self.global_head_dim.unwrap_or(self.head_dim)
+    }
+
+    fn attention_k_eq_v(&self) -> bool {
+        self.attention_k_eq_v.unwrap_or(false)
+    }
+
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings.unwrap_or(true)
+    }
+
+    fn full_attention_partial_rotary_factor(&self) -> f32 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|params| params.full_attention.as_ref())
+            .and_then(|params| params.partial_rotary_factor)
+            .unwrap_or(0.25)
+    }
+
+    fn rope_local_base_freq(&self) -> f32 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|params| params.sliding_attention.as_ref())
+            .and_then(|params| params.rope_theta)
+            .unwrap_or(10_000.0)
+    }
+
+    fn rope_full_base_freq(&self) -> f32 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|params| params.full_attention.as_ref())
+            .and_then(|params| params.rope_theta)
+            .or_else(|| {
+                self.rope_parameters
+                    .as_ref()
+                    .and_then(|params| params.rope_theta)
+            })
+            .unwrap_or(1_000_000.0)
+    }
 }
 
 enum GemmaModelSource {
@@ -118,6 +195,13 @@ impl GemmaTensorReader {
     fn load_vector(&mut self, tensor_name: &str) -> Result<Vec<f32>> {
         let tensor = self.load_tensor(tensor_name)?;
         decode_vector(&tensor)
+    }
+
+    fn load_optional_matrix(&mut self, tensor_name: &str) -> Result<Option<MatrixF32>> {
+        match self.load_tensor(tensor_name) {
+            Ok(tensor) => Ok(Some(decode_matrix(&tensor)?)),
+            Err(_) => Ok(None),
+        }
     }
 
     fn load_optional_scalar(&mut self, tensor_name: &str) -> Result<Option<f32>> {
@@ -209,6 +293,7 @@ pub fn load_embedding_table_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Re
 }
 
 pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Result<Gemma4Phase2Model> {
+    let _trace = trace_scope("io.load_phase2_model_from_gemma_model_path");
     let source = resolve_gemma_model_source(path.as_ref())?;
     let config = load_gemma_text_config(source.root_dir().join("config.json"))?;
 
@@ -221,86 +306,165 @@ pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Resul
             config.hidden_activation
         );
     }
-    if config.layer_types.first().map(String::as_str) != Some("sliding_attention") {
-        bail!("phase 2 currently expects Gemma layer 0 to use sliding attention");
+    if config.num_hidden_layers != config.layer_types.len() {
+        bail!(
+            "Gemma config layer count mismatch: num_hidden_layers={} vs layer_types={}",
+            config.num_hidden_layers,
+            config.layer_types.len()
+        );
     }
 
     let mut reader = GemmaTensorReader::new(source);
     let (embedding_tensor_name, _vocab_size, hidden_size) =
         reader.load_first_available_tensor_metadata(GEMMA_EMBED_TENSOR_NAMES)?;
-    let layer0 = load_layer0_weights(&mut reader, &config)?;
+    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    for layer_idx in 0..config.num_hidden_layers {
+        trace_event(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
+        layers.push(load_gemma4_layer_weights(&mut reader, &config, layer_idx)?);
+    }
+    let ple_global = load_ple_global_weights(&mut reader, &config)?;
+    trace_event("io.load_final_norm_weight");
+    let final_norm_weight = reader.load_vector("model.language_model.norm.weight")?;
+    trace_event("io.load_logits_projection");
+    let logits_projection = if config.tie_word_embeddings() {
+        Gemma4LogitsProjection::TiedEmbedding(reader.load_matrix(&embedding_tensor_name)?)
+    } else {
+        Gemma4LogitsProjection::UntiedLmHead(
+            reader.load_matrix("model.language_model.lm_head.weight")?,
+        )
+    };
     let embedding_source = build_embedding_source(&reader, &embedding_tensor_name, hidden_size);
 
     Ok(Gemma4Phase2Model {
         embedding_table: None,
         embedding_source: Some(embedding_source),
-        layer0,
+        layers,
+        ple_global,
+        final_norm_weight,
+        logits_projection,
+        final_logit_softcapping: config.final_logit_softcapping,
+        rms_norm_eps: config.rms_norm_eps,
     })
 }
 
-fn load_layer0_weights(
+fn load_ple_global_weights(
     reader: &mut GemmaTensorReader,
     config: &GemmaTextConfigFile,
-) -> Result<Gemma4Layer0Weights> {
-    let layer0_prefix = "model.language_model.layers.0";
+) -> Result<Option<Gemma4PleGlobalWeights>> {
+    let _trace = trace_scope("io.load_ple_global_weights");
     let hidden_size = config.hidden_size;
     let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
+    if ple_dim == 0 {
+        return Ok(None);
+    }
+
     let ple_vocab_size = config.vocab_size_per_layer_input.unwrap_or(config.vocab_size);
-    let ple = if ple_dim > 0 {
-        Some(Gemma4PleLayerWeights {
-            token_embedding: reader.load_matrix_slice(
+    let mut token_embeddings = Vec::with_capacity(config.num_hidden_layers);
+    let mut model_projections = Vec::with_capacity(config.num_hidden_layers);
+    for layer_idx in 0..config.num_hidden_layers {
+        token_embeddings.push(reader.load_matrix_slice(
                 "model.language_model.embed_tokens_per_layer.weight",
                 0,
                 ple_vocab_size,
-                0,
+                layer_idx * ple_dim,
                 ple_dim,
-            )?,
-            model_projection: reader.load_matrix_slice(
+            )?);
+        model_projections.push(reader.load_matrix_slice(
                 "model.language_model.per_layer_model_projection.weight",
-                0,
+                layer_idx * ple_dim,
                 ple_dim,
                 0,
                 hidden_size,
-            )?,
-            projection_norm_weight: reader.load_vector("model.language_model.per_layer_projection_norm.weight")?,
-            input_gate: reader.load_matrix(&format!("{layer0_prefix}.per_layer_input_gate.weight"))?,
-            layer_projection: reader.load_matrix(&format!("{layer0_prefix}.per_layer_projection.weight"))?,
-            post_input_norm_weight: reader.load_vector(&format!(
-                "{layer0_prefix}.post_per_layer_input_norm.weight"
-            ))?,
-            embedding_scale: (ple_dim as f32).sqrt(),
-            projection_scalar: (hidden_size as f32).powf(-0.5),
-            input_scale: 2f32.powf(-0.5),
+            )?);
+    }
+
+    Ok(Some(Gemma4PleGlobalWeights {
+        token_embeddings,
+        model_projections,
+        projection_norm_weight: reader
+            .load_vector("model.language_model.per_layer_projection_norm.weight")?,
+        embedding_scale: (ple_dim as f32).sqrt(),
+        projection_scalar: (hidden_size as f32).powf(-0.5),
+        input_scale: 2f32.powf(-0.5),
+    }))
+}
+
+fn load_gemma4_layer_weights(
+    reader: &mut GemmaTensorReader,
+    config: &GemmaTextConfigFile,
+    layer_idx: usize,
+) -> Result<Gemma4LayerWeights> {
+    let _trace = trace_scope(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
+    let layer_prefix = format!("model.language_model.layers.{layer_idx}");
+    let attention_kind = config.attention_kind_for_layer(layer_idx)?;
+    let is_sliding = attention_kind == Gemma4AttentionKind::Sliding;
+    let head_dim = if is_sliding {
+        config.head_dim
+    } else {
+        config.global_head_dim()
+    };
+    let num_kv_heads = if is_sliding {
+        config.num_key_value_heads
+    } else if config.attention_k_eq_v() {
+        config
+            .num_global_key_value_heads
+            .unwrap_or(config.num_key_value_heads)
+    } else {
+        config.num_key_value_heads
+    };
+    let partial_rotary_dim = if is_sliding {
+        head_dim
+    } else {
+        ((head_dim as f32) * config.full_attention_partial_rotary_factor()) as usize
+    };
+    let ple = if config.hidden_size_per_layer_input.unwrap_or(0) > 0 {
+        Some(Gemma4PleLayerWeights {
+            input_gate: reader.load_matrix(&format!("{layer_prefix}.per_layer_input_gate.weight"))?,
+            layer_projection: reader.load_matrix(&format!("{layer_prefix}.per_layer_projection.weight"))?,
+            post_input_norm_weight: reader
+                .load_vector(&format!("{layer_prefix}.post_per_layer_input_norm.weight"))?,
         })
     } else {
         None
     };
 
-    Ok(Gemma4Layer0Weights {
-        hidden_size,
+    Ok(Gemma4LayerWeights {
+        attention_kind,
+        hidden_size: config.hidden_size,
         num_heads: config.num_attention_heads,
-        num_kv_heads: config.num_key_value_heads,
-        head_dim: config.head_dim,
-        sliding_window: config.sliding_window,
+        num_kv_heads,
+        head_dim,
+        sliding_window: is_sliding.then_some(config.sliding_window),
         rms_norm_eps: config.rms_norm_eps,
-        q_proj: reader.load_matrix(&format!("{layer0_prefix}.self_attn.q_proj.weight"))?,
-        k_proj: reader.load_matrix(&format!("{layer0_prefix}.self_attn.k_proj.weight"))?,
-        v_proj: reader.load_matrix(&format!("{layer0_prefix}.self_attn.v_proj.weight"))?,
-        o_proj: reader.load_matrix(&format!("{layer0_prefix}.self_attn.o_proj.weight"))?,
-        q_norm_weight: reader.load_vector(&format!("{layer0_prefix}.self_attn.q_norm.weight"))?,
-        k_norm_weight: reader.load_vector(&format!("{layer0_prefix}.self_attn.k_norm.weight"))?,
-        input_layernorm_weight: reader.load_vector(&format!("{layer0_prefix}.input_layernorm.weight"))?,
+        rope_base: if is_sliding {
+            config.rope_local_base_freq()
+        } else {
+            config.rope_full_base_freq()
+        },
+        partial_rotary_dim,
+        attention_k_eq_v: !is_sliding && config.attention_k_eq_v(),
+        q_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
+        k_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
+        v_proj: if !is_sliding && config.attention_k_eq_v() {
+            reader.load_optional_matrix(&format!("{layer_prefix}.self_attn.v_proj.weight"))?
+        } else {
+            Some(reader.load_matrix(&format!("{layer_prefix}.self_attn.v_proj.weight"))?)
+        },
+        o_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
+        q_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.q_norm.weight"))?,
+        k_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.k_norm.weight"))?,
+        input_layernorm_weight: reader.load_vector(&format!("{layer_prefix}.input_layernorm.weight"))?,
         post_attention_layernorm_weight: reader
-            .load_vector(&format!("{layer0_prefix}.post_attention_layernorm.weight"))?,
+            .load_vector(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
         pre_feedforward_layernorm_weight: reader
-            .load_vector(&format!("{layer0_prefix}.pre_feedforward_layernorm.weight"))?,
+            .load_vector(&format!("{layer_prefix}.pre_feedforward_layernorm.weight"))?,
         post_feedforward_layernorm_weight: reader
-            .load_vector(&format!("{layer0_prefix}.post_feedforward_layernorm.weight"))?,
-        gate_proj: reader.load_matrix(&format!("{layer0_prefix}.mlp.gate_proj.weight"))?,
-        up_proj: reader.load_matrix(&format!("{layer0_prefix}.mlp.up_proj.weight"))?,
-        down_proj: reader.load_matrix(&format!("{layer0_prefix}.mlp.down_proj.weight"))?,
+            .load_vector(&format!("{layer_prefix}.post_feedforward_layernorm.weight"))?,
+        gate_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.gate_proj.weight"))?,
+        up_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.up_proj.weight"))?,
+        down_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.down_proj.weight"))?,
         ple,
-        layer_scalar: reader.load_optional_scalar(&format!("{layer0_prefix}.layer_scalar"))?,
+        layer_scalar: reader.load_optional_scalar(&format!("{layer_prefix}.layer_scalar"))?,
     })
 }
 
@@ -308,6 +472,7 @@ pub fn embed_input_tokens_from_gemma_source(
     token_ids: &[u32],
     source: &GemmaEmbeddingTensorSource,
 ) -> Result<ActivationSequence> {
+    let _trace = trace_scope("io.embed_input_tokens_from_gemma_source");
     if token_ids.is_empty() {
         bail!("phase 2 embedding requires at least one token id");
     }
@@ -621,5 +786,234 @@ fn decode_scalar(bytes: &[u8], dtype: Dtype) -> Result<f32> {
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]) as f32),
         _ => bail!("unsupported tensor dtype {dtype:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_phase2_model_from_gemma_model_path;
+    use crate::phase2::{Gemma4AttentionKind, Gemma4LogitsProjection};
+    use safetensors::tensor::{serialize_to_file, TensorView};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct FixtureTensor {
+        name: String,
+        shape: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+
+    #[test]
+    fn load_phase2_model_loads_arbitrary_layers_and_untied_lm_head() {
+        let model_dir = create_test_model_dir("untied");
+        write_config(
+            &model_dir,
+            r#"{
+  "text_config": {
+    "enable_moe_block": false,
+    "final_logit_softcapping": 7.5,
+    "global_head_dim": 2,
+    "head_dim": 2,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 4,
+    "layer_types": ["sliding_attention", "full_attention"],
+    "num_global_key_value_heads": 1,
+    "num_attention_heads": 2,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 1,
+    "rms_norm_eps": 0.000001,
+    "rope_parameters": {
+      "full_attention": { "partial_rotary_factor": 1.0, "rope_theta": 12345.0 },
+      "sliding_attention": { "rope_theta": 10000.0 }
+    },
+    "sliding_window": 5,
+    "tie_word_embeddings": false,
+    "vocab_size": 3,
+    "attention_k_eq_v": true
+  }
+}"#,
+        );
+        let mut tensors = vec![matrix_tensor(
+            "model.language_model.embed_tokens.weight",
+            &[3, 4],
+            &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
+        )];
+        tensors.extend(layer_tensors(0, 1.0, true));
+        tensors.extend(layer_tensors(1, 2.0, false));
+        tensors.push(vector_tensor(
+            "model.language_model.norm.weight",
+            &[4],
+            &[1.0, 1.0, 1.0, 1.0],
+        ));
+        tensors.push(matrix_tensor(
+            "model.language_model.lm_head.weight",
+            &[3, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        ));
+        tensors.push(scalar_tensor("model.language_model.layers.1.layer_scalar", 0.5));
+        write_model_file(&model_dir, &tensors);
+
+        let model = load_phase2_model_from_gemma_model_path(&model_dir).unwrap();
+
+        assert_eq!(model.layers.len(), 2);
+        assert_eq!(model.layers[0].attention_kind, Gemma4AttentionKind::Sliding);
+        assert_eq!(model.layers[1].attention_kind, Gemma4AttentionKind::Full);
+        assert_eq!(model.layers[0].q_proj.values[0], 1.0);
+        assert_eq!(model.layers[1].q_proj.values[0], 2.0);
+        assert!(model.layers[1].v_proj.is_none());
+        assert_eq!(model.layers[1].layer_scalar, Some(0.5));
+        assert_eq!(model.final_norm_weight, vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(model.final_logit_softcapping, Some(7.5));
+        match &model.logits_projection {
+            Gemma4LogitsProjection::UntiedLmHead(weight) => {
+                assert_eq!(weight.rows, 3);
+                assert_eq!(weight.cols, 4);
+            }
+            other => panic!("expected untied lm head, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_phase2_model_reuses_embeddings_for_tied_projection() {
+        let model_dir = create_test_model_dir("tied");
+        write_config(
+            &model_dir,
+            r#"{
+  "text_config": {
+    "enable_moe_block": false,
+    "head_dim": 2,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 4,
+    "layer_types": ["sliding_attention"],
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 1,
+    "rms_norm_eps": 0.000001,
+    "sliding_window": 5,
+    "tie_word_embeddings": true,
+    "vocab_size": 3
+  }
+}"#,
+        );
+        let mut tensors = vec![matrix_tensor(
+            "model.language_model.embed_tokens.weight",
+            &[3, 4],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        )];
+        tensors.extend(layer_tensors(0, 1.0, true));
+        tensors.push(vector_tensor(
+            "model.language_model.norm.weight",
+            &[4],
+            &[1.0, 1.0, 1.0, 1.0],
+        ));
+        write_model_file(&model_dir, &tensors);
+
+        let model = load_phase2_model_from_gemma_model_path(&model_dir).unwrap();
+
+        match &model.logits_projection {
+            Gemma4LogitsProjection::TiedEmbedding(weight) => {
+                assert_eq!(weight.rows, 3);
+                assert_eq!(weight.cols, 4);
+                assert_eq!(weight.values[0], 1.0);
+                assert_eq!(weight.values[11], 12.0);
+            }
+            other => panic!("expected tied embedding projection, got {other:?}"),
+        }
+    }
+
+    fn create_test_model_dir(suffix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("raster-inference-{suffix}-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_config(dir: &Path, config: &str) {
+        fs::write(dir.join("config.json"), config).unwrap();
+    }
+
+    fn write_model_file(dir: &Path, tensors: &[FixtureTensor]) {
+        let mut metadata = BTreeMap::new();
+        for tensor in tensors {
+            metadata.insert(
+                tensor.name.clone(),
+                TensorView::new(safetensors::Dtype::F32, tensor.shape.clone(), &tensor.bytes)
+                    .unwrap(),
+            );
+        }
+        serialize_to_file(&metadata, &None, &dir.join("model.safetensors")).unwrap();
+    }
+
+    fn layer_tensors(layer_idx: usize, base: f32, include_v_proj: bool) -> Vec<FixtureTensor> {
+        let prefix = format!("model.language_model.layers.{layer_idx}");
+        let mut tensors = vec![
+            matrix_tensor(&format!("{prefix}.self_attn.q_proj.weight"), &[4, 4], &[base; 16]),
+            matrix_tensor(&format!("{prefix}.self_attn.k_proj.weight"), &[2, 4], &[base; 8]),
+            matrix_tensor(&format!("{prefix}.self_attn.o_proj.weight"), &[4, 4], &[base; 16]),
+            vector_tensor(&format!("{prefix}.self_attn.q_norm.weight"), &[2], &[1.0, 1.0]),
+            vector_tensor(&format!("{prefix}.self_attn.k_norm.weight"), &[2], &[1.0, 1.0]),
+            vector_tensor(&format!("{prefix}.input_layernorm.weight"), &[4], &[1.0; 4]),
+            vector_tensor(
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                &[4],
+                &[1.0; 4],
+            ),
+            vector_tensor(
+                &format!("{prefix}.pre_feedforward_layernorm.weight"),
+                &[4],
+                &[1.0; 4],
+            ),
+            vector_tensor(
+                &format!("{prefix}.post_feedforward_layernorm.weight"),
+                &[4],
+                &[1.0; 4],
+            ),
+            matrix_tensor(&format!("{prefix}.mlp.gate_proj.weight"), &[8, 4], &[0.0; 32]),
+            matrix_tensor(&format!("{prefix}.mlp.up_proj.weight"), &[8, 4], &[0.0; 32]),
+            matrix_tensor(&format!("{prefix}.mlp.down_proj.weight"), &[4, 8], &[0.0; 32]),
+        ];
+        if include_v_proj {
+            tensors.push(matrix_tensor(
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                &[2, 4],
+                &[base; 8],
+            ));
+        }
+        tensors
+    }
+
+    fn matrix_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTensor {
+        FixtureTensor {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            bytes: f32_to_bytes(values),
+        }
+    }
+
+    fn vector_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTensor {
+        FixtureTensor {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            bytes: f32_to_bytes(values),
+        }
+    }
+
+    fn scalar_tensor(name: &str, value: f32) -> FixtureTensor {
+        FixtureTensor {
+            name: name.to_string(),
+            shape: vec![1],
+            bytes: value.to_le_bytes().to_vec(),
+        }
+    }
+
+    fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
     }
 }
