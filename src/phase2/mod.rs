@@ -21,6 +21,14 @@ pub fn run_prefill_pass(
     model: &Gemma4Phase2Model,
     token_embeddings: &ActivationSequence,
 ) -> Result<Phase2State> {
+    run_prefill_pass_for_token_ids(&phase1_state.prompt_token_ids, model, token_embeddings)
+}
+
+fn run_prefill_pass_for_token_ids(
+    prompt_token_ids: &[u32],
+    model: &Gemma4Phase2Model,
+    token_embeddings: &ActivationSequence,
+) -> Result<Phase2State> {
     let _trace = trace_scope("phase2.run_prefill_pass");
     let ple_inputs = model
         .ple_global
@@ -28,7 +36,7 @@ pub fn run_prefill_pass(
         .map(|ple_global| {
             trace_event("phase2.compute_prefill_ple_inputs");
             compute_prefill_ple_inputs(
-                &phase1_state.prompt_token_ids,
+                prompt_token_ids,
                 &token_embeddings.activations,
                 &model.layers,
                 ple_global,
@@ -63,27 +71,42 @@ pub fn run_prefill_pass(
     })
 }
 
+fn embed_token_ids(
+    token_ids: &[u32],
+    model: &Gemma4Phase2Model,
+) -> Result<ActivationSequence> {
+    if let Some(ref embedding_table) = model.embedding_table {
+        trace_event("phase2.embed_input_tokens");
+        embed_input_tokens(token_ids, embedding_table)
+    } else if let Some(ref embedding_source) = model.embedding_source {
+        trace_event("phase2.embed_input_tokens_from_gemma_source");
+        crate::io::embed_input_tokens_from_gemma_source(token_ids, embedding_source)
+    } else {
+        anyhow::bail!("phase 2 model is missing both embedding_table and embedding_source")
+    }
+}
+
+pub fn run_phase2_for_token_ids(
+    token_ids: &[u32],
+    model: &Gemma4Phase2Model,
+) -> Result<Phase2State> {
+    let _trace = trace_scope("phase2.run_phase2_for_token_ids");
+    let token_embeddings = embed_token_ids(token_ids, model)?;
+    run_prefill_pass_for_token_ids(token_ids, model, &token_embeddings)
+}
+
 pub fn run_phase2(
     phase1_state: &crate::phase1::Phase1State,
     model: &Gemma4Phase2Model,
 ) -> Result<Phase2State> {
     let _trace = trace_scope("phase2.run_phase2");
-    let token_embeddings = if let Some(ref embedding_table) = model.embedding_table {
-        trace_event("phase2.embed_input_tokens");
-        embed_input_tokens(&phase1_state.prompt_token_ids, embedding_table)?
-    } else if let Some(ref embedding_source) = model.embedding_source {
-        trace_event("phase2.embed_input_tokens_from_gemma_source");
-        crate::io::embed_input_tokens_from_gemma_source(&phase1_state.prompt_token_ids, embedding_source)?
-    } else {
-        anyhow::bail!("phase 2 model is missing both embedding_table and embedding_source")
-    };
-    run_prefill_pass(phase1_state, model, &token_embeddings)
+    run_phase2_for_token_ids(&phase1_state.prompt_token_ids, model)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        run_phase2, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
+        run_phase2, run_phase2_for_token_ids, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
         Gemma4LogitsProjection, Gemma4Phase2Model, MatrixF32,
     };
     use crate::phase1::Phase1State;
@@ -94,7 +117,57 @@ mod tests {
             prompt_token_ids: vec![1, 0],
             prompt_token_ids_sha256: "unused-for-phase2".to_string(),
         };
+        let model = test_phase2_model();
+
+        let phase2_state = run_phase2(&phase1_state, &model).expect("phase 2 should succeed");
+
+        assert_eq!(
+            phase2_state.token_embeddings.activations,
+            vec![vec![1.0, 1.5, 0.0, 0.0], vec![0.0, 0.5, 0.0, 0.0]]
+        );
+        assert_eq!(
+            phase2_state.final_hidden_states.activations,
+            phase2_state.token_embeddings.activations
+        );
+        assert_eq!(phase2_state.prefill_logits.logits, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn run_phase2_for_token_ids_matches_run_phase2_for_same_tokens() {
+        let phase1_state = Phase1State {
+            prompt_token_ids: vec![1, 0],
+            prompt_token_ids_sha256: "unused-for-phase2".to_string(),
+        };
+        let model = test_phase2_model();
+
+        let via_phase1 = run_phase2(&phase1_state, &model).expect("phase 2 should succeed");
+        let via_token_ids =
+            run_phase2_for_token_ids(&phase1_state.prompt_token_ids, &model).expect("phase 2 replay");
+
+        assert_eq!(via_token_ids, via_phase1);
+    }
+
+    #[test]
+    fn run_phase2_for_token_ids_preserves_missing_embedding_error() {
         let model = Gemma4Phase2Model {
+            embedding_table: None,
+            embedding_source: None,
+            layers: vec![],
+            ple_global: None,
+            final_norm_weight: vec![],
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead(zero_matrix(0, 0)),
+            final_logit_softcapping: None,
+            rms_norm_eps: 1e-6,
+        };
+
+        let error = run_phase2_for_token_ids(&[0], &model).expect_err("missing embeddings should fail");
+        assert!(error
+            .to_string()
+            .contains("phase 2 model is missing both embedding_table and embedding_source"));
+    }
+
+    fn test_phase2_model() -> Gemma4Phase2Model {
+        Gemma4Phase2Model {
             embedding_table: Some(EmbeddingTable {
                 rows: vec![vec![0.0, 0.5, 0.0, 0.0], vec![1.0, 1.5, 0.0, 0.0]],
                 scale: 1.0,
@@ -132,19 +205,7 @@ mod tests {
             logits_projection: Gemma4LogitsProjection::UntiedLmHead(zero_matrix(2, 4)),
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
-        };
-
-        let phase2_state = run_phase2(&phase1_state, &model).expect("phase 2 should succeed");
-
-        assert_eq!(
-            phase2_state.token_embeddings.activations,
-            vec![vec![1.0, 1.5, 0.0, 0.0], vec![0.0, 0.5, 0.0, 0.0]]
-        );
-        assert_eq!(
-            phase2_state.final_hidden_states.activations,
-            phase2_state.token_embeddings.activations
-        );
-        assert_eq!(phase2_state.prefill_logits.logits, vec![0.0, 0.0]);
+        }
     }
 
     fn zero_matrix(rows: usize, cols: usize) -> MatrixF32 {
