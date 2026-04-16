@@ -317,6 +317,31 @@ mod tests {
         assert_eq!(step.decode_state.layer_caches[0].current_len(), 2);
     }
 
+    #[test]
+    fn decode_step_matches_full_replay_for_kv_shared_sliding_layers() {
+        let model = shared_kv_test_model();
+        let token_ids = vec![0, 1, 2];
+        let token_embeddings =
+            crate::phase2::embed_input_tokens(&token_ids, model.embedding_table.as_ref().unwrap())
+                .expect("embedding should succeed");
+        let phase1_state = Phase1State {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-phase2".to_string(),
+        };
+        let prefill = run_prefill_pass(&phase1_state, &model, &token_embeddings).expect("prefill result");
+
+        assert_eq!(prefill.decode_state.layer_caches[0].current_len(), 3);
+        assert_eq!(prefill.decode_state.layer_caches[1].current_len(), 0);
+
+        let step = decode_step(&prefill.decode_state, 0, &model).expect("decode step");
+        let replay = run_phase2_for_token_ids(&[0, 1, 2, 0], &model).expect("replay phase2");
+
+        assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
+        assert_eq!(step.decode_state.layer_caches[0].current_len(), 4);
+        assert_eq!(step.decode_state.layer_caches[1].current_len(), 0);
+    }
+
     fn test_phase2_model() -> Gemma4Phase2Model {
         Gemma4Phase2Model {
             embedding_table: Some(EmbeddingTable {
@@ -331,9 +356,12 @@ mod tests {
                 num_kv_heads: 1,
                 head_dim: 2,
                 sliding_window: Some(2),
+                cache_sliding_window: Some(2),
                 rms_norm_eps: 1e-6,
                 rope_base: 10_000.0,
                 partial_rotary_dim: 2,
+                rope_freq_base_dim: 2,
+                kv_shared_layer_index: None,
                 attention_k_eq_v: false,
                 q_proj: zero_matrix(4, 4),
                 k_proj: zero_matrix(2, 4),
@@ -426,9 +454,12 @@ mod tests {
                 num_kv_heads: 1,
                 head_dim: 2,
                 sliding_window,
+                cache_sliding_window: sliding_window,
                 rms_norm_eps: 1e-6,
                 rope_base: 10_000.0,
                 partial_rotary_dim: 2,
+                rope_freq_base_dim: 2,
+                kv_shared_layer_index: None,
                 attention_k_eq_v: false,
                 q_proj: MatrixF32 {
                     rows: 4,
@@ -479,6 +510,101 @@ mod tests {
                 layer_scalar: None,
             }],
             ple_global,
+            final_norm_weight: vec![1.0; 4],
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead(MatrixF32 {
+                rows: 3,
+                cols: 4,
+                values: vec![
+                    0.7, 0.1, 0.2, 0.0,
+                    0.0, 0.8, 0.1, 0.1,
+                    0.2, 0.0, 0.8, 0.2,
+                ],
+            }),
+            final_logit_softcapping: None,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    fn shared_kv_test_model() -> Gemma4Phase2Model {
+        let donor_layer = Gemma4LayerWeights {
+            attention_kind: Gemma4AttentionKind::Sliding,
+            hidden_size: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            sliding_window: Some(2),
+            cache_sliding_window: None,
+            rms_norm_eps: 1e-6,
+            rope_base: 10_000.0,
+            partial_rotary_dim: 2,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
+            attention_k_eq_v: false,
+            q_proj: MatrixF32 {
+                rows: 4,
+                cols: 4,
+                values: vec![
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                ],
+            },
+            k_proj: MatrixF32 {
+                rows: 2,
+                cols: 4,
+                values: vec![
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                ],
+            },
+            v_proj: Some(MatrixF32 {
+                rows: 2,
+                cols: 4,
+                values: vec![
+                    0.0, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                ],
+            }),
+            o_proj: MatrixF32 {
+                rows: 4,
+                cols: 4,
+                values: vec![
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                ],
+            },
+            q_norm_weight: vec![1.0, 1.0],
+            k_norm_weight: vec![1.0, 1.0],
+            input_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight: vec![1.0; 4],
+            gate_proj: zero_matrix(8, 4),
+            up_proj: zero_matrix(8, 4),
+            down_proj: zero_matrix(4, 8),
+            ple: None,
+            layer_scalar: None,
+        };
+        let shared_layer = Gemma4LayerWeights {
+            kv_shared_layer_index: Some(0),
+            ..donor_layer.clone()
+        };
+
+        Gemma4Phase2Model {
+            embedding_table: Some(EmbeddingTable {
+                rows: vec![
+                    vec![1.0, 0.0, 0.5, 0.0],
+                    vec![0.0, 1.0, 0.0, 0.5],
+                    vec![0.5, 0.5, 1.0, 0.0],
+                ],
+                scale: 1.0,
+            }),
+            embedding_source: None,
+            layers: vec![donor_layer, shared_layer],
+            ple_global: None,
             final_norm_weight: vec![1.0; 4],
             logits_projection: Gemma4LogitsProjection::UntiedLmHead(MatrixF32 {
                 rows: 3,
