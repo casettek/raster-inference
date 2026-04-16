@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     fs::File,
     path::{Path, PathBuf},
@@ -56,6 +56,8 @@ struct GemmaTextConfigFile {
     vocab_size: usize,
     vocab_size_per_layer_input: Option<usize>,
     attention_k_eq_v: Option<bool>,
+    num_kv_shared_layers: Option<usize>,
+    use_bidirectional_attention: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -124,6 +126,45 @@ impl GemmaTextConfigFile {
             })
             .unwrap_or(1_000_000.0)
     }
+
+    fn num_kv_shared_layers(&self) -> usize {
+        self.num_kv_shared_layers.unwrap_or(0)
+    }
+
+    fn effective_sliding_window(&self) -> usize {
+        if self.use_bidirectional_attention.as_deref() == Some("all") {
+            (self.sliding_window / 2) + 1
+        } else {
+            self.sliding_window
+        }
+    }
+}
+
+fn first_kv_shared_layer_idx(config: &GemmaTextConfigFile) -> usize {
+    config
+        .num_hidden_layers
+        .saturating_sub(config.num_kv_shared_layers())
+}
+
+fn kv_shared_layer_index(config: &GemmaTextConfigFile, layer_idx: usize) -> Result<Option<usize>> {
+    let first_shared_layer_idx = first_kv_shared_layer_idx(config);
+    if config.num_kv_shared_layers() == 0 || layer_idx < first_shared_layer_idx {
+        return Ok(None);
+    }
+
+    let attention_type = config
+        .layer_types
+        .get(layer_idx)
+        .ok_or_else(|| anyhow!("missing Gemma layer type for layer {layer_idx}"))?;
+    config.layer_types[..first_shared_layer_idx]
+        .iter()
+        .rposition(|layer_type| layer_type == attention_type)
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow!(
+                "Gemma layer {layer_idx} is configured to share KV without a prior `{attention_type}` donor layer"
+            )
+        })
 }
 
 enum GemmaModelSource {
@@ -317,10 +358,24 @@ pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Resul
     let mut reader = GemmaTensorReader::new(source);
     let (embedding_tensor_name, _vocab_size, hidden_size) =
         reader.load_first_available_tensor_metadata(GEMMA_EMBED_TENSOR_NAMES)?;
+    let first_shared_layer_idx = first_kv_shared_layer_idx(&config);
+    let mut kv_donor_layers = HashSet::new();
+    if first_shared_layer_idx < config.num_hidden_layers {
+        for shared_layer_idx in first_shared_layer_idx..config.num_hidden_layers {
+            if let Some(donor_layer_idx) = kv_shared_layer_index(&config, shared_layer_idx)? {
+                kv_donor_layers.insert(donor_layer_idx);
+            }
+        }
+    }
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for layer_idx in 0..config.num_hidden_layers {
         trace_event(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
-        layers.push(load_gemma4_layer_weights(&mut reader, &config, layer_idx)?);
+        layers.push(load_gemma4_layer_weights(
+            &mut reader,
+            &config,
+            layer_idx,
+            kv_donor_layers.contains(&layer_idx),
+        )?);
     }
     let ple_global = load_ple_global_weights(&mut reader, &config)?;
     trace_event("io.load_final_norm_weight");
@@ -393,6 +448,7 @@ fn load_gemma4_layer_weights(
     reader: &mut GemmaTensorReader,
     config: &GemmaTextConfigFile,
     layer_idx: usize,
+    is_kv_donor: bool,
 ) -> Result<Gemma4LayerWeights> {
     let _trace = trace_scope(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
     let layer_prefix = format!("model.language_model.layers.{layer_idx}");
@@ -417,6 +473,8 @@ fn load_gemma4_layer_weights(
     } else {
         ((head_dim as f32) * config.full_attention_partial_rotary_factor()) as usize
     };
+    let kv_shared_layer_index = kv_shared_layer_index(config, layer_idx)?;
+    let effective_sliding_window = config.effective_sliding_window();
     let ple = if config.hidden_size_per_layer_input.unwrap_or(0) > 0 {
         Some(Gemma4PleLayerWeights {
             input_gate: reader.load_matrix(&format!("{layer_prefix}.per_layer_input_gate.weight"))?,
@@ -434,7 +492,12 @@ fn load_gemma4_layer_weights(
         num_heads: config.num_attention_heads,
         num_kv_heads,
         head_dim,
-        sliding_window: is_sliding.then_some(config.sliding_window),
+        sliding_window: is_sliding.then_some(effective_sliding_window),
+        cache_sliding_window: if is_sliding && !is_kv_donor {
+            Some(effective_sliding_window)
+        } else {
+            None
+        },
         rms_norm_eps: config.rms_norm_eps,
         rope_base: if is_sliding {
             config.rope_local_base_freq()
@@ -442,6 +505,8 @@ fn load_gemma4_layer_weights(
             config.rope_full_base_freq()
         },
         partial_rotary_dim,
+        rope_freq_base_dim: head_dim,
+        kv_shared_layer_index,
         attention_k_eq_v: !is_sliding && config.attention_k_eq_v(),
         q_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
         k_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
@@ -862,6 +927,8 @@ mod tests {
         assert_eq!(model.layers.len(), 2);
         assert_eq!(model.layers[0].attention_kind, Gemma4AttentionKind::Sliding);
         assert_eq!(model.layers[1].attention_kind, Gemma4AttentionKind::Full);
+        assert_eq!(model.layers[0].rope_freq_base_dim, 2);
+        assert_eq!(model.layers[1].rope_freq_base_dim, 2);
         assert_eq!(model.layers[0].q_proj.values[0], 1.0);
         assert_eq!(model.layers[1].q_proj.values[0], 2.0);
         assert!(model.layers[1].v_proj.is_none());
@@ -923,6 +990,94 @@ mod tests {
             }
             other => panic!("expected tied embedding projection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_phase2_model_parses_effective_window_and_kv_sharing_metadata() {
+        let model_dir = create_test_model_dir("shared-kv");
+        write_config(
+            &model_dir,
+            r#"{
+  "text_config": {
+    "enable_moe_block": false,
+    "head_dim": 2,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 4,
+    "layer_types": ["sliding_attention", "sliding_attention"],
+    "num_attention_heads": 2,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 1,
+    "num_kv_shared_layers": 1,
+    "rms_norm_eps": 0.000001,
+    "sliding_window": 5,
+    "tie_word_embeddings": true,
+    "use_bidirectional_attention": "all",
+    "vocab_size": 3
+  }
+}"#,
+        );
+        let mut tensors = vec![matrix_tensor(
+            "model.language_model.embed_tokens.weight",
+            &[3, 4],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        )];
+        tensors.extend(layer_tensors(0, 1.0, true));
+        tensors.extend(layer_tensors(1, 2.0, true));
+        tensors.push(vector_tensor(
+            "model.language_model.norm.weight",
+            &[4],
+            &[1.0, 1.0, 1.0, 1.0],
+        ));
+        write_model_file(&model_dir, &tensors);
+
+        let model = load_phase2_model_from_gemma_model_path(&model_dir).unwrap();
+
+        assert_eq!(model.layers[0].sliding_window, Some(3));
+        assert_eq!(model.layers[0].cache_sliding_window, None);
+        assert_eq!(model.layers[0].kv_shared_layer_index, None);
+        assert_eq!(model.layers[1].sliding_window, Some(3));
+        assert_eq!(model.layers[1].kv_shared_layer_index, Some(0));
+    }
+
+    #[test]
+    fn load_phase2_model_rejects_kv_sharing_without_a_donor_layer() {
+        let model_dir = create_test_model_dir("invalid-shared-kv");
+        write_config(
+            &model_dir,
+            r#"{
+  "text_config": {
+    "enable_moe_block": false,
+    "head_dim": 2,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 4,
+    "layer_types": ["sliding_attention"],
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 1,
+    "num_kv_shared_layers": 1,
+    "rms_norm_eps": 0.000001,
+    "sliding_window": 5,
+    "tie_word_embeddings": true,
+    "vocab_size": 3
+  }
+}"#,
+        );
+        let mut tensors = vec![matrix_tensor(
+            "model.language_model.embed_tokens.weight",
+            &[3, 4],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        )];
+        tensors.extend(layer_tensors(0, 1.0, true));
+        tensors.push(vector_tensor(
+            "model.language_model.norm.weight",
+            &[4],
+            &[1.0, 1.0, 1.0, 1.0],
+        ));
+        write_model_file(&model_dir, &tensors);
+
+        let error = load_phase2_model_from_gemma_model_path(&model_dir).expect_err("missing donor should fail");
+
+        assert!(error.to_string().contains("share KV without a prior"));
     }
 
     fn create_test_model_dir(suffix: &str) -> PathBuf {

@@ -212,13 +212,14 @@ pub fn run_gemma4_layer(
     layer: &Gemma4LayerWeights,
     per_layer_input: Option<&[Vec<f32>]>,
 ) -> Result<ActivationSequence> {
-    Ok(run_gemma4_layer_with_cache(input_activations, layer, per_layer_input)?.0)
+    Ok(run_gemma4_layer_with_cache(input_activations, layer, per_layer_input, None)?.0)
 }
 
 fn run_gemma4_layer_with_cache(
     input_activations: &[Vec<f32>],
     layer: &Gemma4LayerWeights,
     per_layer_input: Option<&[Vec<f32>]>,
+    donor_cache: Option<&LayerKvCache>,
 ) -> Result<(ActivationSequence, LayerKvCache)> {
     let _trace = trace_scope(format!(
         "phase2.run_gemma4_layer attention={:?}",
@@ -261,7 +262,7 @@ fn run_gemma4_layer_with_cache(
     };
     let (attn_out, layer_cache) = {
         let _trace = trace_scope("phase2.run_gemma4_layer.attention.core");
-        run_attention_for_layer_with_cache(&normed, layer)?
+        run_attention_for_layer_with_cache(&normed, layer, donor_cache)?
     };
     let attn_out = {
         let _trace = trace_scope("phase2.run_gemma4_layer.attention.post_rms_norm");
@@ -370,6 +371,7 @@ pub fn run_gemma4_layer_decode(
     layer: &Gemma4LayerWeights,
     per_layer_input: Option<&[f32]>,
     cache: &LayerKvCache,
+    donor_cache: Option<&LayerKvCache>,
     position: usize,
 ) -> Result<(Vec<f32>, LayerKvCache)> {
     let _trace = trace_scope(format!(
@@ -392,7 +394,8 @@ pub fn run_gemma4_layer_decode(
 
     let residual = input_activation.to_vec();
     let normed = apply_rms_norm(input_activation, &layer.input_layernorm_weight, layer.rms_norm_eps)?;
-    let (mut xs, updated_cache) = run_attention_for_layer_decode(&normed, layer, cache, position)?;
+    let (mut xs, updated_cache) =
+        run_attention_for_layer_decode(&normed, layer, cache, donor_cache, position)?;
     xs = apply_rms_norm(&xs, &layer.post_attention_layernorm_weight, layer.rms_norm_eps)?;
     xs = add_rows(&residual, &xs)?;
 
@@ -455,7 +458,9 @@ pub fn run_text_layers_prefill_with_cache(
         let per_layer_input = ple_inputs
             .and_then(|inputs| inputs.per_layer_inputs.get(layer_idx))
             .and_then(|input| input.as_deref());
-        let (layer_output, layer_cache) = run_gemma4_layer_with_cache(&xs, layer, per_layer_input)?;
+        let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
+        let (layer_output, layer_cache) =
+            run_gemma4_layer_with_cache(&xs, layer, per_layer_input, donor_cache)?;
         xs = layer_output.activations;
         layer_caches.push(layer_cache);
     }
@@ -503,8 +508,16 @@ pub fn run_text_layers_decode_step(
             model.ple_global.as_ref(),
             model.rms_norm_eps,
         )?;
-        let (layer_output, updated_cache) =
-            run_gemma4_layer_decode(&xs, layer, per_layer_input.as_deref(), cache, position)?;
+        let donor_cache =
+            resolve_decode_donor_cache(layer, layer_caches, &updated_layer_caches, layer_idx)?;
+        let (layer_output, updated_cache) = run_gemma4_layer_decode(
+            &xs,
+            layer,
+            per_layer_input.as_deref(),
+            cache,
+            donor_cache,
+            position,
+        )?;
         xs = layer_output;
         updated_layer_caches.push(updated_cache);
     }
@@ -516,6 +529,50 @@ pub fn run_text_layers_decode_step(
         },
         layer_caches: updated_layer_caches,
     })
+}
+
+fn resolve_prefill_donor_cache<'a>(
+    layer: &Gemma4LayerWeights,
+    layer_caches: &'a [LayerKvCache],
+    layer_idx: usize,
+) -> Result<Option<&'a LayerKvCache>> {
+    layer
+        .kv_shared_layer_index
+        .map(|donor_idx| {
+            if donor_idx >= layer_idx {
+                bail!(
+                    "phase 2 prefill layer {layer_idx} cannot share KV with non-prior donor {donor_idx}"
+                );
+            }
+            layer_caches.get(donor_idx).ok_or_else(|| {
+                anyhow!("phase 2 prefill donor cache {donor_idx} missing for layer {layer_idx}")
+            })
+        })
+        .transpose()
+}
+
+fn resolve_decode_donor_cache<'a>(
+    layer: &Gemma4LayerWeights,
+    layer_caches: &'a [LayerKvCache],
+    updated_layer_caches: &'a [LayerKvCache],
+    layer_idx: usize,
+) -> Result<Option<&'a LayerKvCache>> {
+    layer
+        .kv_shared_layer_index
+        .map(|donor_idx| {
+            if donor_idx >= layer_idx {
+                bail!(
+                    "phase 2 decode layer {layer_idx} cannot share KV with non-prior donor {donor_idx}"
+                );
+            }
+            updated_layer_caches
+                .get(donor_idx)
+                .or_else(|| layer_caches.get(donor_idx))
+                .ok_or_else(|| {
+                    anyhow!("phase 2 decode donor cache {donor_idx} missing for layer {layer_idx}")
+                })
+        })
+        .transpose()
 }
 
 pub fn apply_final_norm(
@@ -620,10 +677,11 @@ fn build_vector_commitment(values: &[f32]) -> String {
 fn run_attention_for_layer_with_cache(
     inputs: &[Vec<f32>],
     layer: &Gemma4LayerWeights,
+    donor_cache: Option<&LayerKvCache>,
 ) -> Result<(Vec<Vec<f32>>, LayerKvCache)> {
     match layer.attention_kind {
-        Gemma4AttentionKind::Sliding => run_sliding_attention(inputs, layer),
-        Gemma4AttentionKind::Full => run_full_attention(inputs, layer),
+        Gemma4AttentionKind::Sliding => run_sliding_attention(inputs, layer, donor_cache),
+        Gemma4AttentionKind::Full => run_full_attention(inputs, layer, donor_cache),
     }
 }
 
@@ -631,6 +689,7 @@ fn run_attention_for_layer_decode(
     input: &[f32],
     layer: &Gemma4LayerWeights,
     cache: &LayerKvCache,
+    donor_cache: Option<&LayerKvCache>,
     position: usize,
 ) -> Result<(Vec<f32>, LayerKvCache)> {
     match layer.attention_kind {
@@ -638,33 +697,53 @@ fn run_attention_for_layer_decode(
             let sliding_window = layer
                 .sliding_window
                 .ok_or_else(|| anyhow!("sliding attention layer is missing a sliding window"))?;
-            run_causal_attention_decode(input, layer, cache, position, Some(sliding_window))
+            run_causal_attention_decode(
+                input,
+                layer,
+                cache,
+                donor_cache,
+                position,
+                Some(sliding_window),
+                layer.cache_sliding_window,
+            )
         }
-        Gemma4AttentionKind::Full => run_causal_attention_decode(input, layer, cache, position, None),
+        Gemma4AttentionKind::Full => {
+            run_causal_attention_decode(input, layer, cache, donor_cache, position, None, None)
+        }
     }
 }
 
 fn run_sliding_attention(
     inputs: &[Vec<f32>],
     layer: &Gemma4LayerWeights,
+    donor_cache: Option<&LayerKvCache>,
 ) -> Result<(Vec<Vec<f32>>, LayerKvCache)> {
     let sliding_window = layer
         .sliding_window
         .ok_or_else(|| anyhow!("sliding attention layer is missing a sliding window"))?;
-    run_causal_attention(inputs, layer, Some(sliding_window))
+    run_causal_attention(
+        inputs,
+        layer,
+        Some(sliding_window),
+        layer.cache_sliding_window,
+        donor_cache,
+    )
 }
 
 fn run_full_attention(
     inputs: &[Vec<f32>],
     layer: &Gemma4LayerWeights,
+    donor_cache: Option<&LayerKvCache>,
 ) -> Result<(Vec<Vec<f32>>, LayerKvCache)> {
-    run_causal_attention(inputs, layer, None)
+    run_causal_attention(inputs, layer, None, None, donor_cache)
 }
 
 fn run_causal_attention(
     inputs: &[Vec<f32>],
     layer: &Gemma4LayerWeights,
-    sliding_window: Option<usize>,
+    attention_window: Option<usize>,
+    cache_window: Option<usize>,
+    donor_cache: Option<&LayerKvCache>,
 ) -> Result<(Vec<Vec<f32>>, LayerKvCache)> {
     let _trace = trace_scope(format!(
         "phase2.run_causal_attention attention={:?}",
@@ -724,14 +803,28 @@ fn run_causal_attention(
 
     {
         let _trace = trace_scope("phase2.run_causal_attention.q_rope");
-        apply_rope(&mut q, layer.partial_rotary_dim, layer.rope_base);
+        apply_rope(
+            &mut q,
+            layer.partial_rotary_dim,
+            layer.rope_freq_base_dim,
+            layer.rope_base,
+        );
     }
     {
         let _trace = trace_scope("phase2.run_causal_attention.k_rope");
-        apply_rope(&mut k, layer.partial_rotary_dim, layer.rope_base);
+        apply_rope(
+            &mut k,
+            layer.partial_rotary_dim,
+            layer.rope_freq_base_dim,
+            layer.rope_base,
+        );
     }
 
-    let layer_cache = build_layer_kv_cache(&k, &v, sliding_window);
+    let layer_cache = if donor_cache.is_some() {
+        LayerKvCache::new(layer.num_kv_heads)
+    } else {
+        build_layer_kv_cache(&k, &v, cache_window)
+    };
 
     let head_outputs = (0..layer.num_heads)
         .into_par_iter()
@@ -740,17 +833,22 @@ fn run_causal_attention(
             let kv_head_idx = head_idx / kv_groups;
             let mut outputs = vec![vec![0.0; layer.head_dim]; seq_len];
             for (query_idx, output) in outputs.iter_mut().enumerate() {
-                let start = sliding_window
+                let start = attention_window
                     .map(|window| query_idx.saturating_add(1).saturating_sub(window))
                     .unwrap_or(0);
+                let (keys, values) = if let Some(donor_cache) = donor_cache {
+                    (&donor_cache.keys[kv_head_idx], &donor_cache.values[kv_head_idx])
+                } else {
+                    (&k[kv_head_idx], &v[kv_head_idx])
+                };
                 let logits = (start..=query_idx)
-                    .map(|key_idx| dot(&q[head_idx][query_idx], &k[kv_head_idx][key_idx]))
+                    .map(|key_idx| dot(&q[head_idx][query_idx], &keys[key_idx]))
                     .collect::<Vec<_>>();
                 let weights = softmax(&logits);
 
                 for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
                     for (dim_idx, value) in output.iter_mut().enumerate() {
-                        *value += weight * v[kv_head_idx][key_idx][dim_idx];
+                        *value += weight * values[key_idx][dim_idx];
                     }
                 }
             }
@@ -777,8 +875,10 @@ fn run_causal_attention_decode(
     input: &[f32],
     layer: &Gemma4LayerWeights,
     cache: &LayerKvCache,
+    donor_cache: Option<&LayerKvCache>,
     position: usize,
-    sliding_window: Option<usize>,
+    attention_window: Option<usize>,
+    cache_window: Option<usize>,
 ) -> Result<(Vec<f32>, LayerKvCache)> {
     let _trace = trace_scope(format!(
         "phase2.run_causal_attention_decode attention={:?}",
@@ -793,7 +893,11 @@ fn run_causal_attention_decode(
     if kv_groups == 0 {
         bail!("Gemma layer must have at least one KV group");
     }
-    validate_layer_cache(cache, layer)?;
+    if let Some(donor_cache) = donor_cache {
+        validate_layer_cache(donor_cache, layer)?;
+    } else {
+        validate_layer_cache(cache, layer)?;
+    }
 
     let q_projected = linear_row(input, &layer.q_proj)?;
     let raw_k = linear_row(input, &layer.k_proj)?;
@@ -812,20 +916,43 @@ fn run_causal_attention_decode(
     apply_head_rms_norm_row(&mut q, &layer.q_norm_weight, layer.rms_norm_eps)?;
     apply_head_rms_norm_row(&mut k, &layer.k_norm_weight, layer.rms_norm_eps)?;
     apply_value_rms_norm_row(&mut v, layer.rms_norm_eps)?;
-    apply_rope_to_rows(&mut q, layer.partial_rotary_dim, layer.rope_base, position);
-    apply_rope_to_rows(&mut k, layer.partial_rotary_dim, layer.rope_base, position);
+    apply_rope_to_rows(
+        &mut q,
+        layer.partial_rotary_dim,
+        layer.rope_freq_base_dim,
+        layer.rope_base,
+        position,
+    );
+    apply_rope_to_rows(
+        &mut k,
+        layer.partial_rotary_dim,
+        layer.rope_freq_base_dim,
+        layer.rope_base,
+        position,
+    );
 
-    let updated_cache = append_kv_cache(cache, &k, &v, sliding_window)?;
+    let updated_cache = if donor_cache.is_some() {
+        cache.clone()
+    } else {
+        append_kv_cache(cache, &k, &v, cache_window)?
+    };
+    let attention_cache = donor_cache.unwrap_or(&updated_cache);
     let mut combined_heads = vec![0.0; layer.num_heads * layer.head_dim];
     for head_idx in 0..layer.num_heads {
         let kv_head_idx = head_idx / kv_groups;
-        let logits = updated_cache.keys[kv_head_idx]
+        let key_start = attention_window
+            .map(|window| attention_cache.keys[kv_head_idx].len().saturating_sub(window))
+            .unwrap_or(0);
+        let logits = attention_cache.keys[kv_head_idx][key_start..]
             .iter()
             .map(|key_row| dot(&q[head_idx], key_row))
             .collect::<Vec<_>>();
         let weights = softmax(&logits);
         let mut output = vec![0.0; layer.head_dim];
-        for (weight, value_row) in weights.into_iter().zip(&updated_cache.values[kv_head_idx]) {
+        for (weight, value_row) in weights
+            .into_iter()
+            .zip(&attention_cache.values[kv_head_idx][key_start..])
+        {
             for (dim_idx, value) in output.iter_mut().enumerate() {
                 *value += weight * value_row[dim_idx];
             }
@@ -1103,13 +1230,14 @@ fn apply_value_rms_norm_row(heads: &mut [Vec<f32>], eps: f32) -> Result<()> {
     Ok(())
 }
 
-fn apply_rope(heads: &mut [Vec<Vec<f32>>], rotary_dim: usize, base: f32) {
-    apply_rope_with_offset(heads, rotary_dim, base, 0);
+fn apply_rope(heads: &mut [Vec<Vec<f32>>], rotary_dim: usize, freq_base_dim: usize, base: f32) {
+    apply_rope_with_offset(heads, rotary_dim, freq_base_dim, base, 0);
 }
 
 fn apply_rope_with_offset(
     heads: &mut [Vec<Vec<f32>>],
     rotary_dim: usize,
+    freq_base_dim: usize,
     base: f32,
     position_offset: usize,
 ) {
@@ -1122,8 +1250,8 @@ fn apply_rope_with_offset(
             let original = row.clone();
             for dim_idx in 0..half_dim {
                 let absolute_position = position_offset + position;
-                let angle =
-                    absolute_position as f32 / base.powf((2 * dim_idx) as f32 / rotary_dim as f32);
+                let angle = absolute_position as f32
+                    / base.powf((2 * dim_idx) as f32 / freq_base_dim as f32);
                 let cos = angle.cos();
                 let sin = angle.sin();
                 let lhs = original[dim_idx];
@@ -1135,7 +1263,13 @@ fn apply_rope_with_offset(
     }
 }
 
-fn apply_rope_to_rows(heads: &mut [Vec<f32>], rotary_dim: usize, base: f32, position: usize) {
+fn apply_rope_to_rows(
+    heads: &mut [Vec<f32>],
+    rotary_dim: usize,
+    freq_base_dim: usize,
+    base: f32,
+    position: usize,
+) {
     if rotary_dim == 0 {
         return;
     }
@@ -1143,7 +1277,8 @@ fn apply_rope_to_rows(heads: &mut [Vec<f32>], rotary_dim: usize, base: f32, posi
     for row in heads {
         let original = row.clone();
         for dim_idx in 0..half_dim {
-            let angle = position as f32 / base.powf((2 * dim_idx) as f32 / rotary_dim as f32);
+            let angle =
+                position as f32 / base.powf((2 * dim_idx) as f32 / freq_base_dim as f32);
             let cos = angle.cos();
             let sin = angle.sin();
             let lhs = original[dim_idx];
@@ -1239,9 +1374,10 @@ fn gelu_pytorch_tanh(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_final_norm, compute_prefill_ple_inputs, embed_input_tokens, extract_prefill_logits,
-        project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer,
-        run_text_layers_decode_step, run_text_layers_prefill, run_text_layers_prefill_with_cache,
+        apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs, embed_input_tokens,
+        extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
+        run_gemma4_layer, run_text_layers_decode_step, run_text_layers_prefill,
+        run_text_layers_prefill_with_cache,
     };
     use crate::phase2::types::{
         EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
@@ -1309,6 +1445,17 @@ mod tests {
     }
 
     #[test]
+    fn apply_rope_to_rows_uses_full_head_dim_for_frequency_base() {
+        let mut heads = vec![vec![0.0, 1.0, 0.0, 0.0, 9.0, 8.0, 7.0, 6.0]];
+
+        apply_rope_to_rows(&mut heads, 4, 8, 16.0, 1);
+
+        assert!((heads[0][1] - 0.87758255).abs() < 1e-6);
+        assert!((heads[0][3] - 0.47942555).abs() < 1e-6);
+        assert_eq!(heads[0][4..], [9.0, 8.0, 7.0, 6.0]);
+    }
+
+    #[test]
     fn run_gemma4_layer_preserves_residual_when_projections_are_zero() {
         let activations = vec![vec![1.0, 1.5, 0.0, 0.0], vec![0.0, 0.5, 0.0, 0.0]];
         let layer = Gemma4LayerWeights {
@@ -1318,9 +1465,12 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 2,
             sliding_window: Some(2),
+            cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
             rope_base: 10_000.0,
             partial_rotary_dim: 2,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
             attention_k_eq_v: false,
             q_proj: zero_matrix(4, 4),
             k_proj: zero_matrix(2, 4),
@@ -1353,9 +1503,12 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 2,
             sliding_window: Some(2),
+            cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
             rope_base: 10_000.0,
             partial_rotary_dim: 2,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
             attention_k_eq_v: false,
             q_proj: zero_matrix(4, 4),
             k_proj: zero_matrix(2, 4),
@@ -1432,9 +1585,12 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 2,
             sliding_window: Some(2),
+            cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
             rope_base: 10_000.0,
             partial_rotary_dim: 2,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
             attention_k_eq_v: false,
             q_proj: zero_matrix(4, 4),
             k_proj: zero_matrix(2, 4),
@@ -1534,6 +1690,29 @@ mod tests {
         assert_eq!(decoded.layer_caches[0].current_len(), 3);
     }
 
+    #[test]
+    fn run_text_layers_decode_step_rejects_non_prior_kv_donor_metadata() {
+        let model = parity_test_model(Gemma4AttentionKind::Sliding, Some(2));
+        let embeddings = model.embedding_table.as_ref().unwrap().rows.clone();
+        let prompt_embeddings = embeddings[..2].to_vec();
+        let next_embedding = embeddings[2].clone();
+
+        let (_, layer_caches) = run_text_layers_prefill_with_cache(&prompt_embeddings, &model, None).unwrap();
+        let mut invalid_model = model;
+        invalid_model.layers[0].kv_shared_layer_index = Some(0);
+        let error = run_text_layers_decode_step(
+            &next_embedding,
+            2,
+            &invalid_model,
+            &layer_caches,
+            prompt_embeddings.len(),
+        )
+        .err()
+        .expect("non-prior donor should fail");
+
+        assert!(error.to_string().contains("non-prior donor"));
+    }
+
     fn parity_test_model(
         attention_kind: Gemma4AttentionKind,
         sliding_window: Option<usize>,
@@ -1555,9 +1734,12 @@ mod tests {
                 num_kv_heads: 1,
                 head_dim: 2,
                 sliding_window,
+                cache_sliding_window: sliding_window,
                 rms_norm_eps: 1e-6,
                 rope_base: 10_000.0,
                 partial_rotary_dim: 2,
+                rope_freq_base_dim: 2,
+                kv_shared_layer_index: None,
                 attention_k_eq_v: false,
                 q_proj: MatrixF32 {
                     rows: 4,
