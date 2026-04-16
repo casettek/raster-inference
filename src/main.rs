@@ -5,6 +5,9 @@ use raster_inference::{
     run_inference, InferenceRequest, ModelSpec, SamplingConfig, TextDecodingPolicy,
 };
 
+const CLI_MAX_NEW_TOKENS: usize = 3;
+const CLI_TEMPERATURE: f32 = 1.0;
+
 fn print_usage() {
     eprintln!(
         "Usage: raster-inference <model-id> <tokenizer.json> <chat-template.jinja> <gemma-model-path> <prompt...>"
@@ -50,7 +53,11 @@ fn run() -> anyhow::Result<()> {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: true,
         add_special_tokens: true,
-        sampling: SamplingConfig::default(),
+        sampling: SamplingConfig {
+            max_new_tokens: Some(CLI_MAX_NEW_TOKENS),
+            temperature: Some(CLI_TEMPERATURE),
+            ..SamplingConfig::default()
+        },
     };
 
     let inference_state = run_inference(&request, &model, &tokenizer, &phase2_model)?;

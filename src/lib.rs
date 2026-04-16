@@ -18,13 +18,16 @@ pub use phase1::{
     SamplingConfig, TextDecodingPolicy, TextMessage,
 };
 pub use phase2::{
-    apply_final_logit_softcapping, apply_final_norm, compute_prefill_ple_inputs,
-    embed_input_tokens, extract_prefill_logits, project_to_logits, run_gemma4_layer, run_phase2,
-    run_phase2_for_token_ids, run_prefill_pass, run_text_layers_prefill, select_final_position,
-    ActivationSequence, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4Phase2Model, Gemma4PleGlobalWeights,
-    Gemma4PleLayerWeights, Gemma4PrefillPleInputs, GemmaEmbeddingTensorSource, MatrixF32,
-    Phase2State, PrefillLogits,
+    append_kv_cache, apply_final_logit_softcapping, apply_final_norm, compute_decode_ple_input,
+    compute_prefill_ple_inputs, decode_step, embed_input_token, embed_input_tokens,
+    extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer,
+    run_gemma4_layer_decode, run_phase2, run_phase2_for_token_ids, run_prefill_pass,
+    run_text_layers_decode_step, run_text_layers_prefill, run_text_layers_prefill_with_cache,
+    select_final_position, ActivationSequence, EmbeddedTokenSequence, EmbeddingTable,
+    Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4Phase2Model,
+    Gemma4PleGlobalWeights, Gemma4PleLayerWeights, Gemma4PrefillPleInputs,
+    GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, Phase2DecodeState,
+    Phase2DecodeStepResult, Phase2PrefillResult, Phase2State, PrefillLogits,
 };
 pub use phase3::{
     append_token, build_phase3_commitment, check_stop_condition, detokenize_output_tokens,
@@ -46,14 +49,25 @@ pub fn run_inference(
     phase2_model: &Gemma4Phase2Model,
 ) -> Result<InferenceState> {
     let phase1 = run_phase1(request, model, tokenizer)?;
-    let phase2 = run_phase2(&phase1, phase2_model)?;
+    let token_embeddings = if let Some(embedding_table) = phase2_model.embedding_table.as_ref() {
+        embed_input_tokens(&phase1.prompt_token_ids, embedding_table)?
+    } else if let Some(embedding_source) = phase2_model.embedding_source.as_ref() {
+        io::embed_input_tokens_from_gemma_source(&phase1.prompt_token_ids, embedding_source)?
+    } else {
+        anyhow::bail!("phase 2 model is missing both embedding_table and embedding_source")
+    };
+    let prefill = run_prefill_pass(&phase1, phase2_model, &token_embeddings)?;
+    let mut phase2 = prefill.phase2_state.clone();
     let phase3 = run_phase3(
         &phase1.prompt_token_ids,
-        &phase2,
+        &prefill,
         &request.sampling,
         tokenizer,
         phase2_model,
     )?;
+    phase2
+        .activation_states
+        .extend(phase3.phase2_activation_states.iter().cloned());
 
     Ok(InferenceState {
         phase1,

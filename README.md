@@ -23,7 +23,7 @@ This repo only targets:
 
 This repo does not yet include:
 
-- KV cache or incremental decode-state transition
+- scheduler or cache-manager abstractions beyond the explicit per-layer KV cache used for decode
 - stochastic sampling logic (`temperature`, `top_k`, `top_p`, repetition penalties)
 - multimodal support
 - streaming or partial token deltas
@@ -83,7 +83,7 @@ cargo run -- \
   "Hello from phase one"
 ```
 
-It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2. For phase 2 it reads `model.language_model.embed_tokens.weight`, all Gemma text-layer weights, the final text norm, and the output projection path from the Gemma safetensors. It applies Gemma's embedding scale automatically, runs the full text prefill path, and produces final-position logits. Phase 3 then performs deterministic greedy decode by selecting one token at a time, appending it to the explicit token sequence, and rerunning the full prefill path for the extended sequence. This is intentionally slow but simple: there is no KV cache yet, and `temperature`/`top_k`/`top_p` remain unsupported beyond accepting the current deterministic default configuration. The model path can be:
+It runs phase 1 first, then immediately feeds the resulting prompt token IDs into phase 2. For phase 2 it reads `model.language_model.embed_tokens.weight`, all Gemma text-layer weights, the final text norm, and the output projection path from the Gemma safetensors. It applies Gemma's embedding scale automatically, runs the full text prefill path, and produces final-position logits plus an explicit decode state with per-layer KV cache. Phase 3 then performs deterministic greedy decode by selecting one token at a time, appending it to the explicit token sequence, and calling the incremental Phase 2 decode step for the new token. This keeps the architecture simple while avoiding full-sequence replay on every generation step. `temperature`/`top_k`/`top_p` remain unsupported beyond accepting the current deterministic default configuration. The model path can be:
 
 - a Gemma model directory containing `model.safetensors.index.json`
 - a Gemma model directory containing a single `model.safetensors` or `consolidated.safetensors`
