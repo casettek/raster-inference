@@ -27,6 +27,7 @@ pub fn run_phase1(
     let prompt_token_ids_sha256 = build_phase1_commitment(&prompt_token_ids)?;
 
     Ok(types::Phase1State {
+        prompt_text,
         prompt_token_ids,
         prompt_token_ids_sha256,
     })
