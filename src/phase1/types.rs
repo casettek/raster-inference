@@ -79,7 +79,7 @@ pub struct Gemma4Prompt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Phase1State {
-    #[serde(skip_serializing, default)]
+    pub prompt_text: String,
     pub prompt_token_ids: Vec<u32>,
     pub prompt_token_ids_sha256: String,
 }

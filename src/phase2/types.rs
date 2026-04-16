@@ -31,8 +31,47 @@ pub type EmbeddedTokenSequence = ActivationSequence;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Phase2State {
-    pub token_embeddings: ActivationSequence,
-    pub final_hidden_states: ActivationSequence,
+    pub activation_states: Vec<ActivationSequence>,
+    #[serde(skip_serializing, default)]
+    pub prefill_logits: PrefillLogits,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerKvCache {
+    pub keys: Vec<Vec<Vec<f32>>>,
+    pub values: Vec<Vec<Vec<f32>>>,
+}
+
+impl LayerKvCache {
+    pub fn new(num_kv_heads: usize) -> Self {
+        Self {
+            keys: vec![Vec::new(); num_kv_heads],
+            values: vec![Vec::new(); num_kv_heads],
+        }
+    }
+
+    pub fn current_len(&self) -> usize {
+        self.keys.first().map(Vec::len).unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phase2DecodeState {
+    pub layer_caches: Vec<LayerKvCache>,
+    pub position: usize,
+    pub token_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phase2PrefillResult {
+    pub phase2_state: Phase2State,
+    pub decode_state: Phase2DecodeState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phase2DecodeStepResult {
+    pub decode_state: Phase2DecodeState,
+    pub activation_state: ActivationSequence,
     pub prefill_logits: PrefillLogits,
 }
 
@@ -99,7 +138,7 @@ pub enum Gemma4LogitsProjection {
     TiedEmbedding(MatrixF32),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PrefillLogits {
     #[serde(skip_serializing, default)]
     pub logits: Vec<f32>,
