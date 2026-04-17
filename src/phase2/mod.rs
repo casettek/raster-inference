@@ -413,28 +413,30 @@ mod tests {
             },
             post_input_norm_weight: vec![1.0; 4],
         });
-        let ple_global = with_ple.then(|| Gemma4PleGlobalWeights {
-            token_embeddings: vec![MatrixF32 {
-                rows: 3,
-                cols: 2,
-                values: vec![
-                    0.1, 0.0,
-                    0.0, 0.1,
-                    0.1, 0.1,
-                ],
-            }],
-            model_projections: vec![MatrixF32 {
-                rows: 2,
-                cols: 4,
-                values: vec![
-                    0.4, 0.0, 0.0, 0.0,
-                    0.0, 0.4, 0.0, 0.0,
-                ],
-            }],
-            projection_norm_weight: vec![1.0, 1.0],
-            embedding_scale: 1.0,
-            projection_scalar: 1.0,
-            input_scale: 1.0,
+        let ple_global = with_ple.then(|| {
+            Gemma4PleGlobalWeights::from_materialized(
+                vec![MatrixF32 {
+                    rows: 3,
+                    cols: 2,
+                    values: vec![
+                        0.1, 0.0,
+                        0.0, 0.1,
+                        0.1, 0.1,
+                    ],
+                }],
+                vec![MatrixF32 {
+                    rows: 2,
+                    cols: 4,
+                    values: vec![
+                        0.4, 0.0, 0.0, 0.0,
+                        0.0, 0.4, 0.0, 0.0,
+                    ],
+                }],
+                vec![1.0, 1.0],
+                1.0,
+                1.0,
+                1.0,
+            )
         });
 
         Gemma4Phase2Model {

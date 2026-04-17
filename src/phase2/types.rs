@@ -1,6 +1,12 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
+use safetensors::Dtype;
 
 fn default_embedding_scale() -> f32 {
     1.0
@@ -76,13 +82,125 @@ pub struct Phase2DecodeStepResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct GemmaTensorSliceSource {
+    pub weights_path: PathBuf,
+    pub dtype: Dtype,
+    pub total_rows: usize,
+    pub total_cols: usize,
+    pub data_offset: usize,
+    pub row_offset: usize,
+    pub row_count: usize,
+    pub col_offset: usize,
+    pub col_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Gemma4PleMatrixSource {
+    Materialized(MatrixF32),
+    Lazy(GemmaTensorSliceSource),
+}
+
+#[derive(Debug, Clone)]
 pub struct Gemma4PleGlobalWeights {
-    pub token_embeddings: Vec<MatrixF32>,
-    pub model_projections: Vec<MatrixF32>,
+    pub(crate) token_embeddings: Vec<Gemma4PleMatrixSource>,
+    pub(crate) model_projections: Vec<Gemma4PleMatrixSource>,
     pub projection_norm_weight: Vec<f32>,
     pub embedding_scale: f32,
     pub projection_scalar: f32,
     pub input_scale: f32,
+    pub(crate) mmap_cache: Arc<Mutex<HashMap<PathBuf, Arc<Mmap>>>>,
+    pub(crate) token_row_cache: Arc<Mutex<HashMap<(usize, usize), Vec<f32>>>>,
+    pub(crate) model_projection_cache: Arc<Mutex<HashMap<usize, MatrixF32>>>,
+}
+
+impl Gemma4PleGlobalWeights {
+    pub fn from_materialized(
+        token_embeddings: Vec<MatrixF32>,
+        model_projections: Vec<MatrixF32>,
+        projection_norm_weight: Vec<f32>,
+        embedding_scale: f32,
+        projection_scalar: f32,
+        input_scale: f32,
+    ) -> Self {
+        Self::new(
+            token_embeddings
+                .into_iter()
+                .map(Gemma4PleMatrixSource::Materialized)
+                .collect(),
+            model_projections
+                .into_iter()
+                .map(Gemma4PleMatrixSource::Materialized)
+                .collect(),
+            projection_norm_weight,
+            embedding_scale,
+            projection_scalar,
+            input_scale,
+        )
+    }
+
+    pub(crate) fn from_sources(
+        token_embeddings: Vec<GemmaTensorSliceSource>,
+        model_projections: Vec<GemmaTensorSliceSource>,
+        projection_norm_weight: Vec<f32>,
+        embedding_scale: f32,
+        projection_scalar: f32,
+        input_scale: f32,
+    ) -> Self {
+        Self::new(
+            token_embeddings
+                .into_iter()
+                .map(Gemma4PleMatrixSource::Lazy)
+                .collect(),
+            model_projections
+                .into_iter()
+                .map(Gemma4PleMatrixSource::Lazy)
+                .collect(),
+            projection_norm_weight,
+            embedding_scale,
+            projection_scalar,
+            input_scale,
+        )
+    }
+
+    fn new(
+        token_embeddings: Vec<Gemma4PleMatrixSource>,
+        model_projections: Vec<Gemma4PleMatrixSource>,
+        projection_norm_weight: Vec<f32>,
+        embedding_scale: f32,
+        projection_scalar: f32,
+        input_scale: f32,
+    ) -> Self {
+        Self {
+            token_embeddings,
+            model_projections,
+            projection_norm_weight,
+            embedding_scale,
+            projection_scalar,
+            input_scale,
+            mmap_cache: Arc::new(Mutex::new(HashMap::new())),
+            token_row_cache: Arc::new(Mutex::new(HashMap::new())),
+            model_projection_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn token_embedding_layer_count(&self) -> usize {
+        self.token_embeddings.len()
+    }
+
+    pub fn model_projection_layer_count(&self) -> usize {
+        self.model_projections.len()
+    }
+}
+
+impl PartialEq for Gemma4PleGlobalWeights {
+    fn eq(&self, other: &Self) -> bool {
+        self.token_embeddings == other.token_embeddings
+            && self.model_projections == other.model_projections
+            && self.projection_norm_weight == other.projection_norm_weight
+            && self.embedding_scale == other.embedding_scale
+            && self.projection_scalar == other.projection_scalar
+            && self.input_scale == other.input_scale
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
