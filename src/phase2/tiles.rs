@@ -93,17 +93,17 @@ pub fn compute_prefill_ple_inputs(
             "phase 2 PLE computation requires token ids and activations to have matching lengths"
         );
     }
-    if ple_global.token_embeddings.len() != layers.len() {
+    if ple_global.token_embedding_layer_count() != layers.len() {
         bail!(
             "phase 2 PLE token embedding slice count mismatch: {} vs {}",
-            ple_global.token_embeddings.len(),
+            ple_global.token_embedding_layer_count(),
             layers.len()
         );
     }
-    if ple_global.model_projections.len() != layers.len() {
+    if ple_global.model_projection_layer_count() != layers.len() {
         bail!(
             "phase 2 PLE model projection slice count mismatch: {} vs {}",
-            ple_global.model_projections.len(),
+            ple_global.model_projection_layer_count(),
             layers.len()
         );
     }
@@ -116,21 +116,18 @@ pub fn compute_prefill_ple_inputs(
             continue;
         }
 
-        let token_embedding = &ple_global.token_embeddings[layer_idx];
-        let model_projection = &ple_global.model_projections[layer_idx];
-
         let mut embedded = Vec::with_capacity(token_ids.len());
         for token_id in token_ids {
-            let row_idx = usize::try_from(*token_id).expect("u32 should fit into usize");
             embedded.push(
-                row_from_matrix(token_embedding, row_idx)?
+                crate::io::load_ple_token_embedding_row(ple_global, layer_idx, *token_id)?
                     .into_iter()
                     .map(|value| value * ple_global.embedding_scale)
                     .collect::<Vec<_>>(),
             );
         }
 
-        let mut projected = linear_sequence(input_activations, model_projection)?;
+        let model_projection = crate::io::load_ple_model_projection(ple_global, layer_idx)?;
+        let mut projected = linear_sequence(input_activations, &model_projection)?;
         for row in &mut projected {
             for value in row {
                 *value *= ple_global.projection_scalar;
@@ -170,19 +167,12 @@ pub fn compute_decode_ple_input(
     }
 
     validate_vector_width(input_activation, layer.hidden_size, "decode PLE input activation")?;
-    let token_embedding = ple_global
-        .token_embeddings
-        .get(layer_idx)
-        .ok_or_else(|| anyhow!("phase 2 PLE token embedding slice count mismatch at layer {layer_idx}"))?;
-    let model_projection = ple_global.model_projections.get(layer_idx).ok_or_else(|| {
-        anyhow!("phase 2 PLE model projection slice count mismatch at layer {layer_idx}")
-    })?;
-
-    let embedded = row_from_matrix(token_embedding, usize::try_from(token_id).expect("u32 fits usize"))?
+    let embedded = crate::io::load_ple_token_embedding_row(ple_global, layer_idx, token_id)?
         .into_iter()
         .map(|value| value * ple_global.embedding_scale)
         .collect::<Vec<_>>();
-    let mut projected = linear_row(input_activation, model_projection)?;
+    let model_projection = crate::io::load_ple_model_projection(ple_global, layer_idx)?;
+    let mut projected = linear_row(input_activation, &model_projection)?;
     for value in &mut projected {
         *value *= ple_global.projection_scalar;
     }
@@ -1116,15 +1106,6 @@ fn linear_row(input: &[f32], weight: &MatrixF32) -> Result<Vec<f32>> {
     Ok(output)
 }
 
-fn row_from_matrix(matrix: &MatrixF32, row_idx: usize) -> Result<Vec<f32>> {
-    if row_idx >= matrix.rows {
-        bail!("matrix row index {row_idx} is out of bounds for {}", matrix.rows);
-    }
-    let start = row_idx * matrix.cols;
-    let end = start + matrix.cols;
-    Ok(matrix.values[start..end].to_vec())
-}
-
 fn apply_rms_norm_to_sequence(
     inputs: &[Vec<f32>],
     weight: &[f32],
@@ -1530,22 +1511,22 @@ mod tests {
             }),
             layer_scalar: None,
         }];
-        let ple_global = Gemma4PleGlobalWeights {
-            token_embeddings: vec![MatrixF32 {
+        let ple_global = Gemma4PleGlobalWeights::from_materialized(
+            vec![MatrixF32 {
                 rows: 2,
                 cols: 2,
                 values: vec![1.0, 2.0, 3.0, 4.0],
             }],
-            model_projections: vec![MatrixF32 {
+            vec![MatrixF32 {
                 rows: 2,
                 cols: 4,
                 values: vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             }],
-            projection_norm_weight: vec![1.0, 1.0],
-            embedding_scale: 1.0,
-            projection_scalar: 1.0,
-            input_scale: 1.0,
-        };
+            vec![1.0, 1.0],
+            1.0,
+            1.0,
+            1.0,
+        );
         let inputs = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
 
         let first =
