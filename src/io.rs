@@ -740,6 +740,9 @@ fn decode_matrix_row_from_source(
     let encoded_row = mmap
         .get(start..end)
         .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
+    if source.dtype == Dtype::F32 {
+        return decode_f32_bytes_to_vec(encoded_row);
+    }
     let mut row = Vec::with_capacity(source.col_count);
     for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
         row.push(decode_scalar(encoded_value, source.dtype)?);
@@ -767,8 +770,14 @@ fn decode_matrix_slice_from_source(source: &GemmaTensorSliceSource, mmap: &Mmap)
         let encoded_row = mmap
             .get(start..end)
             .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
-        for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
-            values.push(decode_scalar(encoded_value, source.dtype)?);
+        if source.dtype == Dtype::F32 {
+            let write_start = values.len();
+            values.resize(write_start + source.col_count, 0.0);
+            copy_f32_bytes_into_slice(encoded_row, &mut values[write_start..])?;
+        } else {
+            for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
+                values.push(decode_scalar(encoded_value, source.dtype)?);
+            }
         }
     }
     Ok(MatrixF32 {
@@ -1070,9 +1079,17 @@ fn decode_embedding_rows_for_token_ids(
             bail!("token id {token_id} is out of bounds for embedding tensor");
         }
         let encoded_row = &tensor.data()[row_idx * row_bytes..(row_idx + 1) * row_bytes];
-        let mut row = Vec::with_capacity(hidden_size);
-        for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
-            row.push(decode_scalar(encoded_value, tensor.dtype())? * scale);
+        let mut row = if tensor.dtype() == Dtype::F32 {
+            decode_f32_bytes_to_vec(encoded_row)?
+        } else {
+            let mut row = Vec::with_capacity(hidden_size);
+            for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
+                row.push(decode_scalar(encoded_value, tensor.dtype())?);
+            }
+            row
+        };
+        for value in &mut row {
+            *value *= scale;
         }
         activations.push(row);
     }
@@ -1138,8 +1155,14 @@ fn decode_matrix_slice(
     for row_idx in row_offset..row_offset + row_count {
         let encoded_row = &tensor.data()[row_idx * row_bytes..(row_idx + 1) * row_bytes];
         let row_values = &encoded_row[col_offset * bytes_per_scalar..(col_offset + col_count) * bytes_per_scalar];
-        for encoded_value in row_values.chunks_exact(bytes_per_scalar) {
-            values.push(decode_scalar(encoded_value, tensor.dtype())?);
+        if tensor.dtype() == Dtype::F32 {
+            let write_start = values.len();
+            values.resize(write_start + col_count, 0.0);
+            copy_f32_bytes_into_slice(row_values, &mut values[write_start..])?;
+        } else {
+            for encoded_value in row_values.chunks_exact(bytes_per_scalar) {
+                values.push(decode_scalar(encoded_value, tensor.dtype())?);
+            }
         }
     }
 
@@ -1167,6 +1190,10 @@ fn decode_vector(tensor: &impl TensorBytes) -> Result<Vec<f32>> {
         );
     }
 
+    if tensor.dtype() == Dtype::F32 {
+        return decode_f32_bytes_to_vec(tensor.data());
+    }
+
     let mut values = Vec::with_capacity(shape[0]);
     for encoded_value in tensor.data().chunks_exact(bytes_per_scalar) {
         values.push(decode_scalar(encoded_value, tensor.dtype())?);
@@ -1180,6 +1207,12 @@ fn decode_single_scalar(tensor: &impl TensorBytes) -> Result<f32> {
         bail!("expected single-scalar tensor shaped [1], got {shape:?}");
     }
 
+    if tensor.dtype() == Dtype::F32 {
+        let mut value = [0.0];
+        copy_f32_bytes_into_slice(tensor.data(), &mut value)?;
+        return Ok(value[0]);
+    }
+
     decode_scalar(tensor.data(), tensor.dtype())
 }
 
@@ -1190,6 +1223,39 @@ fn bytes_per_scalar(dtype: Dtype) -> Result<usize> {
         Dtype::F64 => Ok(8),
         _ => bail!("unsupported tensor dtype {dtype:?}"),
     }
+}
+
+fn decode_f32_bytes_to_vec(bytes: &[u8]) -> Result<Vec<f32>> {
+    let len = bytes.len() / std::mem::size_of::<f32>();
+    let mut values = vec![0.0; len];
+    copy_f32_bytes_into_slice(bytes, &mut values)?;
+    Ok(values)
+}
+
+fn copy_f32_bytes_into_slice(bytes: &[u8], target: &mut [f32]) -> Result<()> {
+    let expected_bytes = target
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("F32 byte size overflowed"))?;
+    if bytes.len() != expected_bytes {
+        bail!(
+            "F32 byte length mismatch: expected {expected_bytes}, got {}",
+            bytes.len()
+        );
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            target.as_mut_ptr().cast::<u8>(),
+            expected_bytes,
+        );
+    }
+    #[cfg(target_endian = "big")]
+    for value in target.iter_mut() {
+        *value = f32::from_bits(value.to_bits().swap_bytes());
+    }
+    Ok(())
 }
 
 fn decode_scalar(bytes: &[u8], dtype: Dtype) -> Result<f32> {
@@ -1207,13 +1273,18 @@ fn decode_scalar(bytes: &[u8], dtype: Dtype) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
+        decode_embedding_rows_for_token_ids, decode_matrix_row_from_source, decode_matrix_slice,
+        decode_matrix_slice_from_source, decode_single_scalar, decode_vector,
         load_phase2_model_from_gemma_model_path, load_ple_model_projection, load_ple_token_embedding_row,
+        parse_safetensors_metadata,
     };
     use crate::phase2::{Gemma4AttentionKind, Gemma4LogitsProjection};
+    use memmap2::Mmap;
     use safetensors::tensor::{serialize_to_file, TensorView};
     use std::{
         collections::BTreeMap,
         fs,
+        fs::File,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1222,6 +1293,95 @@ mod tests {
         name: String,
         shape: Vec<usize>,
         bytes: Vec<u8>,
+    }
+
+    #[test]
+    fn decode_matrix_slice_copies_f32_rows_without_scalar_loop() {
+        let bytes = f32_to_bytes(&[
+            1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0,
+        ]);
+        let tensor = TensorView::new(
+            safetensors::Dtype::F32,
+            vec![3, 4],
+            &bytes,
+        )
+        .unwrap();
+
+        let matrix = decode_matrix_slice(&tensor, 1, 2, 1, 2).unwrap();
+
+        assert_eq!(matrix.rows, 2);
+        assert_eq!(matrix.cols, 2);
+        assert_eq!(matrix.values, vec![20.0, 30.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    fn decode_vector_and_scalar_copy_f32_values_directly() {
+        let vector_bytes = f32_to_bytes(&[1.25, -2.5, 3.75]);
+        let vector = TensorView::new(
+            safetensors::Dtype::F32,
+            vec![3],
+            &vector_bytes,
+        )
+        .unwrap();
+        let scalar_bytes = f32_to_bytes(&[9.5]);
+        let scalar = TensorView::new(safetensors::Dtype::F32, vec![1], &scalar_bytes).unwrap();
+
+        assert_eq!(decode_vector(&vector).unwrap(), vec![1.25, -2.5, 3.75]);
+        assert_eq!(decode_single_scalar(&scalar).unwrap(), 9.5);
+    }
+
+    #[test]
+    fn decode_embedding_rows_for_token_ids_applies_scale_after_f32_copy() {
+        let bytes = f32_to_bytes(&[1.0, 2.0, -3.0, 4.0, 5.0, -6.0]);
+        let tensor = TensorView::new(
+            safetensors::Dtype::F32,
+            vec![3, 2],
+            &bytes,
+        )
+        .unwrap();
+
+        let rows = decode_embedding_rows_for_token_ids(&tensor, &[2, 0], 2, 0.5).unwrap();
+
+        assert_eq!(rows, vec![vec![2.5, -3.0], vec![0.5, 1.0]]);
+    }
+
+    #[test]
+    fn decode_lazy_f32_ple_rows_and_slices() {
+        let model_dir = create_test_model_dir("f32-lazy-slice");
+        let tensor_name = "model.language_model.embed_tokens_per_layer.weight";
+        let values = [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0];
+        write_model_file(
+            &model_dir,
+            &[FixtureTensor {
+                name: tensor_name.to_string(),
+                shape: vec![3, 4],
+                bytes: f32_to_bytes(&values),
+            }],
+        );
+        let model_path = model_dir.join("model.safetensors");
+        let file = File::open(&model_path).unwrap();
+        let mmap = unsafe { Mmap::map(&file) }.unwrap();
+        let metadata = parse_safetensors_metadata(&mmap, &model_path).unwrap();
+        let tensor = metadata.get(tensor_name).unwrap();
+        let source = crate::phase2::types::GemmaTensorSliceSource {
+            weights_path: model_path,
+            dtype: tensor.dtype,
+            total_rows: tensor.shape[0],
+            total_cols: tensor.shape[1],
+            data_offset: tensor.data_offset,
+            row_offset: 1,
+            row_count: 2,
+            col_offset: 1,
+            col_count: 2,
+        };
+
+        let row = decode_matrix_row_from_source(&source, 1, &mmap).unwrap();
+        let matrix = decode_matrix_slice_from_source(&source, &mmap).unwrap();
+
+        assert_eq!(row, vec![200.0, 300.0]);
+        assert_eq!(matrix.rows, 2);
+        assert_eq!(matrix.cols, 2);
+        assert_eq!(matrix.values, vec![20.0, 30.0, 200.0, 300.0]);
     }
 
     #[test]
