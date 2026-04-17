@@ -132,19 +132,24 @@ pub fn run_phase2(
 }
 
 pub fn decode_step(
-    decode_state: &Phase2DecodeState,
+    decode_state: Phase2DecodeState,
     next_token: u32,
     model: &Gemma4Phase2Model,
 ) -> Result<Phase2DecodeStepResult> {
     let _trace = trace_scope("phase2.decode_step");
+    let Phase2DecodeState {
+        layer_caches,
+        position,
+        token_count,
+    } = decode_state;
     let embedded_token = embed_token_id(next_token, model)?;
     trace_event("phase2.run_text_layers_decode_step");
     let final_hidden_state = run_text_layers_decode_step(
         &embedded_token,
         next_token,
         model,
-        &decode_state.layer_caches,
-        decode_state.position,
+        layer_caches,
+        position,
     )?;
     trace_event("phase2.project_decode_hidden_to_logits");
     let prefill_logits = project_decode_hidden_to_logits(
@@ -158,8 +163,8 @@ pub fn decode_step(
     Ok(Phase2DecodeStepResult {
         decode_state: Phase2DecodeState {
             layer_caches: final_hidden_state.layer_caches,
-            position: decode_state.position + 1,
-            token_count: decode_state.token_count + 1,
+            position: position + 1,
+            token_count: token_count + 1,
         },
         activation_state: final_hidden_state.activation_state,
         prefill_logits,
@@ -265,7 +270,7 @@ mod tests {
         };
         let prefill = run_prefill_pass(&phase1_state, &model, &token_embeddings).expect("prefill result");
 
-        let step = decode_step(&prefill.decode_state, 2, &model).expect("decode step");
+        let step = decode_step(prefill.decode_state, 2, &model).expect("decode step");
         let replay = run_phase2_for_token_ids(&[0, 1, 2], &model).expect("replay phase2");
 
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
@@ -288,7 +293,7 @@ mod tests {
         };
         let prefill = run_prefill_pass(&phase1_state, &model, &token_embeddings).expect("prefill result");
 
-        let step = decode_step(&prefill.decode_state, 2, &model).expect("decode step");
+        let step = decode_step(prefill.decode_state, 2, &model).expect("decode step");
         let replay = run_phase2_for_token_ids(&[0, 1, 2], &model).expect("replay phase2");
 
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
@@ -310,7 +315,7 @@ mod tests {
 
         assert_eq!(prefill.decode_state.layer_caches[0].current_len(), 2);
 
-        let step = decode_step(&prefill.decode_state, 0, &model).expect("decode step");
+        let step = decode_step(prefill.decode_state, 0, &model).expect("decode step");
         let replay = run_phase2_for_token_ids(&[0, 1, 2, 0], &model).expect("replay phase2");
 
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
@@ -334,7 +339,7 @@ mod tests {
         assert_eq!(prefill.decode_state.layer_caches[0].current_len(), 3);
         assert_eq!(prefill.decode_state.layer_caches[1].current_len(), 0);
 
-        let step = decode_step(&prefill.decode_state, 0, &model).expect("decode step");
+        let step = decode_step(prefill.decode_state, 0, &model).expect("decode step");
         let replay = run_phase2_for_token_ids(&[0, 1, 2, 0], &model).expect("replay phase2");
 
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);

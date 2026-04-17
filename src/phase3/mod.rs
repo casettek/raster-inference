@@ -59,8 +59,9 @@ pub fn run_phase3(
             append_token(&decode_state.generated_token_ids, next_token);
 
         trace_event("phase3.decode_step");
+        let phase2_decode_state = std::mem::take(&mut decode_state.phase2_decode_state);
         let phase2_state =
-            crate::phase2::decode_step(&decode_state.phase2_decode_state, next_token, phase2_model)?;
+            crate::phase2::decode_step(phase2_decode_state, next_token, phase2_model)?;
         phase2_activation_states.push(phase2_state.activation_state.clone());
         decode_state.current_logits = phase2_state.prefill_logits.logits;
         decode_state.phase2_decode_state = phase2_state.decode_state;
