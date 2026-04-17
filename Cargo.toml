@@ -3,6 +3,10 @@ name = "raster-inference"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "gemma-fp32-converter"
+path = "tools/gemma-fp32-converter/main.rs"
+
 [dependencies]
 anyhow = "1"
 half = "2"
