@@ -182,9 +182,12 @@ mod tests {
                 num_kv_heads: 1,
                 head_dim: 2,
                 sliding_window: None,
+                cache_sliding_window: None,
                 rms_norm_eps: 1e-6,
                 rope_base: 10_000.0,
                 partial_rotary_dim: 2,
+                rope_freq_base_dim: 2,
+                kv_shared_layer_index: None,
                 attention_k_eq_v: false,
                 q_proj: MatrixF32 {
                     rows: 4,
