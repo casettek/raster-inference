@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -42,26 +42,26 @@ pub struct Phase2State {
     pub prefill_logits: PrefillLogits,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LayerKvCache {
-    pub keys: Vec<Vec<Vec<f32>>>,
-    pub values: Vec<Vec<Vec<f32>>>,
+    pub keys: Vec<VecDeque<Vec<f32>>>,
+    pub values: Vec<VecDeque<Vec<f32>>>,
 }
 
 impl LayerKvCache {
     pub fn new(num_kv_heads: usize) -> Self {
         Self {
-            keys: vec![Vec::new(); num_kv_heads],
-            values: vec![Vec::new(); num_kv_heads],
+            keys: vec![VecDeque::new(); num_kv_heads],
+            values: vec![VecDeque::new(); num_kv_heads],
         }
     }
 
     pub fn current_len(&self) -> usize {
-        self.keys.first().map(Vec::len).unwrap_or(0)
+        self.keys.first().map(VecDeque::len).unwrap_or(0)
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Phase2DecodeState {
     pub layer_caches: Vec<LayerKvCache>,
     pub position: usize,

@@ -360,7 +360,7 @@ pub fn run_gemma4_layer_decode(
     input_activation: &[f32],
     layer: &Gemma4LayerWeights,
     per_layer_input: Option<&[f32]>,
-    cache: &LayerKvCache,
+    cache: LayerKvCache,
     donor_cache: Option<&LayerKvCache>,
     position: usize,
 ) -> Result<(Vec<f32>, LayerKvCache)> {
@@ -468,7 +468,7 @@ pub fn run_text_layers_decode_step(
     input_activation: &[f32],
     token_id: u32,
     model: &Gemma4Phase2Model,
-    layer_caches: &[LayerKvCache],
+    layer_caches: Vec<LayerKvCache>,
     position: usize,
 ) -> Result<ActivationSequenceWithCache> {
     let _trace = trace_scope("phase2.run_text_layers_decode_step");
@@ -485,7 +485,7 @@ pub fn run_text_layers_decode_step(
 
     let mut xs = input_activation.to_vec();
     let mut updated_layer_caches = Vec::with_capacity(model.layers.len());
-    for (layer_idx, (layer, cache)) in model.layers.iter().zip(layer_caches).enumerate() {
+    for (layer_idx, (layer, cache)) in model.layers.iter().zip(layer_caches.into_iter()).enumerate() {
         trace_event(format!(
             "phase2.run_text_layers_decode_step layer={layer_idx} attention={:?}",
             layer.attention_kind
@@ -498,8 +498,7 @@ pub fn run_text_layers_decode_step(
             model.ple_global.as_ref(),
             model.rms_norm_eps,
         )?;
-        let donor_cache =
-            resolve_decode_donor_cache(layer, layer_caches, &updated_layer_caches, layer_idx)?;
+        let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
         let (layer_output, updated_cache) = run_gemma4_layer_decode(
             &xs,
             layer,
@@ -543,7 +542,6 @@ fn resolve_prefill_donor_cache<'a>(
 
 fn resolve_decode_donor_cache<'a>(
     layer: &Gemma4LayerWeights,
-    layer_caches: &'a [LayerKvCache],
     updated_layer_caches: &'a [LayerKvCache],
     layer_idx: usize,
 ) -> Result<Option<&'a LayerKvCache>> {
@@ -555,12 +553,9 @@ fn resolve_decode_donor_cache<'a>(
                     "phase 2 decode layer {layer_idx} cannot share KV with non-prior donor {donor_idx}"
                 );
             }
-            updated_layer_caches
-                .get(donor_idx)
-                .or_else(|| layer_caches.get(donor_idx))
-                .ok_or_else(|| {
-                    anyhow!("phase 2 decode donor cache {donor_idx} missing for layer {layer_idx}")
-                })
+            updated_layer_caches.get(donor_idx).ok_or_else(|| {
+                anyhow!("phase 2 decode donor cache {donor_idx} missing for layer {layer_idx}")
+            })
         })
         .transpose()
 }
@@ -678,7 +673,7 @@ fn run_attention_for_layer_with_cache(
 fn run_attention_for_layer_decode(
     input: &[f32],
     layer: &Gemma4LayerWeights,
-    cache: &LayerKvCache,
+    cache: LayerKvCache,
     donor_cache: Option<&LayerKvCache>,
     position: usize,
 ) -> Result<(Vec<f32>, LayerKvCache)> {
@@ -826,19 +821,27 @@ fn run_causal_attention(
                 let start = attention_window
                     .map(|window| query_idx.saturating_add(1).saturating_sub(window))
                     .unwrap_or(0);
-                let (keys, values) = if let Some(donor_cache) = donor_cache {
-                    (&donor_cache.keys[kv_head_idx], &donor_cache.values[kv_head_idx])
-                } else {
-                    (&k[kv_head_idx], &v[kv_head_idx])
-                };
-                let logits = (start..=query_idx)
-                    .map(|key_idx| dot(&q[head_idx][query_idx], &keys[key_idx]))
-                    .collect::<Vec<_>>();
-                let weights = softmax(&logits);
+                if let Some(donor_cache) = donor_cache {
+                    let logits = (start..=query_idx)
+                        .map(|key_idx| dot(&q[head_idx][query_idx], &donor_cache.keys[kv_head_idx][key_idx]))
+                        .collect::<Vec<_>>();
+                    let weights = softmax(&logits);
 
-                for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
-                    for (dim_idx, value) in output.iter_mut().enumerate() {
-                        *value += weight * values[key_idx][dim_idx];
+                    for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
+                        for (dim_idx, value) in output.iter_mut().enumerate() {
+                            *value += weight * donor_cache.values[kv_head_idx][key_idx][dim_idx];
+                        }
+                    }
+                } else {
+                    let logits = (start..=query_idx)
+                        .map(|key_idx| dot(&q[head_idx][query_idx], &k[kv_head_idx][key_idx]))
+                        .collect::<Vec<_>>();
+                    let weights = softmax(&logits);
+
+                    for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
+                        for (dim_idx, value) in output.iter_mut().enumerate() {
+                            *value += weight * v[kv_head_idx][key_idx][dim_idx];
+                        }
                     }
                 }
             }
@@ -864,7 +867,7 @@ fn run_causal_attention(
 fn run_causal_attention_decode(
     input: &[f32],
     layer: &Gemma4LayerWeights,
-    cache: &LayerKvCache,
+    cache: LayerKvCache,
     donor_cache: Option<&LayerKvCache>,
     position: usize,
     attention_window: Option<usize>,
@@ -886,7 +889,7 @@ fn run_causal_attention_decode(
     if let Some(donor_cache) = donor_cache {
         validate_layer_cache(donor_cache, layer)?;
     } else {
-        validate_layer_cache(cache, layer)?;
+        validate_layer_cache(&cache, layer)?;
     }
 
     let q_projected = linear_row(input, &layer.q_proj)?;
@@ -922,7 +925,7 @@ fn run_causal_attention_decode(
     );
 
     let updated_cache = if donor_cache.is_some() {
-        cache.clone()
+        cache
     } else {
         append_kv_cache(cache, &k, &v, cache_window)?
     };
@@ -933,15 +936,16 @@ fn run_causal_attention_decode(
         let key_start = attention_window
             .map(|window| attention_cache.keys[kv_head_idx].len().saturating_sub(window))
             .unwrap_or(0);
-        let logits = attention_cache.keys[kv_head_idx][key_start..]
+        let logits = attention_cache.keys[kv_head_idx]
             .iter()
+            .skip(key_start)
             .map(|key_row| dot(&q[head_idx], key_row))
             .collect::<Vec<_>>();
         let weights = softmax(&logits);
         let mut output = vec![0.0; layer.head_dim];
         for (weight, value_row) in weights
             .into_iter()
-            .zip(&attention_cache.values[kv_head_idx][key_start..])
+            .zip(attention_cache.values[kv_head_idx].iter().skip(key_start))
         {
             for (dim_idx, value) in output.iter_mut().enumerate() {
                 *value += weight * value_row[dim_idx];
@@ -1296,13 +1300,19 @@ fn build_layer_kv_cache(
         keys.first().map_or(0, |head| head.len().saturating_sub(window))
     });
     LayerKvCache {
-        keys: keys.iter().map(|head| head[retained..].to_vec()).collect(),
-        values: values.iter().map(|head| head[retained..].to_vec()).collect(),
+        keys: keys
+            .iter()
+            .map(|head| head[retained..].iter().cloned().collect())
+            .collect(),
+        values: values
+            .iter()
+            .map(|head| head[retained..].iter().cloned().collect())
+            .collect(),
     }
 }
 
 pub fn append_kv_cache(
-    cache: &LayerKvCache,
+    mut cache: LayerKvCache,
     new_keys: &[Vec<f32>],
     new_values: &[Vec<f32>],
     sliding_window: Option<usize>,
@@ -1316,24 +1326,23 @@ pub fn append_kv_cache(
         );
     }
 
-    let mut keys = cache.keys.clone();
-    let mut values = cache.values.clone();
-    for ((head_keys, head_values), (new_key, new_value)) in keys
+    for ((head_keys, head_values), (new_key, new_value)) in cache
+        .keys
         .iter_mut()
-        .zip(values.iter_mut())
+        .zip(cache.values.iter_mut())
         .zip(new_keys.iter().zip(new_values))
     {
-        head_keys.push(new_key.clone());
-        head_values.push(new_value.clone());
+        head_keys.push_back(new_key.clone());
+        head_values.push_back(new_value.clone());
         if let Some(window) = sliding_window {
             while head_keys.len() > window {
-                head_keys.remove(0);
-                head_values.remove(0);
+                head_keys.pop_front();
+                head_values.pop_front();
             }
         }
     }
 
-    Ok(LayerKvCache { keys, values })
+    Ok(cache)
 }
 
 fn apply_gelu_to_sequence(inputs: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -1355,8 +1364,8 @@ fn gelu_pytorch_tanh(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs, embed_input_tokens,
-        extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
+        append_kv_cache, apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs,
+        embed_input_tokens, extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
         run_gemma4_layer, run_text_layers_decode_step, run_text_layers_prefill,
         run_text_layers_prefill_with_cache,
     };
@@ -1618,6 +1627,25 @@ mod tests {
     }
 
     #[test]
+    fn append_kv_cache_keeps_newest_sliding_window_entries_in_order() {
+        let cache = append_kv_cache(crate::phase2::LayerKvCache::new(1), &[vec![1.0]], &[vec![10.0]], None)
+            .unwrap();
+        let cache = append_kv_cache(cache, &[vec![2.0]], &[vec![20.0]], None).unwrap();
+
+        let updated = append_kv_cache(cache, &[vec![3.0]], &[vec![30.0]], Some(2)).unwrap();
+
+        assert_eq!(updated.current_len(), 2);
+        assert_eq!(
+            updated.keys[0].iter().cloned().collect::<Vec<_>>(),
+            vec![vec![2.0], vec![3.0]]
+        );
+        assert_eq!(
+            updated.values[0].iter().cloned().collect::<Vec<_>>(),
+            vec![vec![20.0], vec![30.0]]
+        );
+    }
+
+    #[test]
     fn run_text_layers_decode_step_matches_prefill_for_appended_token() {
         let model = parity_test_model(Gemma4AttentionKind::Full, None);
         let embeddings = model.embedding_table.as_ref().unwrap().rows.clone();
@@ -1626,7 +1654,7 @@ mod tests {
 
         let (_, layer_caches) = run_text_layers_prefill_with_cache(&prompt_embeddings, &model, None).unwrap();
         let decoded =
-            run_text_layers_decode_step(&next_embedding, 2, &model, &layer_caches, prompt_embeddings.len())
+            run_text_layers_decode_step(&next_embedding, 2, &model, layer_caches, prompt_embeddings.len())
                 .unwrap();
         let replay = run_text_layers_prefill(&embeddings, &model, None).unwrap();
         let replay_last_hidden = replay.activations.last().cloned().unwrap();
@@ -1664,7 +1692,7 @@ mod tests {
 
         let (_, layer_caches) = run_text_layers_prefill_with_cache(&prompt_embeddings, &model, None).unwrap();
         let decoded =
-            run_text_layers_decode_step(&next_embedding, 2, &model, &layer_caches, prompt_embeddings.len())
+            run_text_layers_decode_step(&next_embedding, 2, &model, layer_caches, prompt_embeddings.len())
                 .unwrap();
 
         assert_eq!(decoded.layer_caches.len(), 1);
@@ -1685,7 +1713,7 @@ mod tests {
             &next_embedding,
             2,
             &invalid_model,
-            &layer_caches,
+            layer_caches,
             prompt_embeddings.len(),
         )
         .err()
