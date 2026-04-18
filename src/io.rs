@@ -15,9 +15,11 @@ use tokenizers::Tokenizer;
 use crate::phase2::{
     ActivationSequence, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
     Gemma4LogitsProjection, Gemma4Phase2Model, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-    GemmaEmbeddingTensorSource, MatrixF32,
+    Gemma4LayerMatrixSource, GemmaEmbeddingTensorSource, MatrixF32,
+    ResolvedGemma4LayerWeights, ResolvedGemma4PleLayerWeights,
 };
-use crate::trace::{trace_event, trace_scope};
+use crate::phase2::types::{Gemma4PleMatrixSource, GemmaTensorSliceSource};
+// use crate::trace::{trace_event, trace_scope};
 
 const GEMMA_EMBED_TENSOR_NAMES: &[&str] = &[
     "model.language_model.embed_tokens.weight",
@@ -186,16 +188,91 @@ impl GemmaModelSource {
     }
 }
 
+#[derive(Clone)]
+struct CachedTensorMetadata {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    data_offset: usize,
+    data_len: usize,
+}
+
+struct CachedTensorFile {
+    mmap: Mmap,
+    tensors: HashMap<String, CachedTensorMetadata>,
+}
+
+impl CachedTensorFile {
+    fn tensor<'a>(&'a self, tensor_name: &str, path: &Path) -> Result<CachedTensorView<'a>> {
+        let metadata = self.tensors.get(tensor_name).ok_or_else(|| {
+            anyhow!("failed to load tensor {tensor_name} from {}", path.display())
+        })?;
+        let data_end = metadata
+            .data_offset
+            .checked_add(metadata.data_len)
+            .ok_or_else(|| anyhow!("tensor byte range overflowed for {}", path.display()))?;
+        let data = self
+            .mmap
+            .get(metadata.data_offset..data_end)
+            .ok_or_else(|| anyhow!("tensor byte range is out of bounds for {}", path.display()))?;
+        Ok(CachedTensorView { metadata, data })
+    }
+
+    fn tensor_metadata<'a>(&'a self, tensor_name: &str, path: &Path) -> Result<&'a CachedTensorMetadata> {
+        self.tensors.get(tensor_name).ok_or_else(|| {
+            anyhow!("failed to load tensor {tensor_name} from {}", path.display())
+        })
+    }
+}
+
+struct CachedTensorView<'a> {
+    metadata: &'a CachedTensorMetadata,
+    data: &'a [u8],
+}
+
+trait TensorBytes {
+    fn shape(&self) -> &[usize];
+    fn dtype(&self) -> Dtype;
+    fn data(&self) -> &[u8];
+}
+
+impl TensorBytes for CachedTensorView<'_> {
+    fn shape(&self) -> &[usize] {
+        &self.metadata.shape
+    }
+
+    fn dtype(&self) -> Dtype {
+        self.metadata.dtype
+    }
+
+    fn data(&self) -> &[u8] {
+        self.data
+    }
+}
+
+impl TensorBytes for TensorView<'_> {
+    fn shape(&self) -> &[usize] {
+        TensorView::shape(self)
+    }
+
+    fn dtype(&self) -> Dtype {
+        TensorView::dtype(self)
+    }
+
+    fn data(&self) -> &[u8] {
+        TensorView::data(self)
+    }
+}
+
 struct GemmaTensorReader {
     source: GemmaModelSource,
-    mmaps: HashMap<PathBuf, Mmap>,
+    cached_files: HashMap<PathBuf, CachedTensorFile>,
 }
 
 impl GemmaTensorReader {
     fn new(source: GemmaModelSource) -> Self {
         Self {
             source,
-            mmaps: HashMap::new(),
+            cached_files: HashMap::new(),
         }
     }
 
@@ -221,26 +298,34 @@ impl GemmaTensorReader {
         decode_matrix(&tensor)
     }
 
-    fn load_matrix_slice(
-        &mut self,
-        tensor_name: &str,
-        row_offset: usize,
-        row_count: usize,
-        col_offset: usize,
-        col_count: usize,
-    ) -> Result<MatrixF32> {
-        let tensor = self.load_tensor(tensor_name)?;
-        decode_matrix_slice(&tensor, row_offset, row_count, col_offset, col_count)
-    }
-
     fn load_vector(&mut self, tensor_name: &str) -> Result<Vec<f32>> {
         let tensor = self.load_tensor(tensor_name)?;
         decode_vector(&tensor)
     }
 
-    fn load_optional_matrix(&mut self, tensor_name: &str) -> Result<Option<MatrixF32>> {
-        match self.load_tensor(tensor_name) {
-            Ok(tensor) => Ok(Some(decode_matrix(&tensor)?)),
+    fn resolve_matrix_source(&mut self, tensor_name: &str) -> Result<Gemma4LayerMatrixSource> {
+        let path = self.path_for_tensor(tensor_name)?;
+        let cached_file = self.cached_file_for_path(&path)?;
+        let metadata = cached_file.tensor_metadata(tensor_name, &path)?;
+        if metadata.shape.len() != 2 {
+            bail!(
+                "expected rank-2 tensor for {tensor_name}, got shape {:?}",
+                metadata.shape
+            );
+        }
+        let rows = metadata.shape[0];
+        let cols = metadata.shape[1];
+        Ok(Gemma4LayerMatrixSource::from_source(
+            self.resolve_matrix_slice_source(tensor_name, 0, rows, 0, cols)?,
+        ))
+    }
+
+    fn resolve_optional_matrix_source(
+        &mut self,
+        tensor_name: &str,
+    ) -> Result<Option<Gemma4LayerMatrixSource>> {
+        match self.resolve_matrix_source(tensor_name) {
+            Ok(source) => Ok(Some(source)),
             Err(_) => Ok(None),
         }
     }
@@ -252,17 +337,51 @@ impl GemmaTensorReader {
         }
     }
 
-    fn load_tensor(&mut self, tensor_name: &str) -> Result<TensorView<'_>> {
+    fn load_tensor(&mut self, tensor_name: &str) -> Result<CachedTensorView<'_>> {
         let path = self.path_for_tensor(tensor_name)?;
-        let mmap = self.mmap_for_path(&path)?;
-        let safetensors = SafeTensors::deserialize(mmap.as_ref())
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("failed to deserialize safetensors file {}", path.display()))?;
+        let cached_file = self.cached_file_for_path(&path)?;
+        cached_file.tensor(tensor_name, &path)
+    }
 
-        safetensors
-            .tensor(tensor_name)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("failed to load tensor {tensor_name} from {}", path.display()))
+    fn resolve_matrix_slice_source(
+        &mut self,
+        tensor_name: &str,
+        row_offset: usize,
+        row_count: usize,
+        col_offset: usize,
+        col_count: usize,
+    ) -> Result<GemmaTensorSliceSource> {
+        let path = self.path_for_tensor(tensor_name)?;
+        let cached_file = self.cached_file_for_path(&path)?;
+        let metadata = cached_file.tensor_metadata(tensor_name, &path)?;
+        if metadata.shape.len() != 2 {
+            bail!(
+                "expected rank-2 tensor for {tensor_name}, got shape {:?}",
+                metadata.shape
+            );
+        }
+        let total_rows = metadata.shape[0];
+        let total_cols = metadata.shape[1];
+        if row_offset + row_count > total_rows || col_offset + col_count > total_cols {
+            bail!(
+                "matrix slice [{row_offset}..{}, {col_offset}..{}] is out of bounds for shape {:?}",
+                row_offset + row_count,
+                col_offset + col_count,
+                metadata.shape
+            );
+        }
+
+        Ok(GemmaTensorSliceSource {
+            weights_path: path,
+            dtype: metadata.dtype,
+            total_rows,
+            total_cols,
+            data_offset: metadata.data_offset,
+            row_offset,
+            row_count,
+            col_offset,
+            col_count,
+        })
     }
 
     fn path_for_tensor(&self, tensor_name: &str) -> Result<PathBuf> {
@@ -277,18 +396,96 @@ impl GemmaTensorReader {
         }
     }
 
-    fn mmap_for_path(&mut self, path: &Path) -> Result<&Mmap> {
-        if !self.mmaps.contains_key(path) {
+    fn cached_file_for_path(&mut self, path: &Path) -> Result<&CachedTensorFile> {
+        if !self.cached_files.contains_key(path) {
             let file = File::open(path)
                 .with_context(|| format!("failed to open safetensors file {}", path.display()))?;
             let mmap = unsafe { Mmap::map(&file) }
                 .with_context(|| format!("failed to mmap safetensors file {}", path.display()))?;
-            self.mmaps.insert(path.to_path_buf(), mmap);
+            let tensors = parse_safetensors_metadata(&mmap, path)?;
+            self.cached_files
+                .insert(path.to_path_buf(), CachedTensorFile { mmap, tensors });
         }
 
-        self.mmaps
+        self.cached_files
             .get(path)
-            .ok_or_else(|| anyhow!("failed to cache mmap for {}", path.display()))
+            .ok_or_else(|| anyhow!("failed to cache safetensors metadata for {}", path.display()))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SafetensorsHeaderTensor {
+    dtype: String,
+    shape: Vec<usize>,
+    data_offsets: [usize; 2],
+}
+
+fn parse_safetensors_metadata(
+    mmap: &Mmap,
+    path: &Path,
+) -> Result<HashMap<String, CachedTensorMetadata>> {
+    if mmap.len() < 8 {
+        bail!("safetensors file {} is missing a header", path.display());
+    }
+    let header_len = u64::from_le_bytes(
+        mmap[..8]
+            .try_into()
+            .expect("safetensors header prefix should contain 8 bytes"),
+    ) as usize;
+    let header_end = 8usize
+        .checked_add(header_len)
+        .ok_or_else(|| anyhow!("safetensors header length overflowed for {}", path.display()))?;
+    let header_bytes = mmap
+        .get(8..header_end)
+        .ok_or_else(|| anyhow!("safetensors header is out of bounds for {}", path.display()))?;
+    let header: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(header_bytes)
+            .with_context(|| format!("failed to parse safetensors header from {}", path.display()))?;
+    let data_section_offset = header_end;
+    let mut tensors = HashMap::new();
+    for (tensor_name, raw_entry) in header {
+        if tensor_name == "__metadata__" {
+            continue;
+        }
+        let entry: SafetensorsHeaderTensor = serde_json::from_value(raw_entry).with_context(|| {
+            format!(
+                "failed to parse safetensors tensor header for {tensor_name} in {}",
+                path.display()
+            )
+        })?;
+        let dtype = parse_safetensors_dtype(&entry.dtype)?;
+        let data_start = data_section_offset
+            .checked_add(entry.data_offsets[0])
+            .ok_or_else(|| anyhow!("tensor data offset overflowed for {}", path.display()))?;
+        let data_end = data_section_offset
+            .checked_add(entry.data_offsets[1])
+            .ok_or_else(|| anyhow!("tensor data offset overflowed for {}", path.display()))?;
+        if data_end < data_start || data_end > mmap.len() {
+            bail!(
+                "tensor {tensor_name} byte range [{data_start}..{data_end}] is out of bounds for {}",
+                path.display()
+            );
+        }
+        tensors.insert(
+            tensor_name,
+            CachedTensorMetadata {
+                dtype,
+                shape: entry.shape,
+                data_offset: data_start,
+                data_len: data_end - data_start,
+            },
+        );
+    }
+    Ok(tensors)
+}
+
+fn parse_safetensors_dtype(dtype: &str) -> Result<Dtype> {
+    match dtype {
+        "F16" => Ok(Dtype::F16),
+        "BF16" => Ok(Dtype::BF16),
+        "F32" => Ok(Dtype::F32),
+        "F64" => Ok(Dtype::F64),
+        _ => bail!("unsupported safetensors dtype {dtype}"),
     }
 }
 
@@ -334,7 +531,7 @@ pub fn load_embedding_table_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Re
 }
 
 pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Result<Gemma4Phase2Model> {
-    let _trace = trace_scope("io.load_phase2_model_from_gemma_model_path");
+    // let _trace = trace_scope("io.load_phase2_model_from_gemma_model_path");
     let source = resolve_gemma_model_source(path.as_ref())?;
     let config = load_gemma_text_config(source.root_dir().join("config.json"))?;
 
@@ -369,7 +566,7 @@ pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Resul
     }
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for layer_idx in 0..config.num_hidden_layers {
-        trace_event(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
+        // trace_event(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
         layers.push(load_gemma4_layer_weights(
             &mut reader,
             &config,
@@ -378,9 +575,9 @@ pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Resul
         )?);
     }
     let ple_global = load_ple_global_weights(&mut reader, &config)?;
-    trace_event("io.load_final_norm_weight");
+    // trace_event("io.load_final_norm_weight");
     let final_norm_weight = reader.load_vector("model.language_model.norm.weight")?;
-    trace_event("io.load_logits_projection");
+    // trace_event("io.load_logits_projection");
     let logits_projection = if config.tie_word_embeddings() {
         Gemma4LogitsProjection::TiedEmbedding(reader.load_matrix(&embedding_tensor_name)?)
     } else {
@@ -406,7 +603,7 @@ fn load_ple_global_weights(
     reader: &mut GemmaTensorReader,
     config: &GemmaTextConfigFile,
 ) -> Result<Option<Gemma4PleGlobalWeights>> {
-    let _trace = trace_scope("io.load_ple_global_weights");
+    // let _trace = trace_scope("io.load_ple_global_weights");
     let hidden_size = config.hidden_size;
     let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
     if ple_dim == 0 {
@@ -417,31 +614,293 @@ fn load_ple_global_weights(
     let mut token_embeddings = Vec::with_capacity(config.num_hidden_layers);
     let mut model_projections = Vec::with_capacity(config.num_hidden_layers);
     for layer_idx in 0..config.num_hidden_layers {
-        token_embeddings.push(reader.load_matrix_slice(
-                "model.language_model.embed_tokens_per_layer.weight",
-                0,
-                ple_vocab_size,
-                layer_idx * ple_dim,
-                ple_dim,
-            )?);
-        model_projections.push(reader.load_matrix_slice(
-                "model.language_model.per_layer_model_projection.weight",
-                layer_idx * ple_dim,
-                ple_dim,
-                0,
-                hidden_size,
-            )?);
+        token_embeddings.push(reader.resolve_matrix_slice_source(
+            "model.language_model.embed_tokens_per_layer.weight",
+            0,
+            ple_vocab_size,
+            layer_idx * ple_dim,
+            ple_dim,
+        )?);
+        model_projections.push(reader.resolve_matrix_slice_source(
+            "model.language_model.per_layer_model_projection.weight",
+            layer_idx * ple_dim,
+            ple_dim,
+            0,
+            hidden_size,
+        )?);
     }
 
-    Ok(Some(Gemma4PleGlobalWeights {
+    Ok(Some(Gemma4PleGlobalWeights::from_sources(
         token_embeddings,
         model_projections,
-        projection_norm_weight: reader
-            .load_vector("model.language_model.per_layer_projection_norm.weight")?,
-        embedding_scale: (ple_dim as f32).sqrt(),
-        projection_scalar: (hidden_size as f32).powf(-0.5),
-        input_scale: 2f32.powf(-0.5),
-    }))
+        reader.load_vector("model.language_model.per_layer_projection_norm.weight")?,
+        (ple_dim as f32).sqrt(),
+        (hidden_size as f32).powf(-0.5),
+        2f32.powf(-0.5),
+    )))
+}
+
+pub(crate) fn load_ple_token_embedding_row(
+    ple_global: &Gemma4PleGlobalWeights,
+    layer_idx: usize,
+    token_id: u32,
+) -> Result<Vec<f32>> {
+    let row_idx = usize::try_from(token_id).expect("u32 should fit into usize");
+    let cache_key = (layer_idx, row_idx);
+    if let Some(cached_row) = ple_global
+        .token_row_cache
+        .lock()
+        .map_err(|_| anyhow!("PLE token row cache is poisoned"))?
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(cached_row);
+    }
+
+    let source = ple_global
+        .token_embeddings
+        .get(layer_idx)
+        .ok_or_else(|| anyhow!("phase 2 PLE token embedding slice count mismatch at layer {layer_idx}"))?;
+    let row = match source {
+        Gemma4PleMatrixSource::Materialized(matrix) => matrix_row(matrix, row_idx)?,
+        Gemma4PleMatrixSource::Lazy(source) => {
+            let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
+            decode_matrix_row_from_source(source, row_idx, mmap.as_ref())?
+        }
+    };
+    ple_global
+        .token_row_cache
+        .lock()
+        .map_err(|_| anyhow!("PLE token row cache is poisoned"))?
+        .insert(cache_key, row.clone());
+    Ok(row)
+}
+
+pub(crate) fn load_ple_model_projection(
+    ple_global: &Gemma4PleGlobalWeights,
+    layer_idx: usize,
+) -> Result<MatrixF32> {
+    if let Some(cached_matrix) = ple_global
+        .model_projection_cache
+        .lock()
+        .map_err(|_| anyhow!("PLE model projection cache is poisoned"))?
+        .get(&layer_idx)
+        .cloned()
+    {
+        return Ok(cached_matrix);
+    }
+
+    let source = ple_global.model_projections.get(layer_idx).ok_or_else(|| {
+        anyhow!("phase 2 PLE model projection slice count mismatch at layer {layer_idx}")
+    })?;
+    let matrix = match source {
+        Gemma4PleMatrixSource::Materialized(matrix) => matrix.clone(),
+        Gemma4PleMatrixSource::Lazy(source) => {
+            let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
+            decode_matrix_slice_from_source(source, mmap.as_ref())?
+        }
+    };
+    ple_global
+        .model_projection_cache
+        .lock()
+        .map_err(|_| anyhow!("PLE model projection cache is poisoned"))?
+        .insert(layer_idx, matrix.clone());
+    Ok(matrix)
+}
+
+pub(crate) fn resolve_layer_weights(
+    layer: &Gemma4LayerWeights,
+) -> Result<ResolvedGemma4LayerWeights> {
+    Ok(ResolvedGemma4LayerWeights {
+        attention_kind: layer.attention_kind,
+        hidden_size: layer.hidden_size,
+        num_heads: layer.num_heads,
+        num_kv_heads: layer.num_kv_heads,
+        head_dim: layer.head_dim,
+        sliding_window: layer.sliding_window,
+        cache_sliding_window: layer.cache_sliding_window,
+        rms_norm_eps: layer.rms_norm_eps,
+        rope_base: layer.rope_base,
+        partial_rotary_dim: layer.partial_rotary_dim,
+        rope_freq_base_dim: layer.rope_freq_base_dim,
+        kv_shared_layer_index: layer.kv_shared_layer_index,
+        attention_k_eq_v: layer.attention_k_eq_v,
+        q_proj: materialize_layer_matrix_source(&layer.q_proj)?,
+        k_proj: materialize_layer_matrix_source(&layer.k_proj)?,
+        v_proj: layer
+            .v_proj
+            .as_ref()
+            .map(materialize_layer_matrix_source)
+            .transpose()?,
+        o_proj: materialize_layer_matrix_source(&layer.o_proj)?,
+        q_norm_weight: layer.q_norm_weight.clone(),
+        k_norm_weight: layer.k_norm_weight.clone(),
+        input_layernorm_weight: layer.input_layernorm_weight.clone(),
+        post_attention_layernorm_weight: layer.post_attention_layernorm_weight.clone(),
+        pre_feedforward_layernorm_weight: layer.pre_feedforward_layernorm_weight.clone(),
+        post_feedforward_layernorm_weight: layer.post_feedforward_layernorm_weight.clone(),
+        gate_proj: materialize_layer_matrix_source(&layer.gate_proj)?,
+        up_proj: materialize_layer_matrix_source(&layer.up_proj)?,
+        down_proj: materialize_layer_matrix_source(&layer.down_proj)?,
+        ple: layer
+            .ple
+            .as_ref()
+            .map(resolve_ple_layer_weights)
+            .transpose()?,
+        layer_scalar: layer.layer_scalar,
+    })
+}
+
+fn resolve_ple_layer_weights(
+    ple: &Gemma4PleLayerWeights,
+) -> Result<ResolvedGemma4PleLayerWeights> {
+    Ok(ResolvedGemma4PleLayerWeights {
+        input_gate: materialize_layer_matrix_source(&ple.input_gate)?,
+        layer_projection: materialize_layer_matrix_source(&ple.layer_projection)?,
+        post_input_norm_weight: ple.post_input_norm_weight.clone(),
+    })
+}
+
+fn materialize_layer_matrix_source(source: &Gemma4LayerMatrixSource) -> Result<std::sync::Arc<MatrixF32>> {
+    match source {
+        Gemma4LayerMatrixSource::Materialized(matrix) => Ok(matrix.clone()),
+        Gemma4LayerMatrixSource::Lazy { source, cache } => {
+            if let Some(matrix) = cache
+                .lock()
+                .map_err(|_| anyhow!("layer matrix cache is poisoned"))?
+                .clone()
+            {
+                return Ok(matrix);
+            }
+            let file = File::open(&source.weights_path).with_context(|| {
+                format!("failed to open safetensors file {}", source.weights_path.display())
+            })?;
+            let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
+                format!("failed to mmap safetensors file {}", source.weights_path.display())
+            })?;
+            let matrix = std::sync::Arc::new(decode_matrix_slice_from_source(source, &mmap)?);
+            *cache
+                .lock()
+                .map_err(|_| anyhow!("layer matrix cache is poisoned"))? = Some(matrix.clone());
+            Ok(matrix)
+        }
+    }
+}
+
+fn ple_mmap_for_path(ple_global: &Gemma4PleGlobalWeights, path: &Path) -> Result<std::sync::Arc<Mmap>> {
+    if let Some(mmap) = ple_global
+        .mmap_cache
+        .lock()
+        .map_err(|_| anyhow!("PLE mmap cache is poisoned"))?
+        .get(path)
+        .cloned()
+    {
+        return Ok(mmap);
+    }
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open safetensors file {}", path.display()))?;
+    let mmap = std::sync::Arc::new(
+        unsafe { Mmap::map(&file) }
+            .with_context(|| format!("failed to mmap safetensors file {}", path.display()))?,
+    );
+    ple_global
+        .mmap_cache
+        .lock()
+        .map_err(|_| anyhow!("PLE mmap cache is poisoned"))?
+        .insert(path.to_path_buf(), mmap.clone());
+    Ok(mmap)
+}
+
+fn decode_matrix_row_from_source(
+    source: &GemmaTensorSliceSource,
+    row_idx: usize,
+    mmap: &Mmap,
+) -> Result<Vec<f32>> {
+    if row_idx >= source.row_count {
+        bail!(
+            "matrix row {row_idx} is out of bounds for slice with {} rows",
+            source.row_count
+        );
+    }
+    let bytes_per_scalar = bytes_per_scalar(source.dtype)?;
+    let row_bytes = source
+        .total_cols
+        .checked_mul(bytes_per_scalar)
+        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
+    let global_row_idx = source.row_offset + row_idx;
+    let start = source
+        .data_offset
+        .checked_add(global_row_idx * row_bytes)
+        .and_then(|offset| offset.checked_add(source.col_offset * bytes_per_scalar))
+        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+    let end = start
+        .checked_add(source.col_count * bytes_per_scalar)
+        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+    let encoded_row = mmap
+        .get(start..end)
+        .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
+    if source.dtype == Dtype::F32 {
+        return decode_f32_bytes_to_vec(encoded_row);
+    }
+    let mut row = Vec::with_capacity(source.col_count);
+    for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
+        row.push(decode_scalar(encoded_value, source.dtype)?);
+    }
+    Ok(row)
+}
+
+fn decode_matrix_slice_from_source(source: &GemmaTensorSliceSource, mmap: &Mmap) -> Result<MatrixF32> {
+    let bytes_per_scalar = bytes_per_scalar(source.dtype)?;
+    let row_bytes = source
+        .total_cols
+        .checked_mul(bytes_per_scalar)
+        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
+    let mut values = Vec::with_capacity(source.row_count * source.col_count);
+    for row_idx in 0..source.row_count {
+        let global_row_idx = source.row_offset + row_idx;
+        let start = source
+            .data_offset
+            .checked_add(global_row_idx * row_bytes)
+            .and_then(|offset| offset.checked_add(source.col_offset * bytes_per_scalar))
+            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+        let end = start
+            .checked_add(source.col_count * bytes_per_scalar)
+            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+        let encoded_row = mmap
+            .get(start..end)
+            .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
+        if source.dtype == Dtype::F32 {
+            let write_start = values.len();
+            values.resize(write_start + source.col_count, 0.0);
+            copy_f32_bytes_into_slice(encoded_row, &mut values[write_start..])?;
+        } else {
+            for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
+                values.push(decode_scalar(encoded_value, source.dtype)?);
+            }
+        }
+    }
+    Ok(MatrixF32 {
+        rows: source.row_count,
+        cols: source.col_count,
+        values,
+    })
+}
+
+fn matrix_row(matrix: &MatrixF32, row_idx: usize) -> Result<Vec<f32>> {
+    if row_idx >= matrix.rows {
+        bail!(
+            "matrix row {row_idx} is out of bounds for matrix with {} rows",
+            matrix.rows
+        );
+    }
+    let start = row_idx
+        .checked_mul(matrix.cols)
+        .ok_or_else(|| anyhow!("matrix row start overflowed"))?;
+    let end = start
+        .checked_add(matrix.cols)
+        .ok_or_else(|| anyhow!("matrix row end overflowed"))?;
+    Ok(matrix.values[start..end].to_vec())
 }
 
 fn load_gemma4_layer_weights(
@@ -450,7 +909,7 @@ fn load_gemma4_layer_weights(
     layer_idx: usize,
     is_kv_donor: bool,
 ) -> Result<Gemma4LayerWeights> {
-    let _trace = trace_scope(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
+    // let _trace = trace_scope(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
     let layer_prefix = format!("model.language_model.layers.{layer_idx}");
     let attention_kind = config.attention_kind_for_layer(layer_idx)?;
     let is_sliding = attention_kind == Gemma4AttentionKind::Sliding;
@@ -477,8 +936,10 @@ fn load_gemma4_layer_weights(
     let effective_sliding_window = config.effective_sliding_window();
     let ple = if config.hidden_size_per_layer_input.unwrap_or(0) > 0 {
         Some(Gemma4PleLayerWeights {
-            input_gate: reader.load_matrix(&format!("{layer_prefix}.per_layer_input_gate.weight"))?,
-            layer_projection: reader.load_matrix(&format!("{layer_prefix}.per_layer_projection.weight"))?,
+            input_gate: reader
+                .resolve_matrix_source(&format!("{layer_prefix}.per_layer_input_gate.weight"))?,
+            layer_projection: reader
+                .resolve_matrix_source(&format!("{layer_prefix}.per_layer_projection.weight"))?,
             post_input_norm_weight: reader
                 .load_vector(&format!("{layer_prefix}.post_per_layer_input_norm.weight"))?,
         })
@@ -508,14 +969,14 @@ fn load_gemma4_layer_weights(
         rope_freq_base_dim: head_dim,
         kv_shared_layer_index,
         attention_k_eq_v: !is_sliding && config.attention_k_eq_v(),
-        q_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
-        k_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
+        q_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
+        k_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
         v_proj: if !is_sliding && config.attention_k_eq_v() {
-            reader.load_optional_matrix(&format!("{layer_prefix}.self_attn.v_proj.weight"))?
+            reader.resolve_optional_matrix_source(&format!("{layer_prefix}.self_attn.v_proj.weight"))?
         } else {
-            Some(reader.load_matrix(&format!("{layer_prefix}.self_attn.v_proj.weight"))?)
+            Some(reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.v_proj.weight"))?)
         },
-        o_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
+        o_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
         q_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.q_norm.weight"))?,
         k_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.k_norm.weight"))?,
         input_layernorm_weight: reader.load_vector(&format!("{layer_prefix}.input_layernorm.weight"))?,
@@ -525,9 +986,9 @@ fn load_gemma4_layer_weights(
             .load_vector(&format!("{layer_prefix}.pre_feedforward_layernorm.weight"))?,
         post_feedforward_layernorm_weight: reader
             .load_vector(&format!("{layer_prefix}.post_feedforward_layernorm.weight"))?,
-        gate_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.gate_proj.weight"))?,
-        up_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.up_proj.weight"))?,
-        down_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.down_proj.weight"))?,
+        gate_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.gate_proj.weight"))?,
+        up_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.up_proj.weight"))?,
+        down_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.down_proj.weight"))?,
         ple,
         layer_scalar: reader.load_optional_scalar(&format!("{layer_prefix}.layer_scalar"))?,
     })
@@ -537,7 +998,7 @@ pub fn embed_input_tokens_from_gemma_source(
     token_ids: &[u32],
     source: &GemmaEmbeddingTensorSource,
 ) -> Result<ActivationSequence> {
-    let _trace = trace_scope("io.embed_input_tokens_from_gemma_source");
+    // let _trace = trace_scope("io.embed_input_tokens_from_gemma_source");
     if token_ids.is_empty() {
         bail!("phase 2 embedding requires at least one token id");
     }
@@ -639,7 +1100,7 @@ fn load_gemma_text_config(path: PathBuf) -> Result<GemmaTextConfigFile> {
 }
 
 fn load_full_embedding_table_from_source(source: &GemmaEmbeddingTensorSource) -> Result<EmbeddingTable> {
-    let matrix = with_embedding_tensor(source, decode_matrix)?;
+    let matrix = with_embedding_tensor(source, |tensor| decode_matrix(tensor))?;
 
     let mut rows = Vec::with_capacity(matrix.rows);
     for row_idx in 0..matrix.rows {
@@ -692,7 +1153,7 @@ fn with_embedding_tensor<T>(
 }
 
 fn decode_embedding_rows_for_token_ids(
-    tensor: &TensorView<'_>,
+    tensor: &impl TensorBytes,
     token_ids: &[u32],
     hidden_size: usize,
     scale: f32,
@@ -720,9 +1181,17 @@ fn decode_embedding_rows_for_token_ids(
             bail!("token id {token_id} is out of bounds for embedding tensor");
         }
         let encoded_row = &tensor.data()[row_idx * row_bytes..(row_idx + 1) * row_bytes];
-        let mut row = Vec::with_capacity(hidden_size);
-        for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
-            row.push(decode_scalar(encoded_value, tensor.dtype())? * scale);
+        let mut row = if tensor.dtype() == Dtype::F32 {
+            decode_f32_bytes_to_vec(encoded_row)?
+        } else {
+            let mut row = Vec::with_capacity(hidden_size);
+            for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
+                row.push(decode_scalar(encoded_value, tensor.dtype())?);
+            }
+            row
+        };
+        for value in &mut row {
+            *value *= scale;
         }
         activations.push(row);
     }
@@ -740,7 +1209,7 @@ fn build_activation_commitment(activations: &[Vec<f32>]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn decode_matrix(tensor: &TensorView<'_>) -> Result<MatrixF32> {
+fn decode_matrix(tensor: &impl TensorBytes) -> Result<MatrixF32> {
     let shape = tensor.shape();
     if shape.len() != 2 {
         bail!("expected rank-2 tensor, got shape {shape:?}");
@@ -750,7 +1219,7 @@ fn decode_matrix(tensor: &TensorView<'_>) -> Result<MatrixF32> {
 }
 
 fn decode_matrix_slice(
-    tensor: &TensorView<'_>,
+    tensor: &impl TensorBytes,
     row_offset: usize,
     row_count: usize,
     col_offset: usize,
@@ -788,8 +1257,14 @@ fn decode_matrix_slice(
     for row_idx in row_offset..row_offset + row_count {
         let encoded_row = &tensor.data()[row_idx * row_bytes..(row_idx + 1) * row_bytes];
         let row_values = &encoded_row[col_offset * bytes_per_scalar..(col_offset + col_count) * bytes_per_scalar];
-        for encoded_value in row_values.chunks_exact(bytes_per_scalar) {
-            values.push(decode_scalar(encoded_value, tensor.dtype())?);
+        if tensor.dtype() == Dtype::F32 {
+            let write_start = values.len();
+            values.resize(write_start + col_count, 0.0);
+            copy_f32_bytes_into_slice(row_values, &mut values[write_start..])?;
+        } else {
+            for encoded_value in row_values.chunks_exact(bytes_per_scalar) {
+                values.push(decode_scalar(encoded_value, tensor.dtype())?);
+            }
         }
     }
 
@@ -800,7 +1275,7 @@ fn decode_matrix_slice(
     })
 }
 
-fn decode_vector(tensor: &TensorView<'_>) -> Result<Vec<f32>> {
+fn decode_vector(tensor: &impl TensorBytes) -> Result<Vec<f32>> {
     let shape = tensor.shape();
     if shape.len() != 1 {
         bail!("expected rank-1 tensor, got shape {shape:?}");
@@ -817,6 +1292,10 @@ fn decode_vector(tensor: &TensorView<'_>) -> Result<Vec<f32>> {
         );
     }
 
+    if tensor.dtype() == Dtype::F32 {
+        return decode_f32_bytes_to_vec(tensor.data());
+    }
+
     let mut values = Vec::with_capacity(shape[0]);
     for encoded_value in tensor.data().chunks_exact(bytes_per_scalar) {
         values.push(decode_scalar(encoded_value, tensor.dtype())?);
@@ -824,10 +1303,16 @@ fn decode_vector(tensor: &TensorView<'_>) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-fn decode_single_scalar(tensor: &TensorView<'_>) -> Result<f32> {
+fn decode_single_scalar(tensor: &impl TensorBytes) -> Result<f32> {
     let shape = tensor.shape();
     if shape != [1] {
         bail!("expected single-scalar tensor shaped [1], got {shape:?}");
+    }
+
+    if tensor.dtype() == Dtype::F32 {
+        let mut value = [0.0];
+        copy_f32_bytes_into_slice(tensor.data(), &mut value)?;
+        return Ok(value[0]);
     }
 
     decode_scalar(tensor.data(), tensor.dtype())
@@ -840,6 +1325,39 @@ fn bytes_per_scalar(dtype: Dtype) -> Result<usize> {
         Dtype::F64 => Ok(8),
         _ => bail!("unsupported tensor dtype {dtype:?}"),
     }
+}
+
+fn decode_f32_bytes_to_vec(bytes: &[u8]) -> Result<Vec<f32>> {
+    let len = bytes.len() / std::mem::size_of::<f32>();
+    let mut values = vec![0.0; len];
+    copy_f32_bytes_into_slice(bytes, &mut values)?;
+    Ok(values)
+}
+
+fn copy_f32_bytes_into_slice(bytes: &[u8], target: &mut [f32]) -> Result<()> {
+    let expected_bytes = target
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("F32 byte size overflowed"))?;
+    if bytes.len() != expected_bytes {
+        bail!(
+            "F32 byte length mismatch: expected {expected_bytes}, got {}",
+            bytes.len()
+        );
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            target.as_mut_ptr().cast::<u8>(),
+            expected_bytes,
+        );
+    }
+    #[cfg(target_endian = "big")]
+    for value in target.iter_mut() {
+        *value = f32::from_bits(value.to_bits().swap_bytes());
+    }
+    Ok(())
 }
 
 fn decode_scalar(bytes: &[u8], dtype: Dtype) -> Result<f32> {
@@ -856,12 +1374,19 @@ fn decode_scalar(bytes: &[u8], dtype: Dtype) -> Result<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_phase2_model_from_gemma_model_path;
+    use super::{
+        decode_embedding_rows_for_token_ids, decode_matrix_row_from_source, decode_matrix_slice,
+        decode_matrix_slice_from_source, decode_single_scalar, decode_vector,
+        load_phase2_model_from_gemma_model_path, load_ple_model_projection, load_ple_token_embedding_row,
+        parse_safetensors_metadata,
+    };
     use crate::phase2::{Gemma4AttentionKind, Gemma4LogitsProjection};
+    use memmap2::Mmap;
     use safetensors::tensor::{serialize_to_file, TensorView};
     use std::{
         collections::BTreeMap,
         fs,
+        fs::File,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -870,6 +1395,95 @@ mod tests {
         name: String,
         shape: Vec<usize>,
         bytes: Vec<u8>,
+    }
+
+    #[test]
+    fn decode_matrix_slice_copies_f32_rows_without_scalar_loop() {
+        let bytes = f32_to_bytes(&[
+            1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0,
+        ]);
+        let tensor = TensorView::new(
+            safetensors::Dtype::F32,
+            vec![3, 4],
+            &bytes,
+        )
+        .unwrap();
+
+        let matrix = decode_matrix_slice(&tensor, 1, 2, 1, 2).unwrap();
+
+        assert_eq!(matrix.rows, 2);
+        assert_eq!(matrix.cols, 2);
+        assert_eq!(matrix.values, vec![20.0, 30.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    fn decode_vector_and_scalar_copy_f32_values_directly() {
+        let vector_bytes = f32_to_bytes(&[1.25, -2.5, 3.75]);
+        let vector = TensorView::new(
+            safetensors::Dtype::F32,
+            vec![3],
+            &vector_bytes,
+        )
+        .unwrap();
+        let scalar_bytes = f32_to_bytes(&[9.5]);
+        let scalar = TensorView::new(safetensors::Dtype::F32, vec![1], &scalar_bytes).unwrap();
+
+        assert_eq!(decode_vector(&vector).unwrap(), vec![1.25, -2.5, 3.75]);
+        assert_eq!(decode_single_scalar(&scalar).unwrap(), 9.5);
+    }
+
+    #[test]
+    fn decode_embedding_rows_for_token_ids_applies_scale_after_f32_copy() {
+        let bytes = f32_to_bytes(&[1.0, 2.0, -3.0, 4.0, 5.0, -6.0]);
+        let tensor = TensorView::new(
+            safetensors::Dtype::F32,
+            vec![3, 2],
+            &bytes,
+        )
+        .unwrap();
+
+        let rows = decode_embedding_rows_for_token_ids(&tensor, &[2, 0], 2, 0.5).unwrap();
+
+        assert_eq!(rows, vec![vec![2.5, -3.0], vec![0.5, 1.0]]);
+    }
+
+    #[test]
+    fn decode_lazy_f32_ple_rows_and_slices() {
+        let model_dir = create_test_model_dir("f32-lazy-slice");
+        let tensor_name = "model.language_model.embed_tokens_per_layer.weight";
+        let values = [1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0];
+        write_model_file(
+            &model_dir,
+            &[FixtureTensor {
+                name: tensor_name.to_string(),
+                shape: vec![3, 4],
+                bytes: f32_to_bytes(&values),
+            }],
+        );
+        let model_path = model_dir.join("model.safetensors");
+        let file = File::open(&model_path).unwrap();
+        let mmap = unsafe { Mmap::map(&file) }.unwrap();
+        let metadata = parse_safetensors_metadata(&mmap, &model_path).unwrap();
+        let tensor = metadata.get(tensor_name).unwrap();
+        let source = crate::phase2::types::GemmaTensorSliceSource {
+            weights_path: model_path,
+            dtype: tensor.dtype,
+            total_rows: tensor.shape[0],
+            total_cols: tensor.shape[1],
+            data_offset: tensor.data_offset,
+            row_offset: 1,
+            row_count: 2,
+            col_offset: 1,
+            col_count: 2,
+        };
+
+        let row = decode_matrix_row_from_source(&source, 1, &mmap).unwrap();
+        let matrix = decode_matrix_slice_from_source(&source, &mmap).unwrap();
+
+        assert_eq!(row, vec![200.0, 300.0]);
+        assert_eq!(matrix.rows, 2);
+        assert_eq!(matrix.cols, 2);
+        assert_eq!(matrix.values, vec![20.0, 30.0, 200.0, 300.0]);
     }
 
     #[test]
@@ -923,15 +1537,17 @@ mod tests {
         write_model_file(&model_dir, &tensors);
 
         let model = load_phase2_model_from_gemma_model_path(&model_dir).unwrap();
+        let first_layer = crate::io::resolve_layer_weights(&model.layers[0]).unwrap();
+        let second_layer = crate::io::resolve_layer_weights(&model.layers[1]).unwrap();
 
         assert_eq!(model.layers.len(), 2);
         assert_eq!(model.layers[0].attention_kind, Gemma4AttentionKind::Sliding);
         assert_eq!(model.layers[1].attention_kind, Gemma4AttentionKind::Full);
         assert_eq!(model.layers[0].rope_freq_base_dim, 2);
         assert_eq!(model.layers[1].rope_freq_base_dim, 2);
-        assert_eq!(model.layers[0].q_proj.values[0], 1.0);
-        assert_eq!(model.layers[1].q_proj.values[0], 2.0);
-        assert!(model.layers[1].v_proj.is_none());
+        assert_eq!(first_layer.q_proj.values[0], 1.0);
+        assert_eq!(second_layer.q_proj.values[0], 2.0);
+        assert!(second_layer.v_proj.is_none());
         assert_eq!(model.layers[1].layer_scalar, Some(0.5));
         assert_eq!(model.final_norm_weight, vec![1.0, 1.0, 1.0, 1.0]);
         assert_eq!(model.final_logit_softcapping, Some(7.5));
@@ -990,6 +1606,73 @@ mod tests {
             }
             other => panic!("expected tied embedding projection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_phase2_model_builds_lazy_ple_sources() {
+        let model_dir = create_test_model_dir("lazy-ple");
+        write_config(
+            &model_dir,
+            r#"{
+  "text_config": {
+    "enable_moe_block": false,
+    "head_dim": 2,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 4,
+    "hidden_size_per_layer_input": 2,
+    "layer_types": ["sliding_attention"],
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 1,
+    "rms_norm_eps": 0.000001,
+    "sliding_window": 5,
+    "tie_word_embeddings": true,
+    "vocab_size": 3,
+    "vocab_size_per_layer_input": 3
+  }
+}"#,
+        );
+        let mut tensors = vec![matrix_tensor(
+            "model.language_model.embed_tokens.weight",
+            &[3, 4],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        )];
+        tensors.extend(layer_tensors(0, 1.0, true));
+        tensors.extend(ple_layer_tensors(0, 1.0));
+        tensors.push(matrix_tensor(
+            "model.language_model.embed_tokens_per_layer.weight",
+            &[3, 2],
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        ));
+        tensors.push(matrix_tensor(
+            "model.language_model.per_layer_model_projection.weight",
+            &[2, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        ));
+        tensors.push(vector_tensor(
+            "model.language_model.per_layer_projection_norm.weight",
+            &[2],
+            &[1.0, 1.0],
+        ));
+        tensors.push(vector_tensor(
+            "model.language_model.norm.weight",
+            &[4],
+            &[1.0, 1.0, 1.0, 1.0],
+        ));
+        write_model_file(&model_dir, &tensors);
+
+        let model = load_phase2_model_from_gemma_model_path(&model_dir).unwrap();
+        let ple_global = model.ple_global.as_ref().expect("PLE globals should load");
+
+        assert_eq!(ple_global.token_embedding_layer_count(), 1);
+        assert_eq!(ple_global.model_projection_layer_count(), 1);
+        assert_eq!(ple_global.projection_norm_weight, vec![1.0, 1.0]);
+        assert_eq!(ple_global.embedding_scale, 2f32.sqrt());
+        assert_eq!(load_ple_token_embedding_row(ple_global, 0, 1).unwrap(), vec![0.3, 0.4]);
+        let projection = load_ple_model_projection(ple_global, 0).unwrap();
+        assert_eq!(projection.rows, 2);
+        assert_eq!(projection.cols, 4);
+        assert_eq!(projection.values, vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1142,6 +1825,27 @@ mod tests {
             ));
         }
         tensors
+    }
+
+    fn ple_layer_tensors(layer_idx: usize, base: f32) -> Vec<FixtureTensor> {
+        let prefix = format!("model.language_model.layers.{layer_idx}");
+        vec![
+            matrix_tensor(
+                &format!("{prefix}.per_layer_input_gate.weight"),
+                &[2, 4],
+                &[base; 8],
+            ),
+            matrix_tensor(
+                &format!("{prefix}.per_layer_projection.weight"),
+                &[4, 2],
+                &[base; 8],
+            ),
+            vector_tensor(
+                &format!("{prefix}.post_per_layer_input_norm.weight"),
+                &[4],
+                &[1.0, 1.0, 1.0, 1.0],
+            ),
+        ]
     }
 
     fn matrix_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTensor {

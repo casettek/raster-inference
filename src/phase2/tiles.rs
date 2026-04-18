@@ -6,14 +6,15 @@ use super::types::{
     ActivationSequence, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4Phase2Model, Gemma4PleGlobalWeights,
     Gemma4PrefillPleInputs, LayerKvCache, MatrixF32, PrefillLogits,
+    ResolvedGemma4LayerWeights,
 };
-use crate::trace::{trace_event, trace_scope};
+use crate::trace::trace_scope;
 
 pub fn embed_input_tokens(
     token_ids: &[u32],
     embedding_table: &EmbeddingTable,
 ) -> Result<EmbeddedTokenSequence> {
-    let _trace = trace_scope("phase2.embed_input_tokens");
+    // let _trace = trace_scope("phase2.embed_input_tokens");
     if token_ids.is_empty() {
         bail!("phase 2 embedding requires at least one token id");
     }
@@ -78,7 +79,7 @@ pub fn compute_prefill_ple_inputs(
     ple_global: &Gemma4PleGlobalWeights,
     rms_norm_eps: f32,
 ) -> Result<Gemma4PrefillPleInputs> {
-    let _trace = trace_scope("phase2.compute_prefill_ple_inputs");
+    // let _trace = trace_scope("phase2.compute_prefill_ple_inputs");
     if input_activations.is_empty() {
         bail!("phase 2 PLE computation requires at least one activation row");
     }
@@ -93,44 +94,41 @@ pub fn compute_prefill_ple_inputs(
             "phase 2 PLE computation requires token ids and activations to have matching lengths"
         );
     }
-    if ple_global.token_embeddings.len() != layers.len() {
+    if ple_global.token_embedding_layer_count() != layers.len() {
         bail!(
             "phase 2 PLE token embedding slice count mismatch: {} vs {}",
-            ple_global.token_embeddings.len(),
+            ple_global.token_embedding_layer_count(),
             layers.len()
         );
     }
-    if ple_global.model_projections.len() != layers.len() {
+    if ple_global.model_projection_layer_count() != layers.len() {
         bail!(
             "phase 2 PLE model projection slice count mismatch: {} vs {}",
-            ple_global.model_projections.len(),
+            ple_global.model_projection_layer_count(),
             layers.len()
         );
     }
 
     let mut per_layer_inputs = Vec::with_capacity(layers.len());
     for (layer_idx, layer) in layers.iter().enumerate() {
-        trace_event(format!("phase2.compute_prefill_ple_inputs layer={layer_idx}"));
+        // trace_event(format!("phase2.compute_prefill_ple_inputs layer={layer_idx}"));
         if layer.ple.is_none() {
             per_layer_inputs.push(None);
             continue;
         }
 
-        let token_embedding = &ple_global.token_embeddings[layer_idx];
-        let model_projection = &ple_global.model_projections[layer_idx];
-
         let mut embedded = Vec::with_capacity(token_ids.len());
         for token_id in token_ids {
-            let row_idx = usize::try_from(*token_id).expect("u32 should fit into usize");
             embedded.push(
-                row_from_matrix(token_embedding, row_idx)?
+                crate::io::load_ple_token_embedding_row(ple_global, layer_idx, *token_id)?
                     .into_iter()
                     .map(|value| value * ple_global.embedding_scale)
                     .collect::<Vec<_>>(),
             );
         }
 
-        let mut projected = linear_sequence(input_activations, model_projection)?;
+        let model_projection = crate::io::load_ple_model_projection(ple_global, layer_idx)?;
+        let mut projected = linear_sequence(input_activations, &model_projection)?;
         for row in &mut projected {
             for value in row {
                 *value *= ple_global.projection_scalar;
@@ -170,19 +168,12 @@ pub fn compute_decode_ple_input(
     }
 
     validate_vector_width(input_activation, layer.hidden_size, "decode PLE input activation")?;
-    let token_embedding = ple_global
-        .token_embeddings
-        .get(layer_idx)
-        .ok_or_else(|| anyhow!("phase 2 PLE token embedding slice count mismatch at layer {layer_idx}"))?;
-    let model_projection = ple_global.model_projections.get(layer_idx).ok_or_else(|| {
-        anyhow!("phase 2 PLE model projection slice count mismatch at layer {layer_idx}")
-    })?;
-
-    let embedded = row_from_matrix(token_embedding, usize::try_from(token_id).expect("u32 fits usize"))?
+    let embedded = crate::io::load_ple_token_embedding_row(ple_global, layer_idx, token_id)?
         .into_iter()
         .map(|value| value * ple_global.embedding_scale)
         .collect::<Vec<_>>();
-    let mut projected = linear_row(input_activation, model_projection)?;
+    let model_projection = crate::io::load_ple_model_projection(ple_global, layer_idx)?;
+    let mut projected = linear_row(input_activation, &model_projection)?;
     for value in &mut projected {
         *value *= ple_global.projection_scalar;
     }
@@ -209,7 +200,7 @@ pub fn compute_decode_ple_input(
 
 pub fn run_gemma4_layer(
     input_activations: &[Vec<f32>],
-    layer: &Gemma4LayerWeights,
+    layer: &ResolvedGemma4LayerWeights,
     per_layer_input: Option<&[Vec<f32>]>,
 ) -> Result<ActivationSequence> {
     Ok(run_gemma4_layer_with_cache(input_activations, layer, per_layer_input, None)?.0)
@@ -217,14 +208,14 @@ pub fn run_gemma4_layer(
 
 fn run_gemma4_layer_with_cache(
     input_activations: &[Vec<f32>],
-    layer: &Gemma4LayerWeights,
+    layer: &ResolvedGemma4LayerWeights,
     per_layer_input: Option<&[Vec<f32>]>,
     donor_cache: Option<&LayerKvCache>,
 ) -> Result<(ActivationSequence, LayerKvCache)> {
-    let _trace = trace_scope(format!(
-        "phase2.run_gemma4_layer attention={:?}",
-        layer.attention_kind
-    ));
+    // let _trace = trace_scope(format!(
+    //     "phase2.run_gemma4_layer attention={:?}",
+    //     layer.attention_kind
+    // ));
     if input_activations.is_empty() {
         bail!("phase 2 layer execution requires at least one activation row");
     }
@@ -237,6 +228,7 @@ fn run_gemma4_layer_with_cache(
                 .as_ref()
                 .ok_or_else(|| anyhow!("phase 2 layer received PLE inputs without PLE weights"))?
                 .input_gate
+                .as_ref()
                 .rows,
             "per-layer inputs",
         )?;
@@ -248,24 +240,24 @@ fn run_gemma4_layer_with_cache(
     }
 
     let mut xs = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.clone_input");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.clone_input");
         input_activations.to_vec()
     };
 
     let residual = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.attention.clone_residual");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.attention.clone_residual");
         xs.clone()
     };
     let normed = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.attention.input_rms_norm");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.attention.input_rms_norm");
         apply_rms_norm_to_sequence(&xs, &layer.input_layernorm_weight, layer.rms_norm_eps)?
     };
     let (attn_out, layer_cache) = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.attention.core");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.attention.core");
         run_attention_for_layer_with_cache(&normed, layer, donor_cache)?
     };
     let attn_out = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.attention.post_rms_norm");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.attention.post_rms_norm");
         apply_rms_norm_to_sequence(
             &attn_out,
             &layer.post_attention_layernorm_weight,
@@ -273,36 +265,36 @@ fn run_gemma4_layer_with_cache(
         )?
     };
     xs = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.attention.residual_add");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.attention.residual_add");
         add_sequences(&residual, &attn_out)?
     };
 
     let residual = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.mlp.clone_residual");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.mlp.clone_residual");
         xs.clone()
     };
     let normed = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.mlp.pre_rms_norm");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.mlp.pre_rms_norm");
         apply_rms_norm_to_sequence(&xs, &layer.pre_feedforward_layernorm_weight, layer.rms_norm_eps)?
     };
     let gate = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.mlp.gate_proj_gelu");
-        apply_gelu_to_sequence(&linear_sequence(&normed, &layer.gate_proj)?)
+        // let _trace = trace_scope("phase2.run_gemma4_layer.mlp.gate_proj_gelu");
+        apply_gelu_to_sequence(&linear_sequence(&normed, layer.gate_proj.as_ref())?)
     };
     let up = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.mlp.up_proj");
-        linear_sequence(&normed, &layer.up_proj)?
+        // let _trace = trace_scope("phase2.run_gemma4_layer.mlp.up_proj");
+        linear_sequence(&normed, layer.up_proj.as_ref())?
     };
     let ff_hidden = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.mlp.hidden_mul");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.mlp.hidden_mul");
         elementwise_mul_sequences(&gate, &up)?
     };
     let ff_out = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.mlp.down_proj");
-        linear_sequence(&ff_hidden, &layer.down_proj)?
+        // let _trace = trace_scope("phase2.run_gemma4_layer.mlp.down_proj");
+        linear_sequence(&ff_hidden, layer.down_proj.as_ref())?
     };
     let ff_out = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.mlp.post_rms_norm");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.mlp.post_rms_norm");
         apply_rms_norm_to_sequence(
             &ff_out,
             &layer.post_feedforward_layernorm_weight,
@@ -310,29 +302,29 @@ fn run_gemma4_layer_with_cache(
         )?
     };
     xs = {
-        let _trace = trace_scope("phase2.run_gemma4_layer.mlp.residual_add");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.mlp.residual_add");
         add_sequences(&residual, &ff_out)?
     };
 
     if let (Some(ple), Some(per_layer_input)) = (&layer.ple, per_layer_input) {
         let residual = {
-            let _trace = trace_scope("phase2.run_gemma4_layer.ple.clone_residual");
+            // let _trace = trace_scope("phase2.run_gemma4_layer.ple.clone_residual");
             xs.clone()
         };
         let gated = {
-            let _trace = trace_scope("phase2.run_gemma4_layer.ple.input_gate_gelu");
-            apply_gelu_to_sequence(&linear_sequence(&xs, &ple.input_gate)?)
+            // let _trace = trace_scope("phase2.run_gemma4_layer.ple.input_gate_gelu");
+            apply_gelu_to_sequence(&linear_sequence(&xs, ple.input_gate.as_ref())?)
         };
         let gated = {
-            let _trace = trace_scope("phase2.run_gemma4_layer.ple.input_mul");
+            // let _trace = trace_scope("phase2.run_gemma4_layer.ple.input_mul");
             elementwise_mul_sequences(&gated, per_layer_input)?
         };
         let projected = {
-            let _trace = trace_scope("phase2.run_gemma4_layer.ple.layer_projection");
-            linear_sequence(&gated, &ple.layer_projection)?
+            // let _trace = trace_scope("phase2.run_gemma4_layer.ple.layer_projection");
+            linear_sequence(&gated, ple.layer_projection.as_ref())?
         };
         let projected = {
-            let _trace = trace_scope("phase2.run_gemma4_layer.ple.post_rms_norm");
+            // let _trace = trace_scope("phase2.run_gemma4_layer.ple.post_rms_norm");
             apply_rms_norm_to_sequence(
                 &projected,
                 &ple.post_input_norm_weight,
@@ -340,13 +332,13 @@ fn run_gemma4_layer_with_cache(
             )?
         };
         xs = {
-            let _trace = trace_scope("phase2.run_gemma4_layer.ple.residual_add");
+            // let _trace = trace_scope("phase2.run_gemma4_layer.ple.residual_add");
             add_sequences(&residual, &projected)?
         };
     }
 
     if let Some(layer_scalar) = layer.layer_scalar {
-        let _trace = trace_scope("phase2.run_gemma4_layer.layer_scalar");
+        // let _trace = trace_scope("phase2.run_gemma4_layer.layer_scalar");
         for row in &mut xs {
             for value in row {
                 *value *= layer_scalar;
@@ -357,7 +349,7 @@ fn run_gemma4_layer_with_cache(
     Ok((
         ActivationSequence {
             activations_sha256: {
-                let _trace = trace_scope("phase2.run_gemma4_layer.commitment_hash");
+                // let _trace = trace_scope("phase2.run_gemma4_layer.commitment_hash");
                 build_phase2_commitment(&xs)
             },
             activations: xs,
@@ -368,16 +360,16 @@ fn run_gemma4_layer_with_cache(
 
 pub fn run_gemma4_layer_decode(
     input_activation: &[f32],
-    layer: &Gemma4LayerWeights,
+    layer: &ResolvedGemma4LayerWeights,
     per_layer_input: Option<&[f32]>,
-    cache: &LayerKvCache,
+    cache: LayerKvCache,
     donor_cache: Option<&LayerKvCache>,
     position: usize,
 ) -> Result<(Vec<f32>, LayerKvCache)> {
-    let _trace = trace_scope(format!(
-        "phase2.run_gemma4_layer_decode attention={:?}",
-        layer.attention_kind
-    ));
+    // let _trace = trace_scope(format!(
+    //     "phase2.run_gemma4_layer_decode attention={:?}",
+    //     layer.attention_kind
+    // ));
     validate_vector_width(input_activation, layer.hidden_size, "decode input activation")?;
     if let Some(per_layer_input) = per_layer_input {
         validate_vector_width(
@@ -387,6 +379,7 @@ pub fn run_gemma4_layer_decode(
                 .as_ref()
                 .ok_or_else(|| anyhow!("phase 2 decode received PLE inputs without PLE weights"))?
                 .input_gate
+                .as_ref()
                 .rows,
             "decode per-layer input",
         )?;
@@ -401,10 +394,10 @@ pub fn run_gemma4_layer_decode(
 
     let residual = xs.clone();
     let normed = apply_rms_norm(&xs, &layer.pre_feedforward_layernorm_weight, layer.rms_norm_eps)?;
-    let gate = apply_gelu(&linear_row(&normed, &layer.gate_proj)?);
-    let up = linear_row(&normed, &layer.up_proj)?;
+    let gate = apply_gelu(&linear_row(&normed, layer.gate_proj.as_ref())?);
+    let up = linear_row(&normed, layer.up_proj.as_ref())?;
     let ff_hidden = elementwise_mul_rows(&gate, &up)?;
-    let mut ff_out = linear_row(&ff_hidden, &layer.down_proj)?;
+    let mut ff_out = linear_row(&ff_hidden, layer.down_proj.as_ref())?;
     ff_out = apply_rms_norm(
         &ff_out,
         &layer.post_feedforward_layernorm_weight,
@@ -414,9 +407,9 @@ pub fn run_gemma4_layer_decode(
 
     if let (Some(ple), Some(per_layer_input)) = (&layer.ple, per_layer_input) {
         let residual = xs.clone();
-        let gated = apply_gelu(&linear_row(&xs, &ple.input_gate)?);
+        let gated = apply_gelu(&linear_row(&xs, ple.input_gate.as_ref())?);
         let gated = elementwise_mul_rows(&gated, per_layer_input)?;
-        let mut projected = linear_row(&gated, &ple.layer_projection)?;
+        let mut projected = linear_row(&gated, ple.layer_projection.as_ref())?;
         projected = apply_rms_norm(&projected, &ple.post_input_norm_weight, layer.rms_norm_eps)?;
         xs = add_rows(&residual, &projected)?;
     }
@@ -443,7 +436,7 @@ pub fn run_text_layers_prefill_with_cache(
     model: &Gemma4Phase2Model,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    let _trace = trace_scope("phase2.run_text_layers_prefill");
+    // let _trace = trace_scope("phase2.run_text_layers_prefill");
     if model.layers.is_empty() {
         bail!("phase 2 prefill requires at least one layer");
     }
@@ -451,16 +444,28 @@ pub fn run_text_layers_prefill_with_cache(
     let mut xs = input_activations.to_vec();
     let mut layer_caches = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
-        trace_event(format!(
-            "phase2.run_text_layers_prefill layer={layer_idx} attention={:?}",
-            layer.attention_kind
+        let _trace = trace_scope(format!(
+            "phase2.prefill_layer layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
+            xs.len(),
+            layer.attention_kind,
+            layer.ple.is_some(),
+            layer.kv_shared_layer_index
         ));
+        // trace_event(format!(
+        //     "phase2.run_text_layers_prefill layer={layer_idx} attention={:?}",
+        //     layer.attention_kind
+        // ));
+        // trace_event(format!(
+        //     "phase2.prefill_layer_tokens layer={layer_idx} tokens={}",
+        //     xs.len()
+        // ));
         let per_layer_input = ple_inputs
             .and_then(|inputs| inputs.per_layer_inputs.get(layer_idx))
             .and_then(|input| input.as_deref());
         let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
+        let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, layer_cache) =
-            run_gemma4_layer_with_cache(&xs, layer, per_layer_input, donor_cache)?;
+            run_gemma4_layer_with_cache(&xs, &resolved_layer, per_layer_input, donor_cache)?;
         xs = layer_output.activations;
         layer_caches.push(layer_cache);
     }
@@ -478,10 +483,10 @@ pub fn run_text_layers_decode_step(
     input_activation: &[f32],
     token_id: u32,
     model: &Gemma4Phase2Model,
-    layer_caches: &[LayerKvCache],
+    layer_caches: Vec<LayerKvCache>,
     position: usize,
 ) -> Result<ActivationSequenceWithCache> {
-    let _trace = trace_scope("phase2.run_text_layers_decode_step");
+    // let _trace = trace_scope("phase2.run_text_layers_decode_step");
     if model.layers.is_empty() {
         bail!("phase 2 decode requires at least one layer");
     }
@@ -495,11 +500,24 @@ pub fn run_text_layers_decode_step(
 
     let mut xs = input_activation.to_vec();
     let mut updated_layer_caches = Vec::with_capacity(model.layers.len());
-    for (layer_idx, (layer, cache)) in model.layers.iter().zip(layer_caches).enumerate() {
-        trace_event(format!(
-            "phase2.run_text_layers_decode_step layer={layer_idx} attention={:?}",
-            layer.attention_kind
+    for (layer_idx, (layer, cache)) in model.layers.iter().zip(layer_caches.into_iter()).enumerate() {
+        let _trace = trace_scope(format!(
+            "phase2.decode_layer layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
+            token_id,
+            position,
+            layer.attention_kind,
+            layer.ple.is_some(),
+            layer.kv_shared_layer_index
         ));
+        // trace_event(format!(
+        //     "phase2.run_text_layers_decode_step layer={layer_idx} attention={:?}",
+        //     layer.attention_kind
+        // ));
+        // trace_event(format!(
+        //     "phase2.decode_layer_state layer={layer_idx} token={} position={}",
+        //     token_id,
+        //     position
+        // ));
         let per_layer_input = compute_decode_ple_input(
             token_id,
             input_activation,
@@ -508,11 +526,11 @@ pub fn run_text_layers_decode_step(
             model.ple_global.as_ref(),
             model.rms_norm_eps,
         )?;
-        let donor_cache =
-            resolve_decode_donor_cache(layer, layer_caches, &updated_layer_caches, layer_idx)?;
+        let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
+        let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, updated_cache) = run_gemma4_layer_decode(
             &xs,
-            layer,
+            &resolved_layer,
             per_layer_input.as_deref(),
             cache,
             donor_cache,
@@ -553,7 +571,6 @@ fn resolve_prefill_donor_cache<'a>(
 
 fn resolve_decode_donor_cache<'a>(
     layer: &Gemma4LayerWeights,
-    layer_caches: &'a [LayerKvCache],
     updated_layer_caches: &'a [LayerKvCache],
     layer_idx: usize,
 ) -> Result<Option<&'a LayerKvCache>> {
@@ -565,12 +582,9 @@ fn resolve_decode_donor_cache<'a>(
                     "phase 2 decode layer {layer_idx} cannot share KV with non-prior donor {donor_idx}"
                 );
             }
-            updated_layer_caches
-                .get(donor_idx)
-                .or_else(|| layer_caches.get(donor_idx))
-                .ok_or_else(|| {
-                    anyhow!("phase 2 decode donor cache {donor_idx} missing for layer {layer_idx}")
-                })
+            updated_layer_caches.get(donor_idx).ok_or_else(|| {
+                anyhow!("phase 2 decode donor cache {donor_idx} missing for layer {layer_idx}")
+            })
         })
         .transpose()
 }
@@ -580,7 +594,7 @@ pub fn apply_final_norm(
     weight: &[f32],
     eps: f32,
 ) -> Result<ActivationSequence> {
-    let _trace = trace_scope("phase2.apply_final_norm");
+    // let _trace = trace_scope("phase2.apply_final_norm");
     let activations = apply_rms_norm_to_sequence(input_activations, weight, eps)?;
     Ok(ActivationSequence {
         activations_sha256: build_phase2_commitment(&activations),
@@ -589,7 +603,7 @@ pub fn apply_final_norm(
 }
 
 pub fn select_final_position(input_activations: &[Vec<f32>]) -> Result<Vec<f32>> {
-    let _trace = trace_scope("phase2.select_final_position");
+    // let _trace = trace_scope("phase2.select_final_position");
     input_activations
         .last()
         .cloned()
@@ -600,7 +614,7 @@ pub fn project_to_logits(
     last_hidden_state: &[f32],
     projection: &Gemma4LogitsProjection,
 ) -> Result<Vec<f32>> {
-    let _trace = trace_scope("phase2.project_to_logits");
+    // let _trace = trace_scope("phase2.project_to_logits");
     let weight = match projection {
         Gemma4LogitsProjection::UntiedLmHead(weight)
         | Gemma4LogitsProjection::TiedEmbedding(weight) => weight,
@@ -620,7 +634,7 @@ pub fn project_to_logits(
 }
 
 pub fn apply_final_logit_softcapping(logits: &[f32], softcap: f32) -> Vec<f32> {
-    let _trace = trace_scope("phase2.apply_final_logit_softcapping");
+    // let _trace = trace_scope("phase2.apply_final_logit_softcapping");
     logits
         .iter()
         .map(|logit| (logit / softcap).tanh() * softcap)
@@ -628,7 +642,7 @@ pub fn apply_final_logit_softcapping(logits: &[f32], softcap: f32) -> Vec<f32> {
 }
 
 pub fn extract_prefill_logits(logits: &[f32]) -> PrefillLogits {
-    let _trace = trace_scope("phase2.extract_prefill_logits");
+    // let _trace = trace_scope("phase2.extract_prefill_logits");
     PrefillLogits {
         logits: logits.to_vec(),
         final_logits_sha256: build_vector_commitment(logits),
@@ -642,7 +656,7 @@ pub fn project_decode_hidden_to_logits(
     projection: &Gemma4LogitsProjection,
     final_logit_softcapping: Option<f32>,
 ) -> Result<PrefillLogits> {
-    let _trace = trace_scope("phase2.project_decode_hidden_to_logits");
+    // let _trace = trace_scope("phase2.project_decode_hidden_to_logits");
     let normalized = apply_rms_norm(hidden_state, final_norm_weight, rms_norm_eps)?;
     let mut logits = project_to_logits(&normalized, projection)?;
     if let Some(softcap) = final_logit_softcapping {
@@ -676,7 +690,7 @@ fn build_vector_commitment(values: &[f32]) -> String {
 
 fn run_attention_for_layer_with_cache(
     inputs: &[Vec<f32>],
-    layer: &Gemma4LayerWeights,
+    layer: &ResolvedGemma4LayerWeights,
     donor_cache: Option<&LayerKvCache>,
 ) -> Result<(Vec<Vec<f32>>, LayerKvCache)> {
     match layer.attention_kind {
@@ -687,8 +701,8 @@ fn run_attention_for_layer_with_cache(
 
 fn run_attention_for_layer_decode(
     input: &[f32],
-    layer: &Gemma4LayerWeights,
-    cache: &LayerKvCache,
+    layer: &ResolvedGemma4LayerWeights,
+    cache: LayerKvCache,
     donor_cache: Option<&LayerKvCache>,
     position: usize,
 ) -> Result<(Vec<f32>, LayerKvCache)> {
@@ -715,7 +729,7 @@ fn run_attention_for_layer_decode(
 
 fn run_sliding_attention(
     inputs: &[Vec<f32>],
-    layer: &Gemma4LayerWeights,
+    layer: &ResolvedGemma4LayerWeights,
     donor_cache: Option<&LayerKvCache>,
 ) -> Result<(Vec<Vec<f32>>, LayerKvCache)> {
     let sliding_window = layer
@@ -732,7 +746,7 @@ fn run_sliding_attention(
 
 fn run_full_attention(
     inputs: &[Vec<f32>],
-    layer: &Gemma4LayerWeights,
+    layer: &ResolvedGemma4LayerWeights,
     donor_cache: Option<&LayerKvCache>,
 ) -> Result<(Vec<Vec<f32>>, LayerKvCache)> {
     run_causal_attention(inputs, layer, None, None, donor_cache)
@@ -740,15 +754,15 @@ fn run_full_attention(
 
 fn run_causal_attention(
     inputs: &[Vec<f32>],
-    layer: &Gemma4LayerWeights,
+    layer: &ResolvedGemma4LayerWeights,
     attention_window: Option<usize>,
     cache_window: Option<usize>,
     donor_cache: Option<&LayerKvCache>,
 ) -> Result<(Vec<Vec<f32>>, LayerKvCache)> {
-    let _trace = trace_scope(format!(
-        "phase2.run_causal_attention attention={:?}",
-        layer.attention_kind
-    ));
+    // let _trace = trace_scope(format!(
+    //     "phase2.run_causal_attention attention={:?}",
+    //     layer.attention_kind
+    // ));
     let seq_len = inputs.len();
     let kv_groups = layer
         .num_heads
@@ -759,50 +773,50 @@ fn run_causal_attention(
     }
 
     let q_projected = {
-        let _trace = trace_scope("phase2.run_causal_attention.q_proj");
-        linear_sequence(inputs, &layer.q_proj)?
+        // let _trace = trace_scope("phase2.run_causal_attention.q_proj");
+        linear_sequence(inputs, layer.q_proj.as_ref())?
     };
     let raw_k = {
-        let _trace = trace_scope("phase2.run_causal_attention.k_proj");
-        linear_sequence(inputs, &layer.k_proj)?
+        // let _trace = trace_scope("phase2.run_causal_attention.k_proj");
+        linear_sequence(inputs, layer.k_proj.as_ref())?
     };
     let raw_v = if let Some(v_proj) = &layer.v_proj {
-        let _trace = trace_scope("phase2.run_causal_attention.v_proj");
-        linear_sequence(inputs, v_proj)?
+        // let _trace = trace_scope("phase2.run_causal_attention.v_proj");
+        linear_sequence(inputs, v_proj.as_ref())?
     } else if layer.attention_k_eq_v {
-        trace_event("phase2.run_causal_attention.k_eq_v_reuse");
+        // trace_event("phase2.run_causal_attention.k_eq_v_reuse");
         raw_k.clone()
     } else {
         bail!("Gemma layer is missing v_proj without attention_k_eq_v enabled");
     };
     let mut q = {
-        let _trace = trace_scope("phase2.run_causal_attention.reshape_q");
+        // let _trace = trace_scope("phase2.run_causal_attention.reshape_q");
         reshape_sequence_heads(&q_projected, layer.num_heads, layer.head_dim)?
     };
     let mut k = {
-        let _trace = trace_scope("phase2.run_causal_attention.reshape_k");
+        // let _trace = trace_scope("phase2.run_causal_attention.reshape_k");
         reshape_sequence_heads(&raw_k, layer.num_kv_heads, layer.head_dim)?
     };
     let mut v = {
-        let _trace = trace_scope("phase2.run_causal_attention.reshape_v");
+        // let _trace = trace_scope("phase2.run_causal_attention.reshape_v");
         reshape_sequence_heads(&raw_v, layer.num_kv_heads, layer.head_dim)?
     };
 
     {
-        let _trace = trace_scope("phase2.run_causal_attention.q_rms_norm");
+        // let _trace = trace_scope("phase2.run_causal_attention.q_rms_norm");
         apply_head_rms_norm(&mut q, &layer.q_norm_weight, layer.rms_norm_eps)?;
     }
     {
-        let _trace = trace_scope("phase2.run_causal_attention.k_rms_norm");
+        // let _trace = trace_scope("phase2.run_causal_attention.k_rms_norm");
         apply_head_rms_norm(&mut k, &layer.k_norm_weight, layer.rms_norm_eps)?;
     }
     {
-        let _trace = trace_scope("phase2.run_causal_attention.v_rms_norm");
+        // let _trace = trace_scope("phase2.run_causal_attention.v_rms_norm");
         apply_value_rms_norm(&mut v, layer.rms_norm_eps)?;
     }
 
     {
-        let _trace = trace_scope("phase2.run_causal_attention.q_rope");
+        // let _trace = trace_scope("phase2.run_causal_attention.q_rope");
         apply_rope(
             &mut q,
             layer.partial_rotary_dim,
@@ -811,7 +825,7 @@ fn run_causal_attention(
         );
     }
     {
-        let _trace = trace_scope("phase2.run_causal_attention.k_rope");
+        // let _trace = trace_scope("phase2.run_causal_attention.k_rope");
         apply_rope(
             &mut k,
             layer.partial_rotary_dim,
@@ -829,26 +843,34 @@ fn run_causal_attention(
     let head_outputs = (0..layer.num_heads)
         .into_par_iter()
         .map(|head_idx| {
-            let _trace = trace_scope(format!("phase2.run_causal_attention.head={head_idx}"));
+            // let _trace = trace_scope(format!("phase2.run_causal_attention.head={head_idx}"));
             let kv_head_idx = head_idx / kv_groups;
             let mut outputs = vec![vec![0.0; layer.head_dim]; seq_len];
             for (query_idx, output) in outputs.iter_mut().enumerate() {
                 let start = attention_window
                     .map(|window| query_idx.saturating_add(1).saturating_sub(window))
                     .unwrap_or(0);
-                let (keys, values) = if let Some(donor_cache) = donor_cache {
-                    (&donor_cache.keys[kv_head_idx], &donor_cache.values[kv_head_idx])
-                } else {
-                    (&k[kv_head_idx], &v[kv_head_idx])
-                };
-                let logits = (start..=query_idx)
-                    .map(|key_idx| dot(&q[head_idx][query_idx], &keys[key_idx]))
-                    .collect::<Vec<_>>();
-                let weights = softmax(&logits);
+                if let Some(donor_cache) = donor_cache {
+                    let logits = (start..=query_idx)
+                        .map(|key_idx| dot(&q[head_idx][query_idx], &donor_cache.keys[kv_head_idx][key_idx]))
+                        .collect::<Vec<_>>();
+                    let weights = softmax(&logits);
 
-                for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
-                    for (dim_idx, value) in output.iter_mut().enumerate() {
-                        *value += weight * values[key_idx][dim_idx];
+                    for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
+                        for (dim_idx, value) in output.iter_mut().enumerate() {
+                            *value += weight * donor_cache.values[kv_head_idx][key_idx][dim_idx];
+                        }
+                    }
+                } else {
+                    let logits = (start..=query_idx)
+                        .map(|key_idx| dot(&q[head_idx][query_idx], &k[kv_head_idx][key_idx]))
+                        .collect::<Vec<_>>();
+                    let weights = softmax(&logits);
+
+                    for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
+                        for (dim_idx, value) in output.iter_mut().enumerate() {
+                            *value += weight * v[kv_head_idx][key_idx][dim_idx];
+                        }
                     }
                 }
             }
@@ -866,24 +888,24 @@ fn run_causal_attention(
     }
 
     {
-        let _trace = trace_scope("phase2.run_causal_attention.o_proj");
-        Ok((linear_sequence(&combined_heads, &layer.o_proj)?, layer_cache))
+        // let _trace = trace_scope("phase2.run_causal_attention.o_proj");
+        Ok((linear_sequence(&combined_heads, layer.o_proj.as_ref())?, layer_cache))
     }
 }
 
 fn run_causal_attention_decode(
     input: &[f32],
-    layer: &Gemma4LayerWeights,
-    cache: &LayerKvCache,
+    layer: &ResolvedGemma4LayerWeights,
+    cache: LayerKvCache,
     donor_cache: Option<&LayerKvCache>,
     position: usize,
     attention_window: Option<usize>,
     cache_window: Option<usize>,
 ) -> Result<(Vec<f32>, LayerKvCache)> {
-    let _trace = trace_scope(format!(
-        "phase2.run_causal_attention_decode attention={:?}",
-        layer.attention_kind
-    ));
+    // let _trace = trace_scope(format!(
+    //     "phase2.run_causal_attention_decode attention={:?}",
+    //     layer.attention_kind
+    // ));
     validate_vector_width(input, layer.hidden_size, "decode attention input")?;
 
     let kv_groups = layer
@@ -896,13 +918,13 @@ fn run_causal_attention_decode(
     if let Some(donor_cache) = donor_cache {
         validate_layer_cache(donor_cache, layer)?;
     } else {
-        validate_layer_cache(cache, layer)?;
+        validate_layer_cache(&cache, layer)?;
     }
 
-    let q_projected = linear_row(input, &layer.q_proj)?;
-    let raw_k = linear_row(input, &layer.k_proj)?;
+    let q_projected = linear_row(input, layer.q_proj.as_ref())?;
+    let raw_k = linear_row(input, layer.k_proj.as_ref())?;
     let raw_v = if let Some(v_proj) = &layer.v_proj {
-        linear_row(input, v_proj)?
+        linear_row(input, v_proj.as_ref())?
     } else if layer.attention_k_eq_v {
         raw_k.clone()
     } else {
@@ -932,7 +954,7 @@ fn run_causal_attention_decode(
     );
 
     let updated_cache = if donor_cache.is_some() {
-        cache.clone()
+        cache
     } else {
         append_kv_cache(cache, &k, &v, cache_window)?
     };
@@ -943,15 +965,16 @@ fn run_causal_attention_decode(
         let key_start = attention_window
             .map(|window| attention_cache.keys[kv_head_idx].len().saturating_sub(window))
             .unwrap_or(0);
-        let logits = attention_cache.keys[kv_head_idx][key_start..]
+        let logits = attention_cache.keys[kv_head_idx]
             .iter()
+            .skip(key_start)
             .map(|key_row| dot(&q[head_idx], key_row))
             .collect::<Vec<_>>();
         let weights = softmax(&logits);
         let mut output = vec![0.0; layer.head_dim];
         for (weight, value_row) in weights
             .into_iter()
-            .zip(&attention_cache.values[kv_head_idx][key_start..])
+            .zip(attention_cache.values[kv_head_idx].iter().skip(key_start))
         {
             for (dim_idx, value) in output.iter_mut().enumerate() {
                 *value += weight * value_row[dim_idx];
@@ -961,7 +984,7 @@ fn run_causal_attention_decode(
         dst.copy_from_slice(&output);
     }
 
-    Ok((linear_row(&combined_heads, &layer.o_proj)?, updated_cache))
+    Ok((linear_row(&combined_heads, layer.o_proj.as_ref())?, updated_cache))
 }
 
 fn validate_sequence_width(sequence: &[Vec<f32>], width: usize, label: &str) -> Result<()> {
@@ -982,7 +1005,7 @@ fn validate_vector_width(vector: &[f32], width: usize, label: &str) -> Result<()
     Ok(())
 }
 
-fn validate_layer_cache(cache: &LayerKvCache, layer: &Gemma4LayerWeights) -> Result<()> {
+fn validate_layer_cache(cache: &LayerKvCache, layer: &ResolvedGemma4LayerWeights) -> Result<()> {
     if cache.keys.len() != layer.num_kv_heads || cache.values.len() != layer.num_kv_heads {
         bail!(
             "layer cache head count mismatch: keys {} values {} expected {}",
@@ -1114,15 +1137,6 @@ fn linear_row(input: &[f32], weight: &MatrixF32) -> Result<Vec<f32>> {
         *value = sum;
     }
     Ok(output)
-}
-
-fn row_from_matrix(matrix: &MatrixF32, row_idx: usize) -> Result<Vec<f32>> {
-    if row_idx >= matrix.rows {
-        bail!("matrix row index {row_idx} is out of bounds for {}", matrix.rows);
-    }
-    let start = row_idx * matrix.cols;
-    let end = start + matrix.cols;
-    Ok(matrix.values[start..end].to_vec())
 }
 
 fn apply_rms_norm_to_sequence(
@@ -1315,13 +1329,19 @@ fn build_layer_kv_cache(
         keys.first().map_or(0, |head| head.len().saturating_sub(window))
     });
     LayerKvCache {
-        keys: keys.iter().map(|head| head[retained..].to_vec()).collect(),
-        values: values.iter().map(|head| head[retained..].to_vec()).collect(),
+        keys: keys
+            .iter()
+            .map(|head| head[retained..].iter().cloned().collect())
+            .collect(),
+        values: values
+            .iter()
+            .map(|head| head[retained..].iter().cloned().collect())
+            .collect(),
     }
 }
 
 pub fn append_kv_cache(
-    cache: &LayerKvCache,
+    mut cache: LayerKvCache,
     new_keys: &[Vec<f32>],
     new_values: &[Vec<f32>],
     sliding_window: Option<usize>,
@@ -1335,24 +1355,23 @@ pub fn append_kv_cache(
         );
     }
 
-    let mut keys = cache.keys.clone();
-    let mut values = cache.values.clone();
-    for ((head_keys, head_values), (new_key, new_value)) in keys
+    for ((head_keys, head_values), (new_key, new_value)) in cache
+        .keys
         .iter_mut()
-        .zip(values.iter_mut())
+        .zip(cache.values.iter_mut())
         .zip(new_keys.iter().zip(new_values))
     {
-        head_keys.push(new_key.clone());
-        head_values.push(new_value.clone());
+        head_keys.push_back(new_key.clone());
+        head_values.push_back(new_value.clone());
         if let Some(window) = sliding_window {
             while head_keys.len() > window {
-                head_keys.remove(0);
-                head_values.remove(0);
+                head_keys.pop_front();
+                head_values.pop_front();
             }
         }
     }
 
-    Ok(LayerKvCache { keys, values })
+    Ok(cache)
 }
 
 fn apply_gelu_to_sequence(inputs: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -1374,8 +1393,8 @@ fn gelu_pytorch_tanh(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs, embed_input_tokens,
-        extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
+        append_kv_cache, apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs,
+        embed_input_tokens, extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
         run_gemma4_layer, run_text_layers_decode_step, run_text_layers_prefill,
         run_text_layers_prefill_with_cache,
     };
@@ -1472,24 +1491,26 @@ mod tests {
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
             attention_k_eq_v: false,
-            q_proj: zero_matrix(4, 4),
-            k_proj: zero_matrix(2, 4),
-            v_proj: Some(zero_matrix(2, 4)),
-            o_proj: zero_matrix(4, 4),
+            q_proj: zero_matrix(4, 4).into(),
+            k_proj: zero_matrix(2, 4).into(),
+            v_proj: Some(zero_matrix(2, 4).into()),
+            o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
             k_norm_weight: vec![1.0, 1.0],
             input_layernorm_weight: vec![1.0; 4],
             post_attention_layernorm_weight: vec![1.0; 4],
             pre_feedforward_layernorm_weight: vec![1.0; 4],
             post_feedforward_layernorm_weight: vec![1.0; 4],
-            gate_proj: zero_matrix(8, 4),
-            up_proj: zero_matrix(8, 4),
-            down_proj: zero_matrix(4, 8),
+            gate_proj: zero_matrix(8, 4).into(),
+            up_proj: zero_matrix(8, 4).into(),
+            down_proj: zero_matrix(4, 8).into(),
             ple: None,
             layer_scalar: None,
         };
 
-        let output = run_gemma4_layer(&activations, &layer, None).expect("layer should succeed");
+        let resolved_layer = crate::io::resolve_layer_weights(&layer).expect("resolve layer");
+        let output =
+            run_gemma4_layer(&activations, &resolved_layer, None).expect("layer should succeed");
 
         assert_eq!(output.activations, activations);
     }
@@ -1510,42 +1531,42 @@ mod tests {
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
             attention_k_eq_v: false,
-            q_proj: zero_matrix(4, 4),
-            k_proj: zero_matrix(2, 4),
-            v_proj: Some(zero_matrix(2, 4)),
-            o_proj: zero_matrix(4, 4),
+            q_proj: zero_matrix(4, 4).into(),
+            k_proj: zero_matrix(2, 4).into(),
+            v_proj: Some(zero_matrix(2, 4).into()),
+            o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
             k_norm_weight: vec![1.0, 1.0],
             input_layernorm_weight: vec![1.0; 4],
             post_attention_layernorm_weight: vec![1.0; 4],
             pre_feedforward_layernorm_weight: vec![1.0; 4],
             post_feedforward_layernorm_weight: vec![1.0; 4],
-            gate_proj: zero_matrix(8, 4),
-            up_proj: zero_matrix(8, 4),
-            down_proj: zero_matrix(4, 8),
+            gate_proj: zero_matrix(8, 4).into(),
+            up_proj: zero_matrix(8, 4).into(),
+            down_proj: zero_matrix(4, 8).into(),
             ple: Some(Gemma4PleLayerWeights {
-                input_gate: zero_matrix(2, 4),
-                layer_projection: zero_matrix(4, 2),
+                input_gate: zero_matrix(2, 4).into(),
+                layer_projection: zero_matrix(4, 2).into(),
                 post_input_norm_weight: vec![1.0; 4],
             }),
             layer_scalar: None,
         }];
-        let ple_global = Gemma4PleGlobalWeights {
-            token_embeddings: vec![MatrixF32 {
+        let ple_global = Gemma4PleGlobalWeights::from_materialized(
+            vec![MatrixF32 {
                 rows: 2,
                 cols: 2,
                 values: vec![1.0, 2.0, 3.0, 4.0],
             }],
-            model_projections: vec![MatrixF32 {
+            vec![MatrixF32 {
                 rows: 2,
                 cols: 4,
                 values: vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             }],
-            projection_norm_weight: vec![1.0, 1.0],
-            embedding_scale: 1.0,
-            projection_scalar: 1.0,
-            input_scale: 1.0,
-        };
+            vec![1.0, 1.0],
+            1.0,
+            1.0,
+            1.0,
+        );
         let inputs = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
 
         let first =
@@ -1592,19 +1613,19 @@ mod tests {
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
             attention_k_eq_v: false,
-            q_proj: zero_matrix(4, 4),
-            k_proj: zero_matrix(2, 4),
-            v_proj: Some(zero_matrix(2, 4)),
-            o_proj: zero_matrix(4, 4),
+            q_proj: zero_matrix(4, 4).into(),
+            k_proj: zero_matrix(2, 4).into(),
+            v_proj: Some(zero_matrix(2, 4).into()),
+            o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
             k_norm_weight: vec![1.0, 1.0],
             input_layernorm_weight: vec![1.0; 4],
             post_attention_layernorm_weight: vec![1.0; 4],
             pre_feedforward_layernorm_weight: vec![1.0; 4],
             post_feedforward_layernorm_weight: vec![1.0; 4],
-            gate_proj: zero_matrix(8, 4),
-            up_proj: zero_matrix(8, 4),
-            down_proj: zero_matrix(4, 8),
+            gate_proj: zero_matrix(8, 4).into(),
+            up_proj: zero_matrix(8, 4).into(),
+            down_proj: zero_matrix(4, 8).into(),
             ple: None,
             layer_scalar: None,
         };
@@ -1637,6 +1658,25 @@ mod tests {
     }
 
     #[test]
+    fn append_kv_cache_keeps_newest_sliding_window_entries_in_order() {
+        let cache = append_kv_cache(crate::phase2::LayerKvCache::new(1), &[vec![1.0]], &[vec![10.0]], None)
+            .unwrap();
+        let cache = append_kv_cache(cache, &[vec![2.0]], &[vec![20.0]], None).unwrap();
+
+        let updated = append_kv_cache(cache, &[vec![3.0]], &[vec![30.0]], Some(2)).unwrap();
+
+        assert_eq!(updated.current_len(), 2);
+        assert_eq!(
+            updated.keys[0].iter().cloned().collect::<Vec<_>>(),
+            vec![vec![2.0], vec![3.0]]
+        );
+        assert_eq!(
+            updated.values[0].iter().cloned().collect::<Vec<_>>(),
+            vec![vec![20.0], vec![30.0]]
+        );
+    }
+
+    #[test]
     fn run_text_layers_decode_step_matches_prefill_for_appended_token() {
         let model = parity_test_model(Gemma4AttentionKind::Full, None);
         let embeddings = model.embedding_table.as_ref().unwrap().rows.clone();
@@ -1645,7 +1685,7 @@ mod tests {
 
         let (_, layer_caches) = run_text_layers_prefill_with_cache(&prompt_embeddings, &model, None).unwrap();
         let decoded =
-            run_text_layers_decode_step(&next_embedding, 2, &model, &layer_caches, prompt_embeddings.len())
+            run_text_layers_decode_step(&next_embedding, 2, &model, layer_caches, prompt_embeddings.len())
                 .unwrap();
         let replay = run_text_layers_prefill(&embeddings, &model, None).unwrap();
         let replay_last_hidden = replay.activations.last().cloned().unwrap();
@@ -1683,7 +1723,7 @@ mod tests {
 
         let (_, layer_caches) = run_text_layers_prefill_with_cache(&prompt_embeddings, &model, None).unwrap();
         let decoded =
-            run_text_layers_decode_step(&next_embedding, 2, &model, &layer_caches, prompt_embeddings.len())
+            run_text_layers_decode_step(&next_embedding, 2, &model, layer_caches, prompt_embeddings.len())
                 .unwrap();
 
         assert_eq!(decoded.layer_caches.len(), 1);
@@ -1704,7 +1744,7 @@ mod tests {
             &next_embedding,
             2,
             &invalid_model,
-            &layer_caches,
+            layer_caches,
             prompt_embeddings.len(),
         )
         .err()
@@ -1750,7 +1790,8 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                },
+                }
+                .into(),
                 k_proj: MatrixF32 {
                     rows: 2,
                     cols: 4,
@@ -1758,7 +1799,8 @@ mod tests {
                         1.0, 0.0, 0.0, 0.0,
                         0.0, 1.0, 0.0, 0.0,
                     ],
-                },
+                }
+                .into(),
                 v_proj: Some(MatrixF32 {
                     rows: 2,
                     cols: 4,
@@ -1766,7 +1808,8 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                }),
+                }
+                .into()),
                 o_proj: MatrixF32 {
                     rows: 4,
                     cols: 4,
@@ -1776,16 +1819,17 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                },
+                }
+                .into(),
                 q_norm_weight: vec![1.0, 1.0],
                 k_norm_weight: vec![1.0, 1.0],
                 input_layernorm_weight: vec![1.0; 4],
                 post_attention_layernorm_weight: vec![1.0; 4],
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
                 post_feedforward_layernorm_weight: vec![1.0; 4],
-                gate_proj: zero_matrix(8, 4),
-                up_proj: zero_matrix(8, 4),
-                down_proj: zero_matrix(4, 8),
+                gate_proj: zero_matrix(8, 4).into(),
+                up_proj: zero_matrix(8, 4).into(),
+                down_proj: zero_matrix(4, 8).into(),
                 ple: None,
                 layer_scalar: None,
             }],
