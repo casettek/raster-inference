@@ -65,7 +65,7 @@ pub fn run_inference(
         } else {
             anyhow::bail!("phase 2 model is missing both embedding_table and embedding_source")
         };
-        trace::trace_checkpoint("phase1", &json!({
+        trace::trace_checkpoint("prompt.prepare", &json!({
             "prompt_text": phase1.prompt_text.clone(),
             "prompt_token_ids": phase1.prompt_token_ids.clone(),
             "prompt_token_ids_sha256": phase1.prompt_token_ids_sha256.clone(),
