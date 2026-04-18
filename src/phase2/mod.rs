@@ -14,9 +14,10 @@ pub use tiles::{
 pub use types::{
     ActivationSequence, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4Phase2Model, Gemma4PleGlobalWeights,
-    Gemma4PleLayerWeights, Gemma4PrefillPleInputs, GemmaEmbeddingTensorSource, LayerKvCache,
-    MatrixF32, Phase2DecodeState, Phase2DecodeStepResult, Phase2PrefillResult, Phase2State,
-    PrefillLogits,
+    Gemma4LayerMatrixSource, Gemma4PleLayerWeights, Gemma4PrefillPleInputs,
+    GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, Phase2DecodeState,
+    Phase2DecodeStepResult, Phase2PrefillResult, Phase2State, PrefillLogits,
+    ResolvedGemma4LayerWeights, ResolvedGemma4PleLayerWeights,
 };
 
 pub fn run_prefill_pass(
@@ -33,11 +34,16 @@ fn run_prefill_pass_for_token_ids(
     token_embeddings: &ActivationSequence,
 ) -> Result<Phase2PrefillResult> {
     let _trace = trace_scope("phase2.run_prefill_pass");
+    trace_event(format!(
+        "phase2.prefill_summary tokens={} layers={}",
+        prompt_token_ids.len(),
+        model.layers.len()
+    ));
     let ple_inputs = model
         .ple_global
         .as_ref()
         .map(|ple_global| {
-            trace_event("phase2.compute_prefill_ple_inputs");
+            // trace_event("phase2.compute_prefill_ple_inputs");
             compute_prefill_ple_inputs(
                 prompt_token_ids,
                 &token_embeddings.activations,
@@ -56,15 +62,15 @@ fn run_prefill_pass_for_token_ids(
         &model.final_norm_weight,
         model.rms_norm_eps,
     )?;
-    trace_event("phase2.select_final_position");
+    // trace_event("phase2.select_final_position");
     let final_position = select_final_position(&normalized_hidden_states.activations)?;
     trace_event("phase2.project_to_logits");
     let mut logits = project_to_logits(&final_position, &model.logits_projection)?;
     if let Some(softcap) = model.final_logit_softcapping {
-        trace_event("phase2.apply_final_logit_softcapping");
+        // trace_event("phase2.apply_final_logit_softcapping");
         logits = apply_final_logit_softcapping(&logits, softcap);
     }
-    trace_event("phase2.extract_prefill_logits");
+    // trace_event("phase2.extract_prefill_logits");
     let prefill_logits = extract_prefill_logits(&logits);
 
     let phase2_state = Phase2State {
@@ -90,7 +96,7 @@ fn embed_token_ids(
         trace_event("phase2.embed_input_tokens");
         embed_input_tokens(token_ids, embedding_table)
     } else if let Some(ref embedding_source) = model.embedding_source {
-        trace_event("phase2.embed_input_tokens_from_gemma_source");
+        trace_event("phase2.embed_input_tokens");
         crate::io::embed_input_tokens_from_gemma_source(token_ids, embedding_source)
     } else {
         anyhow::bail!("phase 2 model is missing both embedding_table and embedding_source")
@@ -99,10 +105,10 @@ fn embed_token_ids(
 
 fn embed_token_id(token_id: u32, model: &Gemma4Phase2Model) -> Result<Vec<f32>> {
     if let Some(ref embedding_table) = model.embedding_table {
-        trace_event("phase2.embed_input_token");
+        // trace_event("phase2.embed_input_token");
         embed_input_token(token_id, embedding_table)
     } else if let Some(ref embedding_source) = model.embedding_source {
-        trace_event("phase2.embed_input_token_from_gemma_source");
+        // trace_event("phase2.embed_input_token");
         let embedded = crate::io::embed_input_tokens_from_gemma_source(&[token_id], embedding_source)?;
         embedded
             .activations
@@ -132,19 +138,30 @@ pub fn run_phase2(
 }
 
 pub fn decode_step(
-    decode_state: &Phase2DecodeState,
+    decode_state: Phase2DecodeState,
     next_token: u32,
     model: &Gemma4Phase2Model,
 ) -> Result<Phase2DecodeStepResult> {
     let _trace = trace_scope("phase2.decode_step");
+    let Phase2DecodeState {
+        layer_caches,
+        position,
+        token_count,
+    } = decode_state;
+    trace_event(format!(
+        "phase2.decode_summary token={} position={} layers={}",
+        next_token,
+        position,
+        model.layers.len()
+    ));
     let embedded_token = embed_token_id(next_token, model)?;
     trace_event("phase2.run_text_layers_decode_step");
     let final_hidden_state = run_text_layers_decode_step(
         &embedded_token,
         next_token,
         model,
-        &decode_state.layer_caches,
-        decode_state.position,
+        layer_caches,
+        position,
     )?;
     trace_event("phase2.project_decode_hidden_to_logits");
     let prefill_logits = project_decode_hidden_to_logits(
@@ -158,8 +175,8 @@ pub fn decode_step(
     Ok(Phase2DecodeStepResult {
         decode_state: Phase2DecodeState {
             layer_caches: final_hidden_state.layer_caches,
-            position: decode_state.position + 1,
-            token_count: decode_state.token_count + 1,
+            position: position + 1,
+            token_count: token_count + 1,
         },
         activation_state: final_hidden_state.activation_state,
         prefill_logits,
@@ -265,7 +282,7 @@ mod tests {
         };
         let prefill = run_prefill_pass(&phase1_state, &model, &token_embeddings).expect("prefill result");
 
-        let step = decode_step(&prefill.decode_state, 2, &model).expect("decode step");
+        let step = decode_step(prefill.decode_state, 2, &model).expect("decode step");
         let replay = run_phase2_for_token_ids(&[0, 1, 2], &model).expect("replay phase2");
 
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
@@ -288,7 +305,7 @@ mod tests {
         };
         let prefill = run_prefill_pass(&phase1_state, &model, &token_embeddings).expect("prefill result");
 
-        let step = decode_step(&prefill.decode_state, 2, &model).expect("decode step");
+        let step = decode_step(prefill.decode_state, 2, &model).expect("decode step");
         let replay = run_phase2_for_token_ids(&[0, 1, 2], &model).expect("replay phase2");
 
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
@@ -310,7 +327,7 @@ mod tests {
 
         assert_eq!(prefill.decode_state.layer_caches[0].current_len(), 2);
 
-        let step = decode_step(&prefill.decode_state, 0, &model).expect("decode step");
+        let step = decode_step(prefill.decode_state, 0, &model).expect("decode step");
         let replay = run_phase2_for_token_ids(&[0, 1, 2, 0], &model).expect("replay phase2");
 
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
@@ -334,7 +351,7 @@ mod tests {
         assert_eq!(prefill.decode_state.layer_caches[0].current_len(), 3);
         assert_eq!(prefill.decode_state.layer_caches[1].current_len(), 0);
 
-        let step = decode_step(&prefill.decode_state, 0, &model).expect("decode step");
+        let step = decode_step(prefill.decode_state, 0, &model).expect("decode step");
         let replay = run_phase2_for_token_ids(&[0, 1, 2, 0], &model).expect("replay phase2");
 
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
@@ -363,19 +380,19 @@ mod tests {
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
                 attention_k_eq_v: false,
-                q_proj: zero_matrix(4, 4),
-                k_proj: zero_matrix(2, 4),
-                v_proj: Some(zero_matrix(2, 4)),
-                o_proj: zero_matrix(4, 4),
+                q_proj: zero_matrix(4, 4).into(),
+                k_proj: zero_matrix(2, 4).into(),
+                v_proj: Some(zero_matrix(2, 4).into()),
+                o_proj: zero_matrix(4, 4).into(),
                 q_norm_weight: vec![1.0, 1.0],
                 k_norm_weight: vec![1.0, 1.0],
                 input_layernorm_weight: vec![1.0; 4],
                 post_attention_layernorm_weight: vec![1.0; 4],
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
                 post_feedforward_layernorm_weight: vec![1.0; 4],
-                gate_proj: zero_matrix(8, 4),
-                up_proj: zero_matrix(8, 4),
-                down_proj: zero_matrix(4, 8),
+                gate_proj: zero_matrix(8, 4).into(),
+                up_proj: zero_matrix(8, 4).into(),
+                down_proj: zero_matrix(4, 8).into(),
                 ple: None,
                 layer_scalar: None,
             }],
@@ -400,7 +417,8 @@ mod tests {
                     0.2, 0.1, 0.0, 0.0,
                     0.0, 0.3, 0.1, 0.0,
                 ],
-            },
+            }
+            .into(),
             layer_projection: MatrixF32 {
                 rows: 4,
                 cols: 2,
@@ -410,31 +428,34 @@ mod tests {
                     0.2, 0.1,
                     0.1, 0.2,
                 ],
-            },
+            }
+            .into(),
             post_input_norm_weight: vec![1.0; 4],
         });
-        let ple_global = with_ple.then(|| Gemma4PleGlobalWeights {
-            token_embeddings: vec![MatrixF32 {
-                rows: 3,
-                cols: 2,
-                values: vec![
-                    0.1, 0.0,
-                    0.0, 0.1,
-                    0.1, 0.1,
-                ],
-            }],
-            model_projections: vec![MatrixF32 {
-                rows: 2,
-                cols: 4,
-                values: vec![
-                    0.4, 0.0, 0.0, 0.0,
-                    0.0, 0.4, 0.0, 0.0,
-                ],
-            }],
-            projection_norm_weight: vec![1.0, 1.0],
-            embedding_scale: 1.0,
-            projection_scalar: 1.0,
-            input_scale: 1.0,
+        let ple_global = with_ple.then(|| {
+            Gemma4PleGlobalWeights::from_materialized(
+                vec![MatrixF32 {
+                    rows: 3,
+                    cols: 2,
+                    values: vec![
+                        0.1, 0.0,
+                        0.0, 0.1,
+                        0.1, 0.1,
+                    ],
+                }],
+                vec![MatrixF32 {
+                    rows: 2,
+                    cols: 4,
+                    values: vec![
+                        0.4, 0.0, 0.0, 0.0,
+                        0.0, 0.4, 0.0, 0.0,
+                    ],
+                }],
+                vec![1.0, 1.0],
+                1.0,
+                1.0,
+                1.0,
+            )
         });
 
         Gemma4Phase2Model {
@@ -470,7 +491,8 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                },
+                }
+                .into(),
                 k_proj: MatrixF32 {
                     rows: 2,
                     cols: 4,
@@ -478,7 +500,8 @@ mod tests {
                         1.0, 0.0, 0.0, 0.0,
                         0.0, 1.0, 0.0, 0.0,
                     ],
-                },
+                }
+                .into(),
                 v_proj: Some(MatrixF32 {
                     rows: 2,
                     cols: 4,
@@ -486,7 +509,8 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                }),
+                }
+                .into()),
                 o_proj: MatrixF32 {
                     rows: 4,
                     cols: 4,
@@ -496,16 +520,17 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                },
+                }
+                .into(),
                 q_norm_weight: vec![1.0, 1.0],
                 k_norm_weight: vec![1.0, 1.0],
                 input_layernorm_weight: vec![1.0; 4],
                 post_attention_layernorm_weight: vec![1.0; 4],
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
                 post_feedforward_layernorm_weight: vec![1.0; 4],
-                gate_proj: zero_matrix(8, 4),
-                up_proj: zero_matrix(8, 4),
-                down_proj: zero_matrix(4, 8),
+                gate_proj: zero_matrix(8, 4).into(),
+                up_proj: zero_matrix(8, 4).into(),
+                down_proj: zero_matrix(4, 8).into(),
                 ple,
                 layer_scalar: None,
             }],
@@ -549,7 +574,8 @@ mod tests {
                     0.0, 0.0, 1.0, 0.0,
                     0.0, 0.0, 0.0, 1.0,
                 ],
-            },
+            }
+            .into(),
             k_proj: MatrixF32 {
                 rows: 2,
                 cols: 4,
@@ -557,7 +583,8 @@ mod tests {
                     1.0, 0.0, 0.0, 0.0,
                     0.0, 1.0, 0.0, 0.0,
                 ],
-            },
+            }
+            .into(),
             v_proj: Some(MatrixF32 {
                 rows: 2,
                 cols: 4,
@@ -565,7 +592,8 @@ mod tests {
                     0.0, 0.0, 1.0, 0.0,
                     0.0, 0.0, 0.0, 1.0,
                 ],
-            }),
+            }
+            .into()),
             o_proj: MatrixF32 {
                 rows: 4,
                 cols: 4,
@@ -575,16 +603,17 @@ mod tests {
                     0.0, 0.0, 1.0, 0.0,
                     0.0, 0.0, 0.0, 1.0,
                 ],
-            },
+            }
+            .into(),
             q_norm_weight: vec![1.0, 1.0],
             k_norm_weight: vec![1.0, 1.0],
             input_layernorm_weight: vec![1.0; 4],
             post_attention_layernorm_weight: vec![1.0; 4],
             pre_feedforward_layernorm_weight: vec![1.0; 4],
             post_feedforward_layernorm_weight: vec![1.0; 4],
-            gate_proj: zero_matrix(8, 4),
-            up_proj: zero_matrix(8, 4),
-            down_proj: zero_matrix(4, 8),
+            gate_proj: zero_matrix(8, 4).into(),
+            up_proj: zero_matrix(8, 4).into(),
+            down_proj: zero_matrix(4, 8).into(),
             ple: None,
             layer_scalar: None,
         };

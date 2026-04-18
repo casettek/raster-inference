@@ -29,7 +29,7 @@ pub fn run_phase3(
     );
 
     loop {
-        trace_event("phase3.check_stop_condition");
+        // trace_event("phase3.check_stop_condition");
         if let Some(stop_reason) =
             check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens)
         {
@@ -53,14 +53,15 @@ pub fn run_phase3(
         trace_event("phase3.select_next_token");
         let next_token = select_next_token(&decode_state.current_logits)?;
 
-        trace_event("phase3.append_token");
+        // trace_event("phase3.append_token");
         decode_state.full_token_ids = append_token(&decode_state.full_token_ids, next_token);
         decode_state.generated_token_ids =
             append_token(&decode_state.generated_token_ids, next_token);
 
         trace_event("phase3.decode_step");
+        let phase2_decode_state = std::mem::take(&mut decode_state.phase2_decode_state);
         let phase2_state =
-            crate::phase2::decode_step(&decode_state.phase2_decode_state, next_token, phase2_model)?;
+            crate::phase2::decode_step(phase2_decode_state, next_token, phase2_model)?;
         phase2_activation_states.push(phase2_state.activation_state.clone());
         decode_state.current_logits = phase2_state.prefill_logits.logits;
         decode_state.phase2_decode_state = phase2_state.decode_state;
@@ -198,7 +199,8 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                },
+                }
+                .into(),
                 k_proj: MatrixF32 {
                     rows: 2,
                     cols: 4,
@@ -206,7 +208,8 @@ mod tests {
                         1.0, 0.0, 0.0, 0.0,
                         0.0, 1.0, 0.0, 0.0,
                     ],
-                },
+                }
+                .into(),
                 v_proj: Some(MatrixF32 {
                     rows: 2,
                     cols: 4,
@@ -214,7 +217,8 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                }),
+                }
+                .into()),
                 o_proj: MatrixF32 {
                     rows: 4,
                     cols: 4,
@@ -224,16 +228,17 @@ mod tests {
                         0.0, 0.0, 1.0, 0.0,
                         0.0, 0.0, 0.0, 1.0,
                     ],
-                },
+                }
+                .into(),
                 q_norm_weight: vec![1.0, 1.0],
                 k_norm_weight: vec![1.0, 1.0],
                 input_layernorm_weight: vec![1.0; 4],
                 post_attention_layernorm_weight: vec![1.0; 4],
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
                 post_feedforward_layernorm_weight: vec![1.0; 4],
-                gate_proj: zero_matrix(8, 4),
-                up_proj: zero_matrix(8, 4),
-                down_proj: zero_matrix(4, 8),
+                gate_proj: zero_matrix(8, 4).into(),
+                up_proj: zero_matrix(8, 4).into(),
+                down_proj: zero_matrix(4, 8).into(),
                 ple: None,
                 layer_scalar: None,
             }],
