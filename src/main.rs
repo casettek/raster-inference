@@ -12,7 +12,9 @@ fn print_usage() {
     eprintln!(
         "Usage: raster-inference <model-id> <tokenizer.json> <chat-template.jinja> <gemma-model-path> <prompt...>"
     );
-    eprintln!("Set RASTER_TRACE_TILES=1 to print tile-level timing logs to stderr.");
+    eprintln!(
+        "Set RASTER_TRACE_TILES=1 to print tile-level timing logs to stderr and save checkpoint traces under raster-traces/ (override with RASTER_TRACE_DIR)."
+    );
 }
 
 fn main() {
