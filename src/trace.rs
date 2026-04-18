@@ -1,5 +1,7 @@
 use std::{
     env,
+    fs,
+    path::PathBuf,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -49,8 +51,8 @@ pub fn trace_event(label: impl AsRef<str>) {
 
 #[derive(Default)]
 struct TraceCollector {
-    run_metadata: Option<Value>,
     checkpoints: Vec<Value>,
+    completed_trace_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,11 +66,12 @@ pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
         return;
     }
 
+    let _ = run_metadata;
     let mut collector = trace_collector()
         .lock()
         .expect("trace collector mutex should not be poisoned");
-    collector.run_metadata = Some(serialize_trace_value(run_metadata));
     collector.checkpoints.clear();
+    collector.completed_trace_path = None;
 }
 
 pub fn trace_checkpoint<T: Serialize>(phase: &str, state: &T) {
@@ -80,8 +83,7 @@ pub fn trace_checkpoint<T: Serialize>(phase: &str, state: &T) {
         .lock()
         .expect("trace collector mutex should not be poisoned");
     collector.checkpoints.push(json!({
-        "phase": phase,
-        "state_commitment_sha256": sha256_hex(state),
+        phase: sha256_hex(state),
     }));
 }
 
@@ -90,15 +92,13 @@ pub fn finish_inference_trace<T: Serialize>(summary: &T) {
         return;
     }
 
+    let _ = summary;
     let mut collector = trace_collector()
         .lock()
         .expect("trace collector mutex should not be poisoned");
-    let payload = json!({
-        "run": collector.run_metadata.take(),
-        "summary": serialize_trace_value(summary),
-        "checkpoints": std::mem::take(&mut collector.checkpoints),
-    });
-    emit_checkpoint_bundle(&payload);
+    let payload = Value::Array(std::mem::take(&mut collector.checkpoints));
+    collector.completed_trace_path = write_checkpoint_bundle(&payload).ok();
+    emit_checkpoint_bundle(&payload, collector.completed_trace_path.as_deref());
 }
 
 pub fn abort_inference_trace(error: &anyhow::Error) {
@@ -106,15 +106,13 @@ pub fn abort_inference_trace(error: &anyhow::Error) {
         return;
     }
 
+    let _ = error;
     let mut collector = trace_collector()
         .lock()
         .expect("trace collector mutex should not be poisoned");
-    let payload = json!({
-        "run": collector.run_metadata.take(),
-        "error": error.to_string(),
-        "checkpoints": std::mem::take(&mut collector.checkpoints),
-    });
-    emit_checkpoint_bundle(&payload);
+    let payload = Value::Array(std::mem::take(&mut collector.checkpoints));
+    collector.completed_trace_path = write_checkpoint_bundle(&payload).ok();
+    emit_checkpoint_bundle(&payload, collector.completed_trace_path.as_deref());
 }
 
 pub fn serialize_layer_caches(
@@ -168,11 +166,18 @@ fn emit(kind: &str, label: &str, duration: Option<Duration>) {
     }
 }
 
-fn emit_checkpoint_bundle(payload: &Value) {
+fn emit_checkpoint_bundle(payload: &Value, saved_path: Option<&std::path::Path>) {
     let elapsed = process_start().elapsed().as_secs_f64();
     match serde_json::to_string_pretty(payload) {
         Ok(serialized) => {
-            eprintln!("[raster-trace +{elapsed:>8.3}s] checkpoints\n{serialized}");
+            if let Some(saved_path) = saved_path {
+                eprintln!(
+                    "[raster-trace +{elapsed:>8.3}s] checkpoints saved={}\n{serialized}",
+                    saved_path.display()
+                );
+            } else {
+                eprintln!("[raster-trace +{elapsed:>8.3}s] checkpoints\n{serialized}");
+            }
         }
         Err(error) => {
             eprintln!("[raster-trace +{elapsed:>8.3}s] checkpoints <serialization failed: {error}>");
@@ -180,10 +185,28 @@ fn emit_checkpoint_bundle(payload: &Value) {
     }
 }
 
-fn serialize_trace_value<T: Serialize>(value: &T) -> Value {
-    serde_json::to_value(value).unwrap_or_else(|error| json!({
-        "serialization_error": error.to_string(),
-    }))
+fn write_checkpoint_bundle(payload: &Value) -> anyhow::Result<PathBuf> {
+    let trace_dir = trace_output_directory();
+    fs::create_dir_all(&trace_dir)?;
+    let trace_path = trace_dir.join(format!("trace-{}-{}.json", process_id(), unix_timestamp_ms()?));
+    fs::write(&trace_path, serde_json::to_vec_pretty(payload)?)?;
+    Ok(trace_path)
+}
+
+fn trace_output_directory() -> PathBuf {
+    env::var("RASTER_TRACE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("raster-traces"))
+}
+
+fn unix_timestamp_ms() -> anyhow::Result<u128> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis())
+}
+
+fn process_id() -> u32 {
+    std::process::id()
 }
 
 fn trace_collector() -> &'static Mutex<TraceCollector> {
