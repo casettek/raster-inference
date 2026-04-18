@@ -19,6 +19,40 @@ pub struct MatrixF32 {
     pub values: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub enum Gemma4LayerMatrixSource {
+    Materialized(Arc<MatrixF32>),
+    Lazy {
+        source: GemmaTensorSliceSource,
+        cache: Arc<Mutex<Option<Arc<MatrixF32>>>>,
+    },
+}
+
+impl Gemma4LayerMatrixSource {
+    pub fn from_source(source: GemmaTensorSliceSource) -> Self {
+        Self::Lazy {
+            source,
+            cache: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl From<MatrixF32> for Gemma4LayerMatrixSource {
+    fn from(value: MatrixF32) -> Self {
+        Self::Materialized(Arc::new(value))
+    }
+}
+
+impl PartialEq for Gemma4LayerMatrixSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Materialized(lhs), Self::Materialized(rhs)) => lhs.as_ref() == rhs.as_ref(),
+            (Self::Lazy { source: lhs, .. }, Self::Lazy { source: rhs, .. }) => lhs == rhs,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EmbeddingTable {
     pub rows: Vec<Vec<f32>>,
@@ -205,8 +239,15 @@ impl PartialEq for Gemma4PleGlobalWeights {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gemma4PleLayerWeights {
-    pub input_gate: MatrixF32,
-    pub layer_projection: MatrixF32,
+    pub input_gate: Gemma4LayerMatrixSource,
+    pub layer_projection: Gemma4LayerMatrixSource,
+    pub post_input_norm_weight: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedGemma4PleLayerWeights {
+    pub input_gate: Arc<MatrixF32>,
+    pub layer_projection: Arc<MatrixF32>,
     pub post_input_norm_weight: Vec<f32>,
 }
 
@@ -231,20 +272,52 @@ pub struct Gemma4LayerWeights {
     pub rope_freq_base_dim: usize,
     pub kv_shared_layer_index: Option<usize>,
     pub attention_k_eq_v: bool,
-    pub q_proj: MatrixF32,
-    pub k_proj: MatrixF32,
-    pub v_proj: Option<MatrixF32>,
-    pub o_proj: MatrixF32,
+    pub q_proj: Gemma4LayerMatrixSource,
+    pub k_proj: Gemma4LayerMatrixSource,
+    pub v_proj: Option<Gemma4LayerMatrixSource>,
+    pub o_proj: Gemma4LayerMatrixSource,
     pub q_norm_weight: Vec<f32>,
     pub k_norm_weight: Vec<f32>,
     pub input_layernorm_weight: Vec<f32>,
     pub post_attention_layernorm_weight: Vec<f32>,
     pub pre_feedforward_layernorm_weight: Vec<f32>,
     pub post_feedforward_layernorm_weight: Vec<f32>,
-    pub gate_proj: MatrixF32,
-    pub up_proj: MatrixF32,
-    pub down_proj: MatrixF32,
+    pub gate_proj: Gemma4LayerMatrixSource,
+    pub up_proj: Gemma4LayerMatrixSource,
+    pub down_proj: Gemma4LayerMatrixSource,
     pub ple: Option<Gemma4PleLayerWeights>,
+    pub layer_scalar: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedGemma4LayerWeights {
+    pub attention_kind: Gemma4AttentionKind,
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub sliding_window: Option<usize>,
+    pub cache_sliding_window: Option<usize>,
+    pub rms_norm_eps: f32,
+    pub rope_base: f32,
+    pub partial_rotary_dim: usize,
+    pub rope_freq_base_dim: usize,
+    pub kv_shared_layer_index: Option<usize>,
+    pub attention_k_eq_v: bool,
+    pub q_proj: Arc<MatrixF32>,
+    pub k_proj: Arc<MatrixF32>,
+    pub v_proj: Option<Arc<MatrixF32>>,
+    pub o_proj: Arc<MatrixF32>,
+    pub q_norm_weight: Vec<f32>,
+    pub k_norm_weight: Vec<f32>,
+    pub input_layernorm_weight: Vec<f32>,
+    pub post_attention_layernorm_weight: Vec<f32>,
+    pub pre_feedforward_layernorm_weight: Vec<f32>,
+    pub post_feedforward_layernorm_weight: Vec<f32>,
+    pub gate_proj: Arc<MatrixF32>,
+    pub up_proj: Arc<MatrixF32>,
+    pub down_proj: Arc<MatrixF32>,
+    pub ple: Option<ResolvedGemma4PleLayerWeights>,
     pub layer_scalar: Option<f32>,
 }
 

@@ -15,10 +15,11 @@ use tokenizers::Tokenizer;
 use crate::phase2::{
     ActivationSequence, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
     Gemma4LogitsProjection, Gemma4Phase2Model, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-    GemmaEmbeddingTensorSource, MatrixF32,
+    Gemma4LayerMatrixSource, GemmaEmbeddingTensorSource, MatrixF32,
+    ResolvedGemma4LayerWeights, ResolvedGemma4PleLayerWeights,
 };
 use crate::phase2::types::{Gemma4PleMatrixSource, GemmaTensorSliceSource};
-use crate::trace::{trace_event, trace_scope};
+// use crate::trace::{trace_event, trace_scope};
 
 const GEMMA_EMBED_TENSOR_NAMES: &[&str] = &[
     "model.language_model.embed_tokens.weight",
@@ -302,9 +303,29 @@ impl GemmaTensorReader {
         decode_vector(&tensor)
     }
 
-    fn load_optional_matrix(&mut self, tensor_name: &str) -> Result<Option<MatrixF32>> {
-        match self.load_tensor(tensor_name) {
-            Ok(tensor) => Ok(Some(decode_matrix(&tensor)?)),
+    fn resolve_matrix_source(&mut self, tensor_name: &str) -> Result<Gemma4LayerMatrixSource> {
+        let path = self.path_for_tensor(tensor_name)?;
+        let cached_file = self.cached_file_for_path(&path)?;
+        let metadata = cached_file.tensor_metadata(tensor_name, &path)?;
+        if metadata.shape.len() != 2 {
+            bail!(
+                "expected rank-2 tensor for {tensor_name}, got shape {:?}",
+                metadata.shape
+            );
+        }
+        let rows = metadata.shape[0];
+        let cols = metadata.shape[1];
+        Ok(Gemma4LayerMatrixSource::from_source(
+            self.resolve_matrix_slice_source(tensor_name, 0, rows, 0, cols)?,
+        ))
+    }
+
+    fn resolve_optional_matrix_source(
+        &mut self,
+        tensor_name: &str,
+    ) -> Result<Option<Gemma4LayerMatrixSource>> {
+        match self.resolve_matrix_source(tensor_name) {
+            Ok(source) => Ok(Some(source)),
             Err(_) => Ok(None),
         }
     }
@@ -510,7 +531,7 @@ pub fn load_embedding_table_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Re
 }
 
 pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Result<Gemma4Phase2Model> {
-    let _trace = trace_scope("io.load_phase2_model_from_gemma_model_path");
+    // let _trace = trace_scope("io.load_phase2_model_from_gemma_model_path");
     let source = resolve_gemma_model_source(path.as_ref())?;
     let config = load_gemma_text_config(source.root_dir().join("config.json"))?;
 
@@ -545,7 +566,7 @@ pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Resul
     }
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for layer_idx in 0..config.num_hidden_layers {
-        trace_event(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
+        // trace_event(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
         layers.push(load_gemma4_layer_weights(
             &mut reader,
             &config,
@@ -554,9 +575,9 @@ pub fn load_phase2_model_from_gemma_model_path<P: AsRef<Path>>(path: P) -> Resul
         )?);
     }
     let ple_global = load_ple_global_weights(&mut reader, &config)?;
-    trace_event("io.load_final_norm_weight");
+    // trace_event("io.load_final_norm_weight");
     let final_norm_weight = reader.load_vector("model.language_model.norm.weight")?;
-    trace_event("io.load_logits_projection");
+    // trace_event("io.load_logits_projection");
     let logits_projection = if config.tie_word_embeddings() {
         Gemma4LogitsProjection::TiedEmbedding(reader.load_matrix(&embedding_tensor_name)?)
     } else {
@@ -582,7 +603,7 @@ fn load_ple_global_weights(
     reader: &mut GemmaTensorReader,
     config: &GemmaTextConfigFile,
 ) -> Result<Option<Gemma4PleGlobalWeights>> {
-    let _trace = trace_scope("io.load_ple_global_weights");
+    // let _trace = trace_scope("io.load_ple_global_weights");
     let hidden_size = config.hidden_size;
     let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
     if ple_dim == 0 {
@@ -685,6 +706,85 @@ pub(crate) fn load_ple_model_projection(
         .map_err(|_| anyhow!("PLE model projection cache is poisoned"))?
         .insert(layer_idx, matrix.clone());
     Ok(matrix)
+}
+
+pub(crate) fn resolve_layer_weights(
+    layer: &Gemma4LayerWeights,
+) -> Result<ResolvedGemma4LayerWeights> {
+    Ok(ResolvedGemma4LayerWeights {
+        attention_kind: layer.attention_kind,
+        hidden_size: layer.hidden_size,
+        num_heads: layer.num_heads,
+        num_kv_heads: layer.num_kv_heads,
+        head_dim: layer.head_dim,
+        sliding_window: layer.sliding_window,
+        cache_sliding_window: layer.cache_sliding_window,
+        rms_norm_eps: layer.rms_norm_eps,
+        rope_base: layer.rope_base,
+        partial_rotary_dim: layer.partial_rotary_dim,
+        rope_freq_base_dim: layer.rope_freq_base_dim,
+        kv_shared_layer_index: layer.kv_shared_layer_index,
+        attention_k_eq_v: layer.attention_k_eq_v,
+        q_proj: materialize_layer_matrix_source(&layer.q_proj)?,
+        k_proj: materialize_layer_matrix_source(&layer.k_proj)?,
+        v_proj: layer
+            .v_proj
+            .as_ref()
+            .map(materialize_layer_matrix_source)
+            .transpose()?,
+        o_proj: materialize_layer_matrix_source(&layer.o_proj)?,
+        q_norm_weight: layer.q_norm_weight.clone(),
+        k_norm_weight: layer.k_norm_weight.clone(),
+        input_layernorm_weight: layer.input_layernorm_weight.clone(),
+        post_attention_layernorm_weight: layer.post_attention_layernorm_weight.clone(),
+        pre_feedforward_layernorm_weight: layer.pre_feedforward_layernorm_weight.clone(),
+        post_feedforward_layernorm_weight: layer.post_feedforward_layernorm_weight.clone(),
+        gate_proj: materialize_layer_matrix_source(&layer.gate_proj)?,
+        up_proj: materialize_layer_matrix_source(&layer.up_proj)?,
+        down_proj: materialize_layer_matrix_source(&layer.down_proj)?,
+        ple: layer
+            .ple
+            .as_ref()
+            .map(resolve_ple_layer_weights)
+            .transpose()?,
+        layer_scalar: layer.layer_scalar,
+    })
+}
+
+fn resolve_ple_layer_weights(
+    ple: &Gemma4PleLayerWeights,
+) -> Result<ResolvedGemma4PleLayerWeights> {
+    Ok(ResolvedGemma4PleLayerWeights {
+        input_gate: materialize_layer_matrix_source(&ple.input_gate)?,
+        layer_projection: materialize_layer_matrix_source(&ple.layer_projection)?,
+        post_input_norm_weight: ple.post_input_norm_weight.clone(),
+    })
+}
+
+fn materialize_layer_matrix_source(source: &Gemma4LayerMatrixSource) -> Result<std::sync::Arc<MatrixF32>> {
+    match source {
+        Gemma4LayerMatrixSource::Materialized(matrix) => Ok(matrix.clone()),
+        Gemma4LayerMatrixSource::Lazy { source, cache } => {
+            if let Some(matrix) = cache
+                .lock()
+                .map_err(|_| anyhow!("layer matrix cache is poisoned"))?
+                .clone()
+            {
+                return Ok(matrix);
+            }
+            let file = File::open(&source.weights_path).with_context(|| {
+                format!("failed to open safetensors file {}", source.weights_path.display())
+            })?;
+            let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
+                format!("failed to mmap safetensors file {}", source.weights_path.display())
+            })?;
+            let matrix = std::sync::Arc::new(decode_matrix_slice_from_source(source, &mmap)?);
+            *cache
+                .lock()
+                .map_err(|_| anyhow!("layer matrix cache is poisoned"))? = Some(matrix.clone());
+            Ok(matrix)
+        }
+    }
 }
 
 fn ple_mmap_for_path(ple_global: &Gemma4PleGlobalWeights, path: &Path) -> Result<std::sync::Arc<Mmap>> {
@@ -809,7 +909,7 @@ fn load_gemma4_layer_weights(
     layer_idx: usize,
     is_kv_donor: bool,
 ) -> Result<Gemma4LayerWeights> {
-    let _trace = trace_scope(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
+    // let _trace = trace_scope(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
     let layer_prefix = format!("model.language_model.layers.{layer_idx}");
     let attention_kind = config.attention_kind_for_layer(layer_idx)?;
     let is_sliding = attention_kind == Gemma4AttentionKind::Sliding;
@@ -836,8 +936,10 @@ fn load_gemma4_layer_weights(
     let effective_sliding_window = config.effective_sliding_window();
     let ple = if config.hidden_size_per_layer_input.unwrap_or(0) > 0 {
         Some(Gemma4PleLayerWeights {
-            input_gate: reader.load_matrix(&format!("{layer_prefix}.per_layer_input_gate.weight"))?,
-            layer_projection: reader.load_matrix(&format!("{layer_prefix}.per_layer_projection.weight"))?,
+            input_gate: reader
+                .resolve_matrix_source(&format!("{layer_prefix}.per_layer_input_gate.weight"))?,
+            layer_projection: reader
+                .resolve_matrix_source(&format!("{layer_prefix}.per_layer_projection.weight"))?,
             post_input_norm_weight: reader
                 .load_vector(&format!("{layer_prefix}.post_per_layer_input_norm.weight"))?,
         })
@@ -867,14 +969,14 @@ fn load_gemma4_layer_weights(
         rope_freq_base_dim: head_dim,
         kv_shared_layer_index,
         attention_k_eq_v: !is_sliding && config.attention_k_eq_v(),
-        q_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
-        k_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
+        q_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
+        k_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
         v_proj: if !is_sliding && config.attention_k_eq_v() {
-            reader.load_optional_matrix(&format!("{layer_prefix}.self_attn.v_proj.weight"))?
+            reader.resolve_optional_matrix_source(&format!("{layer_prefix}.self_attn.v_proj.weight"))?
         } else {
-            Some(reader.load_matrix(&format!("{layer_prefix}.self_attn.v_proj.weight"))?)
+            Some(reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.v_proj.weight"))?)
         },
-        o_proj: reader.load_matrix(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
+        o_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
         q_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.q_norm.weight"))?,
         k_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.k_norm.weight"))?,
         input_layernorm_weight: reader.load_vector(&format!("{layer_prefix}.input_layernorm.weight"))?,
@@ -884,9 +986,9 @@ fn load_gemma4_layer_weights(
             .load_vector(&format!("{layer_prefix}.pre_feedforward_layernorm.weight"))?,
         post_feedforward_layernorm_weight: reader
             .load_vector(&format!("{layer_prefix}.post_feedforward_layernorm.weight"))?,
-        gate_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.gate_proj.weight"))?,
-        up_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.up_proj.weight"))?,
-        down_proj: reader.load_matrix(&format!("{layer_prefix}.mlp.down_proj.weight"))?,
+        gate_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.gate_proj.weight"))?,
+        up_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.up_proj.weight"))?,
+        down_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.down_proj.weight"))?,
         ple,
         layer_scalar: reader.load_optional_scalar(&format!("{layer_prefix}.layer_scalar"))?,
     })
@@ -896,7 +998,7 @@ pub fn embed_input_tokens_from_gemma_source(
     token_ids: &[u32],
     source: &GemmaEmbeddingTensorSource,
 ) -> Result<ActivationSequence> {
-    let _trace = trace_scope("io.embed_input_tokens_from_gemma_source");
+    // let _trace = trace_scope("io.embed_input_tokens_from_gemma_source");
     if token_ids.is_empty() {
         bail!("phase 2 embedding requires at least one token id");
     }
@@ -1435,15 +1537,17 @@ mod tests {
         write_model_file(&model_dir, &tensors);
 
         let model = load_phase2_model_from_gemma_model_path(&model_dir).unwrap();
+        let first_layer = crate::io::resolve_layer_weights(&model.layers[0]).unwrap();
+        let second_layer = crate::io::resolve_layer_weights(&model.layers[1]).unwrap();
 
         assert_eq!(model.layers.len(), 2);
         assert_eq!(model.layers[0].attention_kind, Gemma4AttentionKind::Sliding);
         assert_eq!(model.layers[1].attention_kind, Gemma4AttentionKind::Full);
         assert_eq!(model.layers[0].rope_freq_base_dim, 2);
         assert_eq!(model.layers[1].rope_freq_base_dim, 2);
-        assert_eq!(model.layers[0].q_proj.values[0], 1.0);
-        assert_eq!(model.layers[1].q_proj.values[0], 2.0);
-        assert!(model.layers[1].v_proj.is_none());
+        assert_eq!(first_layer.q_proj.values[0], 1.0);
+        assert_eq!(second_layer.q_proj.values[0], 2.0);
+        assert!(second_layer.v_proj.is_none());
         assert_eq!(model.layers[1].layer_scalar, Some(0.5));
         assert_eq!(model.final_norm_weight, vec![1.0, 1.0, 1.0, 1.0]);
         assert_eq!(model.final_logit_softcapping, Some(7.5));
