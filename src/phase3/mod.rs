@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde_json::json;
 use tokenizers::Tokenizer;
 
 use crate::trace::{trace_event, trace_scope};
@@ -39,6 +40,15 @@ pub fn run_phase3(
                 detokenize_output_tokens(tokenizer, &decode_state.generated_token_ids)?;
             let generated_token_ids_sha256 =
                 build_phase3_commitment(&decode_state.generated_token_ids)?;
+            crate::trace::trace_checkpoint("final_output", &json!({
+                "full_token_ids": decode_state.full_token_ids.clone(),
+                "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
+                "generated_token_ids": decode_state.generated_token_ids.clone(),
+                "generated_token_ids_sha256": generated_token_ids_sha256.clone(),
+                "generated_text": generated_text.clone(),
+                "generated_token_count": generated_token_count,
+                "stop_reason": stop_reason.clone(),
+            }));
 
             return Ok(Phase3State {
                 generated_token_ids: decode_state.generated_token_ids,
@@ -57,6 +67,19 @@ pub fn run_phase3(
         decode_state.full_token_ids = append_token(&decode_state.full_token_ids, next_token);
         decode_state.generated_token_ids =
             append_token(&decode_state.generated_token_ids, next_token);
+        crate::trace::trace_checkpoint("phase3a", &json!({
+            "full_token_ids": decode_state.full_token_ids.clone(),
+            "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
+            "generated_token_ids": decode_state.generated_token_ids.clone(),
+            "generated_token_ids_sha256": build_phase3_commitment(&decode_state.generated_token_ids)?,
+            "current_logits": decode_state.current_logits.clone(),
+            "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
+            "selected_next_token": next_token,
+            "decode_position": decode_state.phase2_decode_state.position,
+            "decode_token_count": decode_state.phase2_decode_state.token_count,
+            "layer_caches": crate::trace::serialize_layer_caches(&decode_state.phase2_decode_state.layer_caches),
+            "max_new_tokens": max_new_tokens,
+        }));
 
         trace_event("phase3.decode_step");
         let phase2_decode_state = std::mem::take(&mut decode_state.phase2_decode_state);
@@ -65,6 +88,17 @@ pub fn run_phase3(
         phase2_activation_states.push(phase2_state.activation_state.clone());
         decode_state.current_logits = phase2_state.prefill_logits.logits;
         decode_state.phase2_decode_state = phase2_state.decode_state;
+        crate::trace::trace_checkpoint("phase3b", &json!({
+            "full_token_ids": decode_state.full_token_ids.clone(),
+            "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
+            "generated_token_ids": decode_state.generated_token_ids.clone(),
+            "generated_token_ids_sha256": build_phase3_commitment(&decode_state.generated_token_ids)?,
+            "current_logits": decode_state.current_logits.clone(),
+            "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
+            "decode_position": decode_state.phase2_decode_state.position,
+            "decode_token_count": decode_state.phase2_decode_state.token_count,
+            "layer_caches": crate::trace::serialize_layer_caches(&decode_state.phase2_decode_state.layer_caches),
+        }));
     }
 }
 

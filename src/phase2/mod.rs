@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde_json::json;
 use crate::trace::{trace_event, trace_scope};
 
 pub mod tiles;
@@ -53,6 +54,20 @@ fn run_prefill_pass_for_token_ids(
             )
         })
         .transpose()?;
+    crate::trace::trace_checkpoint("phase2a_prep", &json!({
+        "prompt_token_ids": prompt_token_ids,
+        "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
+        "embedded_prompt_activations": token_embeddings.activations.clone(),
+        "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
+        "per_layer_prefill_inputs": ple_inputs.as_ref().map(|inputs| inputs.per_layer_inputs.clone()),
+        "per_layer_prefill_input_sha256s": ple_inputs.as_ref().map(|inputs| {
+            inputs
+                .per_layer_inputs
+                .iter()
+                .map(|input| input.as_ref().map(crate::trace::sha256_hex))
+                .collect::<Vec<_>>()
+        }),
+    }));
     trace_event("phase2.run_text_layers_prefill");
     let (final_hidden_states, layer_caches) =
         run_text_layers_prefill_with_cache(&token_embeddings.activations, model, ple_inputs.as_ref())?;
@@ -72,6 +87,15 @@ fn run_prefill_pass_for_token_ids(
     }
     // trace_event("phase2.extract_prefill_logits");
     let prefill_logits = extract_prefill_logits(&logits);
+    crate::trace::trace_checkpoint("phase2a_out", &json!({
+        "final_hidden_states": final_hidden_states.activations.clone(),
+        "final_hidden_states_sha256": final_hidden_states.activations_sha256.clone(),
+        "prefill_logits": prefill_logits.logits.clone(),
+        "prefill_logits_sha256": prefill_logits.final_logits_sha256.clone(),
+        "decode_position": prompt_token_ids.len(),
+        "decode_token_count": prompt_token_ids.len(),
+        "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
+    }));
 
     let phase2_state = Phase2State {
         activation_states: vec![final_hidden_states],

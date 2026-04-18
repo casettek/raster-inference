@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokenizers::Tokenizer;
 
 pub mod io;
@@ -48,32 +49,61 @@ pub fn run_inference(
     tokenizer: &Tokenizer,
     phase2_model: &Gemma4Phase2Model,
 ) -> Result<InferenceState> {
-    let phase1 = run_phase1(request, model, tokenizer)?;
-    let token_embeddings = if let Some(embedding_table) = phase2_model.embedding_table.as_ref() {
-        embed_input_tokens(&phase1.prompt_token_ids, embedding_table)?
-    } else if let Some(embedding_source) = phase2_model.embedding_source.as_ref() {
-        io::embed_input_tokens_from_gemma_source(&phase1.prompt_token_ids, embedding_source)?
-    } else {
-        anyhow::bail!("phase 2 model is missing both embedding_table and embedding_source")
-    };
-    let prefill = run_prefill_pass(&phase1, phase2_model, &token_embeddings)?;
-    let mut phase2 = prefill.phase2_state.clone();
-    let phase3 = run_phase3(
-        &phase1.prompt_token_ids,
-        &prefill,
-        &request.sampling,
-        tokenizer,
-        phase2_model,
-    )?;
-    phase2
-        .activation_states
-        .extend(phase3.phase2_activation_states.iter().cloned());
+    trace::start_inference_trace(&json!({
+        "model_id": model.model_id,
+        "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
+        "max_new_tokens": request.sampling.max_new_tokens,
+        "phase2_layer_count": phase2_model.layers.len(),
+    }));
 
-    Ok(InferenceState {
-        phase1,
-        phase2,
-        phase3,
-    })
+    let result = (|| {
+        let phase1 = run_phase1(request, model, tokenizer)?;
+        let token_embeddings = if let Some(embedding_table) = phase2_model.embedding_table.as_ref() {
+            embed_input_tokens(&phase1.prompt_token_ids, embedding_table)?
+        } else if let Some(embedding_source) = phase2_model.embedding_source.as_ref() {
+            io::embed_input_tokens_from_gemma_source(&phase1.prompt_token_ids, embedding_source)?
+        } else {
+            anyhow::bail!("phase 2 model is missing both embedding_table and embedding_source")
+        };
+        trace::trace_checkpoint("phase1", &json!({
+            "prompt_text": phase1.prompt_text.clone(),
+            "prompt_token_ids": phase1.prompt_token_ids.clone(),
+            "prompt_token_ids_sha256": phase1.prompt_token_ids_sha256.clone(),
+            "embedded_prompt_activations": token_embeddings.activations.clone(),
+            "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
+            "sampling": request.sampling.clone(),
+        }));
+        let prefill = run_prefill_pass(&phase1, phase2_model, &token_embeddings)?;
+        let mut phase2 = prefill.phase2_state.clone();
+        let phase3 = run_phase3(
+            &phase1.prompt_token_ids,
+            &prefill,
+            &request.sampling,
+            tokenizer,
+            phase2_model,
+        )?;
+        phase2
+            .activation_states
+            .extend(phase3.phase2_activation_states.iter().cloned());
+
+        Ok(InferenceState {
+            phase1,
+            phase2,
+            phase3,
+        })
+    })();
+
+    match &result {
+        Ok(state) => trace::finish_inference_trace(&json!({
+            "phase1_prompt_token_ids_sha256": state.phase1.prompt_token_ids_sha256,
+            "phase3_generated_token_ids_sha256": state.phase3.generated_token_ids_sha256,
+            "phase3_generated_text_sha256": trace::sha256_hex(&state.phase3.generated_text),
+            "generated_token_count": state.phase3.generated_token_count,
+        })),
+        Err(error) => trace::abort_inference_trace(error),
+    }
+
+    result
 }
 
 #[cfg(test)]

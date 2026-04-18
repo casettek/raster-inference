@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::types::{
@@ -443,6 +444,7 @@ pub fn run_text_layers_prefill_with_cache(
 
     let mut xs = input_activations.to_vec();
     let mut layer_caches = Vec::with_capacity(model.layers.len());
+    let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         let _trace = trace_scope(format!(
             "phase2.prefill_layer layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
@@ -468,6 +470,14 @@ pub fn run_text_layers_prefill_with_cache(
             run_gemma4_layer_with_cache(&xs, &resolved_layer, per_layer_input, donor_cache)?;
         xs = layer_output.activations;
         layer_caches.push(layer_cache);
+        completed_layer_output_sha256s.push(layer_output.activations_sha256);
+        crate::trace::trace_checkpoint("phase2a_layers", &json!({
+            "next_layer_idx": layer_idx + 1,
+            "current_activations": xs.clone(),
+            "current_activations_sha256": build_phase2_commitment(&xs),
+            "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
+            "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
+        }));
     }
 
     Ok((
@@ -500,7 +510,9 @@ pub fn run_text_layers_decode_step(
 
     let mut xs = input_activation.to_vec();
     let mut updated_layer_caches = Vec::with_capacity(model.layers.len());
-    for (layer_idx, (layer, cache)) in model.layers.iter().zip(layer_caches.into_iter()).enumerate() {
+    let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
+    for (layer_idx, layer) in model.layers.iter().enumerate() {
+        let cache = layer_caches[layer_idx].clone();
         let _trace = trace_scope(format!(
             "phase2.decode_layer layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
             token_id,
@@ -538,6 +550,20 @@ pub fn run_text_layers_decode_step(
         )?;
         xs = layer_output;
         updated_layer_caches.push(updated_cache);
+        completed_layer_output_sha256s.push(build_vector_commitment(&xs));
+        let mut checkpoint_layer_caches = updated_layer_caches.clone();
+        checkpoint_layer_caches.extend(layer_caches.iter().skip(layer_idx + 1).cloned());
+        crate::trace::trace_checkpoint("phase2b_layers", &json!({
+            "token_id": token_id,
+            "position": position,
+            "next_layer_idx": layer_idx + 1,
+            "decode_input_activation": input_activation,
+            "decode_input_activation_sha256": build_vector_commitment(input_activation),
+            "current_activation": xs.clone(),
+            "current_activation_sha256": build_vector_commitment(&xs),
+            "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
+            "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
+        }));
     }
 
     Ok(ActivationSequenceWithCache {
