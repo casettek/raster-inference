@@ -34,9 +34,9 @@ fn run_prefill_pass_for_token_ids(
     model: &Gemma4Phase2Model,
     token_embeddings: &ActivationSequence,
 ) -> Result<Phase2PrefillResult> {
-    let _trace = trace_scope("phase2.run_prefill_pass");
+    let _trace = trace_scope("prefill.run");
     trace_event(format!(
-        "phase2.prefill_summary tokens={} layers={}",
+        "prefill.summary tokens={} layers={}",
         prompt_token_ids.len(),
         model.layers.len()
     ));
@@ -54,7 +54,7 @@ fn run_prefill_pass_for_token_ids(
             )
         })
         .transpose()?;
-    crate::trace::trace_checkpoint("phase2a_prep", &json!({
+    crate::trace::trace_checkpoint("prefill.prepare_aux", &json!({
         "prompt_token_ids": prompt_token_ids,
         "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
         "embedded_prompt_activations": token_embeddings.activations.clone(),
@@ -68,10 +68,10 @@ fn run_prefill_pass_for_token_ids(
                 .collect::<Vec<_>>()
         }),
     }));
-    trace_event("phase2.run_text_layers_prefill");
+    trace_event("prefill.layer_stack");
     let (final_hidden_states, layer_caches) =
         run_text_layers_prefill_with_cache(&token_embeddings.activations, model, ple_inputs.as_ref())?;
-    trace_event("phase2.apply_final_norm");
+    trace_event("prefill.apply_final_norm");
     let normalized_hidden_states = apply_final_norm(
         &final_hidden_states.activations,
         &model.final_norm_weight,
@@ -79,7 +79,7 @@ fn run_prefill_pass_for_token_ids(
     )?;
     // trace_event("phase2.select_final_position");
     let final_position = select_final_position(&normalized_hidden_states.activations)?;
-    trace_event("phase2.project_to_logits");
+    trace_event("prefill.project_to_logits");
     let mut logits = project_to_logits(&final_position, &model.logits_projection)?;
     if let Some(softcap) = model.final_logit_softcapping {
         // trace_event("phase2.apply_final_logit_softcapping");
@@ -87,7 +87,7 @@ fn run_prefill_pass_for_token_ids(
     }
     // trace_event("phase2.extract_prefill_logits");
     let prefill_logits = extract_prefill_logits(&logits);
-    crate::trace::trace_checkpoint("phase2a_out", &json!({
+    crate::trace::trace_checkpoint("prefill.finalize", &json!({
         "final_hidden_states": final_hidden_states.activations.clone(),
         "final_hidden_states_sha256": final_hidden_states.activations_sha256.clone(),
         "prefill_logits": prefill_logits.logits.clone(),
@@ -117,10 +117,10 @@ fn embed_token_ids(
     model: &Gemma4Phase2Model,
 ) -> Result<ActivationSequence> {
     if let Some(ref embedding_table) = model.embedding_table {
-        trace_event("phase2.embed_input_tokens");
+        trace_event("prefill.embed_tokens");
         embed_input_tokens(token_ids, embedding_table)
     } else if let Some(ref embedding_source) = model.embedding_source {
-        trace_event("phase2.embed_input_tokens");
+        trace_event("prefill.embed_tokens");
         crate::io::embed_input_tokens_from_gemma_source(token_ids, embedding_source)
     } else {
         anyhow::bail!("phase 2 model is missing both embedding_table and embedding_source")
@@ -148,7 +148,7 @@ pub fn run_phase2_for_token_ids(
     token_ids: &[u32],
     model: &Gemma4Phase2Model,
 ) -> Result<Phase2State> {
-    let _trace = trace_scope("phase2.run_phase2_for_token_ids");
+    let _trace = trace_scope("prefill.from_token_ids");
     let token_embeddings = embed_token_ids(token_ids, model)?;
     Ok(run_prefill_pass_for_token_ids(token_ids, model, &token_embeddings)?.phase2_state)
 }
@@ -157,7 +157,7 @@ pub fn run_phase2(
     phase1_state: &crate::phase1::Phase1State,
     model: &Gemma4Phase2Model,
 ) -> Result<Phase2State> {
-    let _trace = trace_scope("phase2.run_phase2");
+    let _trace = trace_scope("prefill.from_phase1");
     run_phase2_for_token_ids(&phase1_state.prompt_token_ids, model)
 }
 
@@ -166,20 +166,20 @@ pub fn decode_step(
     next_token: u32,
     model: &Gemma4Phase2Model,
 ) -> Result<Phase2DecodeStepResult> {
-    let _trace = trace_scope("phase2.decode_step");
+    let _trace = trace_scope("decode.step");
     let Phase2DecodeState {
         layer_caches,
         position,
         token_count,
     } = decode_state;
     trace_event(format!(
-        "phase2.decode_summary token={} position={} layers={}",
+        "decode.summary token={} position={} layers={}",
         next_token,
         position,
         model.layers.len()
     ));
     let embedded_token = embed_token_id(next_token, model)?;
-    trace_event("phase2.run_text_layers_decode_step");
+    trace_event("decode.layer_stack");
     let final_hidden_state = run_text_layers_decode_step(
         &embedded_token,
         next_token,
@@ -187,7 +187,7 @@ pub fn decode_step(
         layer_caches,
         position,
     )?;
-    trace_event("phase2.project_decode_hidden_to_logits");
+    trace_event("decode.project_to_logits");
     let prefill_logits = project_decode_hidden_to_logits(
         &final_hidden_state.activation_state.activations[0],
         &model.final_norm_weight,

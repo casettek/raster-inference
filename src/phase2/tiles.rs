@@ -447,7 +447,7 @@ pub fn run_text_layers_prefill_with_cache(
     let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         let _trace = trace_scope(format!(
-            "phase2.prefill_layer layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
+            "prefill.layer layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
             xs.len(),
             layer.attention_kind,
             layer.ple.is_some(),
@@ -471,7 +471,7 @@ pub fn run_text_layers_prefill_with_cache(
         xs = layer_output.activations;
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
-        crate::trace::trace_checkpoint("phase2a_layers", &json!({
+        crate::trace::trace_checkpoint("prefill.layer", &json!({
             "next_layer_idx": layer_idx + 1,
             "current_activations": xs.clone(),
             "current_activations_sha256": build_phase2_commitment(&xs),
@@ -480,7 +480,7 @@ pub fn run_text_layers_prefill_with_cache(
         }));
         for (token_idx, token_activation) in xs.iter().enumerate() {
             crate::trace::trace_checkpoint(
-                &format!("phase2a_layer_token.layer_{layer_idx}.token_{token_idx}"),
+                &format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}"),
                 &json!({
                     "layer_idx": layer_idx,
                     "token_idx": token_idx,
@@ -525,7 +525,7 @@ pub fn run_text_layers_decode_step(
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         let cache = layer_caches[layer_idx].clone();
         let _trace = trace_scope(format!(
-            "phase2.decode_layer layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
+            "decode.layer layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
             token_id,
             position,
             layer.attention_kind,
@@ -565,7 +565,7 @@ pub fn run_text_layers_decode_step(
         let mut checkpoint_layer_caches = updated_layer_caches.clone();
         checkpoint_layer_caches.extend(layer_caches.iter().skip(layer_idx + 1).cloned());
         crate::trace::trace_checkpoint(
-            &format!("phase2b_layer_token.layer_{layer_idx}.position_{position}"),
+            &format!("decode.layer_token.layer_{layer_idx}.position_{position}"),
             &json!({
                 "token_id": token_id,
                 "position": position,
