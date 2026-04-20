@@ -49,7 +49,7 @@ Today the implemented routines map onto checkpoint families like this:
 - `decode_transition` -> `decode.layer_token.*` and `decode.finalize`
 - `finalize_output` -> `output.finalize`
 
-The implementation directories now line up with the protocol-level architecture directly: `src/input_embedding/`, `src/transformer_state_transition/`, and `src/output_decode/`.
+The implementation now lives in routine-oriented modules plus shared kernels/contracts rather than phase directories.
 
 Today the implemented serial path produces:
 
@@ -63,9 +63,9 @@ Today the implemented serial path produces:
 
 - `src/checkpoints.rs`: protocol `phase_id` and `routine` taxonomy for checkpoint names
 - `src/io.rs`: thin disk-loading helpers for local assets
-- `src/input_embedding/`: prompt-preparation implementation details
-- `src/transformer_state_transition/`: transformer state-transition implementation details
-- `src/output_decode/`: output-decode loop implementation details
+- `src/prompt_prepare/`, `src/prefill_prepare_aux/`, `src/prefill_layer/`, `src/prefill_finalize/`, `src/decode_select_token/`, `src/decode_transition/`, `src/output_finalize/`: routine implementation details
+- `src/shared/`: shared contracts and transformer kernels
+- `src/pipeline.rs`: consolidated composed inference helpers built from the routines
 - `src/lib.rs`: public API and protocol-aligned aggregate state
 - `src/main.rs`: tiny CLI for local smoke tests
 

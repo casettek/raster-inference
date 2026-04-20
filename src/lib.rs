@@ -8,16 +8,13 @@ pub mod decode_select_token;
 pub mod decode_transition;
 pub mod io;
 pub mod output_finalize;
+mod pipeline;
 pub mod prefill_finalize;
 pub mod prefill_layer;
 pub mod prefill_prepare_aux;
 pub mod prompt_prepare;
 pub mod shared;
 pub mod trace;
-
-mod input_embedding;
-mod output_decode;
-mod transformer_state_transition;
 
 pub use checkpoints::{classify_checkpoint, CheckpointTaxonomy, PhaseId, RoutineId};
 pub use decode_select_token::run as run_decode_select_token;
@@ -27,6 +24,10 @@ pub use io::{
     load_tokenizer_from_path, load_transformer_state_model_from_gemma_model_path,
 };
 pub use output_finalize::run as run_output_finalize;
+pub use pipeline::{
+    decode_step, run_output_decode, run_prefill_pass, run_transformer_state_transition,
+    run_transformer_state_transition_for_token_ids, validate_sampling_config,
+};
 pub use prefill_finalize::run as run_prefill_finalize;
 pub use prefill_layer::run as run_prefill_layer;
 pub use prefill_prepare_aux::run as run_prefill_prepare_aux;
@@ -43,14 +44,14 @@ pub use shared::transformer::{
     MatrixF32, PrefillLogits, TransformerDecodeState, TransformerDecodeStepResult,
     TransformerPrefillResult, TransformerStateTransitionState,
 };
-pub use transformer_state_transition::{
+pub use shared::transformer_kernels::{
     append_kv_cache, apply_final_logit_softcapping, apply_final_norm, compute_decode_ple_input,
-    compute_prefill_ple_inputs, decode_step, embed_input_token, embed_input_tokens,
-    extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer,
-    run_gemma4_layer_decode, run_prefill_pass, run_text_layers_decode_step,
-    run_text_layers_prefill, run_text_layers_prefill_with_cache, run_transformer_state_transition,
-    run_transformer_state_transition_for_token_ids, select_final_position,
+    compute_prefill_ple_inputs, embed_input_token, embed_input_tokens, extract_prefill_logits,
+    project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer, run_gemma4_layer_decode,
+    select_final_position,
 };
+pub use decode_transition::tiles::run_text_layers_decode_step;
+pub use prefill_layer::tiles::{run_text_layers_prefill, run_text_layers_prefill_with_cache};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InputEmbeddingState {
@@ -123,7 +124,7 @@ pub fn run_inference(
             layer_caches,
         )?;
         let mut transformer_state_transition = prefill.transformer_state.clone();
-        let output_decode = output_decode::run_output_decode(
+        let output_decode = run_output_decode(
             &prompt_preparation.prompt_token_ids,
             &prefill,
             &request.sampling,
@@ -164,7 +165,7 @@ mod tests {
         run_decode_transition, run_inference, run_output_finalize, run_prefill_finalize,
         run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare, DecodeState,
         EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
-        Gemma4TransformerModel, InferenceRequest, ModelSpec, OutputDecodeStopReason,
+        Gemma4TransformerModel, InferenceRequest, MatrixF32, ModelSpec, OutputDecodeStopReason,
         SamplingConfig, TextDecodingPolicy,
     };
 
@@ -486,8 +487,8 @@ mod tests {
         }
     }
 
-    fn zero_matrix(rows: usize, cols: usize) -> crate::transformer_state_transition::MatrixF32 {
-        crate::transformer_state_transition::MatrixF32 {
+    fn zero_matrix(rows: usize, cols: usize) -> MatrixF32 {
+        MatrixF32 {
             rows,
             cols,
             values: vec![0.0; rows * cols],

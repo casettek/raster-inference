@@ -1751,7 +1751,7 @@ mod tests {
     #[test]
     fn append_kv_cache_keeps_newest_sliding_window_entries_in_order() {
         let cache = append_kv_cache(
-            crate::transformer_state_transition::LayerKvCache::new(1),
+            crate::shared::transformer::LayerKvCache::new(1),
             &[vec![1.0]],
             &[vec![10.0]],
             None,

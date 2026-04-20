@@ -12,11 +12,11 @@ use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 use sha2::Digest;
 use tokenizers::Tokenizer;
 
-use crate::transformer_state_transition::types::{Gemma4PleMatrixSource, GemmaTensorSliceSource};
-use crate::transformer_state_transition::{
+use crate::shared::transformer::{
     ActivationSequence, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerMatrixSource,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-    Gemma4TransformerModel, GemmaEmbeddingTensorSource, MatrixF32, ResolvedGemma4LayerWeights,
+    Gemma4PleMatrixSource, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
+    GemmaTensorSliceSource, MatrixF32, ResolvedGemma4LayerWeights,
     ResolvedGemma4PleLayerWeights,
 };
 // use crate::trace::{trace_event, trace_scope};
@@ -1426,7 +1426,7 @@ mod tests {
         load_ple_model_projection, load_ple_token_embedding_row,
         load_transformer_state_model_from_gemma_model_path, parse_safetensors_metadata,
     };
-    use crate::transformer_state_transition::{Gemma4AttentionKind, Gemma4LogitsProjection};
+    use crate::{Gemma4AttentionKind, Gemma4LogitsProjection};
     use memmap2::Mmap;
     use safetensors::tensor::{serialize_to_file, TensorView};
     use std::{
@@ -1498,7 +1498,7 @@ mod tests {
         let mmap = unsafe { Mmap::map(&file) }.unwrap();
         let metadata = parse_safetensors_metadata(&mmap, &model_path).unwrap();
         let tensor = metadata.get(tensor_name).unwrap();
-        let source = crate::transformer_state_transition::types::GemmaTensorSliceSource {
+        let source = crate::shared::transformer::GemmaTensorSliceSource {
             weights_path: model_path,
             dtype: tensor.dtype,
             total_rows: tensor.shape[0],

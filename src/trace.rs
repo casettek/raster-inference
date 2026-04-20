@@ -122,7 +122,7 @@ pub fn abort_inference_trace(error: &anyhow::Error) {
 }
 
 pub fn serialize_layer_caches(
-    layer_caches: &[crate::transformer_state_transition::LayerKvCache],
+    layer_caches: &[crate::shared::transformer::LayerKvCache],
 ) -> Vec<SerializableLayerKvCache> {
     layer_caches
         .iter()

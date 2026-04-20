@@ -59,7 +59,7 @@ pub fn finalize(decode_state: &DecodeState) -> Result<()> {
             "full_token_ids": decode_state.full_token_ids.clone(),
             "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
             "generated_token_ids": decode_state.generated_token_ids.clone(),
-            "generated_token_ids_sha256": crate::output_decode::build_output_decode_commitment(&decode_state.generated_token_ids)?,
+            "generated_token_ids_sha256": crate::output_finalize::tiles::build_output_decode_commitment(&decode_state.generated_token_ids)?,
             "current_logits": decode_state.current_logits.clone(),
             "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
             "decode_position": decode_state.transformer_decode_state.position,

@@ -69,7 +69,7 @@ Used for:
 
 ### `build_activation_commitment(activations)`
 
-Location: `src/transformer_state_transition/tiles.rs`
+Location: `src/shared/transformer_kernels.rs`
 
 - Input: `&[Vec<f32>]`
 - Bytes hashed: each `f32` in row-major order via `to_le_bytes()`
@@ -83,7 +83,7 @@ Used for:
 
 ### `build_vector_commitment(values)`
 
-Location: `src/transformer_state_transition/tiles.rs`
+Location: `src/shared/transformer_kernels.rs`
 
 - Input: `&[f32]`
 - Bytes hashed: each `f32` via `to_le_bytes()`
@@ -98,7 +98,7 @@ Used for:
 
 ### `build_output_decode_commitment(token_ids)`
 
-Location: `src/output_decode/tiles.rs`
+Location: `src/output_finalize/tiles.rs`
 
 - Input: `&[u32]`
 - Bytes hashed: `serde_json::to_vec(token_ids)`
@@ -183,7 +183,7 @@ Notes:
 
 ### 2. `prefill.prepare_aux`
 
-Location: `src/transformer_state_transition/mod.rs`
+Location: `src/prefill_prepare_aux/mod.rs`
 
 Protocol taxonomy:
 
@@ -214,7 +214,7 @@ Notes:
 
 ### 3. `prefill.layer`
 
-Location: `src/transformer_state_transition/tiles.rs`
+Location: `src/prefill_layer/tiles.rs`
 
 Protocol taxonomy:
 
@@ -248,7 +248,7 @@ Notes:
 
 ### 4. `prefill.layer_token.layer_{layer_idx}.token_{token_idx}`
 
-Location: `src/transformer_state_transition/tiles.rs`
+Location: `src/prefill_layer/tiles.rs`
 
 Protocol taxonomy:
 
@@ -278,7 +278,7 @@ Notes:
 
 ### 5. `prefill.finalize`
 
-Location: `src/transformer_state_transition/mod.rs`
+Location: `src/prefill_finalize/mod.rs`
 
 Protocol taxonomy:
 
@@ -310,7 +310,7 @@ Notes:
 
 ### 6. `decode.select_token`
 
-Location: `src/output_decode/mod.rs`
+Location: `src/decode_select_token/mod.rs`
 
 Protocol taxonomy:
 
@@ -346,7 +346,7 @@ Notes:
 
 ### 7. `decode.layer_token.layer_{layer_idx}.position_{position}`
 
-Location: `src/transformer_state_transition/tiles.rs`
+Location: `src/decode_transition/tiles.rs`
 
 Protocol taxonomy:
 
@@ -388,7 +388,7 @@ Notes:
 
 ### 8. `decode.finalize`
 
-Location: `src/output_decode/mod.rs`
+Location: `src/decode_transition/mod.rs`
 
 Protocol taxonomy:
 
@@ -419,7 +419,7 @@ Notes:
 
 ### 9. `output.finalize`
 
-Location: `src/output_decode/mod.rs`
+Location: `src/output_finalize/mod.rs`
 
 Protocol taxonomy:
 
@@ -467,7 +467,13 @@ The current checkpoint implementation is spread across:
 
 - `src/trace.rs`
 - `src/lib.rs`
-- `src/transformer_state_transition/mod.rs`
-- `src/transformer_state_transition/tiles.rs`
-- `src/output_decode/mod.rs`
-- `src/output_decode/tiles.rs`
+- `src/pipeline.rs`
+- `src/prefill_prepare_aux/mod.rs`
+- `src/prefill_layer/tiles.rs`
+- `src/prefill_finalize/mod.rs`
+- `src/decode_select_token/mod.rs`
+- `src/decode_transition/mod.rs`
+- `src/decode_transition/tiles.rs`
+- `src/output_finalize/mod.rs`
+- `src/output_finalize/tiles.rs`
+- `src/shared/transformer_kernels.rs`

@@ -14,20 +14,23 @@ pub fn run(
     layer_caches: Vec<LayerKvCache>,
 ) -> Result<TransformerPrefillResult> {
     trace_event("prefill.apply_final_norm");
-    let normalized_hidden_states = crate::transformer_state_transition::apply_final_norm(
+    let normalized_hidden_states = crate::shared::transformer_kernels::apply_final_norm(
         &final_hidden_states.activations,
         &model.final_norm_weight,
         model.rms_norm_eps,
     )?;
-    let final_position =
-        crate::transformer_state_transition::select_final_position(&normalized_hidden_states.activations)?;
+    let final_position = crate::shared::transformer_kernels::select_final_position(
+        &normalized_hidden_states.activations,
+    )?;
     trace_event("prefill.project_to_logits");
-    let mut logits =
-        crate::transformer_state_transition::project_to_logits(&final_position, &model.logits_projection)?;
+    let mut logits = crate::shared::transformer_kernels::project_to_logits(
+        &final_position,
+        &model.logits_projection,
+    )?;
     if let Some(softcap) = model.final_logit_softcapping {
-        logits = crate::transformer_state_transition::apply_final_logit_softcapping(&logits, softcap);
+        logits = crate::shared::transformer_kernels::apply_final_logit_softcapping(&logits, softcap);
     }
-    let prefill_logits = crate::transformer_state_transition::extract_prefill_logits(&logits);
+    let prefill_logits = crate::shared::transformer_kernels::extract_prefill_logits(&logits);
     crate::trace::trace_checkpoint(
         "prefill.finalize",
         &json!({
