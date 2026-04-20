@@ -4,25 +4,44 @@ use serde_json::json;
 use tokenizers::Tokenizer;
 
 pub mod checkpoints;
-pub mod input_embedding;
+pub mod decode_select_token;
+pub mod decode_transition;
 pub mod io;
-pub mod output_decode;
+pub mod output_finalize;
+pub mod prefill_finalize;
+pub mod prefill_layer;
+pub mod prefill_prepare_aux;
+pub mod prompt_prepare;
+pub mod shared;
 pub mod trace;
-pub mod transformer_state_transition;
+
+mod input_embedding;
+mod output_decode;
+mod transformer_state_transition;
 
 pub use checkpoints::{classify_checkpoint, CheckpointTaxonomy, PhaseId, RoutineId};
-pub use input_embedding::{
-    run_prompt_prepare, Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec,
-    PromptPreparationState, SamplingConfig, TextDecodingPolicy, TextMessage,
-};
+pub use decode_select_token::run as run_decode_select_token;
+pub use decode_transition::{finalize as finalize_decode_transition, run as run_decode_transition};
 pub use io::{
     load_chat_template, load_embedding_table_from_gemma_model_path, load_embedding_table_from_path,
     load_tokenizer_from_path, load_transformer_state_model_from_gemma_model_path,
 };
-pub use output_decode::{
-    append_token, build_output_decode_commitment, check_stop_condition, detokenize_output_tokens,
-    run_output_decode, select_next_token, validate_sampling_config, DecodeState, OutputDecodeState,
-    OutputDecodeStopReason,
+pub use output_finalize::run as run_output_finalize;
+pub use prefill_finalize::run as run_prefill_finalize;
+pub use prefill_layer::run as run_prefill_layer;
+pub use prefill_prepare_aux::run as run_prefill_prepare_aux;
+pub use prompt_prepare::run as run_prompt_prepare;
+pub use shared::input::{
+    Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, PromptPreparationState, SamplingConfig,
+    TextDecodingPolicy, TextMessage,
+};
+pub use shared::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
+pub use shared::transformer::{
+    ActivationSequence, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+    Gemma4PrefillPleInputs, Gemma4TransformerModel, GemmaEmbeddingTensorSource, LayerKvCache,
+    MatrixF32, PrefillLogits, TransformerDecodeState, TransformerDecodeStepResult,
+    TransformerPrefillResult, TransformerStateTransitionState,
 };
 pub use transformer_state_transition::{
     append_kv_cache, apply_final_logit_softcapping, apply_final_norm, compute_decode_ple_input,
@@ -30,12 +49,7 @@ pub use transformer_state_transition::{
     extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer,
     run_gemma4_layer_decode, run_prefill_pass, run_text_layers_decode_step,
     run_text_layers_prefill, run_text_layers_prefill_with_cache, run_transformer_state_transition,
-    run_transformer_state_transition_for_token_ids, select_final_position, ActivationSequence,
-    EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
-    Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights, Gemma4PrefillPleInputs,
-    Gemma4TransformerModel, GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, PrefillLogits,
-    TransformerDecodeState, TransformerDecodeStepResult, TransformerPrefillResult,
-    TransformerStateTransitionState,
+    run_transformer_state_transition_for_token_ids, select_final_position,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -95,9 +109,21 @@ pub fn run_inference(
                 "sampling": request.sampling.clone(),
             }),
         );
-        let prefill = run_prefill_pass(&prompt_preparation, transformer_model, &token_embeddings)?;
+        let ple_inputs =
+            run_prefill_prepare_aux(&prompt_preparation.prompt_token_ids, transformer_model, &token_embeddings)?;
+        let (final_hidden_states, layer_caches) = run_prefill_layer(
+            &token_embeddings.activations,
+            transformer_model,
+            ple_inputs.as_ref(),
+        )?;
+        let prefill = run_prefill_finalize(
+            &prompt_preparation.prompt_token_ids,
+            transformer_model,
+            final_hidden_states,
+            layer_caches,
+        )?;
         let mut transformer_state_transition = prefill.transformer_state.clone();
-        let output_decode = run_output_decode(
+        let output_decode = output_decode::run_output_decode(
             &prompt_preparation.prompt_token_ids,
             &prefill,
             &request.sampling,
@@ -134,8 +160,11 @@ mod tests {
     use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
     use super::{
-        run_inference, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
-        Gemma4LogitsProjection, Gemma4TransformerModel, InferenceRequest, ModelSpec,
+        embed_input_tokens, finalize_decode_transition, run_decode_select_token,
+        run_decode_transition, run_inference, run_output_finalize, run_prefill_finalize,
+        run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare, DecodeState,
+        EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
+        Gemma4TransformerModel, InferenceRequest, ModelSpec, OutputDecodeStopReason,
         SamplingConfig, TextDecodingPolicy,
     };
 
@@ -175,7 +204,7 @@ mod tests {
         assert_eq!(inference_state.output_decode.generated_token_count, 2);
         assert_eq!(
             inference_state.output_decode.stop_reason,
-            crate::output_decode::OutputDecodeStopReason::MaxNewTokens
+            OutputDecodeStopReason::MaxNewTokens
         );
     }
 
@@ -308,6 +337,75 @@ mod tests {
             "logits-digest"
         );
         assert_eq!(inference_state.output_decode.generated_text, "hello");
+    }
+
+    #[test]
+    fn routine_exports_support_manual_inference_orchestration() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_model = test_transformer_model();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let prompt_preparation =
+            run_prompt_prepare(&request, &model, &tokenizer).expect("prompt prepare");
+        let token_embeddings = embed_input_tokens(
+            &prompt_preparation.prompt_token_ids,
+            transformer_model.embedding_table.as_ref().expect("embedding table"),
+        )
+        .expect("embed tokens");
+        let ple_inputs = run_prefill_prepare_aux(
+            &prompt_preparation.prompt_token_ids,
+            &transformer_model,
+            &token_embeddings,
+        )
+        .expect("prefill prepare aux");
+        let (final_hidden_states, layer_caches) = run_prefill_layer(
+            &token_embeddings.activations,
+            &transformer_model,
+            ple_inputs.as_ref(),
+        )
+        .expect("prefill layer");
+        let prefill = run_prefill_finalize(
+            &prompt_preparation.prompt_token_ids,
+            &transformer_model,
+            final_hidden_states,
+            layer_caches,
+        )
+        .expect("prefill finalize");
+
+        let mut decode_state = DecodeState::new(
+            prompt_preparation.prompt_token_ids.clone(),
+            prefill.transformer_state.prefill_logits.logits.clone(),
+            prefill.transformer_decode_state.clone(),
+        );
+        let next_token =
+            run_decode_select_token(&mut decode_state, 1).expect("decode select token");
+        let next_token = next_token.expect("should select a token");
+        let decode_transition = run_decode_transition(
+            std::mem::take(&mut decode_state.transformer_decode_state),
+            next_token,
+            &transformer_model,
+        )
+        .expect("decode transition");
+        decode_state.current_logits = decode_transition.prefill_logits.logits;
+        decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
+        finalize_decode_transition(&decode_state).expect("decode finalize trace");
+
+        let output = run_output_finalize(decode_state, &tokenizer).expect("output finalize");
+        assert_eq!(output.generated_token_ids, vec![0]);
+        assert_eq!(output.generated_text, "hello");
+        assert_eq!(output.stop_reason, OutputDecodeStopReason::MaxNewTokens);
     }
 
     fn test_model_spec() -> ModelSpec {

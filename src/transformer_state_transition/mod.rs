@@ -1,6 +1,5 @@
 use crate::trace::{trace_event, trace_scope};
 use anyhow::Result;
-use serde_json::json;
 
 pub mod tiles;
 pub mod types;
@@ -13,12 +12,12 @@ pub use tiles::{
     select_final_position,
 };
 pub use types::{
-    ActivationSequence, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
+    ActivationSequence, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
-    Gemma4PleLayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
-    GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, PrefillLogits, ResolvedGemma4LayerWeights,
-    ResolvedGemma4PleLayerWeights, TransformerDecodeState, TransformerDecodeStepResult,
-    TransformerPrefillResult, TransformerStateTransitionState,
+    Gemma4PleLayerWeights, Gemma4TransformerModel, GemmaEmbeddingTensorSource, LayerKvCache,
+    MatrixF32, ResolvedGemma4LayerWeights, ResolvedGemma4PleLayerWeights,
+    TransformerDecodeState, TransformerDecodeStepResult, TransformerPrefillResult,
+    TransformerStateTransitionState,
 };
 
 pub fn run_prefill_pass(
@@ -44,85 +43,14 @@ fn run_prefill_pass_for_token_ids(
         prompt_token_ids.len(),
         model.layers.len()
     ));
-    let ple_inputs = model
-        .ple_global
-        .as_ref()
-        .map(|ple_global| {
-            // trace_event("transformer_state_transition.compute_prefill_ple_inputs");
-            compute_prefill_ple_inputs(
-                prompt_token_ids,
-                &token_embeddings.activations,
-                &model.layers,
-                ple_global,
-                model.rms_norm_eps,
-            )
-        })
-        .transpose()?;
-    crate::trace::trace_checkpoint(
-        "prefill.prepare_aux",
-        &json!({
-            "prompt_token_ids": prompt_token_ids,
-            "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
-            "embedded_prompt_activations": token_embeddings.activations.clone(),
-            "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
-            "per_layer_prefill_inputs": ple_inputs.as_ref().map(|inputs| inputs.per_layer_inputs.clone()),
-            "per_layer_prefill_input_sha256s": ple_inputs.as_ref().map(|inputs| {
-                inputs
-                    .per_layer_inputs
-                    .iter()
-                    .map(|input| input.as_ref().map(crate::trace::sha256_hex))
-                    .collect::<Vec<_>>()
-            }),
-        }),
-    );
+    let ple_inputs = crate::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings)?;
     trace_event("prefill.layer_stack");
-    let (final_hidden_states, layer_caches) = run_text_layers_prefill_with_cache(
+    let (final_hidden_states, layer_caches) = crate::prefill_layer::run(
         &token_embeddings.activations,
         model,
         ple_inputs.as_ref(),
     )?;
-    trace_event("prefill.apply_final_norm");
-    let normalized_hidden_states = apply_final_norm(
-        &final_hidden_states.activations,
-        &model.final_norm_weight,
-        model.rms_norm_eps,
-    )?;
-    // trace_event("transformer_state_transition.select_final_position");
-    let final_position = select_final_position(&normalized_hidden_states.activations)?;
-    trace_event("prefill.project_to_logits");
-    let mut logits = project_to_logits(&final_position, &model.logits_projection)?;
-    if let Some(softcap) = model.final_logit_softcapping {
-        // trace_event("transformer_state_transition.apply_final_logit_softcapping");
-        logits = apply_final_logit_softcapping(&logits, softcap);
-    }
-    // trace_event("transformer_state_transition.extract_prefill_logits");
-    let prefill_logits = extract_prefill_logits(&logits);
-    crate::trace::trace_checkpoint(
-        "prefill.finalize",
-        &json!({
-            "final_hidden_states": final_hidden_states.activations.clone(),
-            "final_hidden_states_sha256": final_hidden_states.activations_sha256.clone(),
-            "prefill_logits": prefill_logits.logits.clone(),
-            "prefill_logits_sha256": prefill_logits.final_logits_sha256.clone(),
-            "decode_position": prompt_token_ids.len(),
-            "decode_token_count": prompt_token_ids.len(),
-            "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-        }),
-    );
-
-    let transformer_state_transition_state = TransformerStateTransitionState {
-        activation_states: vec![final_hidden_states],
-        prefill_logits,
-    };
-
-    Ok(TransformerPrefillResult {
-        transformer_decode_state: TransformerDecodeState {
-            layer_caches,
-            position: prompt_token_ids.len(),
-            token_count: prompt_token_ids.len(),
-        },
-        transformer_state: transformer_state_transition_state,
-    })
+    crate::prefill_finalize::run(prompt_token_ids, model, final_hidden_states, layer_caches)
 }
 
 fn embed_token_ids(

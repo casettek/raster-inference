@@ -1,5 +1,4 @@
 use anyhow::Result;
-use serde_json::json;
 use tokenizers::Tokenizer;
 
 use crate::trace::{trace_event, trace_scope};
@@ -8,15 +7,14 @@ pub mod tiles;
 pub mod types;
 
 pub use tiles::{
-    append_token, build_output_decode_commitment, check_stop_condition, detokenize_output_tokens,
-    select_next_token, validate_sampling_config,
+    build_output_decode_commitment, check_stop_condition, validate_sampling_config,
 };
-pub use types::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
+pub use types::{DecodeState, OutputDecodeState};
 
 pub fn run_output_decode(
     prompt_token_ids: &[u32],
     initial_transformer_state: &crate::transformer_state_transition::TransformerPrefillResult,
-    sampling: &crate::input_embedding::SamplingConfig,
+    sampling: &crate::shared::input::SamplingConfig,
     tokenizer: &Tokenizer,
     transformer_model: &crate::transformer_state_transition::Gemma4TransformerModel,
 ) -> Result<OutputDecodeState> {
@@ -34,87 +32,25 @@ pub fn run_output_decode(
     );
 
     loop {
-        // trace_event("output_decode.check_stop_condition");
-        if let Some(stop_reason) =
-            check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens)
-        {
+        if check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens).is_some() {
             trace_event("output.detokenize");
-            let generated_token_count = decode_state.generated_token_ids.len();
-            let generated_text =
-                detokenize_output_tokens(tokenizer, &decode_state.generated_token_ids)?;
-            let generated_token_ids_sha256 =
-                build_output_decode_commitment(&decode_state.generated_token_ids)?;
-            crate::trace::trace_checkpoint(
-                "output.finalize",
-                &json!({
-                    "full_token_ids": decode_state.full_token_ids.clone(),
-                    "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
-                    "generated_token_ids": decode_state.generated_token_ids.clone(),
-                    "generated_token_ids_sha256": generated_token_ids_sha256.clone(),
-                    "generated_text": generated_text.clone(),
-                    "generated_token_count": generated_token_count,
-                    "stop_reason": stop_reason.clone(),
-                }),
-            );
-
-            return Ok(OutputDecodeState {
-                generated_token_ids: decode_state.generated_token_ids,
-                generated_token_ids_sha256,
-                generated_text,
-                generated_token_count,
-                stop_reason,
-                decode_transition_states,
-            });
+            let mut output_decode_state = crate::output_finalize::run(decode_state, tokenizer)?;
+            output_decode_state.decode_transition_states = decode_transition_states;
+            return Ok(output_decode_state);
         }
 
         trace_event("decode.select_token");
-        let next_token = select_next_token(&decode_state.current_logits)?;
-
-        // trace_event("output_decode.append_token");
-        decode_state.full_token_ids = append_token(&decode_state.full_token_ids, next_token);
-        decode_state.generated_token_ids =
-            append_token(&decode_state.generated_token_ids, next_token);
-        crate::trace::trace_checkpoint(
-            "decode.select_token",
-            &json!({
-                "full_token_ids": decode_state.full_token_ids.clone(),
-                "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
-                "generated_token_ids": decode_state.generated_token_ids.clone(),
-                "generated_token_ids_sha256": build_output_decode_commitment(&decode_state.generated_token_ids)?,
-                "current_logits": decode_state.current_logits.clone(),
-                "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
-                "selected_next_token": next_token,
-                "decode_position": decode_state.transformer_decode_state.position,
-                "decode_token_count": decode_state.transformer_decode_state.token_count,
-                "layer_caches": crate::trace::serialize_layer_caches(&decode_state.transformer_decode_state.layer_caches),
-                "max_new_tokens": max_new_tokens,
-            }),
-        );
+        let next_token = crate::decode_select_token::run(&mut decode_state, max_new_tokens)?
+            .expect("stop condition should have returned earlier");
 
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
-        let decode_transition = crate::transformer_state_transition::decode_step(
-            transformer_decode_state,
-            next_token,
-            transformer_model,
-        )?;
+        let decode_transition =
+            crate::decode_transition::run(transformer_decode_state, next_token, transformer_model)?;
         decode_transition_states.push(decode_transition.activation_state.clone());
         decode_state.current_logits = decode_transition.prefill_logits.logits;
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
-        crate::trace::trace_checkpoint(
-            "decode.finalize",
-            &json!({
-                "full_token_ids": decode_state.full_token_ids.clone(),
-                "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
-                "generated_token_ids": decode_state.generated_token_ids.clone(),
-                "generated_token_ids_sha256": build_output_decode_commitment(&decode_state.generated_token_ids)?,
-                "current_logits": decode_state.current_logits.clone(),
-                "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
-                "decode_position": decode_state.transformer_decode_state.position,
-                "decode_token_count": decode_state.transformer_decode_state.token_count,
-                "layer_caches": crate::trace::serialize_layer_caches(&decode_state.transformer_decode_state.layer_caches),
-            }),
-        );
+        crate::decode_transition::finalize(&decode_state)?;
     }
 }
 
@@ -123,7 +59,7 @@ mod tests {
     use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
     use super::run_output_decode;
-    use crate::input_embedding::SamplingConfig;
+    use crate::SamplingConfig;
     use crate::transformer_state_transition::{
         embed_input_tokens, run_prefill_pass, EmbeddingTable, Gemma4AttentionKind,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4TransformerModel, MatrixF32,

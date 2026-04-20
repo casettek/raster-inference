@@ -4,6 +4,12 @@ This document inventories every checkpoint commitment emitted by `raster-inferen
 
 The goal is instrumentation parity: another inference library should be able to capture the same raw values at the same semantic points, hash them the same way, and produce checkpoint commitments compatible with this implementation.
 
+Code organization note:
+
+- The public crate API is routine-oriented (`prompt_prepare`, `prefill_prepare_aux`, `prefill_layer`, `prefill_finalize`, `decode_select_token`, `decode_transition`, `output_finalize`).
+- The checkpoint contract is still phase-oriented at the taxonomy level, so `phase_id`, checkpoint names, and serialized payload shapes remain unchanged across the reorganization.
+- Some implementation details still live in shared or legacy internal modules where that keeps transformer math and loading code reusable; compatibility should be judged by emitted checkpoint data, not file paths alone.
+
 ## How checkpoint commitments work
 
 All checkpoint commitments go through `trace_checkpoint()` in `src/trace.rs`.

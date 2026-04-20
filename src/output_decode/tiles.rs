@@ -1,51 +1,8 @@
 use anyhow::{bail, Result};
-use sha2::{Digest, Sha256};
-use tokenizers::Tokenizer;
-
-use super::types::OutputDecodeStopReason;
-use crate::input_embedding::SamplingConfig;
-
-const DEFAULT_TEMPERATURE: f32 = 1.0;
-
-pub fn select_next_token(logits: &[f32]) -> Result<u32> {
-    if logits.is_empty() {
-        bail!("output decode requires at least one logit to select the next token");
-    }
-
-    let mut best_token = 0usize;
-    for (token_id, logit) in logits.iter().enumerate().skip(1) {
-        if logit.total_cmp(&logits[best_token]).is_gt() {
-            best_token = token_id;
-        }
-    }
-
-    Ok(best_token as u32)
-}
-
-pub fn append_token(token_ids: &[u32], next_token: u32) -> Vec<u32> {
-    let mut appended = token_ids.to_vec();
-    appended.push(next_token);
-    appended
-}
-
-pub fn check_stop_condition(
-    generated_token_count: usize,
-    max_new_tokens: usize,
-) -> Option<OutputDecodeStopReason> {
-    (generated_token_count >= max_new_tokens).then_some(OutputDecodeStopReason::MaxNewTokens)
-}
-
-pub fn detokenize_output_tokens(tokenizer: &Tokenizer, token_ids: &[u32]) -> Result<String> {
-    if token_ids.is_empty() {
-        return Ok(String::new());
-    }
-
-    tokenizer
-        .decode(token_ids, true)
-        .map_err(anyhow::Error::msg)
-}
+use crate::shared::input::SamplingConfig;
 
 pub fn validate_sampling_config(sampling: &SamplingConfig) -> Result<usize> {
+    const DEFAULT_TEMPERATURE: f32 = 1.0;
     if let Some(temperature) = sampling.temperature {
         if (temperature - DEFAULT_TEMPERATURE).abs() > f32::EPSILON {
             bail!(
@@ -63,12 +20,10 @@ pub fn validate_sampling_config(sampling: &SamplingConfig) -> Result<usize> {
     Ok(sampling.max_new_tokens.unwrap_or(0))
 }
 
-pub fn build_output_decode_commitment(token_ids: &[u32]) -> Result<String> {
-    let payload =
-        serde_json::to_vec(token_ids).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let digest = Sha256::digest(payload);
-    Ok(format!("{digest:x}"))
-}
+#[allow(unused_imports)]
+pub use crate::decode_select_token::tiles::{append_token, check_stop_condition, select_next_token};
+#[allow(unused_imports)]
+pub use crate::output_finalize::tiles::{build_output_decode_commitment, detokenize_output_tokens};
 
 #[cfg(test)]
 mod tests {
@@ -78,8 +33,8 @@ mod tests {
         append_token, build_output_decode_commitment, check_stop_condition,
         detokenize_output_tokens, select_next_token, validate_sampling_config,
     };
-    use crate::input_embedding::SamplingConfig;
-    use crate::output_decode::OutputDecodeStopReason;
+    use crate::shared::input::SamplingConfig;
+    use crate::shared::output::OutputDecodeStopReason;
 
     #[test]
     fn select_next_token_returns_highest_logit_token_id() {
