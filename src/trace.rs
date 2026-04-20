@@ -10,6 +10,13 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraceMode {
+    Off,
+    LogsOnly,
+    Full,
+}
+
 pub struct TraceSpan {
     label: String,
     start: Instant,
@@ -19,7 +26,7 @@ pub struct TraceSpan {
 impl TraceSpan {
     pub fn new(label: impl Into<String>) -> Self {
         let label = label.into();
-        let enabled = tracing_enabled();
+        let enabled = trace_logging_enabled();
         if enabled {
             emit("start", &label, None);
         }
@@ -44,7 +51,7 @@ pub fn trace_scope(label: impl Into<String>) -> TraceSpan {
 }
 
 pub fn trace_event(label: impl AsRef<str>) {
-    if tracing_enabled() {
+    if trace_logging_enabled() {
         emit("event", label.as_ref(), None);
     }
 }
@@ -62,7 +69,7 @@ pub struct SerializableLayerKvCache {
 }
 
 pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
-    if !tracing_enabled() {
+    if !trace_checkpointing_enabled() {
         return;
     }
 
@@ -75,7 +82,7 @@ pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
 }
 
 pub fn trace_checkpoint<T: Serialize>(phase: &str, state: &T) {
-    if !tracing_enabled() {
+    if !trace_checkpointing_enabled() {
         return;
     }
 
@@ -88,7 +95,7 @@ pub fn trace_checkpoint<T: Serialize>(phase: &str, state: &T) {
 }
 
 pub fn finish_inference_trace<T: Serialize>(summary: &T) {
-    if !tracing_enabled() {
+    if !trace_checkpointing_enabled() {
         return;
     }
 
@@ -102,7 +109,7 @@ pub fn finish_inference_trace<T: Serialize>(summary: &T) {
 }
 
 pub fn abort_inference_trace(error: &anyhow::Error) {
-    if !tracing_enabled() {
+    if !trace_checkpointing_enabled() {
         return;
     }
 
@@ -142,13 +149,21 @@ pub fn sha256_hex<T: Serialize>(value: &T) -> String {
     }
 }
 
-fn tracing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env::var("RASTER_TRACE_TILES")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
-            .unwrap_or(false)
+fn trace_mode() -> TraceMode {
+    static MODE: OnceLock<TraceMode> = OnceLock::new();
+    *MODE.get_or_init(|| match env::var("RASTER_TRACE_TILES").as_deref() {
+        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => TraceMode::Full,
+        Ok("0") => TraceMode::LogsOnly,
+        _ => TraceMode::Off,
     })
+}
+
+fn trace_logging_enabled() -> bool {
+    matches!(trace_mode(), TraceMode::LogsOnly | TraceMode::Full)
+}
+
+fn trace_checkpointing_enabled() -> bool {
+    matches!(trace_mode(), TraceMode::Full)
 }
 
 fn emit(kind: &str, label: &str, duration: Option<Duration>) {

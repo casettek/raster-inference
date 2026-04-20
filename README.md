@@ -99,7 +99,7 @@ The CLI prints the resulting `InferenceState` as formatted JSON with both:
 - `phase3.generated_token_ids_sha256`: SHA-256 digest of the generated token IDs
 - `phase3.stop_reason`: currently `max_new_tokens`
 
-To trace long Gemma runs tile-by-tile, set `RASTER_TRACE_TILES=1`. Trace logs go to stderr and include start/end timing for model loading, major phase-2 tiles, and each decoder layer.
+To trace long Gemma runs tile-by-tile, set `RASTER_TRACE_TILES=1`. That enables full trace logging plus checkpoint hashing and trace-file output. If you want only the stderr phase/tile logs without checkpoint generation, set `RASTER_TRACE_TILES=0`. Trace logs go to stderr and include start/end timing for model loading, major phase-2 tiles, and each decoder layer.
 
 ```bash
 cargo run -- \

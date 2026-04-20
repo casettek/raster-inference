@@ -13,7 +13,7 @@ fn print_usage() {
         "Usage: raster-inference <model-id> <tokenizer.json> <chat-template.jinja> <gemma-model-path> <prompt...>"
     );
     eprintln!(
-        "Set RASTER_TRACE_TILES=1 to print tile-level timing logs to stderr and save checkpoint traces under raster-traces/ (override with RASTER_TRACE_DIR)."
+        "Set RASTER_TRACE_TILES=1 for full tile timing logs plus checkpoint traces, or RASTER_TRACE_TILES=0 for logs only with no checkpoint hashing or trace files."
     );
 }
 
