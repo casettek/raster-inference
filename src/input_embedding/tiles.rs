@@ -32,7 +32,7 @@ pub fn build_gemma4_messages(
     add_generation_prompt: bool,
 ) -> Result<Gemma4Prompt> {
     if prompt_text.is_empty() {
-        bail!("phase 1 requires a non-empty prompt");
+        bail!("input embedding requires a non-empty prompt");
     }
 
     Ok(Gemma4Prompt {
@@ -84,9 +84,9 @@ pub fn tokenize_prompt(
     Ok(encoding.get_ids().to_vec())
 }
 
-pub fn build_phase1_commitment(prompt_token_ids: &[u32]) -> Result<String> {
+pub fn build_prompt_commitment(prompt_token_ids: &[u32]) -> Result<String> {
     let payload = serde_json::to_vec(prompt_token_ids)
-        .context("failed to serialize phase 1 prompt token ids")?;
+        .context("failed to serialize input-embedding prompt token ids")?;
 
     let digest = Sha256::digest(payload);
     Ok(format!("{digest:x}"))
@@ -95,9 +95,9 @@ pub fn build_phase1_commitment(prompt_token_ids: &[u32]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_gemma4_messages, build_phase1_commitment, decode_prompt_bytes, render_prompt,
+        build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes, render_prompt,
     };
-    use crate::phase1::types::{MessageRole, ModelSpec, TextDecodingPolicy};
+    use crate::input_embedding::types::{MessageRole, ModelSpec, TextDecodingPolicy};
 
     #[test]
     fn decode_prompt_bytes_preserves_prompt_text() {
@@ -142,8 +142,8 @@ mod tests {
     }
 
     #[test]
-    fn build_phase1_commitment_hashes_prompt_token_ids_only() {
-        let digest = build_phase1_commitment(&[1, 2, 3]).expect("commitment should build");
+    fn build_prompt_commitment_hashes_prompt_token_ids_only() {
+        let digest = build_prompt_commitment(&[1, 2, 3]).expect("commitment should build");
 
         assert_eq!(
             digest,

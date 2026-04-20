@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum Phase3StopReason {
+pub enum OutputDecodeStopReason {
     #[default]
     MaxNewTokens,
 }
@@ -12,33 +12,33 @@ pub struct DecodeState {
     pub full_token_ids: Vec<u32>,
     pub generated_token_ids: Vec<u32>,
     pub current_logits: Vec<f32>,
-    pub phase2_decode_state: crate::phase2::Phase2DecodeState,
+    pub transformer_decode_state: crate::transformer_state_transition::TransformerDecodeState,
 }
 
 impl DecodeState {
     pub fn new(
         full_token_ids: Vec<u32>,
         current_logits: Vec<f32>,
-        phase2_decode_state: crate::phase2::Phase2DecodeState,
+        transformer_decode_state: crate::transformer_state_transition::TransformerDecodeState,
     ) -> Self {
         Self {
             full_token_ids,
             generated_token_ids: Vec::new(),
             current_logits,
-            phase2_decode_state,
+            transformer_decode_state,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Phase3State {
+pub struct OutputDecodeState {
     pub generated_token_ids: Vec<u32>,
     pub generated_token_ids_sha256: String,
     pub generated_text: String,
     #[serde(skip_serializing, default)]
     pub generated_token_count: usize,
     #[serde(skip_serializing, default)]
-    pub stop_reason: Phase3StopReason,
+    pub stop_reason: OutputDecodeStopReason,
     #[serde(skip_serializing, default)]
-    pub phase2_activation_states: Vec<crate::phase2::ActivationSequence>,
+    pub decode_transition_states: Vec<crate::transformer_state_transition::ActivationSequence>,
 }

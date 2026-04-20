@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     path::PathBuf,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -81,7 +80,7 @@ pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
     collector.completed_trace_path = None;
 }
 
-pub fn trace_checkpoint<T: Serialize>(phase: &str, state: &T) {
+pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) {
     if !trace_checkpointing_enabled() {
         return;
     }
@@ -90,7 +89,7 @@ pub fn trace_checkpoint<T: Serialize>(phase: &str, state: &T) {
         .lock()
         .expect("trace collector mutex should not be poisoned");
     collector.checkpoints.push(json!({
-        phase: sha256_hex(state),
+        checkpoint_name: sha256_hex(state),
     }));
 }
 
@@ -123,7 +122,7 @@ pub fn abort_inference_trace(error: &anyhow::Error) {
 }
 
 pub fn serialize_layer_caches(
-    layer_caches: &[crate::phase2::LayerKvCache],
+    layer_caches: &[crate::transformer_state_transition::LayerKvCache],
 ) -> Vec<SerializableLayerKvCache> {
     layer_caches
         .iter()
@@ -195,7 +194,9 @@ fn emit_checkpoint_bundle(payload: &Value, saved_path: Option<&std::path::Path>)
             }
         }
         Err(error) => {
-            eprintln!("[raster-trace +{elapsed:>8.3}s] checkpoints <serialization failed: {error}>");
+            eprintln!(
+                "[raster-trace +{elapsed:>8.3}s] checkpoints <serialization failed: {error}>"
+            );
         }
     }
 }
@@ -203,7 +204,11 @@ fn emit_checkpoint_bundle(payload: &Value, saved_path: Option<&std::path::Path>)
 fn write_checkpoint_bundle(payload: &Value) -> anyhow::Result<PathBuf> {
     let trace_dir = trace_output_directory();
     fs::create_dir_all(&trace_dir)?;
-    let trace_path = trace_dir.join(format!("trace-{}-{}.json", process_id(), unix_timestamp_ms()?));
+    let trace_path = trace_dir.join(format!(
+        "trace-{}-{}.json",
+        process_id(),
+        unix_timestamp_ms()?
+    ));
     fs::write(&trace_path, serde_json::to_vec_pretty(payload)?)?;
     Ok(trace_path)
 }

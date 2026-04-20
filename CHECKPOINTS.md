@@ -9,9 +9,9 @@ The goal is instrumentation parity: another inference library should be able to 
 All checkpoint commitments go through `trace_checkpoint()` in `src/trace.rs`.
 
 ```rust
-pub fn trace_checkpoint<T: Serialize>(phase: &str, state: &T) {
+pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) {
     collector.checkpoints.push(json!({
-        phase: sha256_hex(state),
+        checkpoint_name: sha256_hex(state),
     }));
 }
 ```
@@ -22,6 +22,25 @@ Important consequences:
 - The digest is `sha256_hex(state)`.
 - `sha256_hex(state)` means: serialize `state` with `serde_json::to_vec`, then SHA-256 those exact bytes, then hex-encode the digest.
 - For compatibility, the instrumented library should build the same logical payload object and hash its JSON bytes in the same way.
+
+## Terminology map
+
+This repo now treats naming at two levels:
+
+- `phase_id`: the coarse protocol stage used by commitment labels
+- `routine_id`: the fixed checkpoint-to-checkpoint unit of execution nested inside a `phase_id`
+
+The current emitted checkpoint names map to the protocol taxonomy like this:
+
+| Checkpoint name or family | `phase_id` | `routine_id` |
+|---|---|---|
+| `prompt.prepare` | `input_embedding` | `prompt_prepare` |
+| `prefill.prepare_aux` | `transformer_state_transition` | `prefill_prepare_aux` |
+| `prefill.layer` and `prefill.layer_token.*` | `transformer_state_transition` | `prefill_layer` |
+| `prefill.finalize` | `transformer_state_transition` | `prefill_finalize` |
+| `decode.select_token` | `output_decode` | `select_output_token` |
+| `decode.layer_token.*` and `decode.finalize` | `transformer_state_transition` | `decode_transition` |
+| `output.finalize` | `output_decode` | `finalize_output` |
 
 ## Related helper commitment functions
 
@@ -42,9 +61,9 @@ Used for:
 - generated text
 - some optional per-layer PLE inputs
 
-### `build_phase2_commitment(activations)`
+### `build_activation_commitment(activations)`
 
-Location: `src/phase2/tiles.rs`
+Location: `src/transformer_state_transition/tiles.rs`
 
 - Input: `&[Vec<f32>]`
 - Bytes hashed: each `f32` in row-major order via `to_le_bytes()`
@@ -58,7 +77,7 @@ Used for:
 
 ### `build_vector_commitment(values)`
 
-Location: `src/phase2/tiles.rs`
+Location: `src/transformer_state_transition/tiles.rs`
 
 - Input: `&[f32]`
 - Bytes hashed: each `f32` via `to_le_bytes()`
@@ -71,9 +90,9 @@ Used for:
 - decode current activation
 - prefill logits
 
-### `build_phase3_commitment(token_ids)`
+### `build_output_decode_commitment(token_ids)`
 
-Location: `src/phase3/tiles.rs`
+Location: `src/output_decode/tiles.rs`
 
 - Input: `&[u32]`
 - Bytes hashed: `serde_json::to_vec(token_ids)`
@@ -131,11 +150,16 @@ The checkpoints below are listed in execution order.
 
 Location: `src/lib.rs`
 
+Protocol taxonomy:
+
+- `phase_id`: `input_embedding`
+- `routine_id`: `prompt_prepare`
+
 When to record:
 
-- After phase 1 prompt processing
+- After prompt preparation completes
 - After prompt token embeddings are available
-- Before phase 2 prefill begins
+- Before transformer prefill begins
 
 Payload fields:
 
@@ -148,12 +172,17 @@ Payload fields:
 
 Notes:
 
-- `prompt_token_ids_sha256` is inherited from phase 1 state.
+- `prompt_token_ids_sha256` is inherited from the prompt-preparation state.
 - `embedded_prompt_activations_sha256` is the activation commitment returned by the embedding step.
 
 ### 2. `prefill.prepare_aux`
 
-Location: `src/phase2/mod.rs`
+Location: `src/transformer_state_transition/mod.rs`
+
+Protocol taxonomy:
+
+- `phase_id`: `transformer_state_transition`
+- `routine_id`: `prefill_prepare_aux`
 
 When to record:
 
@@ -179,7 +208,12 @@ Notes:
 
 ### 3. `prefill.layer`
 
-Location: `src/phase2/tiles.rs`
+Location: `src/transformer_state_transition/tiles.rs`
+
+Protocol taxonomy:
+
+- `phase_id`: `transformer_state_transition`
+- `routine_id`: `prefill_layer`
 
 Checkpoint family:
 
@@ -203,12 +237,17 @@ Notes:
 
 - `next_layer_idx` is `layer_idx + 1`.
 - `current_activations` is the full post-layer activation sequence for the prompt.
-- `current_activations_sha256` is `build_phase2_commitment(current_activations)`.
+- `current_activations_sha256` is `build_activation_commitment(current_activations)`.
 - `completed_layer_output_sha256s` contains one activation commitment per completed layer so far, in layer order.
 
 ### 4. `prefill.layer_token.layer_{layer_idx}.token_{token_idx}`
 
-Location: `src/phase2/tiles.rs`
+Location: `src/transformer_state_transition/tiles.rs`
+
+Protocol taxonomy:
+
+- `phase_id`: `transformer_state_transition`
+- `routine_id`: `prefill_layer`
 
 Checkpoint family:
 
@@ -233,13 +272,18 @@ Notes:
 
 ### 5. `prefill.finalize`
 
-Location: `src/phase2/mod.rs`
+Location: `src/transformer_state_transition/mod.rs`
+
+Protocol taxonomy:
+
+- `phase_id`: `transformer_state_transition`
+- `routine_id`: `prefill_finalize`
 
 When to record:
 
 - After all prefill layers finish
 - After final RMS norm and logits projection
-- Before phase 2 returns its prefill result
+- Before the transformer prefill routine returns its result
 
 Payload fields:
 
@@ -260,13 +304,18 @@ Notes:
 
 ### 6. `decode.select_token`
 
-Location: `src/phase3/mod.rs`
+Location: `src/output_decode/mod.rs`
+
+Protocol taxonomy:
+
+- `phase_id`: `output_decode`
+- `routine_id`: `select_output_token`
 
 When to record:
 
 - At the start of each decode iteration
 - After greedy token selection and append
-- Before running the phase 2 decode step for that selected token
+- Before running the transformer decode-transition routine for that selected token
 
 Payload fields:
 
@@ -287,11 +336,16 @@ Notes:
 - `full_token_ids` includes prompt + generated tokens so far, including the newly selected token.
 - `generated_token_ids` includes generated tokens only, including the newly selected token.
 - `full_token_ids_sha256` and `current_logits_sha256` use `trace::sha256_hex`.
-- `generated_token_ids_sha256` uses `build_phase3_commitment`.
+- `generated_token_ids_sha256` uses `build_output_decode_commitment`.
 
 ### 7. `decode.layer_token.layer_{layer_idx}.position_{position}`
 
-Location: `src/phase2/tiles.rs`
+Location: `src/transformer_state_transition/tiles.rs`
+
+Protocol taxonomy:
+
+- `phase_id`: `transformer_state_transition`
+- `routine_id`: `decode_transition`
 
 Checkpoint family:
 
@@ -328,11 +382,16 @@ Notes:
 
 ### 8. `decode.finalize`
 
-Location: `src/phase3/mod.rs`
+Location: `src/output_decode/mod.rs`
+
+Protocol taxonomy:
+
+- `phase_id`: `transformer_state_transition`
+- `routine_id`: `decode_transition`
 
 When to record:
 
-- After the phase 2 decode step completes for the selected token
+- After the transformer decode-transition routine completes for the selected token
 - After new logits are available for the next decode iteration
 
 Payload fields:
@@ -354,13 +413,18 @@ Notes:
 
 ### 9. `output.finalize`
 
-Location: `src/phase3/mod.rs`
+Location: `src/output_decode/mod.rs`
+
+Protocol taxonomy:
+
+- `phase_id`: `output_decode`
+- `routine_id`: `finalize_output`
 
 When to record:
 
 - When decode stops because the stop condition is satisfied
 - After generated tokens are detokenized to text
-- Before returning final phase 3 state
+- Before returning the final output-decode state
 
 Payload fields:
 
@@ -370,11 +434,11 @@ Payload fields:
 - `generated_token_ids_sha256: String`
 - `generated_text: String`
 - `generated_token_count: usize`
-- `stop_reason: Phase3StopReason`
+- `stop_reason: OutputDecodeStopReason`
 
 Notes:
 
-- `generated_token_ids_sha256` uses `build_phase3_commitment`.
+- `generated_token_ids_sha256` uses `build_output_decode_commitment`.
 - `generated_text` is committed as raw string content inside the checkpoint payload.
 
 ## Instrumentation guidance
@@ -397,7 +461,7 @@ The current checkpoint implementation is spread across:
 
 - `src/trace.rs`
 - `src/lib.rs`
-- `src/phase2/mod.rs`
-- `src/phase2/tiles.rs`
-- `src/phase3/mod.rs`
-- `src/phase3/tiles.rs`
+- `src/transformer_state_transition/mod.rs`
+- `src/transformer_state_transition/tiles.rs`
+- `src/output_decode/mod.rs`
+- `src/output_decode/tiles.rs`

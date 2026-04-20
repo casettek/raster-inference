@@ -307,7 +307,7 @@ Notes:
 - this should only include the truncation policy we truly need for inference correctness
 - keep it explicit rather than hiding it inside tokenization
 
-#### `build_phase1_debug_commitments`
+#### `build_input_embedding_debug_commitments`
 
 Purpose:
 
@@ -330,7 +330,7 @@ Notes:
 
 The first explicit composition should look roughly like this:
 
-- `seq_phase1_gemma4`
+- `seq_input_embedding_gemma4`
 
 Responsibilities:
 
@@ -339,7 +339,7 @@ Responsibilities:
 3. call `apply_gemma4_template`
 4. call `tokenize_rendered_prompt`
 5. call `truncate_prompt_tokens`
-6. optionally call `build_phase1_debug_commitments`
+6. optionally call `build_input_embedding_debug_commitments`
 7. return the phase-1 state
 
 The sequence should do no real logic beyond call ordering and value threading.

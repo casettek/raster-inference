@@ -17,11 +17,11 @@ Observed behavior from traced runs:
 
 Representative timings from recent traced runs:
 
-- `phase2.run_prefill_pass`: about 153s
-- `phase2.run_text_layers_prefill`: about 143s
-- each `phase2.decode_step`: about 66s
-- each `phase2.run_text_layers_decode_step`: about 56s
-- each `phase2.project_decode_hidden_to_logits`: about 9.6s
+- `transformer_state_transition.run_prefill_pass`: about 153s
+- `transformer_state_transition.run_text_layers_prefill`: about 143s
+- each `transformer_state_transition.decode_step`: about 66s
+- each `transformer_state_transition.run_text_layers_decode_step`: about 56s
+- each `transformer_state_transition.project_decode_hidden_to_logits`: about 9.6s
 
 ## Main Bottlenecks
 

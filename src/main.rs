@@ -1,8 +1,9 @@
 use std::{env, path::PathBuf, process};
 
 use raster_inference::{
-    load_chat_template, load_phase2_model_from_gemma_model_path, load_tokenizer_from_path,
-    run_inference, InferenceRequest, ModelSpec, SamplingConfig, TextDecodingPolicy,
+    load_chat_template, load_tokenizer_from_path,
+    load_transformer_state_model_from_gemma_model_path, run_inference, InferenceRequest, ModelSpec,
+    SamplingConfig, TextDecodingPolicy,
 };
 
 const CLI_MAX_NEW_TOKENS: usize = 3;
@@ -39,7 +40,7 @@ fn run() -> anyhow::Result<()> {
 
     let chat_template = load_chat_template(&template_path)?;
     let tokenizer = load_tokenizer_from_path(&tokenizer_path)?;
-    let phase2_model = load_phase2_model_from_gemma_model_path(&gemma_model_path)?;
+    let transformer_model = load_transformer_state_model_from_gemma_model_path(&gemma_model_path)?;
 
     let model = ModelSpec {
         model_id,
@@ -62,7 +63,7 @@ fn run() -> anyhow::Result<()> {
         },
     };
 
-    let inference_state = run_inference(&request, &model, &tokenizer, &phase2_model)?;
+    let inference_state = run_inference(&request, &model, &tokenizer, &transformer_model)?;
     println!("{}", serde_json::to_string_pretty(&inference_state)?);
 
     Ok(())

@@ -5,8 +5,8 @@ use std::{
 };
 
 use memmap2::Mmap;
-use serde::{Deserialize, Serialize};
 use safetensors::Dtype;
+use serde::{Deserialize, Serialize};
 
 fn default_embedding_scale() -> f32 {
     1.0
@@ -70,7 +70,7 @@ pub struct ActivationSequence {
 pub type EmbeddedTokenSequence = ActivationSequence;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Phase2State {
+pub struct TransformerStateTransitionState {
     pub activation_states: Vec<ActivationSequence>,
     #[serde(skip_serializing, default)]
     pub prefill_logits: PrefillLogits,
@@ -96,21 +96,21 @@ impl LayerKvCache {
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct Phase2DecodeState {
+pub struct TransformerDecodeState {
     pub layer_caches: Vec<LayerKvCache>,
     pub position: usize,
     pub token_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Phase2PrefillResult {
-    pub phase2_state: Phase2State,
-    pub decode_state: Phase2DecodeState,
+pub struct TransformerPrefillResult {
+    pub transformer_state: TransformerStateTransitionState,
+    pub transformer_decode_state: TransformerDecodeState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Phase2DecodeStepResult {
-    pub decode_state: Phase2DecodeState,
+pub struct TransformerDecodeStepResult {
+    pub transformer_decode_state: TransformerDecodeState,
     pub activation_state: ActivationSequence,
     pub prefill_logits: PrefillLogits,
 }
@@ -371,7 +371,7 @@ impl GemmaEmbeddingTensorSource {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Gemma4Phase2Model {
+pub struct Gemma4TransformerModel {
     pub embedding_table: Option<EmbeddingTable>,
     pub embedding_source: Option<GemmaEmbeddingTensorSource>,
     pub layers: Vec<Gemma4LayerWeights>,

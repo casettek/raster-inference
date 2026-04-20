@@ -4,7 +4,7 @@ use tokenizers::Tokenizer;
 use crate::trace::{trace_event, trace_scope};
 
 use self::tiles::{
-    build_gemma4_messages, build_phase1_commitment, decode_prompt_bytes, render_prompt,
+    build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes, render_prompt,
     tokenize_prompt,
 };
 
@@ -12,15 +12,15 @@ pub mod tiles;
 pub mod types;
 
 pub use types::{
-    Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, Phase1State, SamplingConfig,
+    Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, PromptPreparationState, SamplingConfig,
     TextDecodingPolicy, TextMessage,
 };
 
-pub fn run_phase1(
+pub fn run_prompt_prepare(
     request: &types::InferenceRequest,
     model: &types::ModelSpec,
     tokenizer: &Tokenizer,
-) -> Result<types::Phase1State> {
+) -> Result<types::PromptPreparationState> {
     let _trace = trace_scope("prompt.prepare");
     trace_event("prompt.decode_bytes");
     let prompt_text = decode_prompt_bytes(&request.prompt_bytes, request.text_decoding_policy)?;
@@ -32,9 +32,9 @@ pub fn run_phase1(
     let prompt_token_ids =
         tokenize_prompt(&rendered_prompt, tokenizer, request.add_special_tokens)?;
     trace_event("prompt.commitment");
-    let prompt_token_ids_sha256 = build_phase1_commitment(&prompt_token_ids)?;
+    let prompt_token_ids_sha256 = build_prompt_commitment(&prompt_token_ids)?;
 
-    Ok(types::Phase1State {
+    Ok(types::PromptPreparationState {
         prompt_text,
         prompt_token_ids,
         prompt_token_ids_sha256,

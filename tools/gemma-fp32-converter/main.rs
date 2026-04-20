@@ -57,7 +57,8 @@ impl CliArgs {
             match arg.as_str() {
                 "--input" => {
                     input = Some(PathBuf::from(
-                        args.next().ok_or_else(|| anyhow!("missing value for --input"))?,
+                        args.next()
+                            .ok_or_else(|| anyhow!("missing value for --input"))?,
                     ));
                 }
                 "--output-dir" => {
@@ -68,7 +69,8 @@ impl CliArgs {
                 }
                 "--config" => {
                     config = Some(PathBuf::from(
-                        args.next().ok_or_else(|| anyhow!("missing value for --config"))?,
+                        args.next()
+                            .ok_or_else(|| anyhow!("missing value for --config"))?,
                     ));
                 }
                 "--help" | "-h" => {
@@ -81,7 +83,8 @@ impl CliArgs {
 
         Ok(Self {
             input: input.ok_or_else(|| anyhow!("missing required --input argument"))?,
-            output_dir: output_dir.ok_or_else(|| anyhow!("missing required --output-dir argument"))?,
+            output_dir: output_dir
+                .ok_or_else(|| anyhow!("missing required --output-dir argument"))?,
             config,
         })
     }
@@ -161,9 +164,14 @@ fn convert_model_to_fp32_artifact(args: &CliArgs) -> Result<ConversionSummary> {
     for tensor in &converted_tensors {
         metadata.insert(
             tensor.name.clone(),
-            TensorView::new(Dtype::F32, tensor.shape.clone(), &tensor.bytes).with_context(|| {
-                format!("failed to build serialized tensor view for `{}`", tensor.name)
-            })?,
+            TensorView::new(Dtype::F32, tensor.shape.clone(), &tensor.bytes).with_context(
+                || {
+                    format!(
+                        "failed to build serialized tensor view for `{}`",
+                        tensor.name
+                    )
+                },
+            )?,
         );
     }
     serialize_to_file(&metadata, &None, &output_weights_path).with_context(|| {
@@ -219,7 +227,10 @@ fn resolve_source(input: &Path, config_override: Option<&Path>) -> Result<Resolv
         });
     }
 
-    if input.extension().is_some_and(|extension| extension == "safetensors") {
+    if input
+        .extension()
+        .is_some_and(|extension| extension == "safetensors")
+    {
         let config_path = match config_override {
             Some(path) => path.to_path_buf(),
             None => input
@@ -248,7 +259,10 @@ fn resolve_source(input: &Path, config_override: Option<&Path>) -> Result<Resolv
 fn prepare_output_dir(output_dir: &Path) -> Result<()> {
     if output_dir.exists() {
         if !output_dir.is_dir() {
-            bail!("output path {} exists but is not a directory", output_dir.display());
+            bail!(
+                "output path {} exists but is not a directory",
+                output_dir.display()
+            );
         }
         if fs::read_dir(output_dir)
             .with_context(|| format!("failed to read output directory {}", output_dir.display()))?
@@ -261,8 +275,9 @@ fn prepare_output_dir(output_dir: &Path) -> Result<()> {
             );
         }
     } else {
-        fs::create_dir_all(output_dir)
-            .with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
+        fs::create_dir_all(output_dir).with_context(|| {
+            format!("failed to create output directory {}", output_dir.display())
+        })?;
     }
     Ok(())
 }
@@ -325,7 +340,9 @@ fn human_bytes(bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_model_to_fp32_artifact, CliArgs, CONFIG_FILENAME, OUTPUT_WEIGHTS_FILENAME};
+    use super::{
+        convert_model_to_fp32_artifact, CliArgs, CONFIG_FILENAME, OUTPUT_WEIGHTS_FILENAME,
+    };
     use safetensors::{
         tensor::{serialize_to_file, TensorView},
         Dtype, SafeTensors,
@@ -351,7 +368,11 @@ mod tests {
         let output_dir = create_temp_dir("output");
         fs::remove_dir_all(&output_dir).unwrap();
 
-        fs::write(input_dir.join(CONFIG_FILENAME), "{\"text_config\":{\"hidden_size\":4}}").unwrap();
+        fs::write(
+            input_dir.join(CONFIG_FILENAME),
+            "{\"text_config\":{\"hidden_size\":4}}",
+        )
+        .unwrap();
         write_model_file(
             &input_dir,
             &[
@@ -381,9 +402,14 @@ mod tests {
 
         let output_raw = fs::read(output_dir.join(OUTPUT_WEIGHTS_FILENAME)).unwrap();
         let output = SafeTensors::deserialize(&output_raw).unwrap();
-        let embedding = output.tensor("model.language_model.embed_tokens.weight").unwrap();
+        let embedding = output
+            .tensor("model.language_model.embed_tokens.weight")
+            .unwrap();
         assert_eq!(embedding.dtype(), Dtype::F32);
-        assert_eq!(decode_f32_values(embedding.data()), vec![1.5, -2.0, 3.25, 4.5]);
+        assert_eq!(
+            decode_f32_values(embedding.data()),
+            vec![1.5, -2.0, 3.25, 4.5]
+        );
         let norm = output.tensor("model.language_model.norm.weight").unwrap();
         assert_eq!(norm.dtype(), Dtype::F32);
         assert_eq!(decode_f32_values(norm.data()), vec![0.5, 1.0]);
@@ -398,7 +424,11 @@ mod tests {
         fs::write(input_dir.join(CONFIG_FILENAME), "{}").unwrap();
         write_model_file(
             &input_dir,
-            &[FixtureTensor::f32("model.language_model.norm.weight", &[1], &[2.5])],
+            &[FixtureTensor::f32(
+                "model.language_model.norm.weight",
+                &[1],
+                &[2.5],
+            )],
         );
 
         let summary = convert_model_to_fp32_artifact(&CliArgs {
@@ -438,7 +468,8 @@ mod tests {
     }
 
     fn decode_f32_values(bytes: &[u8]) -> Vec<f32> {
-        bytes.chunks_exact(4)
+        bytes
+            .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
     }
@@ -473,7 +504,10 @@ mod tests {
                 name: name.to_string(),
                 dtype: Dtype::F32,
                 shape: shape.to_vec(),
-                bytes: values.iter().flat_map(|value| value.to_le_bytes()).collect(),
+                bytes: values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
             }
         }
     }

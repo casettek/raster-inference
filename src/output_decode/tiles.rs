@@ -2,14 +2,14 @@ use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use super::types::Phase3StopReason;
-use crate::phase1::SamplingConfig;
+use super::types::OutputDecodeStopReason;
+use crate::input_embedding::SamplingConfig;
 
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 
 pub fn select_next_token(logits: &[f32]) -> Result<u32> {
     if logits.is_empty() {
-        bail!("phase 3 requires at least one logit to select the next token");
+        bail!("output decode requires at least one logit to select the next token");
     }
 
     let mut best_token = 0usize;
@@ -31,8 +31,8 @@ pub fn append_token(token_ids: &[u32], next_token: u32) -> Vec<u32> {
 pub fn check_stop_condition(
     generated_token_count: usize,
     max_new_tokens: usize,
-) -> Option<Phase3StopReason> {
-    (generated_token_count >= max_new_tokens).then_some(Phase3StopReason::MaxNewTokens)
+) -> Option<OutputDecodeStopReason> {
+    (generated_token_count >= max_new_tokens).then_some(OutputDecodeStopReason::MaxNewTokens)
 }
 
 pub fn detokenize_output_tokens(tokenizer: &Tokenizer, token_ids: &[u32]) -> Result<String> {
@@ -49,21 +49,21 @@ pub fn validate_sampling_config(sampling: &SamplingConfig) -> Result<usize> {
     if let Some(temperature) = sampling.temperature {
         if (temperature - DEFAULT_TEMPERATURE).abs() > f32::EPSILON {
             bail!(
-                "phase 3 only supports deterministic greedy decode; expected temperature {DEFAULT_TEMPERATURE}, got {temperature}"
+                "output decode only supports deterministic greedy decode; expected temperature {DEFAULT_TEMPERATURE}, got {temperature}"
             );
         }
     }
     if let Some(top_k) = sampling.top_k {
-        bail!("phase 3 does not support top_k yet, got {top_k}");
+        bail!("output decode does not support top_k yet, got {top_k}");
     }
     if let Some(top_p) = sampling.top_p {
-        bail!("phase 3 does not support top_p yet, got {top_p}");
+        bail!("output decode does not support top_p yet, got {top_p}");
     }
 
     Ok(sampling.max_new_tokens.unwrap_or(0))
 }
 
-pub fn build_phase3_commitment(token_ids: &[u32]) -> Result<String> {
+pub fn build_output_decode_commitment(token_ids: &[u32]) -> Result<String> {
     let payload =
         serde_json::to_vec(token_ids).map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let digest = Sha256::digest(payload);
@@ -75,11 +75,11 @@ mod tests {
     use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
     use super::{
-        append_token, build_phase3_commitment, check_stop_condition, detokenize_output_tokens,
-        select_next_token, validate_sampling_config,
+        append_token, build_output_decode_commitment, check_stop_condition,
+        detokenize_output_tokens, select_next_token, validate_sampling_config,
     };
-    use crate::phase1::SamplingConfig;
-    use crate::phase3::Phase3StopReason;
+    use crate::input_embedding::SamplingConfig;
+    use crate::output_decode::OutputDecodeStopReason;
 
     #[test]
     fn select_next_token_returns_highest_logit_token_id() {
@@ -111,7 +111,7 @@ mod tests {
     fn check_stop_condition_finishes_at_max_new_tokens() {
         assert_eq!(
             check_stop_condition(2, 2),
-            Some(Phase3StopReason::MaxNewTokens)
+            Some(OutputDecodeStopReason::MaxNewTokens)
         );
     }
 
@@ -119,7 +119,7 @@ mod tests {
     fn check_stop_condition_immediately_finishes_when_limit_is_zero() {
         assert_eq!(
             check_stop_condition(0, 0),
-            Some(Phase3StopReason::MaxNewTokens)
+            Some(OutputDecodeStopReason::MaxNewTokens)
         );
     }
 
@@ -145,8 +145,8 @@ mod tests {
     }
 
     #[test]
-    fn build_phase3_commitment_hashes_generated_token_ids_only() {
-        let digest = build_phase3_commitment(&[4, 5]).expect("commitment should build");
+    fn build_output_decode_commitment_hashes_generated_token_ids_only() {
+        let digest = build_output_decode_commitment(&[4, 5]).expect("commitment should build");
         assert_eq!(
             digest,
             "d4c7a98da55490b0a5a65cc5057db99aa708a436609b177748505342d569457b"
