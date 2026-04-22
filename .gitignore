@@ -6,3 +6,6 @@
 # Editor settings
 .idea/
 .vscode/
+
+# Trace files
+raster-traces/
