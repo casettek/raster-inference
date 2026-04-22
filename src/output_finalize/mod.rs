@@ -8,7 +8,8 @@ pub mod tiles;
 
 pub fn run(decode_state: DecodeState, tokenizer: &Tokenizer) -> Result<OutputDecodeState> {
     let generated_token_count = decode_state.generated_token_ids.len();
-    let generated_text = tiles::detokenize_output_tokens(tokenizer, &decode_state.generated_token_ids)?;
+    let generated_text =
+        tiles::detokenize_output_tokens(tokenizer, &decode_state.generated_token_ids)?;
     let generated_token_ids_sha256 =
         tiles::build_output_decode_commitment(&decode_state.generated_token_ids)?;
     let stop_reason = crate::shared::output::OutputDecodeStopReason::MaxNewTokens;

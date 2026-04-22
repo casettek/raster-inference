@@ -2,8 +2,8 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::shared::transformer::{
-    ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel, LayerKvCache,
-    Gemma4LayerWeights,
+    ActivationSequence, Gemma4LayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
+    LayerKvCache,
 };
 use crate::trace::trace_scope;
 
@@ -75,7 +75,9 @@ pub fn run_text_layers_prefill_with_cache(
 
     Ok((
         ActivationSequence {
-            activations_sha256: crate::shared::transformer_kernels::build_activation_commitment(&xs),
+            activations_sha256: crate::shared::transformer_kernels::build_activation_commitment(
+                &xs,
+            ),
             activations: xs,
         },
         layer_caches,

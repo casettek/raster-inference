@@ -24,7 +24,8 @@ pub fn run(
     trace_event("prompt.render");
     let rendered_prompt = render_prompt(&gemma4_prompt, model)?;
     trace_event("prompt.tokenize");
-    let prompt_token_ids = tokenize_prompt(&rendered_prompt, tokenizer, request.add_special_tokens)?;
+    let prompt_token_ids =
+        tokenize_prompt(&rendered_prompt, tokenizer, request.add_special_tokens)?;
     trace_event("prompt.commitment");
     let prompt_token_ids_sha256 = build_prompt_commitment(&prompt_token_ids)?;
 

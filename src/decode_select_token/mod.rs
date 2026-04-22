@@ -6,13 +6,15 @@ use crate::shared::output::DecodeState;
 pub mod tiles;
 
 pub fn run(decode_state: &mut DecodeState, max_new_tokens: usize) -> Result<Option<u32>> {
-    if tiles::check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens).is_some() {
+    if tiles::check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens).is_some()
+    {
         return Ok(None);
     }
 
     let next_token = tiles::select_next_token(&decode_state.current_logits)?;
     decode_state.full_token_ids = tiles::append_token(&decode_state.full_token_ids, next_token);
-    decode_state.generated_token_ids = tiles::append_token(&decode_state.generated_token_ids, next_token);
+    decode_state.generated_token_ids =
+        tiles::append_token(&decode_state.generated_token_ids, next_token);
     crate::trace::trace_checkpoint(
         "decode.select_token",
         &json!({

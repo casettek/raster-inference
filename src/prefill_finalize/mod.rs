@@ -28,7 +28,8 @@ pub fn run(
         &model.logits_projection,
     )?;
     if let Some(softcap) = model.final_logit_softcapping {
-        logits = crate::shared::transformer_kernels::apply_final_logit_softcapping(&logits, softcap);
+        logits =
+            crate::shared::transformer_kernels::apply_final_logit_softcapping(&logits, softcap);
     }
     let prefill_logits = crate::shared::transformer_kernels::extract_prefill_logits(&logits);
     crate::trace::trace_checkpoint(

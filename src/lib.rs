@@ -18,6 +18,7 @@ pub mod trace;
 
 pub use checkpoints::{classify_checkpoint, CheckpointTaxonomy, PhaseId, RoutineId};
 pub use decode_select_token::run as run_decode_select_token;
+pub use decode_transition::tiles::run_text_layers_decode_step;
 pub use decode_transition::{finalize as finalize_decode_transition, run as run_decode_transition};
 pub use io::{
     load_chat_template, load_embedding_table_from_gemma_model_path, load_embedding_table_from_path,
@@ -30,6 +31,7 @@ pub use pipeline::{
 };
 pub use prefill_finalize::run as run_prefill_finalize;
 pub use prefill_layer::run as run_prefill_layer;
+pub use prefill_layer::tiles::{run_text_layers_prefill, run_text_layers_prefill_with_cache};
 pub use prefill_prepare_aux::run as run_prefill_prepare_aux;
 pub use prompt_prepare::run as run_prompt_prepare;
 pub use shared::input::{
@@ -50,8 +52,6 @@ pub use shared::transformer_kernels::{
     project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer, run_gemma4_layer_decode,
     select_final_position,
 };
-pub use decode_transition::tiles::run_text_layers_decode_step;
-pub use prefill_layer::tiles::{run_text_layers_prefill, run_text_layers_prefill_with_cache};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InputEmbeddingState {
@@ -110,8 +110,11 @@ pub fn run_inference(
                 "sampling": request.sampling.clone(),
             }),
         );
-        let ple_inputs =
-            run_prefill_prepare_aux(&prompt_preparation.prompt_token_ids, transformer_model, &token_embeddings)?;
+        let ple_inputs = run_prefill_prepare_aux(
+            &prompt_preparation.prompt_token_ids,
+            transformer_model,
+            &token_embeddings,
+        )?;
         let (final_hidden_states, layer_caches) = run_prefill_layer(
             &token_embeddings.activations,
             transformer_model,
@@ -362,7 +365,10 @@ mod tests {
             run_prompt_prepare(&request, &model, &tokenizer).expect("prompt prepare");
         let token_embeddings = embed_input_tokens(
             &prompt_preparation.prompt_token_ids,
-            transformer_model.embedding_table.as_ref().expect("embedding table"),
+            transformer_model
+                .embedding_table
+                .as_ref()
+                .expect("embedding table"),
         )
         .expect("embed tokens");
         let ple_inputs = run_prefill_prepare_aux(

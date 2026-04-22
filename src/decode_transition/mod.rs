@@ -2,7 +2,9 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::shared::output::DecodeState;
-use crate::shared::transformer::{Gemma4TransformerModel, TransformerDecodeStepResult, TransformerDecodeState};
+use crate::shared::transformer::{
+    Gemma4TransformerModel, TransformerDecodeState, TransformerDecodeStepResult,
+};
 
 pub mod tiles;
 
@@ -16,23 +18,27 @@ pub fn run(
         position,
         token_count,
     } = transformer_decode_state;
-    let embedded_token = if let Some(ref embedding_table) = model.embedding_table {
-        crate::shared::transformer_kernels::embed_input_token(next_token, embedding_table)?
-    } else if let Some(ref embedding_source) = model.embedding_source {
-        let embedded =
-            crate::io::embed_input_tokens_from_gemma_source(&[next_token], embedding_source)?;
-        embedded
-            .activations
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("transformer embedding returned no activation rows"))?
-    } else {
-        anyhow::bail!(
-            "transformer state model is missing both embedding_table and embedding_source"
-        )
-    };
-    let final_hidden_state =
-        tiles::run_text_layers_decode_step(&embedded_token, next_token, model, layer_caches, position)?;
+    let embedded_token =
+        if let Some(ref embedding_table) = model.embedding_table {
+            crate::shared::transformer_kernels::embed_input_token(next_token, embedding_table)?
+        } else if let Some(ref embedding_source) = model.embedding_source {
+            let embedded =
+                crate::io::embed_input_tokens_from_gemma_source(&[next_token], embedding_source)?;
+            embedded.activations.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("transformer embedding returned no activation rows")
+            })?
+        } else {
+            anyhow::bail!(
+                "transformer state model is missing both embedding_table and embedding_source"
+            )
+        };
+    let final_hidden_state = tiles::run_text_layers_decode_step(
+        &embedded_token,
+        next_token,
+        model,
+        layer_caches,
+        position,
+    )?;
     let prefill_logits = crate::shared::transformer_kernels::project_decode_hidden_to_logits(
         &final_hidden_state.activation_state.activations[0],
         &model.final_norm_weight,

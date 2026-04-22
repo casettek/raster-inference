@@ -9,6 +9,7 @@ path = "tools/gemma-fp32-converter/main.rs"
 
 [dependencies]
 anyhow = "1"
+fixed = "1.30.0"
 half = "2"
 memmap2 = "0.9.10"
 minijinja = "2"

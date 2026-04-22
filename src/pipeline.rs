@@ -4,8 +4,8 @@ use tokenizers::Tokenizer;
 use crate::shared::input::{PromptPreparationState, SamplingConfig};
 use crate::shared::output::OutputDecodeState;
 use crate::shared::transformer::{
-    ActivationSequence, Gemma4TransformerModel, TransformerDecodeState, TransformerDecodeStepResult,
-    TransformerPrefillResult, TransformerStateTransitionState,
+    ActivationSequence, Gemma4TransformerModel, TransformerDecodeState,
+    TransformerDecodeStepResult, TransformerPrefillResult, TransformerStateTransitionState,
 };
 use crate::trace::{trace_event, trace_scope};
 
@@ -59,7 +59,10 @@ fn run_prefill_pass_for_token_ids(
     crate::prefill_finalize::run(prompt_token_ids, model, final_hidden_states, layer_caches)
 }
 
-fn embed_token_ids(token_ids: &[u32], model: &Gemma4TransformerModel) -> Result<ActivationSequence> {
+fn embed_token_ids(
+    token_ids: &[u32],
+    model: &Gemma4TransformerModel,
+) -> Result<ActivationSequence> {
     if let Some(ref embedding_table) = model.embedding_table {
         trace_event("prefill.embed_tokens");
         crate::shared::transformer_kernels::embed_input_tokens(token_ids, embedding_table)
@@ -77,7 +80,8 @@ fn embed_token_id(token_id: u32, model: &Gemma4TransformerModel) -> Result<Vec<f
     if let Some(ref embedding_table) = model.embedding_table {
         crate::shared::transformer_kernels::embed_input_token(token_id, embedding_table)
     } else if let Some(ref embedding_source) = model.embedding_source {
-        let embedded = crate::io::embed_input_tokens_from_gemma_source(&[token_id], embedding_source)?;
+        let embedded =
+            crate::io::embed_input_tokens_from_gemma_source(&[token_id], embedding_source)?;
         embedded
             .activations
             .into_iter()
@@ -104,7 +108,10 @@ pub fn run_transformer_state_transition(
     model: &Gemma4TransformerModel,
 ) -> Result<TransformerStateTransitionState> {
     let _trace = trace_scope("prefill.from_input_embedding");
-    run_transformer_state_transition_for_token_ids(&prompt_preparation_state.prompt_token_ids, model)
+    run_transformer_state_transition_for_token_ids(
+        &prompt_preparation_state.prompt_token_ids,
+        model,
+    )
 }
 
 pub fn decode_step(
@@ -126,14 +133,13 @@ pub fn decode_step(
     ));
     let embedded_token = embed_token_id(next_token, model)?;
     trace_event("decode.layer_stack");
-    let final_hidden_state =
-        crate::decode_transition::tiles::run_text_layers_decode_step(
-            &embedded_token,
-            next_token,
-            model,
-            layer_caches,
-            position,
-        )?;
+    let final_hidden_state = crate::decode_transition::tiles::run_text_layers_decode_step(
+        &embedded_token,
+        next_token,
+        model,
+        layer_caches,
+        position,
+    )?;
     trace_event("decode.project_to_logits");
     let prefill_logits = crate::shared::transformer_kernels::project_decode_hidden_to_logits(
         &final_hidden_state.activation_state.activations[0],
@@ -166,7 +172,11 @@ pub fn run_output_decode(
     let mut decode_transition_states = Vec::new();
     let mut decode_state = crate::shared::output::DecodeState::new(
         prompt_token_ids.to_vec(),
-        initial_transformer_state.transformer_state.prefill_logits.logits.clone(),
+        initial_transformer_state
+            .transformer_state
+            .prefill_logits
+            .logits
+            .clone(),
         initial_transformer_state.transformer_decode_state.clone(),
     );
 
@@ -189,11 +199,8 @@ pub fn run_output_decode(
 
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
-        let decode_transition = crate::decode_transition::run(
-            transformer_decode_state,
-            next_token,
-            transformer_model,
-        )?;
+        let decode_transition =
+            crate::decode_transition::run(transformer_decode_state, next_token, transformer_model)?;
         decode_transition_states.push(decode_transition.activation_state.clone());
         decode_state.current_logits = decode_transition.prefill_logits.logits;
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
@@ -227,7 +234,8 @@ mod tests {
         };
         let token_embeddings =
             embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
-        let prefill = run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
+        let prefill =
+            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
 
         let output_decode_state = run_output_decode(
             &prompt_token_ids,
@@ -260,7 +268,8 @@ mod tests {
         };
         let token_embeddings =
             embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
-        let prefill = run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
+        let prefill =
+            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
 
         let output_decode_state = run_output_decode(
             &prompt_token_ids,
@@ -310,7 +319,10 @@ mod tests {
             transformer_state_transition_state.activation_states[0].activations,
             vec![vec![1.0, 1.5, 0.0, 0.0], vec![0.0, 0.5, 0.0, 0.0]]
         );
-        assert_eq!(transformer_state_transition_state.prefill_logits.logits, vec![0.0, 0.0]);
+        assert_eq!(
+            transformer_state_transition_state.prefill_logits.logits,
+            vec![0.0, 0.0]
+        );
     }
 
     #[test]
@@ -348,9 +360,9 @@ mod tests {
 
         let error = run_transformer_state_transition_for_token_ids(&[0], &model)
             .expect_err("missing embeddings should fail");
-        assert!(error
-            .to_string()
-            .contains("transformer state model is missing both embedding_table and embedding_source"));
+        assert!(error.to_string().contains(
+            "transformer state model is missing both embedding_table and embedding_source"
+        ));
     }
 
     #[test]
@@ -361,13 +373,19 @@ mod tests {
             prompt_token_ids_sha256: "unused-for-transformer_state_transition".to_string(),
         };
         let model = test_transformer_model();
-        let token_embeddings =
-            embed_input_tokens(&prompt_preparation_state.prompt_token_ids, model.embedding_table.as_ref().unwrap())
-                .unwrap();
+        let token_embeddings = embed_input_tokens(
+            &prompt_preparation_state.prompt_token_ids,
+            model.embedding_table.as_ref().unwrap(),
+        )
+        .unwrap();
 
-        let result = run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
+        let result =
+            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
 
-        assert_eq!(result.transformer_state.prefill_logits.logits, vec![0.0, 0.0]);
+        assert_eq!(
+            result.transformer_state.prefill_logits.logits,
+            vec![0.0, 0.0]
+        );
         assert_eq!(result.transformer_state.activation_states.len(), 1);
         assert_eq!(
             result.transformer_state.activation_states[0].activations,
@@ -375,8 +393,14 @@ mod tests {
         );
         assert_eq!(result.transformer_decode_state.position, 2);
         assert_eq!(result.transformer_decode_state.token_count, 2);
-        assert_eq!(result.transformer_decode_state.layer_caches.len(), model.layers.len());
-        assert_eq!(result.transformer_decode_state.layer_caches[0].current_len(), 2);
+        assert_eq!(
+            result.transformer_decode_state.layer_caches.len(),
+            model.layers.len()
+        );
+        assert_eq!(
+            result.transformer_decode_state.layer_caches[0].current_len(),
+            2
+        );
     }
 
     #[test]
@@ -390,7 +414,8 @@ mod tests {
             prompt_token_ids: token_ids.clone(),
             prompt_token_ids_sha256: "unused-for-transformer_state_transition".to_string(),
         };
-        let prefill = run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
+        let prefill =
+            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
 
         let step = decode_step(prefill.transformer_decode_state, 2, &model).unwrap();
         let replay = run_transformer_state_transition_for_token_ids(&[0, 1, 2], &model).unwrap();
@@ -398,7 +423,10 @@ mod tests {
         assert_eq!(step.prefill_logits.logits, replay.prefill_logits.logits);
         assert_eq!(step.activation_state.activations.len(), 1);
         assert_eq!(step.transformer_decode_state.position, 3);
-        assert_eq!(step.transformer_decode_state.layer_caches[0].current_len(), 3);
+        assert_eq!(
+            step.transformer_decode_state.layer_caches[0].current_len(),
+            3
+        );
     }
 
     fn test_tokenizer() -> tokenizers::Tokenizer {

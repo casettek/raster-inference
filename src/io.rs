@@ -16,8 +16,7 @@ use crate::shared::transformer::{
     ActivationSequence, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerMatrixSource,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
     Gemma4PleMatrixSource, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
-    GemmaTensorSliceSource, MatrixF32, ResolvedGemma4LayerWeights,
-    ResolvedGemma4PleLayerWeights,
+    GemmaTensorSliceSource, MatrixF32, ResolvedGemma4LayerWeights, ResolvedGemma4PleLayerWeights,
 };
 // use crate::trace::{trace_event, trace_scope};
 

@@ -52,18 +52,20 @@ pub fn run_text_layers_decode_step(
         )?;
         let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
-        let (layer_output, updated_cache) = crate::shared::transformer_kernels::run_gemma4_layer_decode(
-            &xs,
-            &resolved_layer,
-            per_layer_input.as_deref(),
-            cache,
-            donor_cache,
-            position,
-        )?;
+        let (layer_output, updated_cache) =
+            crate::shared::transformer_kernels::run_gemma4_layer_decode(
+                &xs,
+                &resolved_layer,
+                per_layer_input.as_deref(),
+                cache,
+                donor_cache,
+                position,
+            )?;
         xs = layer_output;
         updated_layer_caches.push(updated_cache);
-        completed_layer_output_sha256s
-            .push(crate::shared::transformer_kernels::build_vector_commitment(&xs));
+        completed_layer_output_sha256s.push(
+            crate::shared::transformer_kernels::build_vector_commitment(&xs),
+        );
         let mut checkpoint_layer_caches = updated_layer_caches.clone();
         checkpoint_layer_caches.extend(layer_caches.iter().skip(layer_idx + 1).cloned());
         crate::trace::trace_checkpoint(
@@ -84,7 +86,9 @@ pub fn run_text_layers_decode_step(
 
     Ok(ActivationSequenceWithCache {
         activation_state: ActivationSequence {
-            activations_sha256: crate::shared::transformer_kernels::build_activation_commitment(&[xs.clone()]),
+            activations_sha256: crate::shared::transformer_kernels::build_activation_commitment(&[
+                xs.clone(),
+            ]),
             activations: vec![xs],
         },
         layer_caches: updated_layer_caches,
