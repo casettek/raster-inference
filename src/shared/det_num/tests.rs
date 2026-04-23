@@ -2,7 +2,7 @@ use std::{mem::size_of, panic};
 
 use super::{
     acc_add_sat, acc_to_le_bytes, act_to_le_bytes, add_sat, argmax_first, clip_act, f32_to_act,
-    f32_to_wgt, mac, mul_wide, requantize, rshift_round_ties_even, sub_sat,
+    f32_to_wgt, mac, mac_bits, mul_wide, requantize, rshift_round_ties_even, sub_sat,
     types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT,
     wgt_to_le_bytes, Acc, Act, Wgt,
 };
@@ -111,6 +111,63 @@ fn mac_matches_golden_vectors() {
             )
             .to_bits(),
             case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn mac_bits_matches_mac_for_representative_vectors() {
+    struct Case {
+        name: &'static str,
+        acc_bits: i64,
+        a_bits: i32,
+        b_bits: i32,
+    }
+
+    let cases = [
+        Case {
+            name: "exact_accumulation",
+            acc_bits: 10,
+            a_bits: 3,
+            b_bits: 4,
+        },
+        Case {
+            name: "negative_product",
+            acc_bits: 25,
+            a_bits: -7,
+            b_bits: 9,
+        },
+        Case {
+            name: "full_width_product",
+            acc_bits: 123,
+            a_bits: i32::MAX,
+            b_bits: i32::MAX,
+        },
+        Case {
+            name: "positive_saturation",
+            acc_bits: i64::MAX - 3,
+            a_bits: 2,
+            b_bits: 2,
+        },
+        Case {
+            name: "negative_saturation",
+            acc_bits: i64::MIN + 3,
+            a_bits: -2,
+            b_bits: 2,
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            mac_bits(case.acc_bits, case.a_bits, case.b_bits),
+            mac(
+                Acc::from_bits(case.acc_bits),
+                Act::from_bits(case.a_bits),
+                Wgt::from_bits(case.b_bits),
+            )
+            .to_bits(),
             "{}",
             case.name
         );

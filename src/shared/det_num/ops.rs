@@ -6,9 +6,14 @@ pub fn mul_wide(a: Act, b: Wgt) -> Acc {
     Acc::from_bits(product_bits)
 }
 
+/// Computes saturating MAC directly on raw fixed-point bit patterns.
+pub fn mac_bits(acc_bits: i64, act_bits: i32, wgt_bits: i32) -> i64 {
+    acc_bits.saturating_add(i64::from(act_bits) * i64::from(wgt_bits))
+}
+
 /// Computes a canonical saturating multiply-accumulate in accumulator precision.
 pub fn mac(acc: Acc, a: Act, b: Wgt) -> Acc {
-    acc_add_sat(acc, mul_wide(a, b))
+    Acc::from_bits(mac_bits(acc.to_bits(), a.to_bits(), b.to_bits()))
 }
 
 /// Adds activation values with saturating overflow semantics.
