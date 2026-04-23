@@ -19,6 +19,13 @@ pub struct MatrixF32 {
     pub values: Vec<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetNumMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    pub values: Vec<i32>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Gemma4LayerMatrixSource {
     Materialized(Arc<MatrixF32>),
@@ -29,6 +36,7 @@ pub enum Gemma4LayerMatrixSource {
     DetNumLazy {
         source: DetNumTensorSliceSource,
         cache: Arc<Mutex<Option<Arc<MatrixF32>>>>,
+        det_cache: Arc<Mutex<Option<Arc<DetNumMatrix>>>>,
     },
 }
 
@@ -44,6 +52,7 @@ impl Gemma4LayerMatrixSource {
         Self::DetNumLazy {
             source,
             cache: Arc::new(Mutex::new(None)),
+            det_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -368,6 +377,7 @@ pub struct ResolvedGemma4LayerWeights {
     pub gate_proj: Arc<MatrixF32>,
     pub up_proj: Arc<MatrixF32>,
     pub down_proj: Arc<MatrixF32>,
+    pub down_proj_det: Option<Arc<DetNumMatrix>>,
     pub ple: Option<ResolvedGemma4PleLayerWeights>,
     pub layer_scalar: Option<f32>,
 }

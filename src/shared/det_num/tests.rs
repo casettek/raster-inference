@@ -1,9 +1,10 @@
 use std::{mem::size_of, panic};
 
 use super::{
-    acc_add_sat, acc_to_le_bytes, act_to_le_bytes, add_sat, argmax_first, clip_act, f32_to_wgt,
-    mac, mul_wide, requantize, rshift_round_ties_even, sub_sat, types::ACC_FRACTIONAL_BITS,
-    types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT, wgt_to_le_bytes, Acc, Act, Wgt,
+    acc_add_sat, acc_to_le_bytes, act_to_le_bytes, add_sat, argmax_first, clip_act, f32_to_act,
+    f32_to_wgt, mac, mul_wide, requantize, rshift_round_ties_even, sub_sat,
+    types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT,
+    wgt_to_le_bytes, Acc, Act, Wgt,
 };
 
 #[test]
@@ -652,10 +653,35 @@ fn f32_to_wgt_matches_golden_vectors() {
 }
 
 #[test]
+fn f32_to_act_matches_f32_to_wgt_for_q16_16_conversion() {
+    let samples = [
+        0.0,
+        1.5,
+        -2.25,
+        0.5 * (1.0 / 65_536.0),
+        3.5 * (1.0 / 65_536.0),
+        40_000.0,
+        -40_000.0,
+    ];
+
+    for sample in samples {
+        assert_eq!(f32_to_act(sample).to_bits(), f32_to_wgt(sample).to_bits());
+    }
+}
+
+#[test]
 fn f32_to_wgt_panics_on_non_finite_values() {
     let nan = panic::catch_unwind(|| f32_to_wgt(f32::NAN));
     assert!(nan.is_err());
     let inf = panic::catch_unwind(|| f32_to_wgt(f32::INFINITY));
+    assert!(inf.is_err());
+}
+
+#[test]
+fn f32_to_act_panics_on_non_finite_values() {
+    let nan = panic::catch_unwind(|| f32_to_act(f32::NAN));
+    assert!(nan.is_err());
+    let inf = panic::catch_unwind(|| f32_to_act(f32::INFINITY));
     assert!(inf.is_err());
 }
 

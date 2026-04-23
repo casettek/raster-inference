@@ -3,8 +3,9 @@ use rayon::prelude::*;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::shared::det_num::{f32_to_act, mac, requantize, Acc, Wgt};
 use crate::shared::transformer::{
-    ActivationSequence, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
+    ActivationSequence, DetNumMatrix, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PrefillPleInputs,
     Gemma4TransformerModel, LayerKvCache, MatrixF32, PrefillLogits, ResolvedGemma4LayerWeights,
 };
@@ -301,7 +302,10 @@ pub(crate) fn run_gemma4_layer_with_cache(
     };
     let ff_out = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.down_proj");
-        linear_sequence(&ff_hidden, layer.down_proj.as_ref())?
+        match layer.down_proj_det.as_ref() {
+            Some(weight) => det_linear_sequence(&ff_hidden, weight.as_ref())?,
+            None => linear_sequence(&ff_hidden, layer.down_proj.as_ref())?,
+        }
     };
     let ff_out = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.post_rms_norm");
@@ -421,7 +425,10 @@ pub fn run_gemma4_layer_decode(
     let gate = apply_gelu(&linear_row(&normed, layer.gate_proj.as_ref())?);
     let up = linear_row(&normed, layer.up_proj.as_ref())?;
     let ff_hidden = elementwise_mul_rows(&gate, &up)?;
-    let mut ff_out = linear_row(&ff_hidden, layer.down_proj.as_ref())?;
+    let mut ff_out = match layer.down_proj_det.as_ref() {
+        Some(weight) => det_linear_row(&ff_hidden, weight.as_ref())?,
+        None => linear_row(&ff_hidden, layer.down_proj.as_ref())?,
+    };
     ff_out = apply_rms_norm(
         &ff_out,
         &layer.post_feedforward_layernorm_weight,
@@ -1222,6 +1229,35 @@ fn linear_row(input: &[f32], weight: &MatrixF32) -> Result<Vec<f32>> {
     Ok(output)
 }
 
+fn det_linear_sequence(inputs: &[Vec<f32>], weight: &DetNumMatrix) -> Result<Vec<Vec<f32>>> {
+    validate_sequence_width(inputs, weight.cols, "deterministic linear input")?;
+    inputs
+        .iter()
+        .map(|input| det_linear_row(input, weight))
+        .collect()
+}
+
+fn det_linear_row(input: &[f32], weight: &DetNumMatrix) -> Result<Vec<f32>> {
+    validate_vector_width(input, weight.cols, "deterministic linear input")?;
+
+    let quantized_input = input.iter().copied().map(f32_to_act).collect::<Vec<_>>();
+    let mut output = vec![0.0; weight.rows];
+    for (row_idx, value) in output.iter_mut().enumerate() {
+        let row_offset = row_idx * weight.cols;
+        let mut acc = Acc::from_bits(0);
+        for (col_idx, act) in quantized_input.iter().enumerate() {
+            let wgt = Wgt::from_bits(weight.values[row_offset + col_idx]);
+            acc = mac(acc, *act, wgt);
+        }
+        *value = act_to_f32(requantize(acc));
+    }
+    Ok(output)
+}
+
+fn act_to_f32(value: crate::shared::det_num::Act) -> f32 {
+    value.to_bits() as f32 / 65_536.0
+}
+
 fn apply_rms_norm_to_sequence(
     inputs: &[Vec<f32>],
     weight: &[f32],
@@ -1484,13 +1520,15 @@ fn gelu_pytorch_tanh(value: f32) -> f32 {
 mod tests {
     use super::{
         append_kv_cache, apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs,
-        embed_input_tokens, extract_prefill_logits, project_decode_hidden_to_logits,
-        project_to_logits, run_gemma4_layer, run_text_layers_decode_step, run_text_layers_prefill,
-        run_text_layers_prefill_with_cache,
+        det_linear_row, embed_input_tokens, extract_prefill_logits,
+        project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer,
+        run_text_layers_decode_step, run_text_layers_prefill, run_text_layers_prefill_with_cache,
     };
+    use crate::shared::det_num::Act;
     use crate::shared::transformer::{
-        EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
-        Gemma4PleGlobalWeights, Gemma4PleLayerWeights, Gemma4TransformerModel, MatrixF32,
+        DetNumMatrix, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
+        Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+        Gemma4TransformerModel, MatrixF32,
     };
 
     #[test]
@@ -1562,6 +1600,54 @@ mod tests {
         assert!((heads[0][1] - 0.87758255).abs() < 1e-6);
         assert!((heads[0][3] - 0.47942555).abs() < 1e-6);
         assert_eq!(heads[0][4..], [9.0, 8.0, 7.0, 6.0]);
+    }
+
+    #[test]
+    fn det_linear_row_matches_exact_q16_dot_product() {
+        let weight = DetNumMatrix {
+            rows: 1,
+            cols: 2,
+            values: vec![Act::from_num(2).to_bits(), Act::from_num(-1).to_bits()],
+        };
+
+        let output = det_linear_row(&[1.5, -0.5], &weight).unwrap();
+
+        assert_eq!(output, vec![3.5]);
+    }
+
+    #[test]
+    fn det_linear_row_uses_ties_to_even_requantization() {
+        let weight = DetNumMatrix {
+            rows: 1,
+            cols: 1,
+            values: vec![Act::from_num(0.5).to_bits()],
+        };
+
+        let rounded_down = det_linear_row(&[1.0 / 65_536.0], &weight).unwrap();
+        let rounded_up = det_linear_row(&[3.0 / 65_536.0], &weight).unwrap();
+
+        assert_eq!(rounded_down, vec![0.0]);
+        assert_eq!(rounded_up, vec![super::act_to_f32(Act::from_bits(2))]);
+    }
+
+    #[test]
+    fn det_linear_row_differs_from_legacy_linear_row_on_rounding_boundaries() {
+        let det_weight = DetNumMatrix {
+            rows: 1,
+            cols: 1,
+            values: vec![Act::from_num(0.5).to_bits()],
+        };
+        let fp32_weight = MatrixF32 {
+            rows: 1,
+            cols: 1,
+            values: vec![0.5],
+        };
+
+        let det_output = det_linear_row(&[1.0 / 65_536.0], &det_weight).unwrap();
+        let fp32_output = super::linear_row(&[1.0 / 65_536.0], &fp32_weight).unwrap();
+
+        assert_eq!(det_output, vec![0.0]);
+        assert!(fp32_output[0] > det_output[0]);
     }
 
     #[test]

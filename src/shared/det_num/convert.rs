@@ -1,4 +1,10 @@
-use super::types::{Wgt, ACT_FRACTIONAL_BITS};
+use super::types::{Act, Wgt, ACT_FRACTIONAL_BITS};
+
+/// Converts a finite FP32 value into the canonical `det_num` v0 Q16.16 activation.
+pub fn f32_to_act(x: f32) -> Act {
+    assert!(x.is_finite(), "f32_to_act requires a finite source value");
+    Act::from_bits(f32_to_q16_16_bits(x))
+}
 
 /// Converts a finite FP32 value into the canonical `det_num` v0 Q16.16 weight.
 ///
@@ -7,10 +13,10 @@ use super::types::{Wgt, ACT_FRACTIONAL_BITS};
 /// depend on host floating-point rounding behavior.
 pub fn f32_to_wgt(x: f32) -> Wgt {
     assert!(x.is_finite(), "f32_to_wgt requires a finite source value");
-    Wgt::from_bits(f32_to_wgt_bits(x))
+    Wgt::from_bits(f32_to_q16_16_bits(x))
 }
 
-fn f32_to_wgt_bits(x: f32) -> i32 {
+fn f32_to_q16_16_bits(x: f32) -> i32 {
     let bits = x.to_bits();
     let is_negative = (bits >> 31) != 0;
     let exponent_bits = ((bits >> 23) & 0xff) as i32;

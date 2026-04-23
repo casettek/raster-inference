@@ -16,7 +16,7 @@ use crate::shared::det_num::{
     DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
 use crate::shared::transformer::{
-    ActivationSequence, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
+    ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
     Gemma4PleLayerWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource, GemmaTensorSliceSource, MatrixF32, ResolvedGemma4LayerWeights,
@@ -1206,6 +1206,7 @@ pub(crate) fn resolve_layer_weights(
         gate_proj: materialize_layer_matrix_source(&layer.gate_proj)?,
         up_proj: materialize_layer_matrix_source(&layer.up_proj)?,
         down_proj: materialize_layer_matrix_source(&layer.down_proj)?,
+        down_proj_det: materialize_det_num_layer_matrix_source(&layer.down_proj)?,
         ple: layer
             .ple
             .as_ref()
@@ -1254,7 +1255,7 @@ fn materialize_layer_matrix_source(
                 .map_err(|_| anyhow!("layer matrix cache is poisoned"))? = Some(matrix.clone());
             Ok(matrix)
         }
-        Gemma4LayerMatrixSource::DetNumLazy { source, cache } => {
+        Gemma4LayerMatrixSource::DetNumLazy { source, cache, .. } => {
             if let Some(matrix) = cache
                 .lock()
                 .map_err(|_| anyhow!("layer matrix cache is poisoned"))?
@@ -1282,6 +1283,44 @@ fn materialize_layer_matrix_source(
             Ok(matrix)
         }
     }
+}
+
+fn materialize_det_num_layer_matrix_source(
+    source: &Gemma4LayerMatrixSource,
+) -> Result<Option<std::sync::Arc<DetNumMatrix>>> {
+    let Gemma4LayerMatrixSource::DetNumLazy {
+        source, det_cache, ..
+    } = source
+    else {
+        return Ok(None);
+    };
+
+    if let Some(matrix) = det_cache
+        .lock()
+        .map_err(|_| anyhow!("deterministic layer matrix cache is poisoned"))?
+        .clone()
+    {
+        return Ok(Some(matrix));
+    }
+
+    let file = File::open(&source.weights_path).with_context(|| {
+        format!(
+            "failed to open deterministic artifact {}",
+            source.weights_path.display()
+        )
+    })?;
+    let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
+        format!(
+            "failed to mmap deterministic artifact {}",
+            source.weights_path.display()
+        )
+    })?;
+    let matrix = std::sync::Arc::new(decode_det_num_matrix_from_source(source, &mmap)?);
+    *det_cache
+        .lock()
+        .map_err(|_| anyhow!("deterministic layer matrix cache is poisoned"))? =
+        Some(matrix.clone());
+    Ok(Some(matrix))
 }
 
 fn ple_mmap_for_path(
@@ -1459,6 +1498,43 @@ fn decode_matrix_slice_from_det_num_source(
         }
     }
     Ok(MatrixF32 {
+        rows: source.row_count,
+        cols: source.col_count,
+        values,
+    })
+}
+
+fn decode_det_num_matrix_from_source(
+    source: &DetNumTensorSliceSource,
+    mmap: &Mmap,
+) -> Result<DetNumMatrix> {
+    let row_bytes = source
+        .total_cols
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
+    let mut values = Vec::with_capacity(source.row_count * source.col_count);
+    for row_idx in 0..source.row_count {
+        let global_row_idx = source.row_offset + row_idx;
+        let start = source
+            .data_offset
+            .checked_add(global_row_idx * row_bytes)
+            .and_then(|offset| offset.checked_add(source.col_offset * 4))
+            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+        let end = start
+            .checked_add(source.col_count * 4)
+            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+        let encoded_row = mmap
+            .get(start..end)
+            .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
+        for encoded_value in encoded_row.chunks_exact(4) {
+            values.push(i32::from_le_bytes(
+                encoded_value
+                    .try_into()
+                    .expect("i32 byte width should match"),
+            ));
+        }
+    }
+    Ok(DetNumMatrix {
         rows: source.row_count,
         cols: source.col_count,
         values,
@@ -2258,7 +2334,12 @@ mod tests {
         decode_embedding_rows_for_token_ids, decode_matrix_row_from_source, decode_matrix_slice,
         decode_matrix_slice_from_source, decode_single_scalar, decode_vector,
         load_ple_model_projection, load_ple_token_embedding_row,
+        load_transformer_state_model_from_det_num_wgt_path,
         load_transformer_state_model_from_gemma_model_path, parse_safetensors_metadata,
+    };
+    use crate::shared::det_num::{
+        f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
+        DET_WGT_ARTIFACT_MAGIC,
     };
     use crate::{Gemma4AttentionKind, Gemma4LogitsProjection};
     use memmap2::Mmap;
@@ -2428,6 +2509,210 @@ mod tests {
             }
             other => panic!("expected untied lm head, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_down_proj() {
+        let fp32_dir = create_test_model_dir("fp32-down-proj");
+        let det_dir = create_test_model_dir("det-down-proj");
+        let config = r#"{
+  "text_config": {
+    "enable_moe_block": false,
+    "head_dim": 2,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 4,
+    "layer_types": ["sliding_attention"],
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 1,
+    "rms_norm_eps": 0.000001,
+    "sliding_window": 2,
+    "tie_word_embeddings": false,
+    "vocab_size": 3
+  }
+}"#;
+        write_config(&fp32_dir, config);
+        write_config(&det_dir, config);
+
+        let down_proj_values = [
+            0.5, -0.25, 0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0, 0.5, 0.25,
+            -0.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0,
+        ];
+        write_model_file(
+            &fp32_dir,
+            &[
+                matrix_tensor(
+                    "model.language_model.embed_tokens.weight",
+                    &[3, 4],
+                    &[0.0; 12],
+                ),
+                matrix_tensor(
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    &[4, 4],
+                    &[0.0; 16],
+                ),
+                matrix_tensor(
+                    "model.language_model.layers.0.self_attn.k_proj.weight",
+                    &[2, 4],
+                    &[0.0; 8],
+                ),
+                matrix_tensor(
+                    "model.language_model.layers.0.self_attn.v_proj.weight",
+                    &[2, 4],
+                    &[0.0; 8],
+                ),
+                matrix_tensor(
+                    "model.language_model.layers.0.self_attn.o_proj.weight",
+                    &[4, 4],
+                    &[0.0; 16],
+                ),
+                vector_tensor(
+                    "model.language_model.layers.0.self_attn.q_norm.weight",
+                    &[2],
+                    &[1.0, 1.0],
+                ),
+                vector_tensor(
+                    "model.language_model.layers.0.self_attn.k_norm.weight",
+                    &[2],
+                    &[1.0, 1.0],
+                ),
+                vector_tensor(
+                    "model.language_model.layers.0.input_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                vector_tensor(
+                    "model.language_model.layers.0.post_attention_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                vector_tensor(
+                    "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                vector_tensor(
+                    "model.language_model.layers.0.post_feedforward_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                matrix_tensor(
+                    "model.language_model.layers.0.mlp.gate_proj.weight",
+                    &[8, 4],
+                    &[0.0; 32],
+                ),
+                matrix_tensor(
+                    "model.language_model.layers.0.mlp.up_proj.weight",
+                    &[8, 4],
+                    &[0.0; 32],
+                ),
+                matrix_tensor(
+                    "model.language_model.layers.0.mlp.down_proj.weight",
+                    &[4, 8],
+                    &down_proj_values,
+                ),
+                vector_tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
+                matrix_tensor("model.language_model.lm_head.weight", &[3, 4], &[0.0; 12]),
+            ],
+        );
+        write_detwgt_file(
+            &det_dir,
+            &[
+                det_matrix_tensor(
+                    "model.language_model.embed_tokens.weight",
+                    &[3, 4],
+                    &[0.0; 12],
+                ),
+                det_matrix_tensor(
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    &[4, 4],
+                    &[0.0; 16],
+                ),
+                det_matrix_tensor(
+                    "model.language_model.layers.0.self_attn.k_proj.weight",
+                    &[2, 4],
+                    &[0.0; 8],
+                ),
+                det_matrix_tensor(
+                    "model.language_model.layers.0.self_attn.v_proj.weight",
+                    &[2, 4],
+                    &[0.0; 8],
+                ),
+                det_matrix_tensor(
+                    "model.language_model.layers.0.self_attn.o_proj.weight",
+                    &[4, 4],
+                    &[0.0; 16],
+                ),
+                det_vector_tensor(
+                    "model.language_model.layers.0.self_attn.q_norm.weight",
+                    &[2],
+                    &[1.0, 1.0],
+                ),
+                det_vector_tensor(
+                    "model.language_model.layers.0.self_attn.k_norm.weight",
+                    &[2],
+                    &[1.0, 1.0],
+                ),
+                det_vector_tensor(
+                    "model.language_model.layers.0.input_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                det_vector_tensor(
+                    "model.language_model.layers.0.post_attention_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                det_vector_tensor(
+                    "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                det_vector_tensor(
+                    "model.language_model.layers.0.post_feedforward_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                det_matrix_tensor(
+                    "model.language_model.layers.0.mlp.gate_proj.weight",
+                    &[8, 4],
+                    &[0.0; 32],
+                ),
+                det_matrix_tensor(
+                    "model.language_model.layers.0.mlp.up_proj.weight",
+                    &[8, 4],
+                    &[0.0; 32],
+                ),
+                det_matrix_tensor(
+                    "model.language_model.layers.0.mlp.down_proj.weight",
+                    &[4, 8],
+                    &down_proj_values,
+                ),
+                det_vector_tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
+                det_matrix_tensor("model.language_model.lm_head.weight", &[3, 4], &[0.0; 12]),
+            ],
+        );
+
+        let fp32_model = load_transformer_state_model_from_gemma_model_path(&fp32_dir).unwrap();
+        let det_model = load_transformer_state_model_from_det_num_wgt_path(&det_dir).unwrap();
+        let fp32_layer = super::resolve_layer_weights(&fp32_model.layers[0]).unwrap();
+        let det_layer = super::resolve_layer_weights(&det_model.layers[0]).unwrap();
+
+        assert!(fp32_layer.down_proj_det.is_none());
+        let det_down_proj = det_layer
+            .down_proj_det
+            .expect("deterministic model should retain raw down_proj weights");
+        assert_eq!(det_down_proj.rows, 4);
+        assert_eq!(det_down_proj.cols, 8);
+        assert_eq!(
+            det_down_proj.values[0],
+            f32_to_wgt(down_proj_values[0]).to_bits()
+        );
+        assert_eq!(
+            det_down_proj.values[1],
+            f32_to_wgt(down_proj_values[1]).to_bits()
+        );
     }
 
     #[test]
@@ -2674,6 +2959,30 @@ mod tests {
         serialize_to_file(&metadata, &None, &dir.join("model.safetensors")).unwrap();
     }
 
+    fn write_detwgt_file(dir: &Path, tensors: &[FixtureTensor]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
+        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+
+        for tensor in tensors {
+            let name_bytes = tensor.name.as_bytes();
+            let element_count = tensor.shape.iter().product::<usize>() as u64;
+            bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(name_bytes);
+            bytes.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
+            for dim in &tensor.shape {
+                bytes.extend_from_slice(&(*dim as u64).to_le_bytes());
+            }
+            bytes.extend_from_slice(&element_count.to_le_bytes());
+            bytes.extend_from_slice(&(tensor.bytes.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&tensor.bytes);
+        }
+
+        fs::write(dir.join("model.detwgt"), bytes).unwrap();
+    }
+
     fn layer_tensors(layer_idx: usize, base: f32, include_v_proj: bool) -> Vec<FixtureTensor> {
         let prefix = format!("model.language_model.layers.{layer_idx}");
         let mut tensors = vec![
@@ -2777,6 +3086,22 @@ mod tests {
         }
     }
 
+    fn det_matrix_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTensor {
+        FixtureTensor {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            bytes: det_wgt_bytes(values),
+        }
+    }
+
+    fn det_vector_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTensor {
+        FixtureTensor {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            bytes: det_wgt_bytes(values),
+        }
+    }
+
     fn scalar_tensor(name: &str, value: f32) -> FixtureTensor {
         FixtureTensor {
             name: name.to_string(),
@@ -2789,6 +3114,13 @@ mod tests {
         values
             .iter()
             .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn det_wgt_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| wgt_to_le_bytes(f32_to_wgt(*value)))
             .collect()
     }
 }
