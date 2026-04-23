@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-use crate::shared::input::{PromptPreparationState, SamplingConfig};
+use crate::shared::input::{InferenceExecutionMode, PromptPreparationState, SamplingConfig};
 use crate::shared::output::OutputDecodeState;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4TransformerModel, TransformerDecodeState,
@@ -34,10 +34,25 @@ pub fn run_prefill_pass(
     model: &Gemma4TransformerModel,
     token_embeddings: &ActivationSequence,
 ) -> Result<TransformerPrefillResult> {
+    run_prefill_pass_with_mode(
+        prompt_preparation_state,
+        model,
+        token_embeddings,
+        InferenceExecutionMode::Fp32,
+    )
+}
+
+pub fn run_prefill_pass_with_mode(
+    prompt_preparation_state: &PromptPreparationState,
+    model: &Gemma4TransformerModel,
+    token_embeddings: &ActivationSequence,
+    execution_mode: InferenceExecutionMode,
+) -> Result<TransformerPrefillResult> {
     run_prefill_pass_for_token_ids(
         &prompt_preparation_state.prompt_token_ids,
         model,
         token_embeddings,
+        execution_mode,
     )
 }
 
@@ -45,6 +60,7 @@ fn run_prefill_pass_for_token_ids(
     prompt_token_ids: &[u32],
     model: &Gemma4TransformerModel,
     token_embeddings: &ActivationSequence,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerPrefillResult> {
     let _trace = trace_scope("prefill.run");
     trace_event(format!(
@@ -54,8 +70,12 @@ fn run_prefill_pass_for_token_ids(
     ));
     let ple_inputs = crate::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings)?;
     trace_event("prefill.layer_stack");
-    let (final_hidden_states, layer_caches) =
-        crate::prefill_layer::run(&token_embeddings.activations, model, ple_inputs.as_ref())?;
+    let (final_hidden_states, layer_caches) = crate::prefill_layer::run_with_mode(
+        &token_embeddings.activations,
+        model,
+        ple_inputs.as_ref(),
+        execution_mode,
+    )?;
     crate::prefill_finalize::run(prompt_token_ids, model, final_hidden_states, layer_caches)
 }
 
@@ -100,7 +120,15 @@ pub fn run_transformer_state_transition_for_token_ids(
 ) -> Result<TransformerStateTransitionState> {
     let _trace = trace_scope("prefill.from_token_ids");
     let token_embeddings = embed_token_ids(token_ids, model)?;
-    Ok(run_prefill_pass_for_token_ids(token_ids, model, &token_embeddings)?.transformer_state)
+    Ok(
+        run_prefill_pass_for_token_ids(
+            token_ids,
+            model,
+            &token_embeddings,
+            InferenceExecutionMode::Fp32,
+        )?
+        .transformer_state,
+    )
 }
 
 pub fn run_transformer_state_transition(
@@ -119,6 +147,20 @@ pub fn decode_step(
     next_token: u32,
     model: &Gemma4TransformerModel,
 ) -> Result<TransformerDecodeStepResult> {
+    decode_step_with_mode(
+        transformer_decode_state,
+        next_token,
+        model,
+        InferenceExecutionMode::Fp32,
+    )
+}
+
+pub fn decode_step_with_mode(
+    transformer_decode_state: TransformerDecodeState,
+    next_token: u32,
+    model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
+) -> Result<TransformerDecodeStepResult> {
     let _trace = trace_scope("decode.step");
     let TransformerDecodeState {
         layer_caches,
@@ -133,13 +175,24 @@ pub fn decode_step(
     ));
     let embedded_token = embed_token_id(next_token, model)?;
     trace_event("decode.layer_stack");
-    let final_hidden_state = crate::decode_transition::tiles::run_text_layers_decode_step(
-        &embedded_token,
-        next_token,
-        model,
-        layer_caches,
-        position,
-    )?;
+    let final_hidden_state = match execution_mode {
+        InferenceExecutionMode::Fp32 => crate::decode_transition::tiles::run_text_layers_decode_step(
+            &embedded_token,
+            next_token,
+            model,
+            layer_caches,
+            position,
+        )?,
+        InferenceExecutionMode::Deterministic => {
+            crate::decode_transition::deterministic_tiles::run_text_layers_decode_step(
+                &embedded_token,
+                next_token,
+                model,
+                layer_caches,
+                position,
+            )?
+        }
+    };
     trace_event("decode.project_to_logits");
     let prefill_logits = crate::shared::transformer_kernels::project_decode_hidden_to_logits(
         &final_hidden_state.activation_state.activations[0],
@@ -166,6 +219,24 @@ pub fn run_output_decode(
     sampling: &SamplingConfig,
     tokenizer: &Tokenizer,
     transformer_model: &Gemma4TransformerModel,
+) -> Result<OutputDecodeState> {
+    run_output_decode_with_mode(
+        prompt_token_ids,
+        initial_transformer_state,
+        sampling,
+        tokenizer,
+        transformer_model,
+        InferenceExecutionMode::Fp32,
+    )
+}
+
+pub fn run_output_decode_with_mode(
+    prompt_token_ids: &[u32],
+    initial_transformer_state: &TransformerPrefillResult,
+    sampling: &SamplingConfig,
+    tokenizer: &Tokenizer,
+    transformer_model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
@@ -199,8 +270,12 @@ pub fn run_output_decode(
 
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
-        let decode_transition =
-            crate::decode_transition::run(transformer_decode_state, next_token, transformer_model)?;
+        let decode_transition = crate::decode_transition::run_with_mode(
+            transformer_decode_state,
+            next_token,
+            transformer_model,
+            execution_mode,
+        )?;
         decode_transition_states.push(decode_transition.activation_state.clone());
         decode_state.current_logits = decode_transition.prefill_logits.logits;
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;

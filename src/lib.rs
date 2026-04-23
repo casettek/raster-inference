@@ -22,21 +22,24 @@ pub use decode_transition::tiles::run_text_layers_decode_step;
 pub use decode_transition::{finalize as finalize_decode_transition, run as run_decode_transition};
 pub use io::{
     load_chat_template, load_embedding_table_from_gemma_model_path, load_embedding_table_from_path,
-    load_tokenizer_from_path, load_transformer_state_model_from_gemma_model_path,
+    load_tokenizer_from_path, load_transformer_state_model_from_det_num_wgt_path,
+    load_transformer_state_model_from_gemma_model_path,
 };
 pub use output_finalize::run as run_output_finalize;
 pub use pipeline::{
-    decode_step, run_output_decode, run_prefill_pass, run_transformer_state_transition,
+    decode_step, decode_step_with_mode, run_output_decode, run_output_decode_with_mode,
+    run_prefill_pass, run_prefill_pass_with_mode, run_transformer_state_transition,
     run_transformer_state_transition_for_token_ids, validate_sampling_config,
 };
 pub use prefill_finalize::run as run_prefill_finalize;
 pub use prefill_layer::run as run_prefill_layer;
+pub use prefill_layer::run_with_mode as run_prefill_layer_with_mode;
 pub use prefill_layer::tiles::{run_text_layers_prefill, run_text_layers_prefill_with_cache};
 pub use prefill_prepare_aux::run as run_prefill_prepare_aux;
 pub use prompt_prepare::run as run_prompt_prepare;
 pub use shared::input::{
-    Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, PromptPreparationState, SamplingConfig,
-    TextDecodingPolicy, TextMessage,
+    Gemma4Prompt, InferenceExecutionMode, InferenceRequest, MessageRole, ModelSpec,
+    PromptPreparationState, SamplingConfig, TextDecodingPolicy, TextMessage,
 };
 pub use shared::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
 pub use shared::transformer::{
@@ -75,6 +78,7 @@ pub fn run_inference(
 ) -> Result<InferenceState> {
     trace::start_inference_trace(&json!({
         "model_id": model.model_id,
+        "execution_mode": request.execution_mode,
         "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
         "max_new_tokens": request.sampling.max_new_tokens,
         "transformer_layer_count": transformer_model.layers.len(),
@@ -115,10 +119,11 @@ pub fn run_inference(
             transformer_model,
             &token_embeddings,
         )?;
-        let (final_hidden_states, layer_caches) = run_prefill_layer(
+        let (final_hidden_states, layer_caches) = run_prefill_layer_with_mode(
             &token_embeddings.activations,
             transformer_model,
             ple_inputs.as_ref(),
+            request.execution_mode,
         )?;
         let prefill = run_prefill_finalize(
             &prompt_preparation.prompt_token_ids,
@@ -127,12 +132,13 @@ pub fn run_inference(
             layer_caches,
         )?;
         let mut transformer_state_transition = prefill.transformer_state.clone();
-        let output_decode = run_output_decode(
+        let output_decode = run_output_decode_with_mode(
             &prompt_preparation.prompt_token_ids,
             &prefill,
             &request.sampling,
             tokenizer,
             transformer_model,
+            request.execution_mode,
         )?;
         transformer_state_transition
             .activation_states
@@ -168,8 +174,8 @@ mod tests {
         run_decode_transition, run_inference, run_output_finalize, run_prefill_finalize,
         run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare, DecodeState,
         EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
-        Gemma4TransformerModel, InferenceRequest, MatrixF32, ModelSpec, OutputDecodeStopReason,
-        SamplingConfig, TextDecodingPolicy,
+        Gemma4TransformerModel, InferenceExecutionMode, InferenceRequest, MatrixF32, ModelSpec,
+        OutputDecodeStopReason, SamplingConfig, TextDecodingPolicy,
     };
 
     #[test]
@@ -182,6 +188,7 @@ mod tests {
             text_decoding_policy: TextDecodingPolicy::Utf8,
             add_generation_prompt: false,
             add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
             sampling: SamplingConfig {
                 max_new_tokens: Some(2),
                 temperature: Some(1.0),
@@ -222,6 +229,7 @@ mod tests {
             text_decoding_policy: TextDecodingPolicy::Utf8,
             add_generation_prompt: false,
             add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
             sampling: SamplingConfig {
                 max_new_tokens: Some(0),
                 temperature: Some(1.0),
@@ -248,6 +256,7 @@ mod tests {
             text_decoding_policy: TextDecodingPolicy::Utf8,
             add_generation_prompt: false,
             add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
             sampling: SamplingConfig {
                 max_new_tokens: Some(1),
                 temperature: Some(1.0),
@@ -271,6 +280,7 @@ mod tests {
             text_decoding_policy: TextDecodingPolicy::Utf8,
             add_generation_prompt: false,
             add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
             sampling: SamplingConfig {
                 max_new_tokens: Some(1),
                 temperature: Some(1.0),
@@ -353,6 +363,7 @@ mod tests {
             text_decoding_policy: TextDecodingPolicy::Utf8,
             add_generation_prompt: false,
             add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
             sampling: SamplingConfig {
                 max_new_tokens: Some(1),
                 temperature: Some(1.0),

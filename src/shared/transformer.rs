@@ -26,11 +26,22 @@ pub enum Gemma4LayerMatrixSource {
         source: GemmaTensorSliceSource,
         cache: Arc<Mutex<Option<Arc<MatrixF32>>>>,
     },
+    DetNumLazy {
+        source: DetNumTensorSliceSource,
+        cache: Arc<Mutex<Option<Arc<MatrixF32>>>>,
+    },
 }
 
 impl Gemma4LayerMatrixSource {
     pub fn from_source(source: GemmaTensorSliceSource) -> Self {
         Self::Lazy {
+            source,
+            cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn from_det_num_source(source: DetNumTensorSliceSource) -> Self {
+        Self::DetNumLazy {
             source,
             cache: Arc::new(Mutex::new(None)),
         }
@@ -48,6 +59,9 @@ impl PartialEq for Gemma4LayerMatrixSource {
         match (self, other) {
             (Self::Materialized(lhs), Self::Materialized(rhs)) => lhs.as_ref() == rhs.as_ref(),
             (Self::Lazy { source: lhs, .. }, Self::Lazy { source: rhs, .. }) => lhs == rhs,
+            (Self::DetNumLazy { source: lhs, .. }, Self::DetNumLazy { source: rhs, .. }) => {
+                lhs == rhs
+            }
             _ => false,
         }
     }
@@ -129,9 +143,22 @@ pub struct GemmaTensorSliceSource {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DetNumTensorSliceSource {
+    pub weights_path: PathBuf,
+    pub total_rows: usize,
+    pub total_cols: usize,
+    pub data_offset: usize,
+    pub row_offset: usize,
+    pub row_count: usize,
+    pub col_offset: usize,
+    pub col_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Gemma4PleMatrixSource {
     Materialized(MatrixF32),
     Lazy(GemmaTensorSliceSource),
+    DetNumLazy(DetNumTensorSliceSource),
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +215,30 @@ impl Gemma4PleGlobalWeights {
             model_projections
                 .into_iter()
                 .map(Gemma4PleMatrixSource::Lazy)
+                .collect(),
+            projection_norm_weight,
+            embedding_scale,
+            projection_scalar,
+            input_scale,
+        )
+    }
+
+    pub(crate) fn from_det_num_sources(
+        token_embeddings: Vec<DetNumTensorSliceSource>,
+        model_projections: Vec<DetNumTensorSliceSource>,
+        projection_norm_weight: Vec<f32>,
+        embedding_scale: f32,
+        projection_scalar: f32,
+        input_scale: f32,
+    ) -> Self {
+        Self::new(
+            token_embeddings
+                .into_iter()
+                .map(Gemma4PleMatrixSource::DetNumLazy)
+                .collect(),
+            model_projections
+                .into_iter()
+                .map(Gemma4PleMatrixSource::DetNumLazy)
                 .collect(),
             projection_norm_weight,
             embedding_scale,
@@ -354,18 +405,25 @@ pub enum GemmaEmbeddingTensorSource {
         hidden_size: usize,
         scale: f32,
     },
+    Deterministic {
+        source: DetNumTensorSliceSource,
+        scale: f32,
+    },
 }
 
 impl GemmaEmbeddingTensorSource {
     pub fn hidden_size(&self) -> usize {
         match self {
             Self::Single { hidden_size, .. } | Self::Indexed { hidden_size, .. } => *hidden_size,
+            Self::Deterministic { source, .. } => source.col_count,
         }
     }
 
     pub fn scale(&self) -> f32 {
         match self {
-            Self::Single { scale, .. } | Self::Indexed { scale, .. } => *scale,
+            Self::Single { scale, .. }
+            | Self::Indexed { scale, .. }
+            | Self::Deterministic { scale, .. } => *scale,
         }
     }
 }

@@ -33,6 +33,14 @@ pub enum TextDecodingPolicy {
     Utf8,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceExecutionMode {
+    #[default]
+    Fp32,
+    Deterministic,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SamplingConfig {
     pub max_new_tokens: Option<usize>,
@@ -68,6 +76,8 @@ pub struct InferenceRequest {
     pub text_decoding_policy: TextDecodingPolicy,
     pub add_generation_prompt: bool,
     pub add_special_tokens: bool,
+    #[serde(default)]
+    pub execution_mode: InferenceExecutionMode,
     pub sampling: SamplingConfig,
 }
 

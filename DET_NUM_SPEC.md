@@ -375,6 +375,12 @@ During migration from the current FP32 inference path:
 - measure logits drift
 - record any quality changes before replacing higher-level arithmetic operators
 
+Implementation note for this repo:
+
+- the current Phase 1 deterministic comparison path may load canonical `Wgt` bytes from `model.detwgt` and reconstruct host runtime matrices to isolate converted-weight quality effects
+- that comparison path is a migration aid only; it is **not** the final canonical end-to-end `det_num` runtime described by the rules above
+- replacing host-runtime arithmetic with full `Act` / `Wgt` / `Acc` execution remains follow-up work after converted-weight parity is validated
+
 ---
 
 ## Versioning

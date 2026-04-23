@@ -1,17 +1,33 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::shared::input::InferenceExecutionMode;
 use crate::shared::output::DecodeState;
 use crate::shared::transformer::{
     Gemma4TransformerModel, TransformerDecodeState, TransformerDecodeStepResult,
 };
 
+pub mod deterministic_tiles;
 pub mod tiles;
 
 pub fn run(
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
     model: &Gemma4TransformerModel,
+) -> Result<TransformerDecodeStepResult> {
+    run_with_mode(
+        transformer_decode_state,
+        next_token,
+        model,
+        InferenceExecutionMode::Fp32,
+    )
+}
+
+pub fn run_with_mode(
+    transformer_decode_state: TransformerDecodeState,
+    next_token: u32,
+    model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerDecodeStepResult> {
     let TransformerDecodeState {
         layer_caches,
@@ -32,13 +48,24 @@ pub fn run(
                 "transformer state model is missing both embedding_table and embedding_source"
             )
         };
-    let final_hidden_state = tiles::run_text_layers_decode_step(
-        &embedded_token,
-        next_token,
-        model,
-        layer_caches,
-        position,
-    )?;
+    let final_hidden_state = match execution_mode {
+        InferenceExecutionMode::Fp32 => tiles::run_text_layers_decode_step(
+            &embedded_token,
+            next_token,
+            model,
+            layer_caches,
+            position,
+        )?,
+        InferenceExecutionMode::Deterministic => {
+            deterministic_tiles::run_text_layers_decode_step(
+                &embedded_token,
+                next_token,
+                model,
+                layer_caches,
+                position,
+            )?
+        }
+    };
     let prefill_logits = crate::shared::transformer_kernels::project_decode_hidden_to_logits(
         &final_hidden_state.activation_state.activations[0],
         &model.final_norm_weight,

@@ -9,14 +9,14 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
-use raster_inference::shared::det_num::{f32_to_wgt, wgt_to_le_bytes};
+use raster_inference::shared::det_num::{
+    f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
+    DET_WGT_ARTIFACT_MAGIC,
+};
 use safetensors::{Dtype, SafeTensors};
 
 const CONFIG_FILENAME: &str = "config.json";
 const OUTPUT_WEIGHTS_FILENAME: &str = "model.detwgt";
-const ARTIFACT_MAGIC: &[u8; 8] = b"DNWGTV0\0";
-const ARTIFACT_FORMAT_VERSION: u32 = 0;
-const DET_NUM_SPEC_VERSION: u32 = 0;
 
 fn main() {
     if let Err(error) = run() {
@@ -345,8 +345,8 @@ fn write_tensor_payload_as_wgt(
 }
 
 fn write_artifact_header(writer: &mut impl Write, tensor_count: u64) -> Result<()> {
-    writer.write_all(ARTIFACT_MAGIC)?;
-    writer.write_all(&ARTIFACT_FORMAT_VERSION.to_le_bytes())?;
+    writer.write_all(DET_WGT_ARTIFACT_MAGIC)?;
+    writer.write_all(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes())?;
     writer.write_all(&DET_NUM_SPEC_VERSION.to_le_bytes())?;
     writer.write_all(&tensor_count.to_le_bytes())?;
     Ok(())
@@ -413,6 +413,8 @@ fn human_bytes(bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use raster_inference::load_transformer_state_model_from_det_num_wgt_path;
+
     use super::{
         convert_model_to_det_num_wgt_artifact, CliArgs, CONFIG_FILENAME, OUTPUT_WEIGHTS_FILENAME,
     };
@@ -567,6 +569,122 @@ mod tests {
 
         let tensors = parse_artifact(&bytes_a);
         assert_eq!(tensors[0].payload, vec![i32::MAX, i32::MIN, -4, 4]);
+    }
+
+    #[test]
+    fn converted_artifact_loads_via_deterministic_model_loader() {
+        let input_dir = create_temp_dir("loader-roundtrip");
+        let output_dir = create_temp_dir("loader-roundtrip-output");
+        fs::remove_dir_all(&output_dir).unwrap();
+
+        fs::write(
+            input_dir.join(CONFIG_FILENAME),
+            r#"{
+  "text_config": {
+    "enable_moe_block": false,
+    "head_dim": 2,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 4,
+    "layer_types": ["sliding_attention"],
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 1,
+    "rms_norm_eps": 0.000001,
+    "sliding_window": 2,
+    "tie_word_embeddings": false,
+    "vocab_size": 3
+  }
+}"#,
+        )
+        .unwrap();
+        write_model_file(
+            &input_dir,
+            &[
+                FixtureTensor::f32(
+                    "model.language_model.embed_tokens.weight",
+                    &[3, 4],
+                    &[0.0; 12],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    &[4, 4],
+                    &[0.0; 16],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.self_attn.k_proj.weight",
+                    &[2, 4],
+                    &[0.0; 8],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.self_attn.v_proj.weight",
+                    &[2, 4],
+                    &[0.0; 8],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.self_attn.o_proj.weight",
+                    &[4, 4],
+                    &[0.0; 16],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.self_attn.q_norm.weight",
+                    &[2],
+                    &[1.0, 1.0],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.self_attn.k_norm.weight",
+                    &[2],
+                    &[1.0, 1.0],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.input_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.post_attention_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.post_feedforward_layernorm.weight",
+                    &[4],
+                    &[1.0; 4],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.mlp.gate_proj.weight",
+                    &[8, 4],
+                    &[0.0; 32],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.mlp.up_proj.weight",
+                    &[8, 4],
+                    &[0.0; 32],
+                ),
+                FixtureTensor::f32(
+                    "model.language_model.layers.0.mlp.down_proj.weight",
+                    &[4, 8],
+                    &[0.0; 32],
+                ),
+                FixtureTensor::f32("model.language_model.norm.weight", &[4], &[1.0; 4]),
+                FixtureTensor::f32("model.language_model.lm_head.weight", &[3, 4], &[0.0; 12]),
+            ],
+        );
+
+        convert_model_to_det_num_wgt_artifact(&CliArgs {
+            input: input_dir.clone(),
+            output_dir: output_dir.clone(),
+            config: None,
+        })
+        .unwrap();
+
+        let model = load_transformer_state_model_from_det_num_wgt_path(&output_dir).unwrap();
+        assert!(model.embedding_source.is_some());
+        assert_eq!(model.layers.len(), 1);
     }
 
     fn parse_artifact(bytes: &[u8]) -> Vec<ParsedTensor> {

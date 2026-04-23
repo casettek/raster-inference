@@ -19,6 +19,7 @@ This repo only targets:
 - one serial input-to-transformer path
 - one prompt-prefill Gemma 4 text path through all decoder layers
 - one minimal output-decode greedy loop built on final-position logits
+- one opt-in deterministic weight-path for comparing converted `model.detwgt` artifacts against the FP32 baseline
 - no scheduler, server, cache manager, or framework abstraction
 
 This repo does not yet include:
@@ -88,7 +89,7 @@ For the working porting method and the first-batch tile plan, see
 
 ## CLI Smoke Test
 
-The current CLI expects local tokenizer and template artifacts plus a Gemma model path for the Gemma text weights:
+The current CLI expects local tokenizer and template artifacts plus a model path for either the default FP32 Gemma weights or the converted deterministic weight artifact:
 
 ```bash
 cargo run -- \
@@ -99,11 +100,30 @@ cargo run -- \
   "Hello from Raster"
 ```
 
-It runs the `input_embedding` prompt-preparation routine first, then immediately feeds the resulting prompt token IDs into the `transformer_state_transition` routines. For the transformer path it reads `model.language_model.embed_tokens.weight`, all Gemma text-layer weights, the final text norm, and the output projection path from the Gemma safetensors. It applies Gemma's embedding scale automatically, runs the full text prefill path, and produces final-position logits plus an explicit decode state with per-layer KV cache. The `output_decode` routine then performs deterministic greedy decode by selecting one token at a time, appending it to the explicit token sequence, and calling the incremental transformer decode-transition routine for the new token. This keeps the architecture simple while avoiding full-sequence replay on every generation step. `temperature`/`top_k`/`top_p` remain unsupported beyond accepting the current deterministic default configuration. The model path can be:
+It runs the `input_embedding` prompt-preparation routine first, then immediately feeds the resulting prompt token IDs into the `transformer_state_transition` routines. For the default FP32 path it reads `model.language_model.embed_tokens.weight`, all Gemma text-layer weights, the final text norm, and the output projection path from the Gemma safetensors. It applies Gemma's embedding scale automatically, runs the full text prefill path, and produces final-position logits plus an explicit decode state with per-layer KV cache. The `output_decode` routine then performs deterministic greedy decode by selecting one token at a time, appending it to the explicit token sequence, and calling the incremental transformer decode-transition routine for the new token. This keeps the architecture simple while avoiding full-sequence replay on every generation step. `temperature`/`top_k`/`top_p` remain unsupported beyond accepting the current deterministic default configuration. The default model path can be:
 
 - a Gemma model directory containing `model.safetensors.index.json`
 - a Gemma model directory containing a single `model.safetensors` or `consolidated.safetensors`
 - a direct path to a `.safetensors` file or `model.safetensors.index.json`
+
+The deterministic comparison path is opt-in:
+
+```bash
+cargo run -- \
+  --deterministic \
+  google/gemma-4-test \
+  /path/to/tokenizer.json \
+  /path/to/chat_template.jinja \
+  /path/to/converted-det-model \
+  "Hello from Raster"
+```
+
+When `--deterministic` is set, the model path must point to either:
+
+- a directory containing `config.json` and `model.detwgt`
+- a direct path to a `model.detwgt` file with a sibling `config.json`
+
+This Phase 1 deterministic path is a **converted-weight parity path**, not the final end-to-end `det_num` runtime. It loads canonical `Wgt` bytes from `model.detwgt`, reconstructs runtime matrices, and then runs the same high-level inference routine structure so you can compare the converted artifact against the existing FP32 baseline.
 
 The CLI prints the resulting `InferenceState` as formatted JSON with:
 
@@ -125,3 +145,16 @@ cargo run -- \
   /path/to/gemma-4-model \
   "Hello from Raster"
 ```
+
+## Comparison Workflow
+
+To validate a converted deterministic artifact against the current baseline:
+
+1. Run the prompt once against the original FP32 model path.
+2. Run the same prompt again with `--deterministic` against the converted `model.detwgt` directory.
+3. Compare:
+   - `output_decode.generated_text`
+   - `output_decode.generated_token_ids_sha256`
+   - `transformer_state_transition.prefill_logits.final_logits_sha256`
+
+For small deterministic fixtures, exact agreement is the target. For real converted Gemma checkpoints, Phase 1 is meant to show whether the converted weight format preserves output quality closely enough before the repo switches to a full `det_num` arithmetic path.
