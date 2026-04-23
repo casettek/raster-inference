@@ -294,7 +294,10 @@ pub(crate) fn run_gemma4_layer_with_cache(
     };
     let up = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.up_proj");
-        linear_sequence(&normed, layer.up_proj.as_ref())?
+        match layer.up_proj_det.as_ref() {
+            Some(weight) => det_linear_sequence(&normed, weight.as_ref())?,
+            None => linear_sequence(&normed, layer.up_proj.as_ref())?,
+        }
     };
     let ff_hidden = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.hidden_mul");
@@ -423,7 +426,10 @@ pub fn run_gemma4_layer_decode(
         layer.rms_norm_eps,
     )?;
     let gate = apply_gelu(&linear_row(&normed, layer.gate_proj.as_ref())?);
-    let up = linear_row(&normed, layer.up_proj.as_ref())?;
+    let up = match layer.up_proj_det.as_ref() {
+        Some(weight) => det_linear_row(&normed, weight.as_ref())?,
+        None => linear_row(&normed, layer.up_proj.as_ref())?,
+    };
     let ff_hidden = elementwise_mul_rows(&gate, &up)?;
     let mut ff_out = match layer.down_proj_det.as_ref() {
         Some(weight) => det_linear_row(&ff_hidden, weight.as_ref())?,
@@ -1518,6 +1524,8 @@ fn gelu_pytorch_tanh(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         append_kv_cache, apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs,
         det_linear_row, embed_input_tokens, extract_prefill_logits,
@@ -1689,6 +1697,107 @@ mod tests {
             run_gemma4_layer(&activations, &resolved_layer, None).expect("layer should succeed");
 
         assert_eq!(output.activations, activations);
+    }
+
+    #[test]
+    fn run_gemma4_layer_uses_det_up_proj_before_hidden_mul() {
+        let activations = vec![vec![1.0, 0.0, 0.0, 0.0]];
+        let layer = Gemma4LayerWeights {
+            attention_kind: Gemma4AttentionKind::Sliding,
+            hidden_size: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            sliding_window: Some(2),
+            cache_sliding_window: Some(2),
+            rms_norm_eps: 1e-6,
+            rope_base: 10_000.0,
+            partial_rotary_dim: 2,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
+            attention_k_eq_v: false,
+            q_proj: zero_matrix(4, 4).into(),
+            k_proj: zero_matrix(2, 4).into(),
+            v_proj: Some(zero_matrix(2, 4).into()),
+            o_proj: zero_matrix(4, 4).into(),
+            q_norm_weight: vec![1.0, 1.0],
+            k_norm_weight: vec![1.0, 1.0],
+            input_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight: vec![1.0; 4],
+            gate_proj: MatrixF32 {
+                rows: 8,
+                cols: 4,
+                values: vec![
+                    0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+            }
+            .into(),
+            up_proj: zero_matrix(8, 4).into(),
+            down_proj: MatrixF32 {
+                rows: 4,
+                cols: 8,
+                values: vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+            }
+            .into(),
+            ple: None,
+            layer_scalar: None,
+        };
+
+        let resolved_without_det =
+            crate::io::resolve_layer_weights(&layer).expect("resolve fp32-only layer");
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.up_proj_det = Some(Arc::new(DetNumMatrix {
+            rows: 8,
+            cols: 4,
+            values: vec![
+                Act::from_num(0.5).to_bits(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        }));
+
+        let without_det =
+            run_gemma4_layer(&activations, &resolved_without_det, None).expect("run fp32 path");
+        let with_det =
+            run_gemma4_layer(&activations, &resolved_with_det, None).expect("run det up_proj");
+
+        assert_eq!(without_det.activations, vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        assert!(with_det.activations[0][0] > without_det.activations[0][0]);
     }
 
     #[test]

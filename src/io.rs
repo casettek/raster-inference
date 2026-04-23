@@ -1206,6 +1206,7 @@ pub(crate) fn resolve_layer_weights(
         gate_proj: materialize_layer_matrix_source(&layer.gate_proj)?,
         up_proj: materialize_layer_matrix_source(&layer.up_proj)?,
         down_proj: materialize_layer_matrix_source(&layer.down_proj)?,
+        up_proj_det: materialize_det_num_layer_matrix_source(&layer.up_proj)?,
         down_proj_det: materialize_det_num_layer_matrix_source(&layer.down_proj)?,
         ple: layer
             .ple
@@ -2512,9 +2513,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_down_proj() {
-        let fp32_dir = create_test_model_dir("fp32-down-proj");
-        let det_dir = create_test_model_dir("det-down-proj");
+    fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_mlp_projections() {
+        let fp32_dir = create_test_model_dir("fp32-mlp-proj");
+        let det_dir = create_test_model_dir("det-mlp-proj");
         let config = r#"{
   "text_config": {
     "enable_moe_block": false,
@@ -2534,6 +2535,11 @@ mod tests {
         write_config(&fp32_dir, config);
         write_config(&det_dir, config);
 
+        let up_proj_values = [
+            0.25, -0.5, 0.75, -1.0, 0.5, -0.25, 0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5,
+            -0.75, 0.0, 0.5, 0.25, -0.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0,
+        ];
         let down_proj_values = [
             0.5, -0.25, 0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0, 0.5, 0.25,
             -0.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -2605,7 +2611,7 @@ mod tests {
                 matrix_tensor(
                     "model.language_model.layers.0.mlp.up_proj.weight",
                     &[8, 4],
-                    &[0.0; 32],
+                    &up_proj_values,
                 ),
                 matrix_tensor(
                     "model.language_model.layers.0.mlp.down_proj.weight",
@@ -2682,7 +2688,7 @@ mod tests {
                 det_matrix_tensor(
                     "model.language_model.layers.0.mlp.up_proj.weight",
                     &[8, 4],
-                    &[0.0; 32],
+                    &up_proj_values,
                 ),
                 det_matrix_tensor(
                     "model.language_model.layers.0.mlp.down_proj.weight",
@@ -2699,10 +2705,24 @@ mod tests {
         let fp32_layer = super::resolve_layer_weights(&fp32_model.layers[0]).unwrap();
         let det_layer = super::resolve_layer_weights(&det_model.layers[0]).unwrap();
 
+        assert!(fp32_layer.up_proj_det.is_none());
         assert!(fp32_layer.down_proj_det.is_none());
+        let det_up_proj = det_layer
+            .up_proj_det
+            .expect("deterministic model should retain raw up_proj weights");
         let det_down_proj = det_layer
             .down_proj_det
             .expect("deterministic model should retain raw down_proj weights");
+        assert_eq!(det_up_proj.rows, 8);
+        assert_eq!(det_up_proj.cols, 4);
+        assert_eq!(
+            det_up_proj.values[0],
+            f32_to_wgt(up_proj_values[0]).to_bits()
+        );
+        assert_eq!(
+            det_up_proj.values[1],
+            f32_to_wgt(up_proj_values[1]).to_bits()
+        );
         assert_eq!(det_down_proj.rows, 4);
         assert_eq!(det_down_proj.cols, 8);
         assert_eq!(

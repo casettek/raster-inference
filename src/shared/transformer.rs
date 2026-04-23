@@ -377,6 +377,7 @@ pub struct ResolvedGemma4LayerWeights {
     pub gate_proj: Arc<MatrixF32>,
     pub up_proj: Arc<MatrixF32>,
     pub down_proj: Arc<MatrixF32>,
+    pub up_proj_det: Option<Arc<DetNumMatrix>>,
     pub down_proj_det: Option<Arc<DetNumMatrix>>,
     pub ple: Option<ResolvedGemma4PleLayerWeights>,
     pub layer_scalar: Option<f32>,
