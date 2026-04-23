@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerDecodeState,
     TransformerPrefillResult, TransformerStateTransitionState,
@@ -12,6 +13,7 @@ pub fn run(
     model: &Gemma4TransformerModel,
     final_hidden_states: ActivationSequence,
     layer_caches: Vec<LayerKvCache>,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerPrefillResult> {
     trace_event("prefill.apply_final_norm");
     let normalized_hidden_states = crate::shared::transformer_kernels::apply_final_norm(
@@ -26,6 +28,8 @@ pub fn run(
     let mut logits = crate::shared::transformer_kernels::project_to_logits(
         &final_position,
         &model.logits_projection,
+        model.embedding_source.as_ref(),
+        execution_mode,
     )?;
     if let Some(softcap) = model.final_logit_softcapping {
         logits =

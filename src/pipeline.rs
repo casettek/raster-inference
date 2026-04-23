@@ -76,7 +76,13 @@ fn run_prefill_pass_for_token_ids(
         ple_inputs.as_ref(),
         execution_mode,
     )?;
-    crate::prefill_finalize::run(prompt_token_ids, model, final_hidden_states, layer_caches)
+    crate::prefill_finalize::run(
+        prompt_token_ids,
+        model,
+        final_hidden_states,
+        layer_caches,
+        execution_mode,
+    )
 }
 
 fn embed_token_ids(
@@ -199,6 +205,8 @@ pub fn decode_step_with_mode(
         &model.final_norm_weight,
         model.rms_norm_eps,
         &model.logits_projection,
+        model.embedding_source.as_ref(),
+        execution_mode,
         model.final_logit_softcapping,
     )?;
 
@@ -428,7 +436,10 @@ mod tests {
             layers: vec![],
             ple_global: None,
             final_norm_weight: vec![],
-            logits_projection: Gemma4LogitsProjection::UntiedLmHead(zero_matrix(0, 0)),
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(0, 0),
+                det_weight: None,
+            },
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
         };
@@ -565,11 +576,14 @@ mod tests {
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
-            logits_projection: Gemma4LogitsProjection::UntiedLmHead(MatrixF32 {
-                rows: 3,
-                cols: 4,
-                values: vec![0.7, 0.1, 0.2, 0.0, 0.0, 0.8, 0.1, 0.1, 0.2, 0.0, 0.8, 0.2],
-            }),
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: MatrixF32 {
+                    rows: 3,
+                    cols: 4,
+                    values: vec![0.7, 0.1, 0.2, 0.0, 0.0, 0.8, 0.1, 0.1, 0.2, 0.0, 0.8, 0.2],
+                },
+                det_weight: None,
+            },
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
         }
@@ -614,7 +628,10 @@ mod tests {
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
-            logits_projection: Gemma4LogitsProjection::UntiedLmHead(zero_matrix(2, 4)),
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(2, 4),
+                det_weight: None,
+            },
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
         }
@@ -729,11 +746,14 @@ mod tests {
             }],
             ple_global,
             final_norm_weight: vec![1.0; 4],
-            logits_projection: Gemma4LogitsProjection::UntiedLmHead(MatrixF32 {
-                rows: 3,
-                cols: 4,
-                values: vec![0.7, 0.1, 0.2, 0.0, 0.0, 0.8, 0.1, 0.1, 0.2, 0.0, 0.8, 0.2],
-            }),
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: MatrixF32 {
+                    rows: 3,
+                    cols: 4,
+                    values: vec![0.7, 0.1, 0.2, 0.0, 0.0, 0.8, 0.1, 0.1, 0.2, 0.0, 0.8, 0.2],
+                },
+                det_weight: None,
+            },
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
         }

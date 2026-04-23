@@ -922,9 +922,10 @@ pub fn load_transformer_state_model_from_gemma_model_path<P: AsRef<Path>>(
     let logits_projection = if config.tie_word_embeddings() {
         Gemma4LogitsProjection::TiedEmbedding(reader.load_matrix(&embedding_tensor_name)?)
     } else {
-        Gemma4LogitsProjection::UntiedLmHead(
-            reader.load_matrix("model.language_model.lm_head.weight")?,
-        )
+        Gemma4LogitsProjection::UntiedLmHead {
+            weight: reader.load_matrix("model.language_model.lm_head.weight")?,
+            det_weight: None,
+        }
     };
     let embedding_source = build_embedding_source(&reader, &embedding_tensor_name, hidden_size);
 
@@ -991,9 +992,13 @@ pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
     let logits_projection = if config.tie_word_embeddings() {
         Gemma4LogitsProjection::TiedEmbedding(reader.load_matrix(&embedding_tensor_name)?)
     } else {
-        Gemma4LogitsProjection::UntiedLmHead(
-            reader.load_matrix("model.language_model.lm_head.weight")?,
-        )
+        Gemma4LogitsProjection::UntiedLmHead {
+            weight: reader.load_matrix("model.language_model.lm_head.weight")?,
+            det_weight: Some(std::sync::Arc::new(decode_det_num_matrix_from_source(
+                &reader.resolve_full_matrix_source("model.language_model.lm_head.weight")?,
+                reader.mmap.as_ref(),
+            )?)),
+        }
     };
 
     Ok(Gemma4TransformerModel {
@@ -1799,7 +1804,7 @@ pub fn embed_input_tokens_from_gemma_source(
     }
 
     let activations = match source {
-        GemmaEmbeddingTensorSource::Deterministic { source, scale } => {
+        GemmaEmbeddingTensorSource::Deterministic { source, scale, .. } => {
             let file = File::open(&source.weights_path).with_context(|| {
                 format!(
                     "failed to open deterministic artifact {}",
@@ -1845,7 +1850,11 @@ fn build_det_num_embedding_source(
     let scale = (source.col_count as f32).sqrt();
     Ok((
         tensor_name,
-        GemmaEmbeddingTensorSource::Deterministic { source, scale },
+        GemmaEmbeddingTensorSource::Deterministic {
+            source,
+            scale,
+            det_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        },
     ))
 }
 
@@ -2010,6 +2019,44 @@ fn load_full_embedding_table_from_source(
         rows,
         scale: source.scale(),
     })
+}
+
+pub(crate) fn materialize_det_num_embedding_matrix(
+    source: &GemmaEmbeddingTensorSource,
+) -> Result<Option<std::sync::Arc<DetNumMatrix>>> {
+    let (source, det_cache) = match source {
+        GemmaEmbeddingTensorSource::Deterministic {
+            source, det_cache, ..
+        } => (source, det_cache),
+        _ => return Ok(None),
+    };
+
+    if let Some(matrix) = det_cache
+        .lock()
+        .map_err(|_| anyhow!("deterministic embedding cache lock poisoned"))?
+        .clone()
+    {
+        return Ok(Some(matrix));
+    }
+
+    let file = File::open(&source.weights_path).with_context(|| {
+        format!(
+            "failed to open deterministic artifact {}",
+            source.weights_path.display()
+        )
+    })?;
+    let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
+        format!(
+            "failed to mmap deterministic artifact {}",
+            source.weights_path.display()
+        )
+    })?;
+    let matrix = std::sync::Arc::new(decode_det_num_matrix_from_source(source, &mmap)?);
+    *det_cache
+        .lock()
+        .map_err(|_| anyhow!("deterministic embedding cache lock poisoned"))? =
+        Some(matrix.clone());
+    Ok(Some(matrix))
 }
 
 fn with_embedding_tensor<T>(
@@ -2514,9 +2561,10 @@ mod tests {
         assert_eq!(model.final_norm_weight, vec![1.0, 1.0, 1.0, 1.0]);
         assert_eq!(model.final_logit_softcapping, Some(7.5));
         match &model.logits_projection {
-            Gemma4LogitsProjection::UntiedLmHead(weight) => {
+            Gemma4LogitsProjection::UntiedLmHead { weight, det_weight } => {
                 assert_eq!(weight.rows, 3);
                 assert_eq!(weight.cols, 4);
+                assert!(det_weight.is_none());
             }
             other => panic!("expected untied lm head, got {other:?}"),
         }
@@ -2554,6 +2602,9 @@ mod tests {
         let o_proj_values = [
             -0.5, 0.25, -0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0, 0.5, 0.25,
             -0.125, 0.0,
+        ];
+        let lm_head_values = [
+            0.5, -0.25, 0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0,
         ];
         let gate_proj_values = [
             0.5, -0.25, 0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0, 0.5, 0.25,
@@ -2644,7 +2695,11 @@ mod tests {
                     &down_proj_values,
                 ),
                 vector_tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
-                matrix_tensor("model.language_model.lm_head.weight", &[3, 4], &[0.0; 12]),
+                matrix_tensor(
+                    "model.language_model.lm_head.weight",
+                    &[3, 4],
+                    &lm_head_values,
+                ),
             ],
         );
         write_detwgt_file(
@@ -2721,7 +2776,11 @@ mod tests {
                     &down_proj_values,
                 ),
                 det_vector_tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
-                det_matrix_tensor("model.language_model.lm_head.weight", &[3, 4], &[0.0; 12]),
+                det_matrix_tensor(
+                    "model.language_model.lm_head.weight",
+                    &[3, 4],
+                    &lm_head_values,
+                ),
             ],
         );
 
@@ -2729,6 +2788,23 @@ mod tests {
         let det_model = load_transformer_state_model_from_det_num_wgt_path(&det_dir).unwrap();
         let fp32_layer = super::resolve_layer_weights(&fp32_model.layers[0]).unwrap();
         let det_layer = super::resolve_layer_weights(&det_model.layers[0]).unwrap();
+        let fp32_lm_head = match &fp32_model.logits_projection {
+            Gemma4LogitsProjection::UntiedLmHead { weight, det_weight } => {
+                assert!(det_weight.is_none());
+                weight
+            }
+            other => panic!("expected untied lm head, got {other:?}"),
+        };
+        let det_lm_head = match &det_model.logits_projection {
+            Gemma4LogitsProjection::UntiedLmHead { weight, det_weight } => {
+                assert_eq!(weight.rows, 3);
+                assert_eq!(weight.cols, 4);
+                det_weight
+                    .as_ref()
+                    .expect("deterministic model should retain raw lm_head weights")
+            }
+            other => panic!("expected untied lm head, got {other:?}"),
+        };
 
         assert!(fp32_layer.q_proj_det.is_none());
         assert!(fp32_layer.k_proj_det.is_none());
@@ -2774,6 +2850,17 @@ mod tests {
         assert_eq!(det_o_proj.cols, 4);
         assert_eq!(det_o_proj.values[0], f32_to_wgt(o_proj_values[0]).to_bits());
         assert_eq!(det_o_proj.values[1], f32_to_wgt(o_proj_values[1]).to_bits());
+        assert_eq!(fp32_lm_head.values[0], lm_head_values[0]);
+        assert_eq!(det_lm_head.rows, 3);
+        assert_eq!(det_lm_head.cols, 4);
+        assert_eq!(
+            det_lm_head.values[0],
+            f32_to_wgt(lm_head_values[0]).to_bits()
+        );
+        assert_eq!(
+            det_lm_head.values[1],
+            f32_to_wgt(lm_head_values[1]).to_bits()
+        );
         assert_eq!(det_gate_proj.rows, 8);
         assert_eq!(det_gate_proj.cols, 4);
         assert_eq!(

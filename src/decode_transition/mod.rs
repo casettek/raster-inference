@@ -69,6 +69,8 @@ pub fn run_with_mode(
         &model.final_norm_weight,
         model.rms_norm_eps,
         &model.logits_projection,
+        model.embedding_source.as_ref(),
+        execution_mode,
         model.final_logit_softcapping,
     )?;
 

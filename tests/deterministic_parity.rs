@@ -126,7 +126,9 @@ fn deterministic_loader_reconstructs_tied_embedding_projection() {
             assert_eq!(matrix.rows, 3);
             assert_eq!(matrix.cols, 4);
         }
-        Gemma4LogitsProjection::UntiedLmHead(_) => panic!("expected tied embedding projection"),
+        Gemma4LogitsProjection::UntiedLmHead { .. } => {
+            panic!("expected tied embedding projection")
+        }
     }
 }
 
@@ -279,6 +281,18 @@ fn deterministic_mode_matches_fp32_path_on_representable_fixture() {
     let tokenizer = test_tokenizer();
     let fp32_model = load_transformer_state_model_from_gemma_model_path(&fp32_dir).unwrap();
     let det_model = load_transformer_state_model_from_det_num_wgt_path(&det_dir).unwrap();
+    match &fp32_model.logits_projection {
+        Gemma4LogitsProjection::UntiedLmHead { det_weight, .. } => {
+            assert!(det_weight.is_none());
+        }
+        other => panic!("expected untied lm head, got {other:?}"),
+    }
+    match &det_model.logits_projection {
+        Gemma4LogitsProjection::UntiedLmHead { det_weight, .. } => {
+            assert!(det_weight.is_some());
+        }
+        other => panic!("expected untied lm head, got {other:?}"),
+    }
 
     let fp32_state = run_inference(
         &InferenceRequest {

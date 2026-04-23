@@ -395,7 +395,10 @@ pub struct Gemma4PrefillPleInputs {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Gemma4LogitsProjection {
-    UntiedLmHead(MatrixF32),
+    UntiedLmHead {
+        weight: MatrixF32,
+        det_weight: Option<Arc<DetNumMatrix>>,
+    },
     TiedEmbedding(MatrixF32),
 }
 
@@ -406,7 +409,7 @@ pub struct PrefillLogits {
     pub final_logits_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum GemmaEmbeddingTensorSource {
     Single {
         weights_path: PathBuf,
@@ -424,6 +427,7 @@ pub enum GemmaEmbeddingTensorSource {
     Deterministic {
         source: DetNumTensorSliceSource,
         scale: f32,
+        det_cache: Arc<Mutex<Option<Arc<DetNumMatrix>>>>,
     },
 }
 
@@ -440,6 +444,67 @@ impl GemmaEmbeddingTensorSource {
             Self::Single { scale, .. }
             | Self::Indexed { scale, .. }
             | Self::Deterministic { scale, .. } => *scale,
+        }
+    }
+}
+
+impl PartialEq for GemmaEmbeddingTensorSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Single {
+                    weights_path: lhs_weights_path,
+                    tensor_name: lhs_tensor_name,
+                    hidden_size: lhs_hidden_size,
+                    scale: lhs_scale,
+                },
+                Self::Single {
+                    weights_path: rhs_weights_path,
+                    tensor_name: rhs_tensor_name,
+                    hidden_size: rhs_hidden_size,
+                    scale: rhs_scale,
+                },
+            ) => {
+                lhs_weights_path == rhs_weights_path
+                    && lhs_tensor_name == rhs_tensor_name
+                    && lhs_hidden_size == rhs_hidden_size
+                    && lhs_scale == rhs_scale
+            }
+            (
+                Self::Indexed {
+                    root_dir: lhs_root_dir,
+                    weight_map: lhs_weight_map,
+                    tensor_name: lhs_tensor_name,
+                    hidden_size: lhs_hidden_size,
+                    scale: lhs_scale,
+                },
+                Self::Indexed {
+                    root_dir: rhs_root_dir,
+                    weight_map: rhs_weight_map,
+                    tensor_name: rhs_tensor_name,
+                    hidden_size: rhs_hidden_size,
+                    scale: rhs_scale,
+                },
+            ) => {
+                lhs_root_dir == rhs_root_dir
+                    && lhs_weight_map == rhs_weight_map
+                    && lhs_tensor_name == rhs_tensor_name
+                    && lhs_hidden_size == rhs_hidden_size
+                    && lhs_scale == rhs_scale
+            }
+            (
+                Self::Deterministic {
+                    source: lhs_source,
+                    scale: lhs_scale,
+                    ..
+                },
+                Self::Deterministic {
+                    source: rhs_source,
+                    scale: rhs_scale,
+                    ..
+                },
+            ) => lhs_source == rhs_source && lhs_scale == rhs_scale,
+            _ => false,
         }
     }
 }

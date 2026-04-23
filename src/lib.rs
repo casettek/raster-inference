@@ -207,6 +207,7 @@ pub fn run_inference_with_controls(
                 transformer_model,
                 final_hidden_states,
                 layer_caches,
+                request.execution_mode,
             )?;
             let mut transformer_state_transition = prefill.transformer_state.clone();
             if should_stop_at_checkpoint(controls, "prefill.finalize") {
@@ -601,6 +602,7 @@ mod tests {
             &transformer_model,
             final_hidden_states,
             layer_caches,
+            InferenceExecutionMode::Fp32,
         )
         .expect("prefill finalize");
 
@@ -700,7 +702,10 @@ mod tests {
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
-            logits_projection: Gemma4LogitsProjection::UntiedLmHead(zero_matrix(3, 4)),
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(3, 4),
+                det_weight: None,
+            },
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
         }

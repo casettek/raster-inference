@@ -4,10 +4,12 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::shared::det_num::{f32_to_act, mac_bits, requantize, Acc, Act};
+use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
     ActivationSequence, DetNumMatrix, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PrefillPleInputs,
-    Gemma4TransformerModel, LayerKvCache, MatrixF32, PrefillLogits, ResolvedGemma4LayerWeights,
+    Gemma4TransformerModel, GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, PrefillLogits,
+    ResolvedGemma4LayerWeights,
 };
 use crate::trace::trace_scope;
 
@@ -729,13 +731,44 @@ pub fn select_final_position(input_activations: &[Vec<f32>]) -> Result<Vec<f32>>
 pub fn project_to_logits(
     last_hidden_state: &[f32],
     projection: &Gemma4LogitsProjection,
+    embedding_source: Option<&GemmaEmbeddingTensorSource>,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<Vec<f32>> {
     // let _trace = trace_scope("transformer_state_transition.project_to_logits");
     let weight = match projection {
-        Gemma4LogitsProjection::UntiedLmHead(weight)
+        Gemma4LogitsProjection::UntiedLmHead { weight, .. }
         | Gemma4LogitsProjection::TiedEmbedding(weight) => weight,
     };
     validate_vector_width(last_hidden_state, weight.cols, "logits projection input")?;
+
+    if execution_mode == InferenceExecutionMode::Deterministic {
+        let quantized_hidden_state = last_hidden_state
+            .iter()
+            .copied()
+            .map(f32_to_act)
+            .collect::<Vec<_>>();
+        match projection {
+            Gemma4LogitsProjection::UntiedLmHead {
+                det_weight: Some(det_weight),
+                ..
+            } => return det_linear_row_from_acts(&quantized_hidden_state, det_weight.as_ref()),
+            Gemma4LogitsProjection::TiedEmbedding(_) => {
+                if let Some(embedding_source) = embedding_source {
+                    if let Some(det_weight) =
+                        crate::io::materialize_det_num_embedding_matrix(embedding_source)?
+                    {
+                        return det_linear_row_from_acts(
+                            &quantized_hidden_state,
+                            det_weight.as_ref(),
+                        );
+                    }
+                }
+            }
+            Gemma4LogitsProjection::UntiedLmHead {
+                det_weight: None, ..
+            } => {}
+        }
+    }
 
     let mut logits = vec![0.0; weight.rows];
     for (row_idx, logit) in logits.iter_mut().enumerate() {
@@ -770,11 +803,13 @@ pub fn project_decode_hidden_to_logits(
     final_norm_weight: &[f32],
     rms_norm_eps: f32,
     projection: &Gemma4LogitsProjection,
+    embedding_source: Option<&GemmaEmbeddingTensorSource>,
+    execution_mode: InferenceExecutionMode,
     final_logit_softcapping: Option<f32>,
 ) -> Result<PrefillLogits> {
     // let _trace = trace_scope("transformer_state_transition.project_decode_hidden_to_logits");
     let normalized = apply_rms_norm(hidden_state, final_norm_weight, rms_norm_eps)?;
-    let mut logits = project_to_logits(&normalized, projection)?;
+    let mut logits = project_to_logits(&normalized, projection, embedding_source, execution_mode)?;
     if let Some(softcap) = final_logit_softcapping {
         logits = apply_final_logit_softcapping(&logits, softcap);
     }
@@ -1686,7 +1721,11 @@ fn gelu_pytorch_tanh(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::{
         append_kv_cache, apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs,
@@ -1695,11 +1734,16 @@ mod tests {
         run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
         run_text_layers_decode_step, run_text_layers_prefill, run_text_layers_prefill_with_cache,
     };
-    use crate::shared::det_num::Act;
+    use crate::shared::det_num::{
+        f32_to_wgt, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
+        DET_WGT_ARTIFACT_MAGIC,
+    };
+    use crate::shared::input::InferenceExecutionMode;
     use crate::shared::transformer::{
-        DetNumMatrix, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
-        Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-        Gemma4TransformerModel, LayerKvCache, MatrixF32, ResolvedGemma4LayerWeights,
+        DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
+        Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+        Gemma4TransformerModel, GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32,
+        ResolvedGemma4LayerWeights,
     };
 
     #[test]
@@ -2282,6 +2326,61 @@ mod tests {
     }
 
     #[test]
+    fn project_to_logits_uses_det_untied_lm_head() {
+        let without_det = project_to_logits(
+            &[1.0, 0.0],
+            &Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(2, 2),
+                det_weight: None,
+            },
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        let with_det = project_to_logits(
+            &[1.0, 0.0],
+            &Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(2, 2),
+                det_weight: Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0])),
+            },
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(without_det, vec![0.0, 0.0]);
+        assert_eq!(with_det, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn project_to_logits_uses_det_tied_embedding_source() {
+        let embedding_source = deterministic_embedding_source(
+            "tied-logits",
+            "model.language_model.embed_tokens.weight",
+            2,
+            2,
+            &[1.0, 0.0, 0.0, 1.0],
+        );
+        let without_det = project_to_logits(
+            &[1.0, 0.0],
+            &Gemma4LogitsProjection::TiedEmbedding(zero_matrix(2, 2)),
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        let with_det = project_to_logits(
+            &[1.0, 0.0],
+            &Gemma4LogitsProjection::TiedEmbedding(zero_matrix(2, 2)),
+            Some(&embedding_source),
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(without_det, vec![0.0, 0.0]);
+        assert_eq!(with_det, vec![1.0, 0.0]);
+    }
+
+    #[test]
     fn compute_prefill_ple_inputs_is_stable_for_same_inputs() {
         let layers = vec![Gemma4LayerWeights {
             attention_kind: Gemma4AttentionKind::Sliding,
@@ -2349,11 +2448,16 @@ mod tests {
         let normed = apply_final_norm(&final_hidden_states, &[1.0, 1.0], 0.0).unwrap();
         let logits = project_to_logits(
             &normed.activations[0],
-            &Gemma4LogitsProjection::UntiedLmHead(MatrixF32 {
-                rows: 2,
-                cols: 2,
-                values: vec![1.0, 0.0, 0.0, 1.0],
-            }),
+            &Gemma4LogitsProjection::UntiedLmHead {
+                weight: MatrixF32 {
+                    rows: 2,
+                    cols: 2,
+                    values: vec![1.0, 0.0, 0.0, 1.0],
+                },
+                det_weight: None,
+            },
+            None,
+            InferenceExecutionMode::Fp32,
         )
         .unwrap();
         let extracted = extract_prefill_logits(&logits);
@@ -2401,7 +2505,10 @@ mod tests {
             layers: vec![layer.clone(), layer],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
-            logits_projection: Gemma4LogitsProjection::UntiedLmHead(zero_matrix(2, 4)),
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(2, 4),
+                det_weight: None,
+            },
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
         };
@@ -2475,6 +2582,8 @@ mod tests {
             &model.final_norm_weight,
             model.rms_norm_eps,
             &model.logits_projection,
+            model.embedding_source.as_ref(),
+            InferenceExecutionMode::Fp32,
             model.final_logit_softcapping,
         )
         .unwrap();
@@ -2490,6 +2599,8 @@ mod tests {
             .cloned()
             .unwrap(),
             &model.logits_projection,
+            model.embedding_source.as_ref(),
+            InferenceExecutionMode::Fp32,
         )
         .unwrap();
 
@@ -2616,11 +2727,14 @@ mod tests {
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
-            logits_projection: Gemma4LogitsProjection::UntiedLmHead(MatrixF32 {
-                rows: 3,
-                cols: 4,
-                values: vec![0.7, 0.1, 0.2, 0.0, 0.0, 0.8, 0.1, 0.1, 0.2, 0.0, 0.8, 0.2],
-            }),
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: MatrixF32 {
+                    rows: 3,
+                    cols: 4,
+                    values: vec![0.7, 0.1, 0.2, 0.0, 0.0, 0.8, 0.1, 0.1, 0.2, 0.0, 0.8, 0.2],
+                },
+                det_weight: None,
+            },
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
         }
@@ -2695,5 +2809,56 @@ mod tests {
             layer_scalar: None,
         })
         .expect("resolve attention test layer")
+    }
+
+    fn deterministic_embedding_source(
+        label: &str,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        values: &[f32],
+    ) -> GemmaEmbeddingTensorSource {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let weights_path =
+            std::env::temp_dir().join(format!("raster-inference-{label}-{unique}.detwgt"));
+        let name_bytes = tensor_name.as_bytes();
+        let payload = values
+            .iter()
+            .flat_map(|value| wgt_to_le_bytes(f32_to_wgt(*value)))
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
+        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name_bytes);
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&(rows as u64).to_le_bytes());
+        bytes.extend_from_slice(&(cols as u64).to_le_bytes());
+        bytes.extend_from_slice(&((rows * cols) as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        let data_offset = bytes.len();
+        bytes.extend_from_slice(&payload);
+        fs::write(&weights_path, bytes).expect("write det embedding artifact");
+
+        GemmaEmbeddingTensorSource::Deterministic {
+            source: DetNumTensorSliceSource {
+                weights_path,
+                total_rows: rows,
+                total_cols: cols,
+                data_offset,
+                row_offset: 0,
+                row_count: rows,
+                col_offset: 0,
+                col_count: cols,
+            },
+            scale: (cols as f32).sqrt(),
+            det_cache: Arc::new(Mutex::new(None)),
+        }
     }
 }
