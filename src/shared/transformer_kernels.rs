@@ -888,17 +888,43 @@ fn run_causal_attention(
         bail!("Gemma layer must have at least one KV group");
     }
 
+    let quantized_inputs =
+        if layer.q_proj_det.is_some() || layer.k_proj_det.is_some() || layer.v_proj_det.is_some() {
+            Some(
+                inputs
+                    .iter()
+                    .map(|row| row.iter().copied().map(f32_to_act).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
     let q_projected = {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.q_proj");
-        linear_sequence(inputs, layer.q_proj.as_ref())?
+        project_linear_sequence(
+            inputs,
+            quantized_inputs.as_deref(),
+            layer.q_proj.as_ref(),
+            layer.q_proj_det.as_deref(),
+        )?
     };
     let raw_k = {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.k_proj");
-        linear_sequence(inputs, layer.k_proj.as_ref())?
+        project_linear_sequence(
+            inputs,
+            quantized_inputs.as_deref(),
+            layer.k_proj.as_ref(),
+            layer.k_proj_det.as_deref(),
+        )?
     };
     let raw_v = if let Some(v_proj) = &layer.v_proj {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.v_proj");
-        linear_sequence(inputs, v_proj.as_ref())?
+        project_linear_sequence(
+            inputs,
+            quantized_inputs.as_deref(),
+            v_proj.as_ref(),
+            layer.v_proj_det.as_deref(),
+        )?
     } else if layer.attention_k_eq_v {
         // trace_event("transformer_state_transition.run_causal_attention.k_eq_v_reuse");
         raw_k.clone()
@@ -1011,7 +1037,12 @@ fn run_causal_attention(
     {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.o_proj");
         Ok((
-            linear_sequence(&combined_heads, layer.o_proj.as_ref())?,
+            project_linear_sequence(
+                &combined_heads,
+                None,
+                layer.o_proj.as_ref(),
+                layer.o_proj_det.as_deref(),
+            )?,
             layer_cache,
         ))
     }
@@ -1045,10 +1076,31 @@ fn run_causal_attention_decode(
         validate_layer_cache(&cache, layer)?;
     }
 
-    let q_projected = linear_row(input, layer.q_proj.as_ref())?;
-    let raw_k = linear_row(input, layer.k_proj.as_ref())?;
+    let quantized_input =
+        if layer.q_proj_det.is_some() || layer.k_proj_det.is_some() || layer.v_proj_det.is_some() {
+            Some(input.iter().copied().map(f32_to_act).collect::<Vec<_>>())
+        } else {
+            None
+        };
+    let q_projected = project_linear_row(
+        input,
+        quantized_input.as_deref(),
+        layer.q_proj.as_ref(),
+        layer.q_proj_det.as_deref(),
+    )?;
+    let raw_k = project_linear_row(
+        input,
+        quantized_input.as_deref(),
+        layer.k_proj.as_ref(),
+        layer.k_proj_det.as_deref(),
+    )?;
     let raw_v = if let Some(v_proj) = &layer.v_proj {
-        linear_row(input, v_proj.as_ref())?
+        project_linear_row(
+            input,
+            quantized_input.as_deref(),
+            v_proj.as_ref(),
+            layer.v_proj_det.as_deref(),
+        )?
     } else if layer.attention_k_eq_v {
         raw_k.clone()
     } else {
@@ -1113,7 +1165,12 @@ fn run_causal_attention_decode(
     }
 
     Ok((
-        linear_row(&combined_heads, layer.o_proj.as_ref())?,
+        project_linear_row(
+            &combined_heads,
+            None,
+            layer.o_proj.as_ref(),
+            layer.o_proj_det.as_deref(),
+        )?,
         updated_cache,
     ))
 }
@@ -1273,11 +1330,65 @@ fn linear_row(input: &[f32], weight: &MatrixF32) -> Result<Vec<f32>> {
     Ok(output)
 }
 
+fn project_linear_sequence(
+    inputs: &[Vec<f32>],
+    quantized_inputs: Option<&[Vec<Act>]>,
+    weight: &MatrixF32,
+    det_weight: Option<&DetNumMatrix>,
+) -> Result<Vec<Vec<f32>>> {
+    match det_weight {
+        Some(det_weight) => match quantized_inputs {
+            Some(quantized_inputs) => det_linear_sequence_from_acts(quantized_inputs, det_weight),
+            None => det_linear_sequence(inputs, det_weight),
+        },
+        None => linear_sequence(inputs, weight),
+    }
+}
+
+fn project_linear_row(
+    input: &[f32],
+    quantized_input: Option<&[Act]>,
+    weight: &MatrixF32,
+    det_weight: Option<&DetNumMatrix>,
+) -> Result<Vec<f32>> {
+    match det_weight {
+        Some(det_weight) => match quantized_input {
+            Some(quantized_input) => det_linear_row_from_acts(quantized_input, det_weight),
+            None => det_linear_row(input, det_weight),
+        },
+        None => linear_row(input, weight),
+    }
+}
+
 fn det_linear_sequence(inputs: &[Vec<f32>], weight: &DetNumMatrix) -> Result<Vec<Vec<f32>>> {
     validate_sequence_width(inputs, weight.cols, "deterministic linear input")?;
     inputs
         .par_iter()
         .map(|input| det_linear_row(input, weight))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn det_linear_sequence_from_acts(
+    quantized_inputs: &[Vec<Act>],
+    weight: &DetNumMatrix,
+) -> Result<Vec<Vec<f32>>> {
+    if let Some((row_idx, row)) = quantized_inputs
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.len() != weight.cols)
+    {
+        bail!(
+            "deterministic linear input row {row_idx} has width {}, expected {}",
+            row.len(),
+            weight.cols
+        );
+    }
+
+    quantized_inputs
+        .par_iter()
+        .map(|input| det_linear_row_from_acts(input, weight))
         .collect::<Vec<_>>()
         .into_iter()
         .collect()
@@ -1581,14 +1692,14 @@ mod tests {
         append_kv_cache, apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs,
         det_linear_row, det_linear_row_from_acts, det_linear_sequence, embed_input_tokens,
         extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
-        run_gemma4_layer, run_text_layers_decode_step, run_text_layers_prefill,
-        run_text_layers_prefill_with_cache,
+        run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
+        run_text_layers_decode_step, run_text_layers_prefill, run_text_layers_prefill_with_cache,
     };
     use crate::shared::det_num::Act;
     use crate::shared::transformer::{
         DetNumMatrix, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
         Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-        Gemma4TransformerModel, MatrixF32,
+        Gemma4TransformerModel, LayerKvCache, MatrixF32, ResolvedGemma4LayerWeights,
     };
 
     #[test]
@@ -2013,6 +2124,164 @@ mod tests {
     }
 
     #[test]
+    fn run_causal_attention_uses_det_q_proj_during_prefill() {
+        let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let resolved_without_det = attention_test_layer(
+            zero_matrix(2, 2),
+            identity_matrix(2),
+            identity_matrix(2),
+            identity_matrix(2),
+        );
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.q_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+
+        let without_det =
+            run_causal_attention(&inputs, &resolved_without_det, None, None, None).unwrap();
+        let with_det = run_causal_attention(&inputs, &resolved_with_det, None, None, None).unwrap();
+
+        assert!(with_det.0[1][1] > without_det.0[1][1]);
+    }
+
+    #[test]
+    fn run_causal_attention_uses_det_k_proj_during_prefill() {
+        let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let resolved_without_det = attention_test_layer(
+            identity_matrix(2),
+            zero_matrix(2, 2),
+            identity_matrix(2),
+            identity_matrix(2),
+        );
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.k_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+
+        let without_det =
+            run_causal_attention(&inputs, &resolved_without_det, None, None, None).unwrap();
+        let with_det = run_causal_attention(&inputs, &resolved_with_det, None, None, None).unwrap();
+
+        assert!(with_det.0[1][1] > without_det.0[1][1]);
+    }
+
+    #[test]
+    fn run_causal_attention_uses_det_v_proj_during_prefill() {
+        let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let resolved_without_det = attention_test_layer(
+            identity_matrix(2),
+            identity_matrix(2),
+            zero_matrix(2, 2),
+            identity_matrix(2),
+        );
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.v_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+
+        let without_det =
+            run_causal_attention(&inputs, &resolved_without_det, None, None, None).unwrap();
+        let with_det = run_causal_attention(&inputs, &resolved_with_det, None, None, None).unwrap();
+
+        assert_eq!(without_det.0, vec![vec![0.0, 0.0], vec![0.0, 0.0]]);
+        assert!(with_det.0[1][1] > 0.0);
+    }
+
+    #[test]
+    fn run_causal_attention_uses_det_o_proj_during_prefill() {
+        let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let resolved_without_det = attention_test_layer(
+            identity_matrix(2),
+            identity_matrix(2),
+            identity_matrix(2),
+            zero_matrix(2, 2),
+        );
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.o_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+
+        let without_det =
+            run_causal_attention(&inputs, &resolved_without_det, None, None, None).unwrap();
+        let with_det = run_causal_attention(&inputs, &resolved_with_det, None, None, None).unwrap();
+
+        assert_eq!(without_det.0, vec![vec![0.0, 0.0], vec![0.0, 0.0]]);
+        assert!(with_det.0[1][1] > 0.0);
+    }
+
+    #[test]
+    fn run_causal_attention_decode_uses_det_q_proj() {
+        let input = vec![0.0, 1.0];
+        let resolved_without_det = attention_test_layer(
+            zero_matrix(2, 2),
+            identity_matrix(2),
+            identity_matrix(2),
+            identity_matrix(2),
+        );
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.q_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+        let initial_cache = append_kv_cache(
+            LayerKvCache::new(1),
+            &[vec![1.0, 0.0]],
+            &[vec![1.0, 0.0]],
+            None,
+        )
+        .unwrap();
+
+        let without_det = run_causal_attention_decode(
+            &input,
+            &resolved_without_det,
+            initial_cache.clone(),
+            None,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        let with_det = run_causal_attention_decode(
+            &input,
+            &resolved_with_det,
+            initial_cache,
+            None,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(with_det.0[1] > without_det.0[1]);
+    }
+
+    #[test]
+    fn run_causal_attention_decode_uses_det_o_proj() {
+        let input = vec![1.0, 0.0];
+        let resolved_without_det = attention_test_layer(
+            identity_matrix(2),
+            identity_matrix(2),
+            identity_matrix(2),
+            zero_matrix(2, 2),
+        );
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.o_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+
+        let without_det = run_causal_attention_decode(
+            &input,
+            &resolved_without_det,
+            LayerKvCache::new(1),
+            None,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let with_det = run_causal_attention_decode(
+            &input,
+            &resolved_with_det,
+            LayerKvCache::new(1),
+            None,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(without_det.0, vec![0.0, 0.0]);
+        assert!(with_det.0[0] > 0.0);
+    }
+
+    #[test]
     fn compute_prefill_ple_inputs_is_stable_for_same_inputs() {
         let layers = vec![Gemma4LayerWeights {
             attention_kind: Gemma4AttentionKind::Sliding,
@@ -2363,5 +2632,68 @@ mod tests {
             cols,
             values: vec![0.0; rows * cols],
         }
+    }
+
+    fn identity_matrix(size: usize) -> MatrixF32 {
+        let mut values = vec![0.0; size * size];
+        for idx in 0..size {
+            values[idx * size + idx] = 1.0;
+        }
+        MatrixF32 {
+            rows: size,
+            cols: size,
+            values,
+        }
+    }
+
+    fn det_matrix(rows: usize, cols: usize, values: &[f32]) -> Arc<DetNumMatrix> {
+        Arc::new(DetNumMatrix {
+            rows,
+            cols,
+            values: values
+                .iter()
+                .copied()
+                .map(|value| Act::from_num(value).to_bits())
+                .collect(),
+        })
+    }
+
+    fn attention_test_layer(
+        q_proj: MatrixF32,
+        k_proj: MatrixF32,
+        v_proj: MatrixF32,
+        o_proj: MatrixF32,
+    ) -> ResolvedGemma4LayerWeights {
+        crate::io::resolve_layer_weights(&Gemma4LayerWeights {
+            attention_kind: Gemma4AttentionKind::Full,
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            sliding_window: None,
+            cache_sliding_window: None,
+            rms_norm_eps: 1e-6,
+            rope_base: 10_000.0,
+            partial_rotary_dim: 0,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
+            attention_k_eq_v: false,
+            q_proj: q_proj.into(),
+            k_proj: k_proj.into(),
+            v_proj: Some(v_proj.into()),
+            o_proj: o_proj.into(),
+            q_norm_weight: vec![1.0, 1.0],
+            k_norm_weight: vec![1.0, 1.0],
+            input_layernorm_weight: vec![1.0; 2],
+            post_attention_layernorm_weight: vec![1.0; 2],
+            pre_feedforward_layernorm_weight: vec![1.0; 2],
+            post_feedforward_layernorm_weight: vec![1.0; 2],
+            gate_proj: zero_matrix(4, 2).into(),
+            up_proj: zero_matrix(4, 2).into(),
+            down_proj: zero_matrix(2, 4).into(),
+            ple: None,
+            layer_scalar: None,
+        })
+        .expect("resolve attention test layer")
     }
 }

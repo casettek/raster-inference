@@ -1197,6 +1197,15 @@ pub(crate) fn resolve_layer_weights(
             .map(materialize_layer_matrix_source)
             .transpose()?,
         o_proj: materialize_layer_matrix_source(&layer.o_proj)?,
+        q_proj_det: materialize_det_num_layer_matrix_source(&layer.q_proj)?,
+        k_proj_det: materialize_det_num_layer_matrix_source(&layer.k_proj)?,
+        v_proj_det: layer
+            .v_proj
+            .as_ref()
+            .map(materialize_det_num_layer_matrix_source)
+            .transpose()?
+            .flatten(),
+        o_proj_det: materialize_det_num_layer_matrix_source(&layer.o_proj)?,
         q_norm_weight: layer.q_norm_weight.clone(),
         k_norm_weight: layer.k_norm_weight.clone(),
         input_layernorm_weight: layer.input_layernorm_weight.clone(),
@@ -2514,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_mlp_projections() {
+    fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_attention_and_mlp_projections() {
         let fp32_dir = create_test_model_dir("fp32-mlp-proj");
         let det_dir = create_test_model_dir("det-mlp-proj");
         let config = r#"{
@@ -2536,6 +2545,16 @@ mod tests {
         write_config(&fp32_dir, config);
         write_config(&det_dir, config);
 
+        let q_proj_values = [
+            0.5, -0.25, 0.125, 0.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0, 0.5, 0.25, -0.125,
+            0.0, 0.0,
+        ];
+        let k_proj_values = [0.25, -0.5, 0.75, -1.0, 0.5, -0.25, 0.125, 0.0];
+        let v_proj_values = [1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0];
+        let o_proj_values = [
+            -0.5, 0.25, -0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0, 0.5, 0.25,
+            -0.125, 0.0,
+        ];
         let gate_proj_values = [
             0.5, -0.25, 0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0, 0.5, 0.25,
             -0.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -2562,22 +2581,22 @@ mod tests {
                 matrix_tensor(
                     "model.language_model.layers.0.self_attn.q_proj.weight",
                     &[4, 4],
-                    &[0.0; 16],
+                    &q_proj_values,
                 ),
                 matrix_tensor(
                     "model.language_model.layers.0.self_attn.k_proj.weight",
                     &[2, 4],
-                    &[0.0; 8],
+                    &k_proj_values,
                 ),
                 matrix_tensor(
                     "model.language_model.layers.0.self_attn.v_proj.weight",
                     &[2, 4],
-                    &[0.0; 8],
+                    &v_proj_values,
                 ),
                 matrix_tensor(
                     "model.language_model.layers.0.self_attn.o_proj.weight",
                     &[4, 4],
-                    &[0.0; 16],
+                    &o_proj_values,
                 ),
                 vector_tensor(
                     "model.language_model.layers.0.self_attn.q_norm.weight",
@@ -2639,22 +2658,22 @@ mod tests {
                 det_matrix_tensor(
                     "model.language_model.layers.0.self_attn.q_proj.weight",
                     &[4, 4],
-                    &[0.0; 16],
+                    &q_proj_values,
                 ),
                 det_matrix_tensor(
                     "model.language_model.layers.0.self_attn.k_proj.weight",
                     &[2, 4],
-                    &[0.0; 8],
+                    &k_proj_values,
                 ),
                 det_matrix_tensor(
                     "model.language_model.layers.0.self_attn.v_proj.weight",
                     &[2, 4],
-                    &[0.0; 8],
+                    &v_proj_values,
                 ),
                 det_matrix_tensor(
                     "model.language_model.layers.0.self_attn.o_proj.weight",
                     &[4, 4],
-                    &[0.0; 16],
+                    &o_proj_values,
                 ),
                 det_vector_tensor(
                     "model.language_model.layers.0.self_attn.q_norm.weight",
@@ -2711,9 +2730,25 @@ mod tests {
         let fp32_layer = super::resolve_layer_weights(&fp32_model.layers[0]).unwrap();
         let det_layer = super::resolve_layer_weights(&det_model.layers[0]).unwrap();
 
+        assert!(fp32_layer.q_proj_det.is_none());
+        assert!(fp32_layer.k_proj_det.is_none());
+        assert!(fp32_layer.v_proj_det.is_none());
+        assert!(fp32_layer.o_proj_det.is_none());
         assert!(fp32_layer.gate_proj_det.is_none());
         assert!(fp32_layer.up_proj_det.is_none());
         assert!(fp32_layer.down_proj_det.is_none());
+        let det_q_proj = det_layer
+            .q_proj_det
+            .expect("deterministic model should retain raw q_proj weights");
+        let det_k_proj = det_layer
+            .k_proj_det
+            .expect("deterministic model should retain raw k_proj weights");
+        let det_v_proj = det_layer
+            .v_proj_det
+            .expect("deterministic model should retain raw v_proj weights");
+        let det_o_proj = det_layer
+            .o_proj_det
+            .expect("deterministic model should retain raw o_proj weights");
         let det_gate_proj = det_layer
             .gate_proj_det
             .expect("deterministic model should retain raw gate_proj weights");
@@ -2723,6 +2758,22 @@ mod tests {
         let det_down_proj = det_layer
             .down_proj_det
             .expect("deterministic model should retain raw down_proj weights");
+        assert_eq!(det_q_proj.rows, 4);
+        assert_eq!(det_q_proj.cols, 4);
+        assert_eq!(det_q_proj.values[0], f32_to_wgt(q_proj_values[0]).to_bits());
+        assert_eq!(det_q_proj.values[1], f32_to_wgt(q_proj_values[1]).to_bits());
+        assert_eq!(det_k_proj.rows, 2);
+        assert_eq!(det_k_proj.cols, 4);
+        assert_eq!(det_k_proj.values[0], f32_to_wgt(k_proj_values[0]).to_bits());
+        assert_eq!(det_k_proj.values[1], f32_to_wgt(k_proj_values[1]).to_bits());
+        assert_eq!(det_v_proj.rows, 2);
+        assert_eq!(det_v_proj.cols, 4);
+        assert_eq!(det_v_proj.values[0], f32_to_wgt(v_proj_values[0]).to_bits());
+        assert_eq!(det_v_proj.values[1], f32_to_wgt(v_proj_values[1]).to_bits());
+        assert_eq!(det_o_proj.rows, 4);
+        assert_eq!(det_o_proj.cols, 4);
+        assert_eq!(det_o_proj.values[0], f32_to_wgt(o_proj_values[0]).to_bits());
+        assert_eq!(det_o_proj.values[1], f32_to_wgt(o_proj_values[1]).to_bits());
         assert_eq!(det_gate_proj.rows, 8);
         assert_eq!(det_gate_proj.cols, 4);
         assert_eq!(
