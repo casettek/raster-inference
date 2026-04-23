@@ -1,3 +1,5 @@
+use std::{fmt, str::FromStr};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -6,6 +8,37 @@ pub enum PhaseId {
     InputEmbedding,
     TransformerStateTransition,
     OutputDecode,
+}
+
+impl PhaseId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InputEmbedding => "input_embedding",
+            Self::TransformerStateTransition => "transformer_state_transition",
+            Self::OutputDecode => "output_decode",
+        }
+    }
+}
+
+impl fmt::Display for PhaseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PhaseId {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "input_embedding" => Ok(Self::InputEmbedding),
+            "transformer_state_transition" => Ok(Self::TransformerStateTransition),
+            "output_decode" => Ok(Self::OutputDecode),
+            _ => anyhow::bail!(
+                "unknown phase id `{value}`; expected one of: input_embedding, transformer_state_transition, output_decode"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,5 +132,14 @@ mod tests {
                 routine_id: RoutineId::DecodeTransition,
             })
         );
+    }
+
+    #[test]
+    fn phase_id_round_trips_through_strings() {
+        assert_eq!(
+            "transformer_state_transition".parse::<PhaseId>().unwrap(),
+            PhaseId::TransformerStateTransition
+        );
+        assert_eq!(PhaseId::OutputDecode.to_string(), "output_decode");
     }
 }

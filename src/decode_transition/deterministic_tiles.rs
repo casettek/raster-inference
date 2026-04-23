@@ -48,14 +48,15 @@ pub fn run_text_layers_decode_step(
         )?;
         let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
-        let (layer_output, updated_cache) = crate::shared::transformer_kernels::run_gemma4_layer_decode(
-            &xs,
-            &resolved_layer,
-            per_layer_input.as_deref(),
-            cache,
-            donor_cache,
-            position,
-        )?;
+        let (layer_output, updated_cache) =
+            crate::shared::transformer_kernels::run_gemma4_layer_decode(
+                &xs,
+                &resolved_layer,
+                per_layer_input.as_deref(),
+                cache,
+                donor_cache,
+                position,
+            )?;
         xs = layer_output;
         updated_layer_caches.push(updated_cache);
         completed_layer_output_sha256s.push(

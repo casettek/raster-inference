@@ -5,16 +5,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use raster_inference::{
-    load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, run_inference, InferenceExecutionMode,
-    InferenceRequest, ModelSpec, SamplingConfig, TextDecodingPolicy,
-};
 use raster_inference::shared::det_num::{
     f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
     DET_WGT_ARTIFACT_MAGIC,
 };
 use raster_inference::Gemma4LogitsProjection;
+use raster_inference::{
+    load_transformer_state_model_from_det_num_wgt_path,
+    load_transformer_state_model_from_gemma_model_path, run_inference, InferenceExecutionMode,
+    InferenceRequest, ModelSpec, SamplingConfig, TextDecodingPolicy,
+};
 use safetensors::tensor::{serialize_to_file, TensorView};
 use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, Tokenizer};
 
@@ -43,20 +43,76 @@ fn deterministic_loader_reconstructs_tied_embedding_projection() {
     write_detwgt_file(
         &model_dir.join("model.detwgt"),
         &[
-            tensor("model.language_model.embed_tokens.weight", &[3, 4], &[0.0, 0.5, 0.0, 0.0, 1.0, 1.5, 0.0, 0.0, 0.5, 0.5, 1.0, 0.0]),
-            tensor("model.language_model.layers.0.self_attn.q_proj.weight", &[4, 4], &[0.0; 16]),
-            tensor("model.language_model.layers.0.self_attn.k_proj.weight", &[2, 4], &[0.0; 8]),
-            tensor("model.language_model.layers.0.self_attn.v_proj.weight", &[2, 4], &[0.0; 8]),
-            tensor("model.language_model.layers.0.self_attn.o_proj.weight", &[4, 4], &[0.0; 16]),
-            tensor("model.language_model.layers.0.self_attn.q_norm.weight", &[2], &[1.0, 1.0]),
-            tensor("model.language_model.layers.0.self_attn.k_norm.weight", &[2], &[1.0, 1.0]),
-            tensor("model.language_model.layers.0.input_layernorm.weight", &[4], &[1.0; 4]),
-            tensor("model.language_model.layers.0.post_attention_layernorm.weight", &[4], &[1.0; 4]),
-            tensor("model.language_model.layers.0.pre_feedforward_layernorm.weight", &[4], &[1.0; 4]),
-            tensor("model.language_model.layers.0.post_feedforward_layernorm.weight", &[4], &[1.0; 4]),
-            tensor("model.language_model.layers.0.mlp.gate_proj.weight", &[8, 4], &[0.0; 32]),
-            tensor("model.language_model.layers.0.mlp.up_proj.weight", &[8, 4], &[0.0; 32]),
-            tensor("model.language_model.layers.0.mlp.down_proj.weight", &[4, 8], &[0.0; 32]),
+            tensor(
+                "model.language_model.embed_tokens.weight",
+                &[3, 4],
+                &[0.0, 0.5, 0.0, 0.0, 1.0, 1.5, 0.0, 0.0, 0.5, 0.5, 1.0, 0.0],
+            ),
+            tensor(
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                &[4, 4],
+                &[0.0; 16],
+            ),
+            tensor(
+                "model.language_model.layers.0.self_attn.k_proj.weight",
+                &[2, 4],
+                &[0.0; 8],
+            ),
+            tensor(
+                "model.language_model.layers.0.self_attn.v_proj.weight",
+                &[2, 4],
+                &[0.0; 8],
+            ),
+            tensor(
+                "model.language_model.layers.0.self_attn.o_proj.weight",
+                &[4, 4],
+                &[0.0; 16],
+            ),
+            tensor(
+                "model.language_model.layers.0.self_attn.q_norm.weight",
+                &[2],
+                &[1.0, 1.0],
+            ),
+            tensor(
+                "model.language_model.layers.0.self_attn.k_norm.weight",
+                &[2],
+                &[1.0, 1.0],
+            ),
+            tensor(
+                "model.language_model.layers.0.input_layernorm.weight",
+                &[4],
+                &[1.0; 4],
+            ),
+            tensor(
+                "model.language_model.layers.0.post_attention_layernorm.weight",
+                &[4],
+                &[1.0; 4],
+            ),
+            tensor(
+                "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+                &[4],
+                &[1.0; 4],
+            ),
+            tensor(
+                "model.language_model.layers.0.post_feedforward_layernorm.weight",
+                &[4],
+                &[1.0; 4],
+            ),
+            tensor(
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                &[8, 4],
+                &[0.0; 32],
+            ),
+            tensor(
+                "model.language_model.layers.0.mlp.up_proj.weight",
+                &[8, 4],
+                &[0.0; 32],
+            ),
+            tensor(
+                "model.language_model.layers.0.mlp.down_proj.weight",
+                &[4, 8],
+                &[0.0; 32],
+            ),
             tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
         ],
     );
@@ -105,7 +161,9 @@ fn deterministic_loader_rejects_unsupported_artifact_version() {
 
     let error =
         load_transformer_state_model_from_det_num_wgt_path(&model_dir).expect_err("bad version");
-    assert!(error.to_string().contains("unsupported deterministic artifact format version"));
+    assert!(error
+        .to_string()
+        .contains("unsupported deterministic artifact format version"));
 }
 
 #[test]
@@ -134,20 +192,76 @@ fn deterministic_mode_matches_fp32_path_on_representable_fixture() {
     fs::copy(fp32_dir.join("config.json"), det_dir.join("config.json")).unwrap();
 
     let tensors = vec![
-        tensor("model.language_model.embed_tokens.weight", &[3, 4], &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        tensor("model.language_model.layers.0.self_attn.q_proj.weight", &[4, 4], &[0.0; 16]),
-        tensor("model.language_model.layers.0.self_attn.k_proj.weight", &[2, 4], &[0.0; 8]),
-        tensor("model.language_model.layers.0.self_attn.v_proj.weight", &[2, 4], &[0.0; 8]),
-        tensor("model.language_model.layers.0.self_attn.o_proj.weight", &[4, 4], &[0.0; 16]),
-        tensor("model.language_model.layers.0.self_attn.q_norm.weight", &[2], &[1.0, 1.0]),
-        tensor("model.language_model.layers.0.self_attn.k_norm.weight", &[2], &[1.0, 1.0]),
-        tensor("model.language_model.layers.0.input_layernorm.weight", &[4], &[1.0; 4]),
-        tensor("model.language_model.layers.0.post_attention_layernorm.weight", &[4], &[1.0; 4]),
-        tensor("model.language_model.layers.0.pre_feedforward_layernorm.weight", &[4], &[1.0; 4]),
-        tensor("model.language_model.layers.0.post_feedforward_layernorm.weight", &[4], &[1.0; 4]),
-        tensor("model.language_model.layers.0.mlp.gate_proj.weight", &[8, 4], &[0.0; 32]),
-        tensor("model.language_model.layers.0.mlp.up_proj.weight", &[8, 4], &[0.0; 32]),
-        tensor("model.language_model.layers.0.mlp.down_proj.weight", &[4, 8], &[0.0; 32]),
+        tensor(
+            "model.language_model.embed_tokens.weight",
+            &[3, 4],
+            &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            &[4, 4],
+            &[0.0; 16],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.k_proj.weight",
+            &[2, 4],
+            &[0.0; 8],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.v_proj.weight",
+            &[2, 4],
+            &[0.0; 8],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.o_proj.weight",
+            &[4, 4],
+            &[0.0; 16],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.q_norm.weight",
+            &[2],
+            &[1.0, 1.0],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.k_norm.weight",
+            &[2],
+            &[1.0, 1.0],
+        ),
+        tensor(
+            "model.language_model.layers.0.input_layernorm.weight",
+            &[4],
+            &[1.0; 4],
+        ),
+        tensor(
+            "model.language_model.layers.0.post_attention_layernorm.weight",
+            &[4],
+            &[1.0; 4],
+        ),
+        tensor(
+            "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+            &[4],
+            &[1.0; 4],
+        ),
+        tensor(
+            "model.language_model.layers.0.post_feedforward_layernorm.weight",
+            &[4],
+            &[1.0; 4],
+        ),
+        tensor(
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            &[8, 4],
+            &[0.0; 32],
+        ),
+        tensor(
+            "model.language_model.layers.0.mlp.up_proj.weight",
+            &[8, 4],
+            &[0.0; 32],
+        ),
+        tensor(
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            &[4, 8],
+            &[0.0; 32],
+        ),
         tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
         tensor("model.language_model.lm_head.weight", &[3, 4], &[0.0; 12]),
     ];
@@ -205,11 +319,23 @@ fn deterministic_mode_matches_fp32_path_on_representable_fixture() {
     )
     .unwrap();
 
-    assert_eq!(det_state.output_decode.generated_token_ids, fp32_state.output_decode.generated_token_ids);
-    assert_eq!(det_state.output_decode.generated_text, fp32_state.output_decode.generated_text);
     assert_eq!(
-        det_state.transformer_state_transition.prefill_logits.final_logits_sha256,
-        fp32_state.transformer_state_transition.prefill_logits.final_logits_sha256
+        det_state.output_decode.generated_token_ids,
+        fp32_state.output_decode.generated_token_ids
+    );
+    assert_eq!(
+        det_state.output_decode.generated_text,
+        fp32_state.output_decode.generated_text
+    );
+    assert_eq!(
+        det_state
+            .transformer_state_transition
+            .prefill_logits
+            .final_logits_sha256,
+        fp32_state
+            .transformer_state_transition
+            .prefill_logits
+            .final_logits_sha256
     );
     assert_eq!(
         det_state.output_decode.generated_token_ids_sha256,

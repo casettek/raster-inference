@@ -110,6 +110,7 @@ The deterministic comparison path is opt-in:
 
 ```bash
 cargo run -- \
+  --commit-checkpoints \
   --deterministic \
   google/gemma-4-test \
   /path/to/tokenizer.json \
@@ -117,6 +118,8 @@ cargo run -- \
   /path/to/converted-det-model \
   "Hello from Raster"
 ```
+
+To stop after a specific checkpoint, pass `--terminal-checkpoint <checkpoint-id>`. For example, `--terminal-checkpoint prefill.finalize` stops after the prefill finalize checkpoint has been emitted.
 
 When `--deterministic` is set, the model path must point to either:
 
@@ -135,7 +138,9 @@ The CLI prints the resulting `InferenceState` as formatted JSON with:
 - `output_decode.generated_token_ids_sha256`: SHA-256 digest of the generated token IDs
 - `output_decode.stop_reason`: currently `max_new_tokens`
 
-To trace long Gemma runs tile-by-tile, set `RASTER_TRACE_TILES=1`. That enables full trace logging plus checkpoint hashing and trace-file output. If you want only the stderr routine/tile logs without checkpoint generation, set `RASTER_TRACE_TILES=0`. Trace logs go to stderr and include start/end timing for model loading, major transformer routines, and each decoder layer.
+If you stop at a terminal checkpoint before the normal end of inference, the CLI prints a `PausedInferenceState` instead, with `terminal_checkpoint_id` plus the completed outputs gathered so far.
+
+Pass `--commit-checkpoints` to emit the checkpoint trace file at the end of the run. Leave it off to skip checkpoint commitment work entirely. Checkpoint hits and phase start/end logs still go to stderr even when checkpoint output is disabled.
 
 ```bash
 cargo run -- \

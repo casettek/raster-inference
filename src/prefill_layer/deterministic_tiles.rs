@@ -40,12 +40,13 @@ pub fn run_text_layers_prefill_with_cache(
             .and_then(|input| input.as_deref());
         let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
-        let (layer_output, layer_cache) = crate::shared::transformer_kernels::run_gemma4_layer_with_cache(
-            &xs,
-            &resolved_layer,
-            per_layer_input,
-            donor_cache,
-        )?;
+        let (layer_output, layer_cache) =
+            crate::shared::transformer_kernels::run_gemma4_layer_with_cache(
+                &xs,
+                &resolved_layer,
+                per_layer_input,
+                donor_cache,
+            )?;
         xs = layer_output.activations;
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);

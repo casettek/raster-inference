@@ -56,15 +56,13 @@ pub fn run_with_mode(
             layer_caches,
             position,
         )?,
-        InferenceExecutionMode::Deterministic => {
-            deterministic_tiles::run_text_layers_decode_step(
-                &embedded_token,
-                next_token,
-                model,
-                layer_caches,
-                position,
-            )?
-        }
+        InferenceExecutionMode::Deterministic => deterministic_tiles::run_text_layers_decode_step(
+            &embedded_token,
+            next_token,
+            model,
+            layer_caches,
+            position,
+        )?,
     };
     let prefill_logits = crate::shared::transformer_kernels::project_decode_hidden_to_logits(
         &final_hidden_state.activation_state.activations[0],

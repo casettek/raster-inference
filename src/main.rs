@@ -3,8 +3,9 @@ use std::{env, path::PathBuf, process};
 use raster_inference::{
     load_chat_template, load_tokenizer_from_path,
     load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, run_inference, InferenceExecutionMode,
-    InferenceRequest, ModelSpec, SamplingConfig, TextDecodingPolicy,
+    load_transformer_state_model_from_gemma_model_path, run_inference_with_controls,
+    InferenceControls, InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, ModelSpec,
+    SamplingConfig, TextDecodingPolicy,
 };
 
 const CLI_MAX_NEW_TOKENS: usize = 3;
@@ -12,10 +13,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Set RASTER_TRACE_TILES=1 for full tile timing logs plus checkpoint traces, or RASTER_TRACE_TILES=0 for logs only with no checkpoint hashing or trace files."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize."
     );
 }
 
@@ -65,14 +66,32 @@ fn run() -> anyhow::Result<()> {
         },
     };
 
-    let inference_state = run_inference(&request, &model, &tokenizer, &transformer_model)?;
-    println!("{}", serde_json::to_string_pretty(&inference_state)?);
+    let inference_outcome = run_inference_with_controls(
+        &request,
+        &model,
+        &tokenizer,
+        &transformer_model,
+        &InferenceControls {
+            commit_checkpoints: cli_args.commit_checkpoints,
+            terminal_checkpoint: cli_args.terminal_checkpoint,
+        },
+    )?;
+    match inference_outcome {
+        InferenceRunOutcome::Completed(inference_state) => {
+            println!("{}", serde_json::to_string_pretty(&inference_state)?);
+        }
+        InferenceRunOutcome::Paused(paused_state) => {
+            println!("{}", serde_json::to_string_pretty(&paused_state)?);
+        }
+    }
 
     Ok(())
 }
 
 struct CliArgs {
+    commit_checkpoints: bool,
     execution_mode: InferenceExecutionMode,
+    terminal_checkpoint: Option<String>,
     model_id: String,
     tokenizer_path: PathBuf,
     template_path: PathBuf,
@@ -82,11 +101,28 @@ struct CliArgs {
 
 impl CliArgs {
     fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
+        let mut commit_checkpoints = false;
         let mut execution_mode = InferenceExecutionMode::Fp32;
+        let mut terminal_checkpoint = None;
         let mut positional_args = Vec::new();
-        for arg in args {
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--commit-checkpoints" => commit_checkpoints = true,
                 "--deterministic" => execution_mode = InferenceExecutionMode::Deterministic,
+                "--terminal-checkpoint" => {
+                    let checkpoint_id = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("expected a checkpoint id after {arg}"))?;
+                    terminal_checkpoint = Some(checkpoint_id);
+                }
+                _ if arg.starts_with("--terminal-checkpoint=") => {
+                    let checkpoint_id = arg
+                        .split_once('=')
+                        .map(|(_, value)| value)
+                        .expect("split_once should succeed for --terminal-checkpoint=value");
+                    terminal_checkpoint = Some(checkpoint_id.to_string());
+                }
                 "--help" | "-h" => {
                     print_usage();
                     process::exit(0);
@@ -100,12 +136,72 @@ impl CliArgs {
         }
 
         Ok(Self {
+            commit_checkpoints,
             execution_mode,
+            terminal_checkpoint,
             model_id: positional_args[0].clone(),
             tokenizer_path: PathBuf::from(&positional_args[1]),
             template_path: PathBuf::from(&positional_args[2]),
             model_path: PathBuf::from(&positional_args[3]),
             prompt: positional_args[4..].join(" "),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliArgs;
+    use raster_inference::InferenceExecutionMode;
+
+    #[test]
+    fn parse_terminal_checkpoint_flag() {
+        let args = CliArgs::parse([
+            "--terminal-checkpoint".to_string(),
+            "prefill.finalize".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(
+            args.terminal_checkpoint.as_deref(),
+            Some("prefill.finalize")
+        );
+        assert_eq!(args.execution_mode, InferenceExecutionMode::Fp32);
+    }
+
+    #[test]
+    fn parse_terminal_checkpoint_equals_and_deterministic_flag() {
+        let args = CliArgs::parse([
+            "--deterministic".to_string(),
+            "--terminal-checkpoint=output.finalize".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(args.terminal_checkpoint.as_deref(), Some("output.finalize"));
+        assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
+    }
+
+    #[test]
+    fn parse_commit_checkpoints_flag() {
+        let args = CliArgs::parse([
+            "--commit-checkpoints".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert!(args.commit_checkpoints);
     }
 }

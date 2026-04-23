@@ -70,98 +70,206 @@ pub struct InferenceState {
     pub output_decode: OutputDecodeState,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InferenceControls {
+    pub commit_checkpoints: bool,
+    pub terminal_checkpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PausedInferenceState {
+    pub terminal_checkpoint_id: String,
+    pub input_embedding: InputEmbeddingState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transformer_state_transition: Option<TransformerStateTransitionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_decode: Option<OutputDecodeState>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InferenceRunOutcome {
+    Completed(InferenceState),
+    Paused(PausedInferenceState),
+}
+
 pub fn run_inference(
     request: &InferenceRequest,
     model: &ModelSpec,
     tokenizer: &Tokenizer,
     transformer_model: &Gemma4TransformerModel,
 ) -> Result<InferenceState> {
-    trace::start_inference_trace(&json!({
-        "model_id": model.model_id,
-        "execution_mode": request.execution_mode,
-        "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
-        "max_new_tokens": request.sampling.max_new_tokens,
-        "transformer_layer_count": transformer_model.layers.len(),
-    }));
+    match run_inference_with_controls(
+        request,
+        model,
+        tokenizer,
+        transformer_model,
+        &InferenceControls::default(),
+    )? {
+        InferenceRunOutcome::Completed(state) => Ok(state),
+        InferenceRunOutcome::Paused(paused) => anyhow::bail!(
+            "inference paused unexpectedly at checkpoint {}",
+            paused.terminal_checkpoint_id
+        ),
+    }
+}
 
-    let result = (|| {
-        let prompt_preparation = run_prompt_prepare(request, model, tokenizer)?;
-        let token_embeddings =
-            if let Some(embedding_table) = transformer_model.embedding_table.as_ref() {
-                embed_input_tokens(&prompt_preparation.prompt_token_ids, embedding_table)?
-            } else if let Some(embedding_source) = transformer_model.embedding_source.as_ref() {
-                io::embed_input_tokens_from_gemma_source(
-                    &prompt_preparation.prompt_token_ids,
-                    embedding_source,
-                )?
-            } else {
-                anyhow::bail!(
+pub fn run_inference_with_controls(
+    request: &InferenceRequest,
+    model: &ModelSpec,
+    tokenizer: &Tokenizer,
+    transformer_model: &Gemma4TransformerModel,
+    controls: &InferenceControls,
+) -> Result<InferenceRunOutcome> {
+    trace::with_checkpointing_enabled(controls.commit_checkpoints, || {
+        trace::start_inference_trace(&json!({
+            "model_id": model.model_id,
+            "execution_mode": request.execution_mode,
+            "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
+            "max_new_tokens": request.sampling.max_new_tokens,
+            "transformer_layer_count": transformer_model.layers.len(),
+            "terminal_checkpoint": controls.terminal_checkpoint,
+            "commit_checkpoints": controls.commit_checkpoints,
+        }));
+
+        let result = (|| {
+            trace::phase_started(PhaseId::InputEmbedding);
+            let prompt_preparation = run_prompt_prepare(request, model, tokenizer)?;
+            let token_embeddings =
+                if let Some(embedding_table) = transformer_model.embedding_table.as_ref() {
+                    embed_input_tokens(&prompt_preparation.prompt_token_ids, embedding_table)?
+                } else if let Some(embedding_source) = transformer_model.embedding_source.as_ref() {
+                    io::embed_input_tokens_from_gemma_source(
+                        &prompt_preparation.prompt_token_ids,
+                        embedding_source,
+                    )?
+                } else {
+                    anyhow::bail!(
                     "transformer state model is missing both embedding_table and embedding_source"
                 )
+                };
+            let input_embedding = InputEmbeddingState {
+                prompt_preparation: prompt_preparation.clone(),
+                embedded_prompt_activations_sha256: token_embeddings.activations_sha256.clone(),
             };
-        let input_embedding = InputEmbeddingState {
-            prompt_preparation: prompt_preparation.clone(),
-            embedded_prompt_activations_sha256: token_embeddings.activations_sha256.clone(),
-        };
-        trace::trace_checkpoint(
-            "prompt.prepare",
-            &json!({
-                "prompt_text": prompt_preparation.prompt_text.clone(),
-                "prompt_token_ids": prompt_preparation.prompt_token_ids.clone(),
-                "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
-                "embedded_prompt_activations": token_embeddings.activations.clone(),
-                "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
-                "sampling": request.sampling.clone(),
-            }),
-        );
-        let ple_inputs = run_prefill_prepare_aux(
-            &prompt_preparation.prompt_token_ids,
-            transformer_model,
-            &token_embeddings,
-        )?;
-        let (final_hidden_states, layer_caches) = run_prefill_layer_with_mode(
-            &token_embeddings.activations,
-            transformer_model,
-            ple_inputs.as_ref(),
-            request.execution_mode,
-        )?;
-        let prefill = run_prefill_finalize(
-            &prompt_preparation.prompt_token_ids,
-            transformer_model,
-            final_hidden_states,
-            layer_caches,
-        )?;
-        let mut transformer_state_transition = prefill.transformer_state.clone();
-        let output_decode = run_output_decode_with_mode(
-            &prompt_preparation.prompt_token_ids,
-            &prefill,
-            &request.sampling,
-            tokenizer,
-            transformer_model,
-            request.execution_mode,
-        )?;
-        transformer_state_transition
-            .activation_states
-            .extend(output_decode.decode_transition_states.iter().cloned());
+            trace::trace_checkpoint(
+                "prompt.prepare",
+                &json!({
+                    "prompt_text": prompt_preparation.prompt_text.clone(),
+                    "prompt_token_ids": prompt_preparation.prompt_token_ids.clone(),
+                    "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
+                    "embedded_prompt_activations": token_embeddings.activations.clone(),
+                    "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
+                    "sampling": request.sampling.clone(),
+                }),
+            );
+            if should_stop_at_checkpoint(controls, "prompt.prepare") {
+                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                    terminal_checkpoint_id: "prompt.prepare".to_string(),
+                    input_embedding,
+                    transformer_state_transition: None,
+                    output_decode: None,
+                }));
+            }
+            trace::phase_finished(PhaseId::InputEmbedding);
 
-        Ok(InferenceState {
-            input_embedding,
-            transformer_state_transition,
-            output_decode,
-        })
-    })();
+            trace::phase_started(PhaseId::TransformerStateTransition);
+            let ple_inputs = run_prefill_prepare_aux(
+                &prompt_preparation.prompt_token_ids,
+                transformer_model,
+                &token_embeddings,
+            )?;
+            if should_stop_at_checkpoint(controls, "prefill.prepare_aux") {
+                trace::phase_paused(PhaseId::TransformerStateTransition);
+                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                    terminal_checkpoint_id: "prefill.prepare_aux".to_string(),
+                    input_embedding,
+                    transformer_state_transition: None,
+                    output_decode: None,
+                }));
+            }
+            let (final_hidden_states, layer_caches) = run_prefill_layer_with_mode(
+                &token_embeddings.activations,
+                transformer_model,
+                ple_inputs.as_ref(),
+                request.execution_mode,
+            )?;
+            if should_stop_at_checkpoint(controls, "prefill.layer") {
+                trace::phase_paused(PhaseId::TransformerStateTransition);
+                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                    terminal_checkpoint_id: "prefill.layer".to_string(),
+                    input_embedding,
+                    transformer_state_transition: None,
+                    output_decode: None,
+                }));
+            }
+            let prefill = run_prefill_finalize(
+                &prompt_preparation.prompt_token_ids,
+                transformer_model,
+                final_hidden_states,
+                layer_caches,
+            )?;
+            let mut transformer_state_transition = prefill.transformer_state.clone();
+            if should_stop_at_checkpoint(controls, "prefill.finalize") {
+                trace::phase_paused(PhaseId::TransformerStateTransition);
+                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                    terminal_checkpoint_id: "prefill.finalize".to_string(),
+                    input_embedding,
+                    transformer_state_transition: Some(transformer_state_transition),
+                    output_decode: None,
+                }));
+            }
+            trace::phase_finished(PhaseId::TransformerStateTransition);
 
-    match &result {
-        Ok(state) => trace::finish_inference_trace(&json!({
-            "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
-            "output_decode_generated_token_ids_sha256": state.output_decode.generated_token_ids_sha256,
-            "output_decode_generated_text_sha256": trace::sha256_hex(&state.output_decode.generated_text),
-            "generated_token_count": state.output_decode.generated_token_count,
-        })),
-        Err(error) => trace::abort_inference_trace(error),
-    }
+            trace::phase_started(PhaseId::OutputDecode);
+            let output_decode = run_output_decode_with_mode(
+                &prompt_preparation.prompt_token_ids,
+                &prefill,
+                &request.sampling,
+                tokenizer,
+                transformer_model,
+                request.execution_mode,
+            )?;
+            transformer_state_transition
+                .activation_states
+                .extend(output_decode.decode_transition_states.iter().cloned());
+            if should_stop_at_checkpoint(controls, "output.finalize") {
+                trace::phase_paused(PhaseId::OutputDecode);
+                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                    terminal_checkpoint_id: "output.finalize".to_string(),
+                    input_embedding,
+                    transformer_state_transition: Some(transformer_state_transition),
+                    output_decode: Some(output_decode),
+                }));
+            }
+            trace::phase_finished(PhaseId::OutputDecode);
 
-    result
+            Ok(InferenceRunOutcome::Completed(InferenceState {
+                input_embedding,
+                transformer_state_transition,
+                output_decode,
+            }))
+        })();
+
+        match &result {
+            Ok(InferenceRunOutcome::Completed(state)) => trace::finish_inference_trace(&json!({
+                "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
+                "output_decode_generated_token_ids_sha256": state.output_decode.generated_token_ids_sha256,
+                "output_decode_generated_text_sha256": trace::sha256_hex(&state.output_decode.generated_text),
+                "generated_token_count": state.output_decode.generated_token_count,
+            })),
+            Ok(InferenceRunOutcome::Paused(state)) => trace::finish_inference_trace(&json!({
+                "terminal_checkpoint_id": state.terminal_checkpoint_id,
+                "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
+            })),
+            Err(error) => trace::abort_inference_trace(error),
+        }
+
+        result
+    })
+}
+
+fn should_stop_at_checkpoint(controls: &InferenceControls, checkpoint_id: &str) -> bool {
+    controls.terminal_checkpoint.as_deref() == Some(checkpoint_id)
 }
 
 #[cfg(test)]
@@ -171,11 +279,12 @@ mod tests {
 
     use super::{
         embed_input_tokens, finalize_decode_transition, run_decode_select_token,
-        run_decode_transition, run_inference, run_output_finalize, run_prefill_finalize,
-        run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare, DecodeState,
-        EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
-        Gemma4TransformerModel, InferenceExecutionMode, InferenceRequest, MatrixF32, ModelSpec,
-        OutputDecodeStopReason, SamplingConfig, TextDecodingPolicy,
+        run_decode_transition, run_inference, run_inference_with_controls, run_output_finalize,
+        run_prefill_finalize, run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare,
+        DecodeState, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
+        Gemma4LogitsProjection, Gemma4TransformerModel, InferenceControls, InferenceExecutionMode,
+        InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec, OutputDecodeStopReason,
+        SamplingConfig, TextDecodingPolicy,
     };
 
     #[test]
@@ -268,6 +377,99 @@ mod tests {
         let error = run_inference(&request, &model, &tokenizer, &transformer_model)
             .expect_err("top_k should fail");
         assert!(error.to_string().contains("top_k"));
+    }
+
+    #[test]
+    fn run_inference_with_controls_pauses_after_prompt_prepare_checkpoint() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_model = test_transformer_model();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: Some("prompt.prepare".to_string()),
+            },
+        )
+        .expect("inference should pause");
+
+        match paused {
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
+                assert_eq!(
+                    state.input_embedding.prompt_preparation.prompt_token_ids,
+                    vec![1]
+                );
+                assert!(state.transformer_state_transition.is_none());
+                assert!(state.output_decode.is_none());
+            }
+            InferenceRunOutcome::Completed(_) => panic!("expected paused inference"),
+        }
+    }
+
+    #[test]
+    fn run_inference_with_controls_pauses_after_prefill_finalize_checkpoint() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_model = test_transformer_model();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: Some("prefill.finalize".to_string()),
+            },
+        )
+        .expect("inference should pause");
+
+        match paused {
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prefill.finalize");
+                assert_eq!(
+                    state
+                        .transformer_state_transition
+                        .expect("transformer phase should be present")
+                        .activation_states
+                        .len(),
+                    1
+                );
+                assert!(state.output_decode.is_none());
+            }
+            InferenceRunOutcome::Completed(_) => panic!("expected paused inference"),
+        }
     }
 
     #[test]

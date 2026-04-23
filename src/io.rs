@@ -16,10 +16,10 @@ use crate::shared::det_num::{
     DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
 use crate::shared::transformer::{
-    ActivationSequence, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-    Gemma4PleMatrixSource, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
-    GemmaTensorSliceSource, DetNumTensorSliceSource, MatrixF32, ResolvedGemma4LayerWeights,
+    ActivationSequence, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
+    Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
+    Gemma4PleLayerWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
+    GemmaEmbeddingTensorSource, GemmaTensorSliceSource, MatrixF32, ResolvedGemma4LayerWeights,
     ResolvedGemma4PleLayerWeights,
 };
 // use crate::trace::{trace_event, trace_scope};
@@ -213,10 +213,9 @@ impl DetNumTensorReader {
     fn load_artifact(path: &Path) -> Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("failed to open deterministic artifact {}", path.display()))?;
-        let mmap = std::sync::Arc::new(
-            unsafe { Mmap::map(&file) }
-                .with_context(|| format!("failed to mmap deterministic artifact {}", path.display()))?,
-        );
+        let mmap = std::sync::Arc::new(unsafe { Mmap::map(&file) }.with_context(|| {
+            format!("failed to mmap deterministic artifact {}", path.display())
+        })?);
         let bytes = mmap.as_ref();
         let mut cursor = 0usize;
 
@@ -367,18 +366,16 @@ impl DetNumTensorReader {
     }
 
     fn load_matrix(&self, tensor_name: &str) -> Result<MatrixF32> {
-        let tensor = self
-            .tensors
-            .get(tensor_name)
-            .ok_or_else(|| anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact"))?;
+        let tensor = self.tensors.get(tensor_name).ok_or_else(|| {
+            anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact")
+        })?;
         self.tensor_to_matrix(tensor_name, tensor)
     }
 
     fn resolve_full_matrix_source(&self, tensor_name: &str) -> Result<DetNumTensorSliceSource> {
-        let tensor = self
-            .tensors
-            .get(tensor_name)
-            .ok_or_else(|| anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact"))?;
+        let tensor = self.tensors.get(tensor_name).ok_or_else(|| {
+            anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact")
+        })?;
         if tensor.shape.len() != 2 {
             bail!(
                 "tensor `{tensor_name}` has rank {}, expected 2 for a matrix",
@@ -389,10 +386,9 @@ impl DetNumTensorReader {
     }
 
     fn load_vector(&self, tensor_name: &str) -> Result<Vec<f32>> {
-        let tensor = self
-            .tensors
-            .get(tensor_name)
-            .ok_or_else(|| anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact"))?;
+        let tensor = self.tensors.get(tensor_name).ok_or_else(|| {
+            anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact")
+        })?;
         if tensor.shape.len() != 1 {
             bail!(
                 "tensor `{tensor_name}` has rank {}, expected 1 for a vector",
@@ -402,7 +398,11 @@ impl DetNumTensorReader {
         let payload = self.payload_slice(tensor_name, tensor)?;
         Ok(payload
             .chunks_exact(4)
-            .map(|chunk| det_wgt_to_f32(i32::from_le_bytes(chunk.try_into().expect("i32 byte width should match"))))
+            .map(|chunk| {
+                det_wgt_to_f32(i32::from_le_bytes(
+                    chunk.try_into().expect("i32 byte width should match"),
+                ))
+            })
             .collect())
     }
 
@@ -425,14 +425,19 @@ impl DetNumTensorReader {
         ))))
     }
 
-    fn tensor_to_matrix(&self, tensor_name: &str, tensor: &DetNumTensorMetadata) -> Result<MatrixF32> {
+    fn tensor_to_matrix(
+        &self,
+        tensor_name: &str,
+        tensor: &DetNumTensorMetadata,
+    ) -> Result<MatrixF32> {
         if tensor.shape.len() != 2 {
             bail!(
                 "tensor `{tensor_name}` has rank {}, expected 2 for a matrix",
                 tensor.shape.len()
             );
         }
-        let source = self.resolve_matrix_source(tensor_name, 0, tensor.shape[0], 0, tensor.shape[1])?;
+        let source =
+            self.resolve_matrix_source(tensor_name, 0, tensor.shape[0], 0, tensor.shape[1])?;
         decode_matrix_slice_from_det_num_source(&source, self.mmap.as_ref())
     }
 
@@ -444,10 +449,9 @@ impl DetNumTensorReader {
         col_offset: usize,
         col_count: usize,
     ) -> Result<DetNumTensorSliceSource> {
-        let tensor = self
-            .tensors
-            .get(tensor_name)
-            .ok_or_else(|| anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact"))?;
+        let tensor = self.tensors.get(tensor_name).ok_or_else(|| {
+            anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact")
+        })?;
         if tensor.shape.len() != 2 {
             bail!(
                 "tensor `{tensor_name}` has rank {}, expected 2 for a matrix",
@@ -496,10 +500,9 @@ impl DetNumTensorReader {
     }
 
     fn artifact_path(&self, tensor_name: &str) -> Result<PathBuf> {
-        let _ = self
-            .tensors
-            .get(tensor_name)
-            .ok_or_else(|| anyhow!("failed to locate tensor `{tensor_name}` in deterministic artifact"))?;
+        let _ = self.tensors.get(tensor_name).ok_or_else(|| {
+            anyhow!("failed to locate tensor `{tensor_name}` in deterministic artifact")
+        })?;
         Ok(self.weights_path.clone())
     }
 }
@@ -1271,7 +1274,8 @@ fn materialize_layer_matrix_source(
                     source.weights_path.display()
                 )
             })?;
-            let matrix = std::sync::Arc::new(decode_matrix_slice_from_det_num_source(source, &mmap)?);
+            let matrix =
+                std::sync::Arc::new(decode_matrix_slice_from_det_num_source(source, &mmap)?);
             *cache
                 .lock()
                 .map_err(|_| anyhow!("layer matrix cache is poisoned"))? = Some(matrix.clone());
@@ -1416,7 +1420,9 @@ fn decode_matrix_row_from_det_num_source(
     let mut row = Vec::with_capacity(source.col_count);
     for encoded_value in encoded_row.chunks_exact(4) {
         row.push(det_wgt_to_f32(i32::from_le_bytes(
-            encoded_value.try_into().expect("i32 byte width should match"),
+            encoded_value
+                .try_into()
+                .expect("i32 byte width should match"),
         )));
     }
     Ok(row)
@@ -1446,7 +1452,9 @@ fn decode_matrix_slice_from_det_num_source(
             .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
         for encoded_value in encoded_row.chunks_exact(4) {
             values.push(det_wgt_to_f32(i32::from_le_bytes(
-                encoded_value.try_into().expect("i32 byte width should match"),
+                encoded_value
+                    .try_into()
+                    .expect("i32 byte width should match"),
             )));
         }
     }
@@ -1600,10 +1608,14 @@ fn load_det_num_gemma4_layer_weights(
     let ple = if config.hidden_size_per_layer_input.unwrap_or(0) > 0 {
         Some(Gemma4PleLayerWeights {
             input_gate: Gemma4LayerMatrixSource::from_det_num_source(
-                reader.resolve_full_matrix_source(&format!("{layer_prefix}.per_layer_input_gate.weight"))?,
+                reader.resolve_full_matrix_source(&format!(
+                    "{layer_prefix}.per_layer_input_gate.weight"
+                ))?,
             ),
             layer_projection: Gemma4LayerMatrixSource::from_det_num_source(
-                reader.resolve_full_matrix_source(&format!("{layer_prefix}.per_layer_projection.weight"))?,
+                reader.resolve_full_matrix_source(&format!(
+                    "{layer_prefix}.per_layer_projection.weight"
+                ))?,
             ),
             post_input_norm_weight: reader
                 .load_vector(&format!("{layer_prefix}.post_per_layer_input_norm.weight"))?,
@@ -1635,10 +1647,12 @@ fn load_det_num_gemma4_layer_weights(
         kv_shared_layer_index,
         attention_k_eq_v: !is_sliding && config.attention_k_eq_v(),
         q_proj: Gemma4LayerMatrixSource::from_det_num_source(
-            reader.resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
+            reader
+                .resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
         ),
         k_proj: Gemma4LayerMatrixSource::from_det_num_source(
-            reader.resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
+            reader
+                .resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
         ),
         v_proj: if !is_sliding && config.attention_k_eq_v() {
             if reader
@@ -1646,18 +1660,23 @@ fn load_det_num_gemma4_layer_weights(
                 .contains_key(&format!("{layer_prefix}.self_attn.v_proj.weight"))
             {
                 Some(Gemma4LayerMatrixSource::from_det_num_source(
-                    reader.resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.v_proj.weight"))?,
+                    reader.resolve_full_matrix_source(&format!(
+                        "{layer_prefix}.self_attn.v_proj.weight"
+                    ))?,
                 ))
             } else {
                 None
             }
         } else {
             Some(Gemma4LayerMatrixSource::from_det_num_source(
-                reader.resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.v_proj.weight"))?,
+                reader.resolve_full_matrix_source(&format!(
+                    "{layer_prefix}.self_attn.v_proj.weight"
+                ))?,
             ))
         },
         o_proj: Gemma4LayerMatrixSource::from_det_num_source(
-            reader.resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
+            reader
+                .resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
         ),
         q_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.q_norm.weight"))?,
         k_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.k_norm.weight"))?,
@@ -1715,7 +1734,12 @@ pub fn embed_input_tokens_from_gemma_source(
             )?
         }
         _ => with_embedding_tensor(source, |tensor| {
-            decode_embedding_rows_for_token_ids(tensor, token_ids, source.hidden_size(), source.scale())
+            decode_embedding_rows_for_token_ids(
+                tensor,
+                token_ids,
+                source.hidden_size(),
+                source.scale(),
+            )
         })?,
     };
     let activations_sha256 = build_activation_commitment(&activations);
@@ -2042,7 +2066,9 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
         for encoded_value in encoded_row.chunks_exact(4) {
             row.push(
                 det_wgt_to_f32(i32::from_le_bytes(
-                    encoded_value.try_into().expect("i32 byte width should match"),
+                    encoded_value
+                        .try_into()
+                        .expect("i32 byte width should match"),
                 )) * scale,
             );
         }

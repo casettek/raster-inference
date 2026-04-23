@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     env, fs,
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -9,11 +10,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::checkpoints::PhaseId;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TraceMode {
     Off,
-    LogsOnly,
-    Full,
+    Verbose,
 }
 
 pub struct TraceSpan {
@@ -55,6 +57,28 @@ pub fn trace_event(label: impl AsRef<str>) {
     }
 }
 
+pub fn phase_started(phase_id: PhaseId) {
+    emit_phase("start", phase_id);
+}
+
+pub fn phase_finished(phase_id: PhaseId) {
+    emit_phase("end", phase_id);
+}
+
+pub fn phase_paused(phase_id: PhaseId) {
+    emit_phase("pause", phase_id);
+}
+
+pub fn with_checkpointing_enabled<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    CHECKPOINTING_ENABLED.with(|checkpointing_enabled| {
+        let previous = checkpointing_enabled.replace(enabled);
+        let reset = ResetCheckpointingFlag(previous);
+        let result = f();
+        drop(reset);
+        result
+    })
+}
+
 #[derive(Default)]
 struct TraceCollector {
     checkpoints: Vec<Value>,
@@ -81,6 +105,7 @@ pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
 }
 
 pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) {
+    emit_checkpoint(checkpoint_name);
     if !trace_checkpointing_enabled() {
         return;
     }
@@ -149,20 +174,18 @@ pub fn sha256_hex<T: Serialize>(value: &T) -> String {
 }
 
 fn trace_mode() -> TraceMode {
-    static MODE: OnceLock<TraceMode> = OnceLock::new();
-    *MODE.get_or_init(|| match env::var("RASTER_TRACE_TILES").as_deref() {
-        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => TraceMode::Full,
-        Ok("0") => TraceMode::LogsOnly,
+    match env::var("RASTER_TRACE_TILES").as_deref() {
+        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => TraceMode::Verbose,
         _ => TraceMode::Off,
-    })
+    }
 }
 
 fn trace_logging_enabled() -> bool {
-    matches!(trace_mode(), TraceMode::LogsOnly | TraceMode::Full)
+    matches!(trace_mode(), TraceMode::Verbose)
 }
 
 fn trace_checkpointing_enabled() -> bool {
-    matches!(trace_mode(), TraceMode::Full)
+    CHECKPOINTING_ENABLED.with(Cell::get)
 }
 
 fn emit(kind: &str, label: &str, duration: Option<Duration>) {
@@ -178,6 +201,19 @@ fn emit(kind: &str, label: &str, duration: Option<Duration>) {
             eprintln!("[raster-trace +{elapsed:>8.3}s] {kind:<5} {label}");
         }
     }
+}
+
+fn emit_phase(kind: &str, phase_id: PhaseId) {
+    let elapsed = process_start().elapsed().as_secs_f64();
+    eprintln!(
+        "[raster-phase +{elapsed:>8.3}s] {kind:<5} {}",
+        phase_id.as_str()
+    );
+}
+
+fn emit_checkpoint(checkpoint_name: &str) {
+    let elapsed = process_start().elapsed().as_secs_f64();
+    eprintln!("[raster-checkpoint +{elapsed:>8.3}s] hit   {checkpoint_name}");
 }
 
 fn emit_checkpoint_bundle(payload: &Value, saved_path: Option<&std::path::Path>) {
@@ -237,4 +273,16 @@ fn trace_collector() -> &'static Mutex<TraceCollector> {
 fn process_start() -> &'static Instant {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now)
+}
+
+struct ResetCheckpointingFlag(bool);
+
+impl Drop for ResetCheckpointingFlag {
+    fn drop(&mut self) {
+        CHECKPOINTING_ENABLED.with(|checkpointing_enabled| checkpointing_enabled.set(self.0));
+    }
+}
+
+thread_local! {
+    static CHECKPOINTING_ENABLED: Cell<bool> = const { Cell::new(false) };
 }

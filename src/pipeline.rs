@@ -120,15 +120,13 @@ pub fn run_transformer_state_transition_for_token_ids(
 ) -> Result<TransformerStateTransitionState> {
     let _trace = trace_scope("prefill.from_token_ids");
     let token_embeddings = embed_token_ids(token_ids, model)?;
-    Ok(
-        run_prefill_pass_for_token_ids(
-            token_ids,
-            model,
-            &token_embeddings,
-            InferenceExecutionMode::Fp32,
-        )?
-        .transformer_state,
-    )
+    Ok(run_prefill_pass_for_token_ids(
+        token_ids,
+        model,
+        &token_embeddings,
+        InferenceExecutionMode::Fp32,
+    )?
+    .transformer_state)
 }
 
 pub fn run_transformer_state_transition(
@@ -176,13 +174,15 @@ pub fn decode_step_with_mode(
     let embedded_token = embed_token_id(next_token, model)?;
     trace_event("decode.layer_stack");
     let final_hidden_state = match execution_mode {
-        InferenceExecutionMode::Fp32 => crate::decode_transition::tiles::run_text_layers_decode_step(
-            &embedded_token,
-            next_token,
-            model,
-            layer_caches,
-            position,
-        )?,
+        InferenceExecutionMode::Fp32 => {
+            crate::decode_transition::tiles::run_text_layers_decode_step(
+                &embedded_token,
+                next_token,
+                model,
+                layer_caches,
+                position,
+            )?
+        }
         InferenceExecutionMode::Deterministic => {
             crate::decode_transition::deterministic_tiles::run_text_layers_decode_step(
                 &embedded_token,
