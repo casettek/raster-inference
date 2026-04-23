@@ -7,6 +7,10 @@ edition = "2021"
 name = "gemma-fp32-converter"
 path = "tools/gemma-fp32-converter/main.rs"
 
+[[bin]]
+name = "gemma-det-num-wgt-converter"
+path = "tools/gemma-det-num-wgt-converter/main.rs"
+
 [dependencies]
 anyhow = "1"
 fixed = "1.30.0"

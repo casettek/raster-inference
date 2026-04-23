@@ -1,9 +1,9 @@
 use std::{mem::size_of, panic};
 
 use super::{
-    acc_add_sat, acc_to_le_bytes, act_to_le_bytes, add_sat, argmax_first, clip_act, mac, mul_wide,
-    requantize, rshift_round_ties_even, sub_sat, types::ACC_FRACTIONAL_BITS,
-    types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT, Acc, Act, Wgt,
+    acc_add_sat, acc_to_le_bytes, act_to_le_bytes, add_sat, argmax_first, clip_act, f32_to_wgt,
+    mac, mul_wide, requantize, rshift_round_ties_even, sub_sat, types::ACC_FRACTIONAL_BITS,
+    types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT, wgt_to_le_bytes, Acc, Act, Wgt,
 };
 
 #[test]
@@ -496,6 +496,12 @@ fn serialization_helpers_match_golden_vectors() {
         expected: [u8; 8],
     }
 
+    struct WgtCase {
+        name: &'static str,
+        bits: i32,
+        expected: [u8; 4],
+    }
+
     let act_cases = [
         ActCase {
             name: "zero",
@@ -532,6 +538,24 @@ fn serialization_helpers_match_golden_vectors() {
         },
     ];
 
+    let wgt_cases = [
+        WgtCase {
+            name: "zero",
+            bits: 0,
+            expected: [0x00, 0x00, 0x00, 0x00],
+        },
+        WgtCase {
+            name: "positive",
+            bits: 0x0102_0304,
+            expected: [0x04, 0x03, 0x02, 0x01],
+        },
+        WgtCase {
+            name: "negative",
+            bits: -2,
+            expected: [0xfe, 0xff, 0xff, 0xff],
+        },
+    ];
+
     for case in act_cases {
         assert_eq!(
             act_to_le_bytes(Act::from_bits(case.bits)),
@@ -549,6 +573,90 @@ fn serialization_helpers_match_golden_vectors() {
             case.name
         );
     }
+
+    for case in wgt_cases {
+        assert_eq!(
+            wgt_to_le_bytes(Wgt::from_bits(case.bits)),
+            case.expected,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn f32_to_wgt_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        value: f32,
+        expected_bits: i32,
+    }
+
+    let q16_step = 1.0 / 65_536.0;
+    let cases = [
+        Case {
+            name: "zero",
+            value: 0.0,
+            expected_bits: 0,
+        },
+        Case {
+            name: "exact_value",
+            value: 1.5,
+            expected_bits: 98_304,
+        },
+        Case {
+            name: "half_step_to_zero",
+            value: 0.5 * q16_step,
+            expected_bits: 0,
+        },
+        Case {
+            name: "positive_half_tie_stays_even",
+            value: 2.5 * q16_step,
+            expected_bits: 2,
+        },
+        Case {
+            name: "positive_half_tie_up_to_even",
+            value: 3.5 * q16_step,
+            expected_bits: 4,
+        },
+        Case {
+            name: "negative_half_tie_to_even",
+            value: -3.5 * q16_step,
+            expected_bits: -4,
+        },
+        Case {
+            name: "largest_subnormal_rounds_to_zero",
+            value: f32::from_bits(0x007f_ffff),
+            expected_bits: 0,
+        },
+        Case {
+            name: "positive_saturation",
+            value: 40_000.0,
+            expected_bits: i32::MAX,
+        },
+        Case {
+            name: "negative_saturation",
+            value: -40_000.0,
+            expected_bits: i32::MIN,
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            f32_to_wgt(case.value).to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn f32_to_wgt_panics_on_non_finite_values() {
+    let nan = panic::catch_unwind(|| f32_to_wgt(f32::NAN));
+    assert!(nan.is_err());
+    let inf = panic::catch_unwind(|| f32_to_wgt(f32::INFINITY));
+    assert!(inf.is_err());
 }
 
 #[test]

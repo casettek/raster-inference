@@ -1,4 +1,4 @@
-# `det_num` v0 Arithmetic Spec
+# `det_num` v0 Arithmetic and Model-Compilation Spec
 
 ## Purpose
 
@@ -12,6 +12,8 @@ Its purpose is to ensure that the same model, inputs, and code produce identical
 
 `det_num` is the source of truth for arithmetic semantics. External libraries like `fixed` and `fixed_analytics` are implementation dependencies only.
 
+In v0, `det_num` also defines the canonical numeric representation of compiled model weights used by inference kernels.
+
 ---
 
 ## Design goals
@@ -21,6 +23,7 @@ Its purpose is to ensure that the same model, inputs, and code produce identical
 - efficient enough for CPU inference
 - strict enough to preserve future zkVM parity
 - small surface area for v0
+- isolate arithmetic-path quality effects from storage-format compression effects
 
 ---
 
@@ -53,8 +56,19 @@ This gives:
 - enough fractional precision to start safely
 - wide accumulation headroom
 - easy multiply/requantize behavior
+- a single canonical executable weight format for v0
 
 These bit layouts and semantics are part of the arithmetic contract.
+
+### Real-value interpretation
+
+Canonical interpretation is:
+
+- `Act(x)` represents `x / 2^16`
+- `Wgt(x)` represents `x / 2^16`
+- `Acc(x)` represents `x / 2^32`
+
+where `x` is the signed integer payload of the scalar.
 
 ---
 
@@ -73,6 +87,7 @@ Semantics:
 - multiplication is performed in widened precision
 - no narrow multiply is allowed in canonical kernels
 - no implicit truncation is allowed during multiply
+- the mathematical interpretation is Q16.16 × Q16.16 -> Q32.32
 
 ### 2. Multiply-accumulate
 
@@ -101,6 +116,7 @@ This applies to:
 - subtraction
 - narrowing/requantization
 - explicit clipping steps
+- model-compilation conversion into canonical scalar types
 
 Wrapping arithmetic is forbidden in canonical inference kernels unless a future spec version explicitly introduces it.
 
@@ -116,7 +132,6 @@ Semantics:
 - rounding mode is:
   - **round to nearest**
   - **ties to even**
-
 - narrowing uses saturating conversion
 - no implicit casts are allowed in canonical kernels
 - in v0, `clip_act(x)` is intentionally identical to `requantize(x)`
@@ -157,6 +172,70 @@ This tie-break rule is part of the contract.
 
 ---
 
+## Canonical source conversion rules
+
+### Overview
+
+`det_num` v0 defines a canonical conversion from source FP32 weights into executable `Wgt` tensors.
+
+This conversion is part of the deterministic model-compilation process.
+
+The source FP32 model is an upstream artifact only. It is **not** the canonical executable inference artifact.
+
+The canonical executable model artifact for v0 stores weights directly as `Wgt` values.
+
+### FP32 -> `Wgt` conversion
+
+Rule:
+
+- `f32_to_wgt(x: f32) -> Wgt`
+
+Semantics:
+
+1. Interpret `x` as a real-valued scalar.
+2. Multiply by `2^16`.
+3. Round to nearest, ties to even.
+4. Saturate to signed 32-bit range.
+5. Store the resulting signed 32-bit integer payload as `Wgt`.
+
+Equivalent mathematical form:
+
+- `q = sat_i32(round_ties_even(x * 65536.0))`
+
+Interpretation:
+
+- resulting `Wgt(q)` represents `q / 65536`
+
+### v0 storage policy
+
+v0 uses **direct canonical Q16.16 weight storage**.
+
+v0 does **not** introduce:
+
+- per-tensor external scales
+- per-channel external scales
+- block quantization metadata
+- compressed weight encodings optimized for size
+
+This is intentional, to isolate arithmetic-path effects from separate storage-format approximation schemes.
+
+### Canonical model artifact
+
+The v0 executable model artifact must store weights in canonical `Wgt` form.
+
+The artifact may contain:
+
+- format magic/version
+- `det_num_spec_version`
+- tensor metadata
+- tensor shapes
+- tensor role/type
+- canonical `Wgt` payload bytes
+
+The artifact must not require host-native floating-point interpretation during inference.
+
+---
+
 ## Serialization rules
 
 All serialized arithmetic values must use:
@@ -170,6 +249,12 @@ Rules:
 - all scalar numeric values serialized with explicit byte conversion
 - no raw memory reinterpretation as canonical serialization format
 - all checkpoint/state hashes must derive from canonical serialized bytes
+
+For v0 compiled weights:
+
+- each `Wgt` scalar is serialized as a 4-byte signed little-endian integer
+- each `Act` scalar is serialized as a 4-byte signed little-endian integer
+- each `Acc` scalar is serialized as an 8-byte signed little-endian integer
 
 ---
 
@@ -185,6 +270,12 @@ The following are forbidden in canonical arithmetic code:
 - platform-dependent serialization
 - unordered or unstable argmax behavior
 
+The following are additionally forbidden in the v0 executable inference path:
+
+- reading FP32 weights as runtime arithmetic truth
+- load-time weight interpretation that changes canonical numeric meaning
+- alternate weight encodings that are not direct `Wgt` payloads
+
 ---
 
 ## Required wrapper API
@@ -192,20 +283,18 @@ The following are forbidden in canonical arithmetic code:
 `det_num` v0 must expose at least:
 
 - `type Act`
-
 - `type Wgt`
-
 - `type Acc`
 
 - `fn mul_wide(a: Act, b: Wgt) -> Acc`
-
 - `fn mac(acc: Acc, a: Act, b: Wgt) -> Acc`
 
 - `fn requantize(x: Acc) -> Act`
-
 - `fn clip_act(x: Acc) -> Act`
 
 - `fn argmax_first(xs: &[Act]) -> usize`
+
+- `fn f32_to_wgt(x: f32) -> Wgt`
 
 Recommended additional helpers:
 
@@ -214,6 +303,7 @@ Recommended additional helpers:
 - `fn acc_add_sat(a: Acc, b: Acc) -> Acc`
 - `fn rshift_round_ties_even(x: Acc, shift: u32) -> Acc`
 - `fn act_to_le_bytes(x: Act) -> [u8; 4]`
+- `fn wgt_to_le_bytes(x: Wgt) -> [u8; 4]`
 - `fn acc_to_le_bytes(x: Acc) -> [u8; 8]`
 
 ---
@@ -235,7 +325,13 @@ Recommended additional helpers:
 
 Those belong in later layers built on top of `det_num`.
 
-v0 only defines the arithmetic substrate those operators must use.
+v0 defines:
+
+- the arithmetic substrate
+- the canonical executable weight representation
+- the canonical FP32 -> `Wgt` model-compilation rule
+
+v0 does **not** yet define full end-to-end inference semantics.
 
 ---
 
@@ -252,6 +348,13 @@ Before using `det_num` in model kernels, it must pass:
 - signed shift behavior
 - argmax tie-breaking
 
+### Weight-conversion tests
+
+- `f32_to_wgt` exactness for representative values
+- ties-to-even conversion cases near half-step boundaries
+- saturation behavior at extreme source values
+- byte-stable serialized `Wgt` output
+
 ### Serialization tests
 
 - byte encoding is stable
@@ -262,6 +365,15 @@ Before using `det_num` in model kernels, it must pass:
 
 - debug vs release parity
 - x86 vs ARM parity for the same inputs
+
+### Transitional validation tests
+
+During migration from the current FP32 inference path:
+
+- compare converted-weight path against existing FP32 baseline
+- measure token agreement
+- measure logits drift
+- record any quality changes before replacing higher-level arithmetic operators
 
 ---
 
@@ -274,11 +386,14 @@ This spec is versioned as:
 Any future change to:
 
 - type aliases
+- numeric interpretation
+- source conversion rule
 - rounding mode
 - overflow policy
 - shift policy
 - tie-breaking
 - serialization
+- executable weight artifact format
 
 must increment the spec version.
 
@@ -297,3 +412,5 @@ must increment the spec version.
 - round-to-nearest, ties-to-even
 - little-endian serialization
 - argmax ties resolved by lowest index
+- direct canonical Q16.16 compiled weight storage
+- explicit FP32 -> `Wgt` deterministic model compilation
