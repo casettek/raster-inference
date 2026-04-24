@@ -251,6 +251,62 @@ Semantics:
 - accumulation uses saturating `Acc`
 - each output dimension is materialized with canonical `requantize`
 
+### 11. Deterministic tanh semantics
+
+Canonical deterministic `tanh` is defined on `Act` inputs and must not rely on host `f32`
+transcendentals at execution time.
+
+Rule:
+
+- `tanh_act(input: Act) -> Act`
+
+Semantics:
+
+- inputs are interpreted canonically in Q16.16
+- saturation is explicit: `input >= 3.0` maps to `1.0`, and `input <= -3.0` maps to `-1.0`
+- otherwise, evaluation uses the fixed rational approximation `x * (27 + x^2) / (27 + 9x^2)`
+- `x^2` is materialized with canonical `mul_sat`
+- numerator and denominator terms are formed with canonical saturating add/multiply helpers
+- division uses canonical `div_act`, so rounding is ties-to-even
+- evaluation order is fixed and part of the contract:
+  1. compute `x^2`
+  2. compute `27 + x^2`
+  3. compute `27 + 9x^2`
+  4. compute `x * (27 + x^2)`
+  5. divide by `27 + 9x^2`
+
+### 12. Deterministic GELU(tanh) semantics
+
+Canonical deterministic GELU uses the repo's existing PyTorch tanh structure, but every step is
+defined on canonical fixed-point inputs.
+
+Rule:
+
+- `gelu_pytorch_tanh_act(input: Act) -> Act`
+
+Semantics:
+
+- the helper implements `0.5 * x * (1 + tanh(sqrt(2 / pi) * (x + 0.044715 * x^3)))`
+- constants are encoded canonically in Q16.16 before evaluation:
+  - `0.5 -> 32768`
+  - `sqrt(2 / pi) -> 52290`
+  - `0.044715 -> 2930`
+- `x^2` and `x^3` use canonical `mul_sat`
+- the cubic term is formed before adding back to `x`
+- the inner scale multiplication happens after that addition
+- the `tanh` stage must call canonical `tanh_act`
+- the final multiply order is fixed and part of the contract:
+  1. compute `x^2`
+  2. compute `x^3`
+  3. compute `0.044715 * x^3`
+  4. compute `x + 0.044715 * x^3`
+  5. compute `sqrt(2 / pi) * (...)`
+  6. compute `tanh_act(...)`
+  7. compute `0.5 * x`
+  8. compute `1 + tanh(...)`
+  9. multiply those two terms
+- no host-float GELU or host `tanh` fallback is allowed once deterministic MLP execution is active
+
 ---
 
 ## Canonical source conversion rules
@@ -378,6 +434,8 @@ The following are additionally forbidden in the v0 executable inference path:
 - `fn attention_score(query: &[Act], key: &[Act]) -> Act`
 - `fn attention_softmax(logits: &[Act]) -> Vec<Act>`
 - `fn attention_weighted_sum(weights: &[Act], value_rows: &[Vec<Act>]) -> Vec<Act>`
+- `fn tanh_act(input: Act) -> Act`
+- `fn gelu_pytorch_tanh_act(input: Act) -> Act`
 
 - `fn f32_to_wgt(x: f32) -> Wgt`
 
@@ -403,7 +461,6 @@ Recommended additional helpers:
 - `rsqrt`
 - `sin`
 - `cos`
-- `tanh`
 - `rmsnorm`
 
 Those belong in later layers built on top of `det_num`.
@@ -433,6 +490,8 @@ Before using `det_num` in model kernels, it must pass:
 - attention score accumulation
 - attention softmax normalization and tie handling
 - attention weighted-value aggregation
+- tanh saturation, sign, and ties-to-even division behavior
+- GELU representative positive, negative, near-zero, and tie-sensitive cases
 
 ### Weight-conversion tests
 

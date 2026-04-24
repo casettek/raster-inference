@@ -3,11 +3,10 @@ use std::{mem::size_of, panic};
 use super::{
     acc_add_sat, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first,
     attention_score, attention_softmax, attention_weighted_sum, clip_act, div_acc_by_u32, div_act,
-    f32_to_acc, f32_to_act, f32_to_wgt, mac, mac_bits, mul_sat, mul_wide, requantize, rms_norm,
-    rms_norm_scale, rope_rotate_pairs, rshift_round_ties_even, scale_act, sub_sat,
-    value_rms_norm,
-    types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT,
-    wgt_to_le_bytes, Acc, Act, Wgt,
+    f32_to_acc, f32_to_act, f32_to_wgt, gelu_pytorch_tanh_act, mac, mac_bits, mul_sat, mul_wide,
+    requantize, rms_norm, rms_norm_scale, rope_rotate_pairs, rshift_round_ties_even, scale_act,
+    sub_sat, tanh_act, types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS,
+    types::REQUANTIZE_SHIFT, value_rms_norm, wgt_to_le_bytes, Acc, Act, Wgt,
 };
 
 #[test]
@@ -434,7 +433,10 @@ fn rms_norm_matches_golden_vectors() {
         Acc::from_bits(0),
     );
     assert_eq!(
-        normalized.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        normalized
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
         vec![46_341, 0]
     );
 
@@ -444,7 +446,10 @@ fn rms_norm_matches_golden_vectors() {
         Acc::from_bits(0),
     );
     assert_eq!(
-        signed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        signed
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
         vec![65_536, -65_536]
     );
 }
@@ -456,13 +461,22 @@ fn value_rms_norm_matches_golden_vectors() {
         Acc::from_bits(0),
     );
     assert_eq!(
-        normalized.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        normalized
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
         vec![92_682, 0]
     );
 
-    let zero_row = value_rms_norm(&[Act::from_bits(0)], Acc::from_bits(1_i64 << ACC_FRACTIONAL_BITS));
+    let zero_row = value_rms_norm(
+        &[Act::from_bits(0)],
+        Acc::from_bits(1_i64 << ACC_FRACTIONAL_BITS),
+    );
     assert_eq!(
-        zero_row.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        zero_row
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
         vec![0]
     );
 }
@@ -483,7 +497,10 @@ fn attention_score_matches_golden_vectors() {
 fn attention_softmax_matches_contract_vectors() {
     let equal = attention_softmax(&[Act::from_num(0.0), Act::from_num(0.0)]);
     assert_eq!(
-        equal.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        equal
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
         vec![32_768, 32_768]
     );
 
@@ -496,7 +513,8 @@ fn attention_softmax_matches_contract_vectors() {
         vec![43_695, 21_841]
     );
 
-    let stable_tie = attention_softmax(&[Act::from_num(0.0), Act::from_num(0.0), Act::from_num(0.0)]);
+    let stable_tie =
+        attention_softmax(&[Act::from_num(0.0), Act::from_num(0.0), Act::from_num(0.0)]);
     assert_eq!(
         stable_tie
             .iter()
@@ -516,7 +534,10 @@ fn attention_weighted_sum_matches_golden_vectors() {
         ],
     );
     assert_eq!(
-        mixed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        mixed
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
         vec![32_768, 32_768]
     );
 
@@ -528,6 +549,113 @@ fn attention_weighted_sum_matches_golden_vectors() {
         ],
     );
     assert_eq!(saturated, vec![Act::from_bits(i32::MAX)]);
+}
+
+#[test]
+fn tanh_act_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        input_bits: i32,
+        expected_bits: i32,
+    }
+
+    let cases = [
+        Case {
+            name: "zero",
+            input_bits: 0,
+            expected_bits: 0,
+        },
+        Case {
+            name: "near_zero_preserves_sign",
+            input_bits: 1,
+            expected_bits: 1,
+        },
+        Case {
+            name: "positive_midrange",
+            input_bits: Act::from_num(0.5).to_bits(),
+            expected_bits: 30_527,
+        },
+        Case {
+            name: "negative_midrange",
+            input_bits: Act::from_num(-0.5).to_bits(),
+            expected_bits: -30_527,
+        },
+        Case {
+            name: "saturates_positive_at_three",
+            input_bits: Act::from_num(3.0).to_bits(),
+            expected_bits: Act::from_num(1.0).to_bits(),
+        },
+        Case {
+            name: "saturates_negative_at_three",
+            input_bits: Act::from_num(-3.0).to_bits(),
+            expected_bits: Act::from_num(-1.0).to_bits(),
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            tanh_act(Act::from_bits(case.input_bits)).to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn gelu_pytorch_tanh_act_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        input_bits: i32,
+        expected_bits: i32,
+    }
+
+    let cases = [
+        Case {
+            name: "zero",
+            input_bits: 0,
+            expected_bits: 0,
+        },
+        Case {
+            name: "half_step_rounds_to_zero",
+            input_bits: 1,
+            expected_bits: 0,
+        },
+        Case {
+            name: "positive_midrange",
+            input_bits: Act::from_num(0.5).to_bits(),
+            expected_bits: 22_691,
+        },
+        Case {
+            name: "negative_midrange",
+            input_bits: Act::from_num(-0.5).to_bits(),
+            expected_bits: -10_077,
+        },
+        Case {
+            name: "large_positive",
+            input_bits: Act::from_num(2.0).to_bits(),
+            expected_bits: 129_512,
+        },
+        Case {
+            name: "large_negative",
+            input_bits: Act::from_num(-2.0).to_bits(),
+            expected_bits: -1_560,
+        },
+        Case {
+            name: "tie_sensitive_small_positive",
+            input_bits: 3,
+            expected_bits: 2,
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            gelu_pytorch_tanh_act(Act::from_bits(case.input_bits)).to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
 }
 
 #[test]
@@ -546,7 +674,10 @@ fn rope_rotate_pairs_matches_golden_vectors() {
     );
 
     assert_eq!(
-        rotated.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        rotated
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
         vec![7_835, 8_107, 72_850, -31_750]
     );
 }

@@ -6,9 +6,10 @@ use sha2::{Digest, Sha256};
 use crate::shared::det_num::{
     act_to_f32, add_sat, attention_score as det_attention_score,
     attention_softmax as det_attention_softmax,
-    attention_weighted_sum as det_attention_weighted_sum, f32_to_acc, f32_to_act, mac_bits,
-    mul_sat, requantize, rms_norm as det_rms_norm, rope_rotate_pairs as det_rope_rotate_pairs,
-    scale_act, value_rms_norm as det_value_rms_norm, Acc, Act,
+    attention_weighted_sum as det_attention_weighted_sum, f32_to_acc, f32_to_act,
+    gelu_pytorch_tanh_act, mac_bits, mul_sat, requantize, rms_norm as det_rms_norm,
+    rope_rotate_pairs as det_rope_rotate_pairs, scale_act, value_rms_norm as det_value_rms_norm,
+    Acc, Act,
 };
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
@@ -144,9 +145,9 @@ pub fn compute_prefill_ple_inputs(
 
         let mut embedded = Vec::with_capacity(token_ids.len());
         for token_id in token_ids {
-            embedded.push(
-                crate::io::load_ple_token_embedding_row(ple_global, layer_idx, *token_id)?,
-            );
+            embedded.push(crate::io::load_ple_token_embedding_row(
+                ple_global, layer_idx, *token_id,
+            )?);
         }
         let embedded = scale_sequence_buffer(
             &ActivationSequenceBuffer::from_values(embedded),
@@ -163,11 +164,8 @@ pub fn compute_prefill_ple_inputs(
             model_projection_det.as_deref(),
         )?;
         let projected_uses_det = projected.acts.is_some();
-        let projected = scale_sequence_buffer(
-            &projected,
-            ple_global.projection_scalar,
-            projected_uses_det,
-        );
+        let projected =
+            scale_sequence_buffer(&projected, ple_global.projection_scalar, projected_uses_det);
         let projected = ActivationSequenceBuffer::from_values(apply_rms_norm_to_sequence(
             &projected.values,
             &ple_global.projection_norm_weight,
@@ -263,16 +261,14 @@ pub fn run_gemma4_layer(
     layer: &ResolvedGemma4LayerWeights,
     per_layer_input: Option<&[Vec<f32>]>,
 ) -> Result<ActivationSequence> {
-    Ok(
-        run_gemma4_layer_with_cache(
-            input_activations,
-            layer,
-            per_layer_input,
-            None,
-            InferenceExecutionMode::Fp32,
-        )?
-        .0,
-    )
+    Ok(run_gemma4_layer_with_cache(
+        input_activations,
+        layer,
+        per_layer_input,
+        None,
+        InferenceExecutionMode::Fp32,
+    )?
+    .0)
 }
 
 pub(crate) fn run_gemma4_layer_with_cache(
@@ -366,12 +362,9 @@ pub(crate) fn run_gemma4_layer_with_cache(
                 .iter()
                 .map(|row| row.iter().copied().map(f32_to_act).collect::<Vec<_>>())
                 .collect::<Vec<_>>();
-            let gate_preactivation = quantized_normed
-                .par_iter()
-                .map(|row| det_linear_row_from_acts(row, gate_weight.as_ref()))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
+            let gate_preactivation = ActivationSequenceBuffer::from_acts(
+                det_linear_sequence_acts_from_acts(&quantized_normed, gate_weight.as_ref())?,
+            );
             let up = quantized_normed
                 .par_iter()
                 .map(|row| det_linear_row_acts_from_acts(row, up_weight.as_ref()))
@@ -379,7 +372,7 @@ pub(crate) fn run_gemma4_layer_with_cache(
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
             (
-                ActivationSequenceBuffer::from_values(apply_gelu_to_sequence(&gate_preactivation)),
+                apply_gelu_to_sequence_buffer(&gate_preactivation, execution_mode),
                 ActivationSequenceBuffer::from_acts(up),
             )
         }
@@ -407,9 +400,7 @@ pub(crate) fn run_gemma4_layer_with_cache(
                 )?),
             };
             (
-                ActivationSequenceBuffer::from_values(apply_gelu_to_sequence(
-                    &gate_preactivation.values,
-                )),
+                apply_gelu_to_sequence_buffer(&gate_preactivation, execution_mode),
                 up,
             )
         }
@@ -421,9 +412,11 @@ pub(crate) fn run_gemma4_layer_with_cache(
     let ff_out = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.down_proj");
         match layer.down_proj_det.as_ref() {
-            Some(weight) => {
-                project_linear_sequence_buffer(&ff_hidden, layer.down_proj.as_ref(), Some(weight.as_ref()))?
-            }
+            Some(weight) => project_linear_sequence_buffer(
+                &ff_hidden,
+                layer.down_proj.as_ref(),
+                Some(weight.as_ref()),
+            )?,
             None => ActivationSequenceBuffer::from_values(linear_sequence(
                 &ff_hidden.values,
                 layer.down_proj.as_ref(),
@@ -450,20 +443,14 @@ pub(crate) fn run_gemma4_layer_with_cache(
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.clone_residual");
             xs.clone()
         };
-        let quantized_xs = ple
-            .input_gate_det
-            .as_ref()
-            .map(|_| quantize_sequence_to_acts(&xs.values));
         let gated = {
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.input_gate_gelu");
-            ActivationSequenceBuffer::from_values(apply_gelu_to_sequence(
-                &project_linear_sequence(
-                    &xs.values,
-                    quantized_xs.as_deref(),
-                    ple.input_gate.as_ref(),
-                    ple.input_gate_det.as_deref(),
-                )?,
-            ))
+            let gate_preactivation = project_linear_sequence_buffer(
+                &ActivationSequenceBuffer::from_values(xs.values.clone()),
+                ple.input_gate.as_ref(),
+                ple.input_gate_det.as_deref(),
+            )?;
+            apply_gelu_to_sequence_buffer(&gate_preactivation, execution_mode)
         };
         let gated = {
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.input_mul");
@@ -574,8 +561,14 @@ pub fn run_gemma4_layer_decode_with_mode(
         layer.rms_norm_eps,
         execution_mode,
     )?;
-    let (xs_values, updated_cache) =
-        run_attention_for_layer_decode(&normed, layer, cache, donor_cache, position, execution_mode)?;
+    let (xs_values, updated_cache) = run_attention_for_layer_decode(
+        &normed,
+        layer,
+        cache,
+        donor_cache,
+        position,
+        execution_mode,
+    )?;
     let mut xs = ActivationRowBuffer::from_values(apply_rms_norm(
         &xs_values,
         &layer.post_attention_layernorm_weight,
@@ -595,10 +588,14 @@ pub fn run_gemma4_layer_decode_with_mode(
     {
         (Some(gate_weight), Some(up_weight)) => {
             let quantized_normed = normed.iter().copied().map(f32_to_act).collect::<Vec<_>>();
-            let gate_preactivation =
-                det_linear_row_from_acts(&quantized_normed, gate_weight.as_ref())?;
             (
-                ActivationRowBuffer::from_values(apply_gelu(&gate_preactivation)),
+                apply_gelu_to_row_buffer(
+                    &ActivationRowBuffer::from_acts(det_linear_row_acts_from_acts(
+                        &quantized_normed,
+                        gate_weight.as_ref(),
+                    )?),
+                    execution_mode,
+                ),
                 ActivationRowBuffer::from_acts(det_linear_row_acts_from_acts(
                     &quantized_normed,
                     up_weight.as_ref(),
@@ -612,10 +609,9 @@ pub fn run_gemma4_layer_decode_with_mode(
                     layer.gate_proj.as_ref(),
                     Some(weight.as_ref()),
                 )?,
-                None => ActivationRowBuffer::from_values(linear_row(
-                    &normed,
-                    layer.gate_proj.as_ref(),
-                )?),
+                None => {
+                    ActivationRowBuffer::from_values(linear_row(&normed, layer.gate_proj.as_ref())?)
+                }
             };
             let up = match up_weight {
                 Some(weight) => project_linear_row_buffer(
@@ -623,13 +619,12 @@ pub fn run_gemma4_layer_decode_with_mode(
                     layer.up_proj.as_ref(),
                     Some(weight.as_ref()),
                 )?,
-                None => ActivationRowBuffer::from_values(linear_row(
-                    &normed,
-                    layer.up_proj.as_ref(),
-                )?),
+                None => {
+                    ActivationRowBuffer::from_values(linear_row(&normed, layer.up_proj.as_ref())?)
+                }
             };
             (
-                ActivationRowBuffer::from_values(apply_gelu(&gate_preactivation.values)),
+                apply_gelu_to_row_buffer(&gate_preactivation, execution_mode),
                 up,
             )
         }
@@ -659,16 +654,14 @@ pub fn run_gemma4_layer_decode_with_mode(
 
     if let (Some(ple), Some(per_layer_input)) = (&layer.ple, per_layer_input) {
         let residual = xs.clone();
-        let quantized_xs = ple
-            .input_gate_det
-            .as_ref()
-            .map(|_| quantize_row_to_acts(&xs.values));
-        let gated = ActivationRowBuffer::from_values(apply_gelu(&project_linear_row(
-            &xs.values,
-            quantized_xs.as_deref(),
-            ple.input_gate.as_ref(),
-            ple.input_gate_det.as_deref(),
-        )?));
+        let gated = apply_gelu_to_row_buffer(
+            &project_linear_row_buffer(
+                &ActivationRowBuffer::from_values(xs.values.clone()),
+                ple.input_gate.as_ref(),
+                ple.input_gate_det.as_deref(),
+            )?,
+            execution_mode,
+        );
         let gated = mul_row_buffers(
             &gated,
             &ActivationRowBuffer::from_values(per_layer_input.to_vec()),
@@ -738,14 +731,13 @@ pub fn run_text_layers_prefill_with_cache(
             .and_then(|input| input.as_deref());
         let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
-        let (layer_output, layer_cache) =
-            run_gemma4_layer_with_cache(
-                &xs,
-                &resolved_layer,
-                per_layer_input,
-                donor_cache,
-                InferenceExecutionMode::Fp32,
-            )?;
+        let (layer_output, layer_cache) = run_gemma4_layer_with_cache(
+            &xs,
+            &resolved_layer,
+            per_layer_input,
+            donor_cache,
+            InferenceExecutionMode::Fp32,
+        )?;
         xs = layer_output.activations;
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
@@ -1021,8 +1013,12 @@ pub fn project_decode_hidden_to_logits(
     final_logit_softcapping: Option<f32>,
 ) -> Result<PrefillLogits> {
     // let _trace = trace_scope("transformer_state_transition.project_decode_hidden_to_logits");
-    let normalized =
-        apply_rms_norm(hidden_state, final_norm_weight, rms_norm_eps, execution_mode)?;
+    let normalized = apply_rms_norm(
+        hidden_state,
+        final_norm_weight,
+        rms_norm_eps,
+        execution_mode,
+    )?;
     let mut logits = project_to_logits(&normalized, projection, embedding_source, execution_mode)?;
     if let Some(softcap) = final_logit_softcapping {
         logits = apply_final_logit_softcapping(&logits, softcap);
@@ -1211,11 +1207,21 @@ fn run_causal_attention(
 
     {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.q_rms_norm");
-        apply_head_rms_norm(&mut q, &layer.q_norm_weight, layer.rms_norm_eps, execution_mode)?;
+        apply_head_rms_norm(
+            &mut q,
+            &layer.q_norm_weight,
+            layer.rms_norm_eps,
+            execution_mode,
+        )?;
     }
     {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.k_rms_norm");
-        apply_head_rms_norm(&mut k, &layer.k_norm_weight, layer.rms_norm_eps, execution_mode)?;
+        apply_head_rms_norm(
+            &mut k,
+            &layer.k_norm_weight,
+            layer.rms_norm_eps,
+            execution_mode,
+        )?;
     }
     {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.v_rms_norm");
@@ -1384,8 +1390,18 @@ fn run_causal_attention_decode(
     let mut k = reshape_row_heads(&raw_k, layer.num_kv_heads, layer.head_dim)?;
     let mut v = reshape_row_heads(&raw_v, layer.num_kv_heads, layer.head_dim)?;
 
-    apply_head_rms_norm_row(&mut q, &layer.q_norm_weight, layer.rms_norm_eps, execution_mode)?;
-    apply_head_rms_norm_row(&mut k, &layer.k_norm_weight, layer.rms_norm_eps, execution_mode)?;
+    apply_head_rms_norm_row(
+        &mut q,
+        &layer.q_norm_weight,
+        layer.rms_norm_eps,
+        execution_mode,
+    )?;
+    apply_head_rms_norm_row(
+        &mut k,
+        &layer.k_norm_weight,
+        layer.rms_norm_eps,
+        execution_mode,
+    )?;
     apply_value_rms_norm_row(&mut v, layer.rms_norm_eps, execution_mode)?;
     apply_rope_to_rows(
         &mut q,
@@ -1726,7 +1742,10 @@ fn add_row_buffers(
             &row_buffer_acts(rhs),
         )?))
     } else {
-        Ok(ActivationRowBuffer::from_values(add_rows(&lhs.values, &rhs.values)?))
+        Ok(ActivationRowBuffer::from_values(add_rows(
+            &lhs.values,
+            &rhs.values,
+        )?))
     }
 }
 
@@ -1741,10 +1760,9 @@ fn mul_sequence_buffers(
             &sequence_buffer_acts(rhs),
         )?))
     } else {
-        Ok(ActivationSequenceBuffer::from_values(elementwise_mul_sequences(
-            &lhs.values,
-            &rhs.values,
-        )?))
+        Ok(ActivationSequenceBuffer::from_values(
+            elementwise_mul_sequences(&lhs.values, &rhs.values)?,
+        ))
     }
 }
 
@@ -1781,7 +1799,11 @@ fn scale_sequence_buffer(
     }
 }
 
-fn scale_row_buffer(values: &ActivationRowBuffer, scalar: f32, deterministic: bool) -> ActivationRowBuffer {
+fn scale_row_buffer(
+    values: &ActivationRowBuffer,
+    scalar: f32,
+    deterministic: bool,
+) -> ActivationRowBuffer {
     if deterministic {
         ActivationRowBuffer::from_acts(scale_act_rows(&row_buffer_acts(values), f32_to_act(scalar)))
     } else {
@@ -1876,11 +1898,13 @@ fn project_linear_row_buffer(
     det_weight: Option<&DetNumMatrix>,
 ) -> Result<ActivationRowBuffer> {
     match det_weight {
-        Some(det_weight) => Ok(ActivationRowBuffer::from_acts(det_linear_row_acts_from_acts(
-            &row_buffer_acts(input),
-            det_weight,
+        Some(det_weight) => Ok(ActivationRowBuffer::from_acts(
+            det_linear_row_acts_from_acts(&row_buffer_acts(input), det_weight)?,
+        )),
+        None => Ok(ActivationRowBuffer::from_values(linear_row(
+            &input.values,
+            weight,
         )?)),
-        None => Ok(ActivationRowBuffer::from_values(linear_row(&input.values, weight)?)),
     }
 }
 
@@ -1919,7 +1943,10 @@ fn det_linear_sequence_acts_from_acts(
         .collect()
 }
 
-fn det_linear_row_acts_from_acts(quantized_input: &[Act], weight: &DetNumMatrix) -> Result<Vec<Act>> {
+fn det_linear_row_acts_from_acts(
+    quantized_input: &[Act],
+    weight: &DetNumMatrix,
+) -> Result<Vec<Act>> {
     if quantized_input.len() != weight.cols {
         bail!(
             "deterministic linear input width mismatch: {} vs {}",
@@ -2003,7 +2030,8 @@ fn apply_rms_norm(
 
     match execution_mode {
         InferenceExecutionMode::Fp32 => {
-            let mean_square = input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
+            let mean_square =
+                input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
             let scale = (mean_square + eps).sqrt().recip();
             Ok(input
                 .iter()
@@ -2018,10 +2046,12 @@ fn apply_rms_norm(
                 .copied()
                 .map(crate::shared::det_num::f32_to_wgt)
                 .collect::<Vec<_>>();
-            Ok(det_rms_norm(&quantized_input, &quantized_weight, f32_to_acc(eps))
-                .into_iter()
-                .map(act_to_f32)
-                .collect())
+            Ok(
+                det_rms_norm(&quantized_input, &quantized_weight, f32_to_acc(eps))
+                    .into_iter()
+                    .map(act_to_f32)
+                    .collect(),
+            )
         }
     }
 }
@@ -2381,6 +2411,37 @@ fn apply_gelu(inputs: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+fn apply_gelu_to_sequence_buffer(
+    inputs: &ActivationSequenceBuffer,
+    execution_mode: InferenceExecutionMode,
+) -> ActivationSequenceBuffer {
+    if matches!(execution_mode, InferenceExecutionMode::Deterministic) {
+        return ActivationSequenceBuffer::from_acts(
+            sequence_buffer_acts(inputs)
+                .iter()
+                .map(|row| apply_det_gelu(row))
+                .collect(),
+        );
+    }
+
+    ActivationSequenceBuffer::from_values(apply_gelu_to_sequence(&inputs.values))
+}
+
+fn apply_gelu_to_row_buffer(
+    inputs: &ActivationRowBuffer,
+    execution_mode: InferenceExecutionMode,
+) -> ActivationRowBuffer {
+    if matches!(execution_mode, InferenceExecutionMode::Deterministic) {
+        return ActivationRowBuffer::from_acts(apply_det_gelu(&row_buffer_acts(inputs)));
+    }
+
+    ActivationRowBuffer::from_values(apply_gelu(&inputs.values))
+}
+
+fn apply_det_gelu(inputs: &[Act]) -> Vec<Act> {
+    inputs.iter().copied().map(gelu_pytorch_tanh_act).collect()
+}
+
 fn gelu_pytorch_tanh(value: f32) -> f32 {
     let inner = std::f32::consts::FRAC_2_SQRT_PI * (value + 0.044_715 * value.powi(3));
     0.5 * value * (1.0 + inner.tanh())
@@ -2395,19 +2456,20 @@ mod tests {
     };
 
     use super::{
-        append_kv_cache, apply_final_norm, apply_final_norm_with_mode, apply_head_rms_norm,
-        apply_head_rms_norm_row, apply_rms_norm_to_sequence, apply_rope_to_rows,
-        apply_value_rms_norm, apply_value_rms_norm_row, compute_decode_ple_input,
-        compute_prefill_ple_inputs, det_linear_row, det_linear_row_from_acts, det_linear_sequence,
-        embed_input_tokens, extract_prefill_logits, project_decode_hidden_to_logits,
-        project_to_logits, run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
+        append_kv_cache, apply_final_norm, apply_final_norm_with_mode, apply_gelu,
+        apply_gelu_to_row_buffer, apply_head_rms_norm, apply_head_rms_norm_row,
+        apply_rms_norm_to_sequence, apply_rope_to_rows, apply_value_rms_norm,
+        apply_value_rms_norm_row, compute_decode_ple_input, compute_prefill_ple_inputs,
+        det_linear_row, det_linear_row_from_acts, det_linear_sequence, embed_input_tokens,
+        extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
+        run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
         run_gemma4_layer_decode, run_text_layers_decode_step, run_text_layers_prefill,
-        run_text_layers_prefill_with_cache,
+        run_text_layers_prefill_with_cache, ActivationRowBuffer,
     };
     use crate::shared::det_num::{
         act_to_f32, attention_score, attention_softmax, attention_weighted_sum, f32_to_act,
-        f32_to_wgt, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-        DET_WGT_ARTIFACT_MAGIC,
+        f32_to_wgt, gelu_pytorch_tanh_act, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
+        DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
     };
     use crate::shared::input::InferenceExecutionMode;
     use crate::shared::transformer::{
@@ -2484,7 +2546,8 @@ mod tests {
             scale: 0.5,
         };
 
-        let fp32 = embed_input_tokens(&[0], &embedding_table).expect("fp32 embedding should succeed");
+        let fp32 =
+            embed_input_tokens(&[0], &embedding_table).expect("fp32 embedding should succeed");
         let det = super::embed_input_tokens_with_mode(
             &[0],
             &embedding_table,
@@ -2712,6 +2775,30 @@ mod tests {
             run_gemma4_layer(&activations, &resolved_layer, None).expect("layer should succeed");
 
         assert_eq!(output.activations, activations);
+    }
+
+    #[test]
+    fn apply_gelu_to_row_buffer_uses_det_num_contract_in_deterministic_mode() {
+        let input = ActivationRowBuffer::from_values(vec![0.5, -0.5]);
+
+        let output = apply_gelu_to_row_buffer(&input, InferenceExecutionMode::Deterministic);
+
+        let expected_acts = vec![
+            gelu_pytorch_tanh_act(Act::from_num(0.5)),
+            gelu_pytorch_tanh_act(Act::from_num(-0.5)),
+        ];
+        let fp32_output = apply_gelu(&[0.5, -0.5]);
+
+        assert_eq!(output.acts, Some(expected_acts.clone()));
+        assert_eq!(
+            output.values,
+            expected_acts
+                .iter()
+                .copied()
+                .map(act_to_f32)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(output.values, fp32_output);
     }
 
     #[test]
@@ -3029,16 +3116,15 @@ mod tests {
         let mut resolved_with_det = resolved_without_det.clone();
         resolved_with_det.q_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
 
-        let without_det =
-            run_causal_attention(
-                &inputs,
-                &resolved_without_det,
-                None,
-                None,
-                None,
-                InferenceExecutionMode::Fp32,
-            )
-            .unwrap();
+        let without_det = run_causal_attention(
+            &inputs,
+            &resolved_without_det,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
         let with_det = run_causal_attention(
             &inputs,
             &resolved_with_det,
@@ -3064,16 +3150,15 @@ mod tests {
         let mut resolved_with_det = resolved_without_det.clone();
         resolved_with_det.k_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
 
-        let without_det =
-            run_causal_attention(
-                &inputs,
-                &resolved_without_det,
-                None,
-                None,
-                None,
-                InferenceExecutionMode::Fp32,
-            )
-            .unwrap();
+        let without_det = run_causal_attention(
+            &inputs,
+            &resolved_without_det,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
         let with_det = run_causal_attention(
             &inputs,
             &resolved_with_det,
@@ -3099,16 +3184,15 @@ mod tests {
         let mut resolved_with_det = resolved_without_det.clone();
         resolved_with_det.v_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
 
-        let without_det =
-            run_causal_attention(
-                &inputs,
-                &resolved_without_det,
-                None,
-                None,
-                None,
-                InferenceExecutionMode::Fp32,
-            )
-            .unwrap();
+        let without_det = run_causal_attention(
+            &inputs,
+            &resolved_without_det,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
         let with_det = run_causal_attention(
             &inputs,
             &resolved_with_det,
@@ -3135,16 +3219,15 @@ mod tests {
         let mut resolved_with_det = resolved_without_det.clone();
         resolved_with_det.o_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
 
-        let without_det =
-            run_causal_attention(
-                &inputs,
-                &resolved_without_det,
-                None,
-                None,
-                None,
-                InferenceExecutionMode::Fp32,
-            )
-            .unwrap();
+        let without_det = run_causal_attention(
+            &inputs,
+            &resolved_without_det,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
         let with_det = run_causal_attention(
             &inputs,
             &resolved_with_det,
@@ -3429,12 +3512,8 @@ mod tests {
             cols: 2,
             values: vec![0.0, -0.693_147_2, 0.0, 0.0],
         };
-        let resolved = attention_test_layer(
-            query_proj,
-            key_proj,
-            identity_matrix(2),
-            identity_matrix(2),
-        );
+        let resolved =
+            attention_test_layer(query_proj, key_proj, identity_matrix(2), identity_matrix(2));
 
         let fp32 = run_causal_attention(
             &inputs,
@@ -3478,11 +3557,7 @@ mod tests {
             InferenceExecutionMode::Deterministic,
         )
         .unwrap();
-        let expected = expected_det_attention_output(
-            &q_rows[0][1],
-            &k_rows[0],
-            &v_rows[0],
-        );
+        let expected = expected_det_attention_output(&q_rows[0][1], &k_rows[0], &v_rows[0]);
         assert_eq!(det.0[1], expected);
         assert_ne!(det.0[1], fp32.0[1]);
     }
@@ -3500,12 +3575,8 @@ mod tests {
             cols: 2,
             values: vec![0.0, -0.693_147_2, 0.0, 0.0],
         };
-        let resolved = attention_test_layer(
-            query_proj,
-            key_proj,
-            identity_matrix(2),
-            identity_matrix(2),
-        );
+        let resolved =
+            attention_test_layer(query_proj, key_proj, identity_matrix(2), identity_matrix(2));
         let initial_cache = append_kv_cache(
             LayerKvCache::new(1),
             &[vec![0.0, 0.0]],
@@ -3790,8 +3861,9 @@ mod tests {
             ..resolved_without_det.ple.clone().unwrap()
         });
 
-        let without_det = run_gemma4_layer(&activations, &resolved_without_det, Some(&[vec![1.0, 1.0]]))
-            .expect("run fp32 ple path");
+        let without_det =
+            run_gemma4_layer(&activations, &resolved_without_det, Some(&[vec![1.0, 1.0]]))
+                .expect("run fp32 ple path");
         let with_det = run_gemma4_layer(&activations, &resolved_with_det, Some(&[vec![1.0, 1.0]]))
             .expect("run det ple input gate");
 
@@ -3953,7 +4025,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(normalized, vec![vec![act_to_f32(Act::from_bits(46_341)), 0.0]]);
+        assert_eq!(
+            normalized,
+            vec![vec![act_to_f32(Act::from_bits(46_341)), 0.0]]
+        );
     }
 
     #[test]
@@ -3972,8 +4047,12 @@ mod tests {
         );
 
         let mut value_normed = vec![vec![vec![1.0, 0.0]]];
-        apply_value_rms_norm(&mut value_normed, 0.0, InferenceExecutionMode::Deterministic)
-            .unwrap();
+        apply_value_rms_norm(
+            &mut value_normed,
+            0.0,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
         assert_eq!(
             value_normed,
             vec![vec![vec![act_to_f32(Act::from_bits(92_682)), 0.0]]]

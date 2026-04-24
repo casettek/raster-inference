@@ -2241,13 +2241,11 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
             .ok_or_else(|| anyhow!("embedding row byte range is out of bounds"))?;
         let mut row = Vec::with_capacity(hidden_size);
         for encoded_value in encoded_row.chunks_exact(4) {
-            row.push(
-                det_wgt_to_f32(i32::from_le_bytes(
-                    encoded_value
-                        .try_into()
-                        .expect("i32 byte width should match"),
-                )),
-            );
+            row.push(det_wgt_to_f32(i32::from_le_bytes(
+                encoded_value
+                    .try_into()
+                    .expect("i32 byte width should match"),
+            )));
         }
         activations.push(apply_embedding_scale(row, scale, execution_mode));
     }
@@ -2453,11 +2451,11 @@ mod tests {
         load_transformer_state_model_from_det_num_wgt_path,
         load_transformer_state_model_from_gemma_model_path, parse_safetensors_metadata,
     };
-    use crate::shared::input::InferenceExecutionMode;
     use crate::shared::det_num::{
         f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
         DET_WGT_ARTIFACT_MAGIC,
     };
+    use crate::shared::input::InferenceExecutionMode;
     use crate::{Gemma4AttentionKind, Gemma4LogitsProjection};
     use memmap2::Mmap;
     use safetensors::tensor::{serialize_to_file, TensorView};
@@ -3050,8 +3048,16 @@ mod tests {
             &[2],
             &[1.0, 1.0],
         ));
-        fp32_tensors.push(vector_tensor("model.language_model.norm.weight", &[4], &[1.0; 4]));
-        fp32_tensors.push(matrix_tensor("model.language_model.lm_head.weight", &[3, 4], &[0.0; 12]));
+        fp32_tensors.push(vector_tensor(
+            "model.language_model.norm.weight",
+            &[4],
+            &[1.0; 4],
+        ));
+        fp32_tensors.push(matrix_tensor(
+            "model.language_model.lm_head.weight",
+            &[3, 4],
+            &[0.0; 12],
+        ));
         write_model_file(&fp32_dir, &fp32_tensors);
 
         let mut det_tensors = vec![det_matrix_tensor(
@@ -3090,7 +3096,11 @@ mod tests {
                 &[2],
                 &[1.0, 1.0],
             ),
-            det_vector_tensor("model.language_model.layers.0.input_layernorm.weight", &[4], &[1.0; 4]),
+            det_vector_tensor(
+                "model.language_model.layers.0.input_layernorm.weight",
+                &[4],
+                &[1.0; 4],
+            ),
             det_vector_tensor(
                 "model.language_model.layers.0.post_attention_layernorm.weight",
                 &[4],
@@ -3163,7 +3173,10 @@ mod tests {
         let fp32_ple = fp32_layer.ple.expect("fp32 PLE should resolve");
         let det_ple = det_layer.ple.expect("det PLE should resolve");
         let det_global_projection = super::materialize_det_num_ple_model_projection(
-            det_model.ple_global.as_ref().expect("det PLE globals should load"),
+            det_model
+                .ple_global
+                .as_ref()
+                .expect("det PLE globals should load"),
             0,
         )
         .unwrap()

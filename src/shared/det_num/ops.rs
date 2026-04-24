@@ -23,7 +23,9 @@ pub fn add_sat(a: Act, b: Act) -> Act {
 
 /// Multiplies activation values under the canonical requantize-and-saturate contract.
 pub fn mul_sat(a: Act, b: Act) -> Act {
-    requantize(Acc::from_bits(i64::from(a.to_bits()) * i64::from(b.to_bits())))
+    requantize(Acc::from_bits(
+        i64::from(a.to_bits()) * i64::from(b.to_bits()),
+    ))
 }
 
 /// Applies a Q16.16 scalar to an activation under the canonical multiply contract.
@@ -33,20 +35,30 @@ pub fn scale_act(value: Act, scalar: Act) -> Act {
 
 /// Divides one activation-scaled value by another with ties-to-even rounding.
 pub fn div_act(numerator: Act, denominator: Act) -> Act {
-    assert!(denominator.to_bits() != 0, "div_act requires a non-zero denominator");
+    assert!(
+        denominator.to_bits() != 0,
+        "div_act requires a non-zero denominator"
+    );
 
     let dividend = i128::from(numerator.to_bits()) << ACT_FRACTIONAL_BITS;
     let divisor = i128::from(denominator.to_bits());
-    Act::from_bits(clamp_i128_to_i32(round_ties_even_division(dividend, divisor)))
+    Act::from_bits(clamp_i128_to_i32(round_ties_even_division(
+        dividend, divisor,
+    )))
 }
 
 /// Divides one accumulator-scaled value by another with ties-to-even rounding.
 fn div_acc(numerator: Acc, denominator: Acc) -> Acc {
-    assert!(denominator.to_bits() != 0, "div_acc requires a non-zero denominator");
+    assert!(
+        denominator.to_bits() != 0,
+        "div_acc requires a non-zero denominator"
+    );
 
     let dividend = i128::from(numerator.to_bits()) << ACC_FRACTIONAL_BITS;
     let divisor = i128::from(denominator.to_bits());
-    Acc::from_bits(clamp_i128_to_i64(round_ties_even_division(dividend, divisor)))
+    Acc::from_bits(clamp_i128_to_i64(round_ties_even_division(
+        dividend, divisor,
+    )))
 }
 
 /// Divides an accumulator by an unsigned integer with ties-to-even rounding.
@@ -61,7 +73,10 @@ pub fn div_acc_by_u32(value: Acc, divisor: u32) -> Acc {
 
 /// Computes deterministic weighted RMSNorm over Q16.16 activations.
 pub fn rms_norm(input: &[Act], weight: &[Wgt], eps: Acc) -> Vec<Act> {
-    assert!(!input.is_empty(), "rms_norm requires a non-empty input slice");
+    assert!(
+        !input.is_empty(),
+        "rms_norm requires a non-empty input slice"
+    );
     assert_eq!(
         input.len(),
         weight.len(),
@@ -87,10 +102,7 @@ pub fn value_rms_norm(input: &[Act], eps: Acc) -> Vec<Act> {
     );
 
     let scale = rms_norm_scale(input, eps);
-    input
-        .iter()
-        .map(|value| mul_sat(*value, scale))
-        .collect()
+    input.iter().map(|value| mul_sat(*value, scale)).collect()
 }
 
 /// Rotates the RoPE prefix of a row under the deterministic fixed-point contract.
@@ -187,10 +199,7 @@ pub fn attention_softmax(logits: &[Act]) -> Vec<Act> {
         .iter()
         .map(|term| requantize(div_acc(*term, sum_exp)))
         .collect::<Vec<_>>();
-    let summed_weights = weights
-        .iter()
-        .copied()
-        .fold(Act::from_bits(0), add_sat);
+    let summed_weights = weights.iter().copied().fold(Act::from_bits(0), add_sat);
     let residual = sub_sat(one_act(), summed_weights);
     weights[max_index] = add_sat(weights[max_index], residual);
     weights
@@ -231,6 +240,47 @@ pub fn attention_weighted_sum(weights: &[Act], value_rows: &[Vec<Act>]) -> Vec<A
             requantize(Acc::from_bits(acc_bits))
         })
         .collect()
+}
+
+/// Materializes deterministic tanh over a canonical activation input.
+pub fn tanh_act(input: Act) -> Act {
+    const TANH_LINEAR_TERM_BITS: i32 = 27_i32 << ACT_FRACTIONAL_BITS;
+    const TANH_QUADRATIC_TERM_BITS: i32 = 9_i32 << ACT_FRACTIONAL_BITS;
+    const TANH_SATURATION_INPUT_BITS: i32 = 3_i32 << ACT_FRACTIONAL_BITS;
+
+    if input.to_bits() >= TANH_SATURATION_INPUT_BITS {
+        return one_act();
+    }
+    if input.to_bits() <= -TANH_SATURATION_INPUT_BITS {
+        return Act::from_bits(one_act().to_bits().saturating_neg());
+    }
+
+    let input_sq = mul_sat(input, input);
+    let numerator_scale = add_sat(Act::from_bits(TANH_LINEAR_TERM_BITS), input_sq);
+    let denominator_scale = add_sat(
+        Act::from_bits(TANH_LINEAR_TERM_BITS),
+        mul_sat(Act::from_bits(TANH_QUADRATIC_TERM_BITS), input_sq),
+    );
+    let numerator = mul_sat(input, numerator_scale);
+    div_act(numerator, denominator_scale)
+}
+
+/// Materializes the repo's canonical GELU(tanh) contract over a fixed-point activation.
+pub fn gelu_pytorch_tanh_act(input: Act) -> Act {
+    const GELU_HALF_BITS: i32 = 1_i32 << (ACT_FRACTIONAL_BITS - 1);
+    const GELU_TANH_INNER_SCALE_BITS: i32 = 52_290;
+    const GELU_TANH_CUBIC_BITS: i32 = 2_930;
+
+    let input_sq = mul_sat(input, input);
+    let input_cu = mul_sat(input_sq, input);
+    let cubic_term = mul_sat(Act::from_bits(GELU_TANH_CUBIC_BITS), input_cu);
+    let inner_poly = add_sat(input, cubic_term);
+    let tanh_input = mul_sat(Act::from_bits(GELU_TANH_INNER_SCALE_BITS), inner_poly);
+    let tanh_term = tanh_act(tanh_input);
+    mul_sat(
+        mul_sat(Act::from_bits(GELU_HALF_BITS), input),
+        add_sat(one_act(), tanh_term),
+    )
 }
 
 /// Returns the canonical deterministic inverse-RMS scale for a row of activations.
@@ -364,7 +414,11 @@ fn softmax_exp_term(delta: Acc) -> Acc {
                 Acc::from_bits(div_acc_by_u32(remainder_cu, 6).to_bits().saturating_neg()),
                 acc_add_sat(
                     div_acc_by_u32(remainder_qu, 24),
-                    Acc::from_bits(div_acc_by_u32(remainder_qui, 120).to_bits().saturating_neg()),
+                    Acc::from_bits(
+                        div_acc_by_u32(remainder_qui, 120)
+                            .to_bits()
+                            .saturating_neg(),
+                    ),
                 ),
             ),
         ),
@@ -387,7 +441,10 @@ fn rope_frequency_step(base: Acc, freq_base_dim: usize) -> Acc {
 
 fn nth_root_acc(value: Acc, degree: u32) -> Acc {
     assert!(degree > 0, "nth_root_acc requires a positive degree");
-    assert!(value.to_bits() > 0, "nth_root_acc requires a positive input");
+    assert!(
+        value.to_bits() > 0,
+        "nth_root_acc requires a positive input"
+    );
 
     if degree == 1 || value == one_acc() {
         return value;
@@ -510,7 +567,10 @@ fn acc_mul(lhs: Acc, rhs: Acc) -> Acc {
 }
 
 fn round_ties_even_division(dividend: i128, divisor: i128) -> i128 {
-    assert!(divisor != 0, "round_ties_even_division requires a non-zero divisor");
+    assert!(
+        divisor != 0,
+        "round_ties_even_division requires a non-zero divisor"
+    );
 
     let quotient = dividend / divisor;
     let remainder = dividend % divisor;
@@ -520,7 +580,11 @@ fn round_ties_even_division(dividend: i128, divisor: i128) -> i128 {
 
     let twice_abs_remainder = remainder.abs() * 2;
     let abs_divisor = divisor.abs();
-    let step = if (dividend < 0) ^ (divisor < 0) { -1 } else { 1 };
+    let step = if (dividend < 0) ^ (divisor < 0) {
+        -1
+    } else {
+        1
+    };
 
     if twice_abs_remainder < abs_divisor {
         quotient
@@ -581,9 +645,7 @@ fn inv_sqrt_acc(x: Acc) -> Act {
 
 fn inv_sqrt_product(candidate_bits: u32, divisor: u128) -> u128 {
     let candidate = u128::from(candidate_bits);
-    candidate
-        .saturating_mul(candidate)
-        .saturating_mul(divisor)
+    candidate.saturating_mul(candidate).saturating_mul(divisor)
 }
 
 fn rshift_round_ties_even_bits(x: i64, shift: u32) -> i64 {

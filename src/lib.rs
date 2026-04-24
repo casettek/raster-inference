@@ -51,10 +51,9 @@ pub use shared::transformer::{
 };
 pub use shared::transformer_kernels::{
     append_kv_cache, apply_final_logit_softcapping, apply_final_norm, compute_decode_ple_input,
-    compute_prefill_ple_inputs, embed_input_token, embed_input_token_with_mode,
-    embed_input_tokens, embed_input_tokens_with_mode, extract_prefill_logits,
-    project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer, run_gemma4_layer_decode,
-    select_final_position,
+    compute_prefill_ple_inputs, embed_input_token, embed_input_token_with_mode, embed_input_tokens,
+    embed_input_tokens_with_mode, extract_prefill_logits, project_decode_hidden_to_logits,
+    project_to_logits, run_gemma4_layer, run_gemma4_layer_decode, select_final_position,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
