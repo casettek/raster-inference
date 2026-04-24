@@ -46,6 +46,7 @@ pub fn run_text_layers_prefill_with_cache(
                 &resolved_layer,
                 per_layer_input,
                 donor_cache,
+                crate::shared::input::InferenceExecutionMode::Fp32,
             )?;
         xs = layer_output.activations;
         layer_caches.push(layer_cache);

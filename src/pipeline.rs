@@ -320,11 +320,17 @@ mod tests {
 
     use super::{
         decode_step, decode_step_with_mode, run_output_decode, run_prefill_pass,
+        run_prefill_pass_with_mode,
         run_transformer_state_transition, run_transformer_state_transition_for_token_ids,
         validate_sampling_config,
     };
     use crate::{
-        shared::{det_num::Act, input::InferenceExecutionMode, transformer::DetNumMatrix, transformer_kernels::embed_input_tokens},
+        shared::{
+            det_num::{act_to_f32, Act},
+            input::InferenceExecutionMode,
+            transformer::DetNumMatrix,
+            transformer_kernels::embed_input_tokens,
+        },
         EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
         Gemma4PleGlobalWeights, Gemma4PleLayerWeights, Gemma4TransformerModel, MatrixF32,
         PromptPreparationState, SamplingConfig,
@@ -594,6 +600,65 @@ mod tests {
         assert!(det_step.prefill_logits.logits.iter().any(|value| *value != 0.0));
     }
 
+    #[test]
+    fn run_prefill_pass_with_mode_uses_deterministic_final_norm_contract() {
+        let model = deterministic_norm_routing_model();
+        let prompt_token_ids = vec![0];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-det-final-norm-prefill".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+
+        let prefill = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prefill.transformer_state.prefill_logits.logits,
+            vec![act_to_f32(Act::from_bits(46_341)), act_to_f32(Act::from_bits(92_682))]
+        );
+    }
+
+    #[test]
+    fn decode_step_with_mode_uses_deterministic_final_norm_contract() {
+        let model = deterministic_norm_routing_model();
+        let prompt_token_ids = vec![0];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-det-final-norm-decode".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let prefill = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let step = decode_step_with_mode(
+            prefill.transformer_decode_state,
+            1,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(
+            step.prefill_logits.logits,
+            vec![act_to_f32(Act::from_bits(46_341)), act_to_f32(Act::from_bits(92_682))]
+        );
+    }
+
     fn test_tokenizer() -> tokenizers::Tokenizer {
         let vocab = [
             ("hello".to_string(), 0),
@@ -662,6 +727,67 @@ mod tests {
                     values: vec![0.7, 0.1, 0.2, 0.0, 0.0, 0.8, 0.1, 0.1, 0.2, 0.0, 0.8, 0.2],
                 },
                 det_weight: None,
+            },
+            final_logit_softcapping: None,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    fn deterministic_norm_routing_model() -> Gemma4TransformerModel {
+        Gemma4TransformerModel {
+            embedding_table: Some(EmbeddingTable {
+                rows: vec![vec![1.0, 1.0, 0.0, 0.0], vec![1.0, 1.0, 0.0, 0.0]],
+                scale: 1.0,
+            }),
+            embedding_source: None,
+            layers: vec![Gemma4LayerWeights {
+                attention_kind: Gemma4AttentionKind::Full,
+                hidden_size: 4,
+                num_heads: 2,
+                num_kv_heads: 1,
+                head_dim: 2,
+                sliding_window: None,
+                cache_sliding_window: None,
+                rms_norm_eps: 1e-6,
+                rope_base: 10_000.0,
+                partial_rotary_dim: 2,
+                rope_freq_base_dim: 2,
+                kv_shared_layer_index: None,
+                attention_k_eq_v: false,
+                q_proj: zero_matrix(4, 4).into(),
+                k_proj: zero_matrix(2, 4).into(),
+                v_proj: Some(zero_matrix(2, 4).into()),
+                o_proj: zero_matrix(4, 4).into(),
+                q_norm_weight: vec![1.0, 0.5],
+                k_norm_weight: vec![0.5, 1.0],
+                input_layernorm_weight: vec![1.0, 0.5, 1.0, 0.5],
+                post_attention_layernorm_weight: vec![1.0, 0.5, 1.0, 0.5],
+                pre_feedforward_layernorm_weight: vec![1.0, 0.5, 1.0, 0.5],
+                post_feedforward_layernorm_weight: vec![1.0, 0.5, 1.0, 0.5],
+                gate_proj: zero_matrix(8, 4).into(),
+                up_proj: zero_matrix(8, 4).into(),
+                down_proj: zero_matrix(4, 8).into(),
+                ple: None,
+                layer_scalar: None,
+            }],
+            ple_global: None,
+            final_norm_weight: vec![0.5, 1.0, 1.0, 1.0],
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(2, 4),
+                det_weight: Some(Arc::new(DetNumMatrix {
+                    rows: 2,
+                    cols: 4,
+                    values: vec![
+                        Act::from_num(1.0).to_bits(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        Act::from_num(1.0).to_bits(),
+                        0,
+                        0,
+                    ],
+                })),
             },
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,

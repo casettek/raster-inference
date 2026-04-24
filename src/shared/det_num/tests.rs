@@ -2,8 +2,9 @@ use std::{mem::size_of, panic};
 
 use super::{
     acc_add_sat, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first, clip_act,
-    f32_to_act, f32_to_wgt, mac, mac_bits, mul_sat, mul_wide, requantize, rshift_round_ties_even,
-    scale_act, sub_sat,
+    div_acc_by_u32, f32_to_acc, f32_to_act, f32_to_wgt, mac, mac_bits, mul_sat, mul_wide,
+    requantize, rms_norm, rms_norm_scale, rshift_round_ties_even, scale_act, sub_sat,
+    value_rms_norm,
     types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT,
     wgt_to_le_bytes, Acc, Act, Wgt,
 };
@@ -280,6 +281,145 @@ fn scale_act_matches_mul_sat_contract() {
 
     assert_eq!(scale_act(value, scale), mul_sat(value, scale));
     assert_eq!(act_to_f32(scale_act(value, scale)), 1.5);
+}
+
+#[test]
+fn div_acc_by_u32_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        value_bits: i64,
+        divisor: u32,
+        expected_bits: i64,
+    }
+
+    let cases = [
+        Case {
+            name: "exact_division",
+            value_bits: 8,
+            divisor: 4,
+            expected_bits: 2,
+        },
+        Case {
+            name: "positive_half_tie_rounds_to_even",
+            value_bits: 3,
+            divisor: 2,
+            expected_bits: 2,
+        },
+        Case {
+            name: "positive_above_half_rounds_up",
+            value_bits: 7,
+            divisor: 4,
+            expected_bits: 2,
+        },
+        Case {
+            name: "negative_half_tie_rounds_to_even",
+            value_bits: -3,
+            divisor: 2,
+            expected_bits: -2,
+        },
+        Case {
+            name: "negative_below_half_rounds_toward_zero",
+            value_bits: -5,
+            divisor: 4,
+            expected_bits: -1,
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            div_acc_by_u32(Acc::from_bits(case.value_bits), case.divisor).to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn rms_norm_scale_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        input_bits: &'static [i32],
+        eps_bits: i64,
+        expected_bits: i32,
+    }
+
+    let cases = [
+        Case {
+            name: "unit_vector",
+            input_bits: &[65_536],
+            eps_bits: 0,
+            expected_bits: 65_536,
+        },
+        Case {
+            name: "half_energy",
+            input_bits: &[65_536, 0],
+            eps_bits: 0,
+            expected_bits: 92_682,
+        },
+        Case {
+            name: "zero_row_uses_epsilon",
+            input_bits: &[0],
+            eps_bits: 1_i64 << ACC_FRACTIONAL_BITS,
+            expected_bits: 65_536,
+        },
+    ];
+
+    for case in cases {
+        let input = case
+            .input_bits
+            .iter()
+            .copied()
+            .map(Act::from_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rms_norm_scale(&input, Acc::from_bits(case.eps_bits)).to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn rms_norm_matches_golden_vectors() {
+    let normalized = rms_norm(
+        &[Act::from_bits(65_536), Act::from_bits(0)],
+        &[Wgt::from_bits(32_768), Wgt::from_bits(65_536)],
+        Acc::from_bits(0),
+    );
+    assert_eq!(
+        normalized.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        vec![46_341, 0]
+    );
+
+    let signed = rms_norm(
+        &[Act::from_bits(65_536), Act::from_bits(-65_536)],
+        &[Wgt::from_bits(65_536), Wgt::from_bits(65_536)],
+        Acc::from_bits(0),
+    );
+    assert_eq!(
+        signed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        vec![65_536, -65_536]
+    );
+}
+
+#[test]
+fn value_rms_norm_matches_golden_vectors() {
+    let normalized = value_rms_norm(
+        &[Act::from_bits(65_536), Act::from_bits(0)],
+        Acc::from_bits(0),
+    );
+    assert_eq!(
+        normalized.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        vec![92_682, 0]
+    );
+
+    let zero_row = value_rms_norm(&[Act::from_bits(0)], Acc::from_bits(1_i64 << ACC_FRACTIONAL_BITS));
+    assert_eq!(
+        zero_row.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        vec![0]
+    );
 }
 
 #[test]
@@ -764,6 +904,68 @@ fn f32_to_wgt_matches_golden_vectors() {
     for case in cases {
         assert_eq!(
             f32_to_wgt(case.value).to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn f32_to_acc_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        value: f32,
+        expected_bits: i64,
+    }
+
+    let q32_step = 1.0 / 4_294_967_296.0;
+    let cases = [
+        Case {
+            name: "zero",
+            value: 0.0,
+            expected_bits: 0,
+        },
+        Case {
+            name: "exact_value",
+            value: 1.5,
+            expected_bits: 6_442_450_944,
+        },
+        Case {
+            name: "half_step_to_zero",
+            value: 0.5 * q32_step,
+            expected_bits: 0,
+        },
+        Case {
+            name: "positive_half_tie_stays_even",
+            value: 2.5 * q32_step,
+            expected_bits: 2,
+        },
+        Case {
+            name: "positive_half_tie_up_to_even",
+            value: 3.5 * q32_step,
+            expected_bits: 4,
+        },
+        Case {
+            name: "tiny_epsilon_survives_q32",
+            value: 0.000_001,
+            expected_bits: 4_295,
+        },
+        Case {
+            name: "positive_saturation",
+            value: 3_000_000_000.0,
+            expected_bits: i64::MAX,
+        },
+        Case {
+            name: "negative_saturation",
+            value: -3_000_000_000.0,
+            expected_bits: i64::MIN,
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            f32_to_acc(case.value).to_bits(),
             case.expected_bits,
             "{}",
             case.name

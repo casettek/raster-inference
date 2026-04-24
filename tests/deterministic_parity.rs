@@ -410,23 +410,27 @@ fn deterministic_mode_matches_fp32_path_on_nonzero_ple_fixture() {
             &[4, 4],
             &[0.0; 16],
         ),
-        tensor("model.language_model.layers.0.self_attn.q_norm.weight", &[2], &[1.0, 1.0]),
-        tensor("model.language_model.layers.0.self_attn.k_norm.weight", &[2], &[1.0, 1.0]),
-        tensor("model.language_model.layers.0.input_layernorm.weight", &[4], &[1.0; 4]),
+        tensor("model.language_model.layers.0.self_attn.q_norm.weight", &[2], &[0.5, 1.0]),
+        tensor("model.language_model.layers.0.self_attn.k_norm.weight", &[2], &[1.0, 0.5]),
+        tensor(
+            "model.language_model.layers.0.input_layernorm.weight",
+            &[4],
+            &[1.0, 0.5, 1.0, 0.5],
+        ),
         tensor(
             "model.language_model.layers.0.post_attention_layernorm.weight",
             &[4],
-            &[1.0; 4],
+            &[1.0, 0.5, 1.0, 0.5],
         ),
         tensor(
             "model.language_model.layers.0.pre_feedforward_layernorm.weight",
             &[4],
-            &[1.0; 4],
+            &[1.0, 0.5, 1.0, 0.5],
         ),
         tensor(
             "model.language_model.layers.0.post_feedforward_layernorm.weight",
             &[4],
-            &[1.0; 4],
+            &[1.0, 0.5, 1.0, 0.5],
         ),
         tensor("model.language_model.layers.0.mlp.gate_proj.weight", &[8, 4], &[0.0; 32]),
         tensor("model.language_model.layers.0.mlp.up_proj.weight", &[8, 4], &[0.0; 32]),
@@ -444,7 +448,7 @@ fn deterministic_mode_matches_fp32_path_on_nonzero_ple_fixture() {
         tensor(
             "model.language_model.layers.0.post_per_layer_input_norm.weight",
             &[4],
-            &[1.0; 4],
+            &[1.0, 0.5, 1.0, 0.5],
         ),
         tensor(
             "model.language_model.embed_tokens_per_layer.weight",
@@ -459,9 +463,9 @@ fn deterministic_mode_matches_fp32_path_on_nonzero_ple_fixture() {
         tensor(
             "model.language_model.per_layer_projection_norm.weight",
             &[2],
-            &[1.0, 1.0],
+            &[0.5, 1.0],
         ),
-        tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
+        tensor("model.language_model.norm.weight", &[4], &[1.0, 0.5, 1.0, 0.5]),
         tensor(
             "model.language_model.lm_head.weight",
             &[3, 4],
