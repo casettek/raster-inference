@@ -6,6 +6,11 @@ pub fn f32_to_act(x: f32) -> Act {
     Act::from_bits(f32_to_q16_16_bits(x))
 }
 
+/// Converts a canonical Q16.16 activation back into FP32 for host-side APIs.
+pub fn act_to_f32(x: Act) -> f32 {
+    x.to_bits() as f32 / (1_u32 << ACT_FRACTIONAL_BITS) as f32
+}
+
 /// Converts a finite FP32 value into the canonical `det_num` v0 Q16.16 weight.
 ///
 /// This implements `sat_i32(round_ties_even(x * 65536.0))` exactly from the

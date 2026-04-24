@@ -357,6 +357,197 @@ fn deterministic_mode_matches_fp32_path_on_representable_fixture() {
     );
 }
 
+#[test]
+fn deterministic_mode_matches_fp32_path_on_nonzero_ple_fixture() {
+    let fp32_dir = create_temp_dir("det-parity-ple-fp32");
+    let det_dir = create_temp_dir("det-parity-ple-det");
+    write_config(
+        &fp32_dir,
+        r#"{
+  "text_config": {
+    "enable_moe_block": false,
+    "head_dim": 2,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 4,
+    "hidden_size_per_layer_input": 2,
+    "layer_types": ["full_attention"],
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 1,
+    "rms_norm_eps": 0.000001,
+  "sliding_window": 2,
+    "tie_word_embeddings": false,
+    "vocab_size": 3,
+    "vocab_size_per_layer_input": 3
+  }
+}"#,
+    );
+    fs::copy(fp32_dir.join("config.json"), det_dir.join("config.json")).unwrap();
+
+    let tensors = vec![
+        tensor(
+            "model.language_model.embed_tokens.weight",
+            &[3, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            &[4, 4],
+            &[0.0; 16],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.k_proj.weight",
+            &[2, 4],
+            &[0.0; 8],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.v_proj.weight",
+            &[2, 4],
+            &[0.0; 8],
+        ),
+        tensor(
+            "model.language_model.layers.0.self_attn.o_proj.weight",
+            &[4, 4],
+            &[0.0; 16],
+        ),
+        tensor("model.language_model.layers.0.self_attn.q_norm.weight", &[2], &[1.0, 1.0]),
+        tensor("model.language_model.layers.0.self_attn.k_norm.weight", &[2], &[1.0, 1.0]),
+        tensor("model.language_model.layers.0.input_layernorm.weight", &[4], &[1.0; 4]),
+        tensor(
+            "model.language_model.layers.0.post_attention_layernorm.weight",
+            &[4],
+            &[1.0; 4],
+        ),
+        tensor(
+            "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+            &[4],
+            &[1.0; 4],
+        ),
+        tensor(
+            "model.language_model.layers.0.post_feedforward_layernorm.weight",
+            &[4],
+            &[1.0; 4],
+        ),
+        tensor("model.language_model.layers.0.mlp.gate_proj.weight", &[8, 4], &[0.0; 32]),
+        tensor("model.language_model.layers.0.mlp.up_proj.weight", &[8, 4], &[0.0; 32]),
+        tensor("model.language_model.layers.0.mlp.down_proj.weight", &[4, 8], &[0.0; 32]),
+        tensor(
+            "model.language_model.layers.0.per_layer_input_gate.weight",
+            &[2, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        ),
+        tensor(
+            "model.language_model.layers.0.per_layer_projection.weight",
+            &[4, 2],
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+        tensor(
+            "model.language_model.layers.0.post_per_layer_input_norm.weight",
+            &[4],
+            &[1.0; 4],
+        ),
+        tensor(
+            "model.language_model.embed_tokens_per_layer.weight",
+            &[3, 2],
+            &[0.0, 0.0, 0.5, 0.0, 0.0, 0.5],
+        ),
+        tensor(
+            "model.language_model.per_layer_model_projection.weight",
+            &[2, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        ),
+        tensor(
+            "model.language_model.per_layer_projection_norm.weight",
+            &[2],
+            &[1.0, 1.0],
+        ),
+        tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
+        tensor(
+            "model.language_model.lm_head.weight",
+            &[3, 4],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        ),
+    ];
+    write_fp32_model_file(&fp32_dir.join("model.safetensors"), &tensors);
+    write_detwgt_file(&det_dir.join("model.detwgt"), &tensors);
+
+    let model_spec = ModelSpec {
+        model_id: "gemma-4-test".to_string(),
+        tokenizer_path: "tokenizer.json".into(),
+        chat_template: "{{ messages[0].content }}".to_string(),
+        bos_token: None,
+        eos_token: None,
+        unk_token: Some("<unk>".to_string()),
+    };
+    let tokenizer = test_tokenizer();
+    let fp32_model = load_transformer_state_model_from_gemma_model_path(&fp32_dir).unwrap();
+    let det_model = load_transformer_state_model_from_det_num_wgt_path(&det_dir).unwrap();
+
+    let fp32_state = run_inference(
+        &InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        },
+        &model_spec,
+        &tokenizer,
+        &fp32_model,
+    )
+    .unwrap();
+    let det_state = run_inference(
+        &InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        },
+        &model_spec,
+        &tokenizer,
+        &det_model,
+    )
+    .unwrap();
+
+    assert_eq!(
+        det_state.output_decode.generated_token_ids,
+        fp32_state.output_decode.generated_token_ids
+    );
+    assert!(
+        fp32_state
+            .transformer_state_transition
+            .prefill_logits
+            .logits
+            .iter()
+            .any(|value| *value != 0.0)
+    );
+    assert!(
+        det_state
+            .transformer_state_transition
+            .prefill_logits
+            .logits
+            .iter()
+            .any(|value| *value != 0.0)
+    );
+    assert_eq!(
+        det_state.output_decode.generated_token_ids_sha256,
+        fp32_state.output_decode.generated_token_ids_sha256
+    );
+}
+
 fn create_temp_dir(label: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use super::tiles::ActivationSequenceWithCache;
+use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4TransformerModel, LayerKvCache,
 };
@@ -45,6 +46,7 @@ pub fn run_text_layers_decode_step(
             layer,
             model.ple_global.as_ref(),
             model.rms_norm_eps,
+            InferenceExecutionMode::Deterministic,
         )?;
         let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;

@@ -68,7 +68,8 @@ fn run_prefill_pass_for_token_ids(
         prompt_token_ids.len(),
         model.layers.len()
     ));
-    let ple_inputs = crate::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings)?;
+    let ple_inputs =
+        crate::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     trace_event("prefill.layer_stack");
     let (final_hidden_states, layer_caches) = crate::prefill_layer::run_with_mode(
         &token_embeddings.activations,
@@ -88,13 +89,22 @@ fn run_prefill_pass_for_token_ids(
 fn embed_token_ids(
     token_ids: &[u32],
     model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<ActivationSequence> {
     if let Some(ref embedding_table) = model.embedding_table {
         trace_event("prefill.embed_tokens");
-        crate::shared::transformer_kernels::embed_input_tokens(token_ids, embedding_table)
+        crate::shared::transformer_kernels::embed_input_tokens_with_mode(
+            token_ids,
+            embedding_table,
+            execution_mode,
+        )
     } else if let Some(ref embedding_source) = model.embedding_source {
         trace_event("prefill.embed_tokens");
-        crate::io::embed_input_tokens_from_gemma_source(token_ids, embedding_source)
+        crate::io::embed_input_tokens_from_gemma_source_with_mode(
+            token_ids,
+            embedding_source,
+            execution_mode,
+        )
     } else {
         anyhow::bail!(
             "transformer state model is missing both embedding_table and embedding_source"
@@ -102,12 +112,23 @@ fn embed_token_ids(
     }
 }
 
-fn embed_token_id(token_id: u32, model: &Gemma4TransformerModel) -> Result<Vec<f32>> {
+fn embed_token_id_with_mode(
+    token_id: u32,
+    model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
+) -> Result<Vec<f32>> {
     if let Some(ref embedding_table) = model.embedding_table {
-        crate::shared::transformer_kernels::embed_input_token(token_id, embedding_table)
+        crate::shared::transformer_kernels::embed_input_token_with_mode(
+            token_id,
+            embedding_table,
+            execution_mode,
+        )
     } else if let Some(ref embedding_source) = model.embedding_source {
-        let embedded =
-            crate::io::embed_input_tokens_from_gemma_source(&[token_id], embedding_source)?;
+        let embedded = crate::io::embed_input_tokens_from_gemma_source_with_mode(
+            &[token_id],
+            embedding_source,
+            execution_mode,
+        )?;
         embedded
             .activations
             .into_iter()
@@ -125,7 +146,7 @@ pub fn run_transformer_state_transition_for_token_ids(
     model: &Gemma4TransformerModel,
 ) -> Result<TransformerStateTransitionState> {
     let _trace = trace_scope("prefill.from_token_ids");
-    let token_embeddings = embed_token_ids(token_ids, model)?;
+    let token_embeddings = embed_token_ids(token_ids, model, InferenceExecutionMode::Fp32)?;
     Ok(run_prefill_pass_for_token_ids(
         token_ids,
         model,
@@ -177,7 +198,7 @@ pub fn decode_step_with_mode(
         position,
         model.layers.len()
     ));
-    let embedded_token = embed_token_id(next_token, model)?;
+    let embedded_token = embed_token_id_with_mode(next_token, model, execution_mode)?;
     trace_event("decode.layer_stack");
     let final_hidden_state = match execution_mode {
         InferenceExecutionMode::Fp32 => {
@@ -293,16 +314,20 @@ pub fn run_output_decode_with_mode(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
     use super::{
-        decode_step, run_output_decode, run_prefill_pass, run_transformer_state_transition,
-        run_transformer_state_transition_for_token_ids, validate_sampling_config,
+        decode_step, decode_step_with_mode, run_output_decode, run_prefill_pass,
+        run_transformer_state_transition, run_transformer_state_transition_for_token_ids,
+        validate_sampling_config,
     };
     use crate::{
-        shared::transformer_kernels::embed_input_tokens, EmbeddingTable, Gemma4AttentionKind,
-        Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-        Gemma4TransformerModel, MatrixF32, PromptPreparationState, SamplingConfig,
+        shared::{det_num::Act, input::InferenceExecutionMode, transformer::DetNumMatrix, transformer_kernels::embed_input_tokens},
+        EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
+        Gemma4PleGlobalWeights, Gemma4PleLayerWeights, Gemma4TransformerModel, MatrixF32,
+        PromptPreparationState, SamplingConfig,
     };
 
     #[test]
@@ -513,6 +538,60 @@ mod tests {
             step.transformer_decode_state.layer_caches[0].current_len(),
             3
         );
+    }
+
+    #[test]
+    fn decode_step_with_mode_uses_det_logits_projection() {
+        let mut model = test_decode_model();
+        model.logits_projection = Gemma4LogitsProjection::UntiedLmHead {
+            weight: zero_matrix(3, 4),
+            det_weight: Some(Arc::new(DetNumMatrix {
+                rows: 3,
+                cols: 4,
+                values: vec![
+                    Act::from_num(1.0).to_bits(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Act::from_num(1.0).to_bits(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Act::from_num(1.0).to_bits(),
+                    0,
+                ],
+            })),
+        };
+        let token_ids = vec![1, 0];
+        let token_embeddings =
+            embed_input_tokens(&token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: token_ids,
+            prompt_token_ids_sha256: "unused-for-transformer_state_transition".to_string(),
+        };
+        let prefill =
+            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
+
+        let fp32_step = decode_step_with_mode(
+            prefill.transformer_decode_state.clone(),
+            2,
+            &model,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det_step = decode_step_with_mode(
+            prefill.transformer_decode_state,
+            2,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(fp32_step.prefill_logits.logits, vec![0.0, 0.0, 0.0]);
+        assert!(det_step.prefill_logits.logits.iter().any(|value| *value != 0.0));
     }
 
     fn test_tokenizer() -> tokenizers::Tokenizer {

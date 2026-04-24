@@ -181,6 +181,7 @@ pub struct Gemma4PleGlobalWeights {
     pub(crate) mmap_cache: Arc<Mutex<HashMap<PathBuf, Arc<Mmap>>>>,
     pub(crate) token_row_cache: Arc<Mutex<HashMap<(usize, usize), Vec<f32>>>>,
     pub(crate) model_projection_cache: Arc<Mutex<HashMap<usize, MatrixF32>>>,
+    pub(crate) model_projection_det_cache: Arc<Mutex<HashMap<usize, Arc<DetNumMatrix>>>>,
 }
 
 impl Gemma4PleGlobalWeights {
@@ -274,6 +275,7 @@ impl Gemma4PleGlobalWeights {
             mmap_cache: Arc::new(Mutex::new(HashMap::new())),
             token_row_cache: Arc::new(Mutex::new(HashMap::new())),
             model_projection_cache: Arc::new(Mutex::new(HashMap::new())),
+            model_projection_det_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -308,6 +310,8 @@ pub struct Gemma4PleLayerWeights {
 pub struct ResolvedGemma4PleLayerWeights {
     pub input_gate: Arc<MatrixF32>,
     pub layer_projection: Arc<MatrixF32>,
+    pub input_gate_det: Option<Arc<DetNumMatrix>>,
+    pub layer_projection_det: Option<Arc<DetNumMatrix>>,
     pub post_input_norm_weight: Vec<f32>,
 }
 

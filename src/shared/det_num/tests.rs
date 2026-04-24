@@ -1,8 +1,9 @@
 use std::{mem::size_of, panic};
 
 use super::{
-    acc_add_sat, acc_to_le_bytes, act_to_le_bytes, add_sat, argmax_first, clip_act, f32_to_act,
-    f32_to_wgt, mac, mac_bits, mul_wide, requantize, rshift_round_ties_even, sub_sat,
+    acc_add_sat, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first, clip_act,
+    f32_to_act, f32_to_wgt, mac, mac_bits, mul_sat, mul_wide, requantize, rshift_round_ties_even,
+    scale_act, sub_sat,
     types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT,
     wgt_to_le_bytes, Acc, Act, Wgt,
 };
@@ -218,6 +219,67 @@ fn add_sat_matches_golden_vectors() {
             case.name
         );
     }
+}
+
+#[test]
+fn mul_sat_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        a_bits: i32,
+        b_bits: i32,
+        expected_bits: i32,
+    }
+
+    let cases = [
+        Case {
+            name: "exact_product",
+            a_bits: Act::from_num(1.5).to_bits(),
+            b_bits: Act::from_num(2.0).to_bits(),
+            expected_bits: Act::from_num(3.0).to_bits(),
+        },
+        Case {
+            name: "ties_to_even_down",
+            a_bits: 1,
+            b_bits: 0x8000,
+            expected_bits: 0,
+        },
+        Case {
+            name: "ties_to_even_up",
+            a_bits: 3,
+            b_bits: 0x8000,
+            expected_bits: 2,
+        },
+        Case {
+            name: "positive_saturation",
+            a_bits: i32::MAX,
+            b_bits: i32::MAX,
+            expected_bits: i32::MAX,
+        },
+        Case {
+            name: "negative_saturation",
+            a_bits: i32::MIN,
+            b_bits: i32::MAX,
+            expected_bits: i32::MIN,
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            mul_sat(Act::from_bits(case.a_bits), Act::from_bits(case.b_bits)).to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn scale_act_matches_mul_sat_contract() {
+    let scale = Act::from_num(0.5);
+    let value = Act::from_num(3.0);
+
+    assert_eq!(scale_act(value, scale), mul_sat(value, scale));
+    assert_eq!(act_to_f32(scale_act(value, scale)), 1.5);
 }
 
 #[test]

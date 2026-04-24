@@ -21,6 +21,16 @@ pub fn add_sat(a: Act, b: Act) -> Act {
     Act::from_bits(a.to_bits().saturating_add(b.to_bits()))
 }
 
+/// Multiplies activation values under the canonical requantize-and-saturate contract.
+pub fn mul_sat(a: Act, b: Act) -> Act {
+    requantize(Acc::from_bits(i64::from(a.to_bits()) * i64::from(b.to_bits())))
+}
+
+/// Applies a Q16.16 scalar to an activation under the canonical multiply contract.
+pub fn scale_act(value: Act, scalar: Act) -> Act {
+    mul_sat(value, scalar)
+}
+
 /// Subtracts activation values with saturating overflow semantics.
 pub fn sub_sat(a: Act, b: Act) -> Act {
     Act::from_bits(a.to_bits().saturating_sub(b.to_bits()))

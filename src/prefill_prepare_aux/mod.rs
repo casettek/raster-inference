@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel,
 };
@@ -9,6 +10,7 @@ pub fn run(
     prompt_token_ids: &[u32],
     model: &Gemma4TransformerModel,
     token_embeddings: &ActivationSequence,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let ple_inputs = model
         .ple_global
@@ -20,6 +22,7 @@ pub fn run(
                 &model.layers,
                 ple_global,
                 model.rms_norm_eps,
+                execution_mode,
             )
         })
         .transpose()?;

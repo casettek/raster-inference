@@ -51,7 +51,8 @@ pub use shared::transformer::{
 };
 pub use shared::transformer_kernels::{
     append_kv_cache, apply_final_logit_softcapping, apply_final_norm, compute_decode_ple_input,
-    compute_prefill_ple_inputs, embed_input_token, embed_input_tokens, extract_prefill_logits,
+    compute_prefill_ple_inputs, embed_input_token, embed_input_token_with_mode,
+    embed_input_tokens, embed_input_tokens_with_mode, extract_prefill_logits,
     project_decode_hidden_to_logits, project_to_logits, run_gemma4_layer, run_gemma4_layer_decode,
     select_final_position,
 };
@@ -136,11 +137,16 @@ pub fn run_inference_with_controls(
             let prompt_preparation = run_prompt_prepare(request, model, tokenizer)?;
             let token_embeddings =
                 if let Some(embedding_table) = transformer_model.embedding_table.as_ref() {
-                    embed_input_tokens(&prompt_preparation.prompt_token_ids, embedding_table)?
+                    embed_input_tokens_with_mode(
+                        &prompt_preparation.prompt_token_ids,
+                        embedding_table,
+                        request.execution_mode,
+                    )?
                 } else if let Some(embedding_source) = transformer_model.embedding_source.as_ref() {
-                    io::embed_input_tokens_from_gemma_source(
+                    io::embed_input_tokens_from_gemma_source_with_mode(
                         &prompt_preparation.prompt_token_ids,
                         embedding_source,
+                        request.execution_mode,
                     )?
                 } else {
                     anyhow::bail!(
@@ -177,6 +183,7 @@ pub fn run_inference_with_controls(
                 &prompt_preparation.prompt_token_ids,
                 transformer_model,
                 &token_embeddings,
+                request.execution_mode,
             )?;
             if should_stop_at_checkpoint(controls, "prefill.prepare_aux") {
                 trace::phase_paused(PhaseId::TransformerStateTransition);
@@ -589,6 +596,7 @@ mod tests {
             &prompt_preparation.prompt_token_ids,
             &transformer_model,
             &token_embeddings,
+            InferenceExecutionMode::Fp32,
         )
         .expect("prefill prepare aux");
         let (final_hidden_states, layer_caches) = run_prefill_layer(

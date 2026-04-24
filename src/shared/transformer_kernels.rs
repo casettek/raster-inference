@@ -3,7 +3,9 @@ use rayon::prelude::*;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::shared::det_num::{f32_to_act, mac_bits, requantize, Acc, Act};
+use crate::shared::det_num::{
+    act_to_f32, add_sat, f32_to_act, mac_bits, mul_sat, requantize, scale_act, Acc, Act,
+};
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
     ActivationSequence, DetNumMatrix, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
@@ -16,6 +18,14 @@ use crate::trace::trace_scope;
 pub fn embed_input_tokens(
     token_ids: &[u32],
     embedding_table: &EmbeddingTable,
+) -> Result<EmbeddedTokenSequence> {
+    embed_input_tokens_with_mode(token_ids, embedding_table, InferenceExecutionMode::Fp32)
+}
+
+pub fn embed_input_tokens_with_mode(
+    token_ids: &[u32],
+    embedding_table: &EmbeddingTable,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<EmbeddedTokenSequence> {
     // let _trace = trace_scope("transformer_state_transition.embed_input_tokens");
     if token_ids.is_empty() {
@@ -49,13 +59,12 @@ pub fn embed_input_tokens(
         let row = embedding_table.rows.get(row_idx).ok_or_else(|| {
             anyhow::anyhow!("token id {token_id} is out of bounds for embedding table")
         })?;
-        let mut activation = row.clone();
-        if embedding_table.scale != 1.0 {
-            for value in &mut activation {
-                *value *= embedding_table.scale;
-            }
-        }
-        activations.push(activation);
+        let activation = scale_row_buffer(
+            &ActivationRowBuffer::from_values(row.clone()),
+            embedding_table.scale,
+            execution_mode == InferenceExecutionMode::Deterministic,
+        );
+        activations.push(activation.values);
     }
 
     let activations_sha256 = build_activation_commitment(&activations);
@@ -67,7 +76,15 @@ pub fn embed_input_tokens(
 }
 
 pub fn embed_input_token(token_id: u32, embedding_table: &EmbeddingTable) -> Result<Vec<f32>> {
-    let embedded = embed_input_tokens(&[token_id], embedding_table)?;
+    embed_input_token_with_mode(token_id, embedding_table, InferenceExecutionMode::Fp32)
+}
+
+pub fn embed_input_token_with_mode(
+    token_id: u32,
+    embedding_table: &EmbeddingTable,
+    execution_mode: InferenceExecutionMode,
+) -> Result<Vec<f32>> {
+    let embedded = embed_input_tokens_with_mode(&[token_id], embedding_table, execution_mode)?;
     embedded
         .activations
         .into_iter()
@@ -81,6 +98,7 @@ pub fn compute_prefill_ple_inputs(
     layers: &[Gemma4LayerWeights],
     ple_global: &Gemma4PleGlobalWeights,
     rms_norm_eps: f32,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<Gemma4PrefillPleInputs> {
     // let _trace = trace_scope("transformer_state_transition.compute_prefill_ple_inputs");
     if input_activations.is_empty() {
@@ -123,33 +141,46 @@ pub fn compute_prefill_ple_inputs(
         let mut embedded = Vec::with_capacity(token_ids.len());
         for token_id in token_ids {
             embedded.push(
-                crate::io::load_ple_token_embedding_row(ple_global, layer_idx, *token_id)?
-                    .into_iter()
-                    .map(|value| value * ple_global.embedding_scale)
-                    .collect::<Vec<_>>(),
+                crate::io::load_ple_token_embedding_row(ple_global, layer_idx, *token_id)?,
             );
         }
+        let embedded = scale_sequence_buffer(
+            &ActivationSequenceBuffer::from_values(embedded),
+            ple_global.embedding_scale,
+            execution_mode == InferenceExecutionMode::Deterministic,
+        );
 
         let model_projection = crate::io::load_ple_model_projection(ple_global, layer_idx)?;
-        let mut projected = linear_sequence(input_activations, &model_projection)?;
-        for row in &mut projected {
-            for value in row {
-                *value *= ple_global.projection_scalar;
-            }
-        }
-        let projected = apply_rms_norm_to_sequence(
+        let model_projection_det =
+            crate::io::materialize_det_num_ple_model_projection(ple_global, layer_idx)?;
+        let projected = project_linear_sequence_buffer(
+            &ActivationSequenceBuffer::from_values(input_activations.to_vec()),
+            &model_projection,
+            model_projection_det.as_deref(),
+        )?;
+        let projected_uses_det = projected.acts.is_some();
+        let projected = scale_sequence_buffer(
             &projected,
+            ple_global.projection_scalar,
+            projected_uses_det,
+        );
+        let projected = ActivationSequenceBuffer::from_values(apply_rms_norm_to_sequence(
+            &projected.values,
             &ple_global.projection_norm_weight,
             rms_norm_eps,
-        )?;
+        )?);
 
-        let mut combined = add_sequences(&embedded, &projected)?;
-        for row in &mut combined {
-            for value in row {
-                *value *= ple_global.input_scale;
-            }
-        }
-        per_layer_inputs.push(Some(combined));
+        let combined = add_sequence_buffers(
+            &embedded,
+            &projected,
+            execution_mode == InferenceExecutionMode::Deterministic || projected_uses_det,
+        )?;
+        let combined = scale_sequence_buffer(
+            &combined,
+            ple_global.input_scale,
+            execution_mode == InferenceExecutionMode::Deterministic || combined.acts.is_some(),
+        );
+        per_layer_inputs.push(Some(combined.values));
     }
 
     Ok(Gemma4PrefillPleInputs { per_layer_inputs })
@@ -162,6 +193,7 @@ pub fn compute_decode_ple_input(
     layer: &Gemma4LayerWeights,
     ple_global: Option<&Gemma4PleGlobalWeights>,
     rms_norm_eps: f32,
+    execution_mode: InferenceExecutionMode,
 ) -> Result<Option<Vec<f32>>> {
     let Some(ple_global) = ple_global else {
         return Ok(None);
@@ -175,34 +207,49 @@ pub fn compute_decode_ple_input(
         layer.hidden_size,
         "decode PLE input activation",
     )?;
-    let embedded = crate::io::load_ple_token_embedding_row(ple_global, layer_idx, token_id)?
-        .into_iter()
-        .map(|value| value * ple_global.embedding_scale)
-        .collect::<Vec<_>>();
+    let embedded = scale_row_buffer(
+        &ActivationRowBuffer::from_values(crate::io::load_ple_token_embedding_row(
+            ple_global, layer_idx, token_id,
+        )?),
+        ple_global.embedding_scale,
+        execution_mode == InferenceExecutionMode::Deterministic,
+    );
     let model_projection = crate::io::load_ple_model_projection(ple_global, layer_idx)?;
-    let mut projected = linear_row(input_activation, &model_projection)?;
-    for value in &mut projected {
-        *value *= ple_global.projection_scalar;
-    }
-    let projected = apply_rms_norm(&projected, &ple_global.projection_norm_weight, rms_norm_eps)?;
+    let model_projection_det =
+        crate::io::materialize_det_num_ple_model_projection(ple_global, layer_idx)?;
+    let projected = project_linear_row_buffer(
+        &ActivationRowBuffer::from_values(input_activation.to_vec()),
+        &model_projection,
+        model_projection_det.as_deref(),
+    )?;
+    let projected_uses_det = projected.acts.is_some();
+    let projected = scale_row_buffer(&projected, ple_global.projection_scalar, projected_uses_det);
+    let projected = ActivationRowBuffer::from_values(apply_rms_norm(
+        &projected.values,
+        &ple_global.projection_norm_weight,
+        rms_norm_eps,
+    )?);
 
-    if embedded.len() != projected.len() {
+    if embedded.values.len() != projected.values.len() {
         bail!(
             "decode PLE width mismatch: embedded {} vs projected {}",
-            embedded.len(),
-            projected.len()
+            embedded.values.len(),
+            projected.values.len()
         );
     }
 
-    Ok(Some(
-        embedded
-            .into_iter()
-            .zip(projected)
-            .map(|(embedded_value, projected_value)| {
-                (embedded_value + projected_value) * ple_global.input_scale
-            })
-            .collect(),
-    ))
+    let combined = add_row_buffers(
+        &embedded,
+        &projected,
+        execution_mode == InferenceExecutionMode::Deterministic || projected_uses_det,
+    )?;
+    let combined = scale_row_buffer(
+        &combined,
+        ple_global.input_scale,
+        execution_mode == InferenceExecutionMode::Deterministic || combined.acts.is_some(),
+    );
+
+    Ok(Some(combined.values))
 }
 
 pub fn run_gemma4_layer(
@@ -250,7 +297,7 @@ pub(crate) fn run_gemma4_layer_with_cache(
 
     let mut xs = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.clone_input");
-        input_activations.to_vec()
+        ActivationSequenceBuffer::from_values(input_activations.to_vec())
     };
 
     let residual = {
@@ -259,7 +306,7 @@ pub(crate) fn run_gemma4_layer_with_cache(
     };
     let normed = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.attention.input_rms_norm");
-        apply_rms_norm_to_sequence(&xs, &layer.input_layernorm_weight, layer.rms_norm_eps)?
+        apply_rms_norm_to_sequence(&xs.values, &layer.input_layernorm_weight, layer.rms_norm_eps)?
     };
     let (attn_out, layer_cache) = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.attention.core");
@@ -267,15 +314,15 @@ pub(crate) fn run_gemma4_layer_with_cache(
     };
     let attn_out = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.attention.post_rms_norm");
-        apply_rms_norm_to_sequence(
+        ActivationSequenceBuffer::from_values(apply_rms_norm_to_sequence(
             &attn_out,
             &layer.post_attention_layernorm_weight,
             layer.rms_norm_eps,
-        )?
+        )?)
     };
     xs = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.attention.residual_add");
-        add_sequences(&residual, &attn_out)?
+        add_sequence_buffers(&residual, &attn_out, layer.o_proj_det.is_some())?
     };
 
     let residual = {
@@ -285,7 +332,7 @@ pub(crate) fn run_gemma4_layer_with_cache(
     let normed = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.pre_rms_norm");
         apply_rms_norm_to_sequence(
-            &xs,
+            &xs.values,
             &layer.pre_feedforward_layernorm_weight,
             layer.rms_norm_eps,
         )?
@@ -304,46 +351,74 @@ pub(crate) fn run_gemma4_layer_with_cache(
                 .collect::<Result<Vec<_>>>()?;
             let up = quantized_normed
                 .par_iter()
-                .map(|row| det_linear_row_from_acts(row, up_weight.as_ref()))
+                .map(|row| det_linear_row_acts_from_acts(row, up_weight.as_ref()))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
-            (apply_gelu_to_sequence(&gate_preactivation), up)
+            (
+                ActivationSequenceBuffer::from_values(apply_gelu_to_sequence(&gate_preactivation)),
+                ActivationSequenceBuffer::from_acts(up),
+            )
         }
         (gate_weight, up_weight) => {
             let gate_preactivation = match gate_weight {
-                Some(weight) => det_linear_sequence(&normed, weight.as_ref())?,
-                None => linear_sequence(&normed, layer.gate_proj.as_ref())?,
+                Some(weight) => project_linear_sequence_buffer(
+                    &ActivationSequenceBuffer::from_values(normed.clone()),
+                    layer.gate_proj.as_ref(),
+                    Some(weight.as_ref()),
+                )?,
+                None => ActivationSequenceBuffer::from_values(linear_sequence(
+                    &normed,
+                    layer.gate_proj.as_ref(),
+                )?),
             };
             let up = match up_weight {
-                Some(weight) => det_linear_sequence(&normed, weight.as_ref())?,
-                None => linear_sequence(&normed, layer.up_proj.as_ref())?,
+                Some(weight) => project_linear_sequence_buffer(
+                    &ActivationSequenceBuffer::from_values(normed.clone()),
+                    layer.up_proj.as_ref(),
+                    Some(weight.as_ref()),
+                )?,
+                None => ActivationSequenceBuffer::from_values(linear_sequence(
+                    &normed,
+                    layer.up_proj.as_ref(),
+                )?),
             };
-            (apply_gelu_to_sequence(&gate_preactivation), up)
+            (
+                ActivationSequenceBuffer::from_values(apply_gelu_to_sequence(
+                    &gate_preactivation.values,
+                )),
+                up,
+            )
         }
     };
     let ff_hidden = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.hidden_mul");
-        elementwise_mul_sequences(&gate, &up)?
+        mul_sequence_buffers(&gate, &up, gate.acts.is_some() || up.acts.is_some())?
     };
     let ff_out = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.down_proj");
         match layer.down_proj_det.as_ref() {
-            Some(weight) => det_linear_sequence(&ff_hidden, weight.as_ref())?,
-            None => linear_sequence(&ff_hidden, layer.down_proj.as_ref())?,
+            Some(weight) => {
+                project_linear_sequence_buffer(&ff_hidden, layer.down_proj.as_ref(), Some(weight.as_ref()))?
+            }
+            None => ActivationSequenceBuffer::from_values(linear_sequence(
+                &ff_hidden.values,
+                layer.down_proj.as_ref(),
+            )?),
         }
     };
+    let ff_out_uses_det = ff_out.acts.is_some();
     let ff_out = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.post_rms_norm");
-        apply_rms_norm_to_sequence(
-            &ff_out,
+        ActivationSequenceBuffer::from_values(apply_rms_norm_to_sequence(
+            &ff_out.values,
             &layer.post_feedforward_layernorm_weight,
             layer.rms_norm_eps,
-        )?
+        )?)
     };
     xs = {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.mlp.residual_add");
-        add_sequences(&residual, &ff_out)?
+        add_sequence_buffers(&residual, &ff_out, ff_out_uses_det)?
     };
 
     if let (Some(ple), Some(per_layer_input)) = (&layer.ple, per_layer_input) {
@@ -351,44 +426,64 @@ pub(crate) fn run_gemma4_layer_with_cache(
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.clone_residual");
             xs.clone()
         };
+        let quantized_xs = ple
+            .input_gate_det
+            .as_ref()
+            .map(|_| quantize_sequence_to_acts(&xs.values));
         let gated = {
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.input_gate_gelu");
-            apply_gelu_to_sequence(&linear_sequence(&xs, ple.input_gate.as_ref())?)
+            ActivationSequenceBuffer::from_values(apply_gelu_to_sequence(
+                &project_linear_sequence(
+                    &xs.values,
+                    quantized_xs.as_deref(),
+                    ple.input_gate.as_ref(),
+                    ple.input_gate_det.as_deref(),
+                )?,
+            ))
         };
         let gated = {
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.input_mul");
-            elementwise_mul_sequences(&gated, per_layer_input)?
+            mul_sequence_buffers(
+                &gated,
+                &ActivationSequenceBuffer::from_values(per_layer_input.to_vec()),
+                ple.input_gate_det.is_some(),
+            )?
         };
         let projected = {
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.layer_projection");
-            linear_sequence(&gated, ple.layer_projection.as_ref())?
+            project_linear_sequence_buffer(
+                &gated,
+                ple.layer_projection.as_ref(),
+                ple.layer_projection_det.as_deref(),
+            )?
         };
+        let projected_uses_det = projected.acts.is_some();
         let projected = {
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.post_rms_norm");
-            apply_rms_norm_to_sequence(&projected, &ple.post_input_norm_weight, layer.rms_norm_eps)?
+            ActivationSequenceBuffer::from_values(apply_rms_norm_to_sequence(
+                &projected.values,
+                &ple.post_input_norm_weight,
+                layer.rms_norm_eps,
+            )?)
         };
         xs = {
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.residual_add");
-            add_sequences(&residual, &projected)?
+            add_sequence_buffers(&residual, &projected, projected_uses_det)?
         };
     }
 
     if let Some(layer_scalar) = layer.layer_scalar {
         // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.layer_scalar");
-        for row in &mut xs {
-            for value in row {
-                *value *= layer_scalar;
-            }
-        }
+        xs = scale_sequence_buffer(&xs, layer_scalar, xs.acts.is_some());
     }
 
     Ok((
         ActivationSequence {
             activations_sha256: {
                 // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.commitment_hash");
-                build_activation_commitment(&xs)
+                build_activation_commitment(&xs.values)
             },
-            activations: xs,
+            activations: xs.values,
         },
         layer_cache,
     ))
@@ -427,24 +522,24 @@ pub fn run_gemma4_layer_decode(
         )?;
     }
 
-    let residual = input_activation.to_vec();
+    let residual = ActivationRowBuffer::from_values(input_activation.to_vec());
     let normed = apply_rms_norm(
         input_activation,
         &layer.input_layernorm_weight,
         layer.rms_norm_eps,
     )?;
-    let (mut xs, updated_cache) =
+    let (xs_values, updated_cache) =
         run_attention_for_layer_decode(&normed, layer, cache, donor_cache, position)?;
-    xs = apply_rms_norm(
-        &xs,
+    let mut xs = ActivationRowBuffer::from_values(apply_rms_norm(
+        &xs_values,
         &layer.post_attention_layernorm_weight,
         layer.rms_norm_eps,
-    )?;
-    xs = add_rows(&residual, &xs)?;
+    )?);
+    xs = add_row_buffers(&residual, &xs, layer.o_proj_det.is_some())?;
 
     let residual = xs.clone();
     let normed = apply_rms_norm(
-        &xs,
+        &xs.values,
         &layer.pre_feedforward_layernorm_weight,
         layer.rms_norm_eps,
     )?;
@@ -452,52 +547,103 @@ pub fn run_gemma4_layer_decode(
     {
         (Some(gate_weight), Some(up_weight)) => {
             let quantized_normed = normed.iter().copied().map(f32_to_act).collect::<Vec<_>>();
+            let gate_preactivation =
+                det_linear_row_from_acts(&quantized_normed, gate_weight.as_ref())?;
             (
-                det_linear_row_from_acts(&quantized_normed, gate_weight.as_ref())?,
-                det_linear_row_from_acts(&quantized_normed, up_weight.as_ref())?,
+                ActivationRowBuffer::from_values(apply_gelu(&gate_preactivation)),
+                ActivationRowBuffer::from_acts(det_linear_row_acts_from_acts(
+                    &quantized_normed,
+                    up_weight.as_ref(),
+                )?),
             )
         }
         (gate_weight, up_weight) => {
             let gate_preactivation = match gate_weight {
-                Some(weight) => det_linear_row(&normed, weight.as_ref())?,
-                None => linear_row(&normed, layer.gate_proj.as_ref())?,
+                Some(weight) => project_linear_row_buffer(
+                    &ActivationRowBuffer::from_values(normed.clone()),
+                    layer.gate_proj.as_ref(),
+                    Some(weight.as_ref()),
+                )?,
+                None => ActivationRowBuffer::from_values(linear_row(
+                    &normed,
+                    layer.gate_proj.as_ref(),
+                )?),
             };
             let up = match up_weight {
-                Some(weight) => det_linear_row(&normed, weight.as_ref())?,
-                None => linear_row(&normed, layer.up_proj.as_ref())?,
+                Some(weight) => project_linear_row_buffer(
+                    &ActivationRowBuffer::from_values(normed.clone()),
+                    layer.up_proj.as_ref(),
+                    Some(weight.as_ref()),
+                )?,
+                None => ActivationRowBuffer::from_values(linear_row(
+                    &normed,
+                    layer.up_proj.as_ref(),
+                )?),
             };
-            (gate_preactivation, up)
+            (
+                ActivationRowBuffer::from_values(apply_gelu(&gate_preactivation.values)),
+                up,
+            )
         }
     };
-    let gate = apply_gelu(&gate_preactivation);
-    let ff_hidden = elementwise_mul_rows(&gate, &up)?;
-    let mut ff_out = match layer.down_proj_det.as_ref() {
-        Some(weight) => det_linear_row(&ff_hidden, weight.as_ref())?,
-        None => linear_row(&ff_hidden, layer.down_proj.as_ref())?,
+    let ff_hidden = mul_row_buffers(
+        &gate_preactivation,
+        &up,
+        gate_preactivation.acts.is_some() || up.acts.is_some(),
+    )?;
+    let ff_out = match layer.down_proj_det.as_ref() {
+        Some(weight) => {
+            project_linear_row_buffer(&ff_hidden, layer.down_proj.as_ref(), Some(weight.as_ref()))?
+        }
+        None => ActivationRowBuffer::from_values(linear_row(
+            &ff_hidden.values,
+            layer.down_proj.as_ref(),
+        )?),
     };
-    ff_out = apply_rms_norm(
-        &ff_out,
+    let ff_out_uses_det = ff_out.acts.is_some();
+    let ff_out = ActivationRowBuffer::from_values(apply_rms_norm(
+        &ff_out.values,
         &layer.post_feedforward_layernorm_weight,
         layer.rms_norm_eps,
-    )?;
-    xs = add_rows(&residual, &ff_out)?;
+    )?);
+    xs = add_row_buffers(&residual, &ff_out, ff_out_uses_det)?;
 
     if let (Some(ple), Some(per_layer_input)) = (&layer.ple, per_layer_input) {
         let residual = xs.clone();
-        let gated = apply_gelu(&linear_row(&xs, ple.input_gate.as_ref())?);
-        let gated = elementwise_mul_rows(&gated, per_layer_input)?;
-        let mut projected = linear_row(&gated, ple.layer_projection.as_ref())?;
-        projected = apply_rms_norm(&projected, &ple.post_input_norm_weight, layer.rms_norm_eps)?;
-        xs = add_rows(&residual, &projected)?;
+        let quantized_xs = ple
+            .input_gate_det
+            .as_ref()
+            .map(|_| quantize_row_to_acts(&xs.values));
+        let gated = ActivationRowBuffer::from_values(apply_gelu(&project_linear_row(
+            &xs.values,
+            quantized_xs.as_deref(),
+            ple.input_gate.as_ref(),
+            ple.input_gate_det.as_deref(),
+        )?));
+        let gated = mul_row_buffers(
+            &gated,
+            &ActivationRowBuffer::from_values(per_layer_input.to_vec()),
+            ple.input_gate_det.is_some(),
+        )?;
+        let projected = project_linear_row_buffer(
+            &gated,
+            ple.layer_projection.as_ref(),
+            ple.layer_projection_det.as_deref(),
+        )?;
+        let projected_uses_det = projected.acts.is_some();
+        let projected = ActivationRowBuffer::from_values(apply_rms_norm(
+            &projected.values,
+            &ple.post_input_norm_weight,
+            layer.rms_norm_eps,
+        )?);
+        xs = add_row_buffers(&residual, &projected, projected_uses_det)?;
     }
 
     if let Some(layer_scalar) = layer.layer_scalar {
-        for value in &mut xs {
-            *value *= layer_scalar;
-        }
+        xs = scale_row_buffer(&xs, layer_scalar, xs.acts.is_some());
     }
 
-    Ok((xs, updated_cache))
+    Ok((xs.values, updated_cache))
 }
 
 pub fn run_text_layers_prefill(
@@ -627,6 +773,7 @@ pub fn run_text_layers_decode_step(
             layer,
             model.ple_global.as_ref(),
             model.rms_norm_eps,
+            InferenceExecutionMode::Fp32,
         )?;
         let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
@@ -928,7 +1075,7 @@ fn run_causal_attention(
             Some(
                 inputs
                     .iter()
-                    .map(|row| row.iter().copied().map(f32_to_act).collect::<Vec<_>>())
+                    .map(|row| quantize_row_to_acts(row))
                     .collect::<Vec<_>>(),
             )
         } else {
@@ -1069,12 +1216,16 @@ fn run_causal_attention(
         }
     }
 
+    let quantized_combined_heads = layer
+        .o_proj_det
+        .as_ref()
+        .map(|_| quantize_sequence_to_acts(&combined_heads));
     {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.o_proj");
         Ok((
             project_linear_sequence(
                 &combined_heads,
-                None,
+                quantized_combined_heads.as_deref(),
                 layer.o_proj.as_ref(),
                 layer.o_proj_det.as_deref(),
             )?,
@@ -1113,7 +1264,7 @@ fn run_causal_attention_decode(
 
     let quantized_input =
         if layer.q_proj_det.is_some() || layer.k_proj_det.is_some() || layer.v_proj_det.is_some() {
-            Some(input.iter().copied().map(f32_to_act).collect::<Vec<_>>())
+            Some(quantize_row_to_acts(input))
         } else {
             None
         };
@@ -1199,10 +1350,14 @@ fn run_causal_attention_decode(
         dst.copy_from_slice(&output);
     }
 
+    let quantized_combined_heads = layer
+        .o_proj_det
+        .as_ref()
+        .map(|_| quantize_row_to_acts(&combined_heads));
     Ok((
         project_linear_row(
             &combined_heads,
-            None,
+            quantized_combined_heads.as_deref(),
             layer.o_proj.as_ref(),
             layer.o_proj_det.as_deref(),
         )?,
@@ -1258,6 +1413,49 @@ fn validate_layer_cache(cache: &LayerKvCache, layer: &ResolvedGemma4LayerWeights
     }
 
     Ok(())
+}
+
+#[derive(Clone)]
+struct ActivationSequenceBuffer {
+    values: Vec<Vec<f32>>,
+    acts: Option<Vec<Vec<Act>>>,
+}
+
+impl ActivationSequenceBuffer {
+    fn from_values(values: Vec<Vec<f32>>) -> Self {
+        Self { values, acts: None }
+    }
+
+    fn from_acts(acts: Vec<Vec<Act>>) -> Self {
+        let values = acts
+            .iter()
+            .map(|row| row.iter().copied().map(act_to_f32).collect())
+            .collect();
+        Self {
+            values,
+            acts: Some(acts),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ActivationRowBuffer {
+    values: Vec<f32>,
+    acts: Option<Vec<Act>>,
+}
+
+impl ActivationRowBuffer {
+    fn from_values(values: Vec<f32>) -> Self {
+        Self { values, acts: None }
+    }
+
+    fn from_acts(acts: Vec<Act>) -> Self {
+        let values = acts.iter().copied().map(act_to_f32).collect();
+        Self {
+            values,
+            acts: Some(acts),
+        }
+    }
 }
 
 fn add_sequences(lhs: &[Vec<f32>], rhs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
@@ -1330,6 +1528,182 @@ fn elementwise_mul_rows(lhs: &[f32], rhs: &[f32]) -> Result<Vec<f32>> {
         .collect())
 }
 
+fn add_act_sequences(lhs: &[Vec<Act>], rhs: &[Vec<Act>]) -> Result<Vec<Vec<Act>>> {
+    if lhs.len() != rhs.len() {
+        bail!("sequence length mismatch: {} vs {}", lhs.len(), rhs.len());
+    }
+
+    lhs.iter()
+        .zip(rhs)
+        .map(|(lhs_row, rhs_row)| add_act_rows(lhs_row, rhs_row))
+        .collect()
+}
+
+fn add_act_rows(lhs: &[Act], rhs: &[Act]) -> Result<Vec<Act>> {
+    if lhs.len() != rhs.len() {
+        bail!("row width mismatch: {} vs {}", lhs.len(), rhs.len());
+    }
+    Ok(lhs
+        .iter()
+        .zip(rhs)
+        .map(|(lhs_value, rhs_value)| add_sat(*lhs_value, *rhs_value))
+        .collect())
+}
+
+fn mul_act_sequences(lhs: &[Vec<Act>], rhs: &[Vec<Act>]) -> Result<Vec<Vec<Act>>> {
+    if lhs.len() != rhs.len() {
+        bail!("sequence length mismatch: {} vs {}", lhs.len(), rhs.len());
+    }
+
+    lhs.iter()
+        .zip(rhs)
+        .map(|(lhs_row, rhs_row)| mul_act_rows(lhs_row, rhs_row))
+        .collect()
+}
+
+fn mul_act_rows(lhs: &[Act], rhs: &[Act]) -> Result<Vec<Act>> {
+    if lhs.len() != rhs.len() {
+        bail!("row width mismatch: {} vs {}", lhs.len(), rhs.len());
+    }
+    Ok(lhs
+        .iter()
+        .zip(rhs)
+        .map(|(lhs_value, rhs_value)| mul_sat(*lhs_value, *rhs_value))
+        .collect())
+}
+
+fn scale_act_sequences(values: &[Vec<Act>], scalar: Act) -> Vec<Vec<Act>> {
+    values
+        .iter()
+        .map(|row| scale_act_rows(row, scalar))
+        .collect()
+}
+
+fn scale_act_rows(values: &[Act], scalar: Act) -> Vec<Act> {
+    values
+        .iter()
+        .copied()
+        .map(|value| scale_act(value, scalar))
+        .collect()
+}
+
+fn scale_sequences(values: &[Vec<f32>], scalar: f32) -> Vec<Vec<f32>> {
+    values
+        .iter()
+        .map(|row| row.iter().map(|value| value * scalar).collect())
+        .collect()
+}
+
+fn scale_rows(values: &[f32], scalar: f32) -> Vec<f32> {
+    values.iter().map(|value| value * scalar).collect()
+}
+
+fn sequence_buffer_acts(buffer: &ActivationSequenceBuffer) -> Vec<Vec<Act>> {
+    buffer
+        .acts
+        .clone()
+        .unwrap_or_else(|| quantize_sequence_to_acts(&buffer.values))
+}
+
+fn row_buffer_acts(buffer: &ActivationRowBuffer) -> Vec<Act> {
+    buffer
+        .acts
+        .clone()
+        .unwrap_or_else(|| quantize_row_to_acts(&buffer.values))
+}
+
+fn add_sequence_buffers(
+    lhs: &ActivationSequenceBuffer,
+    rhs: &ActivationSequenceBuffer,
+    deterministic: bool,
+) -> Result<ActivationSequenceBuffer> {
+    if deterministic {
+        Ok(ActivationSequenceBuffer::from_acts(add_act_sequences(
+            &sequence_buffer_acts(lhs),
+            &sequence_buffer_acts(rhs),
+        )?))
+    } else {
+        Ok(ActivationSequenceBuffer::from_values(add_sequences(
+            &lhs.values,
+            &rhs.values,
+        )?))
+    }
+}
+
+fn add_row_buffers(
+    lhs: &ActivationRowBuffer,
+    rhs: &ActivationRowBuffer,
+    deterministic: bool,
+) -> Result<ActivationRowBuffer> {
+    if deterministic {
+        Ok(ActivationRowBuffer::from_acts(add_act_rows(
+            &row_buffer_acts(lhs),
+            &row_buffer_acts(rhs),
+        )?))
+    } else {
+        Ok(ActivationRowBuffer::from_values(add_rows(&lhs.values, &rhs.values)?))
+    }
+}
+
+fn mul_sequence_buffers(
+    lhs: &ActivationSequenceBuffer,
+    rhs: &ActivationSequenceBuffer,
+    deterministic: bool,
+) -> Result<ActivationSequenceBuffer> {
+    if deterministic {
+        Ok(ActivationSequenceBuffer::from_acts(mul_act_sequences(
+            &sequence_buffer_acts(lhs),
+            &sequence_buffer_acts(rhs),
+        )?))
+    } else {
+        Ok(ActivationSequenceBuffer::from_values(elementwise_mul_sequences(
+            &lhs.values,
+            &rhs.values,
+        )?))
+    }
+}
+
+fn mul_row_buffers(
+    lhs: &ActivationRowBuffer,
+    rhs: &ActivationRowBuffer,
+    deterministic: bool,
+) -> Result<ActivationRowBuffer> {
+    if deterministic {
+        Ok(ActivationRowBuffer::from_acts(mul_act_rows(
+            &row_buffer_acts(lhs),
+            &row_buffer_acts(rhs),
+        )?))
+    } else {
+        Ok(ActivationRowBuffer::from_values(elementwise_mul_rows(
+            &lhs.values,
+            &rhs.values,
+        )?))
+    }
+}
+
+fn scale_sequence_buffer(
+    values: &ActivationSequenceBuffer,
+    scalar: f32,
+    deterministic: bool,
+) -> ActivationSequenceBuffer {
+    if deterministic {
+        ActivationSequenceBuffer::from_acts(scale_act_sequences(
+            &sequence_buffer_acts(values),
+            f32_to_act(scalar),
+        ))
+    } else {
+        ActivationSequenceBuffer::from_values(scale_sequences(&values.values, scalar))
+    }
+}
+
+fn scale_row_buffer(values: &ActivationRowBuffer, scalar: f32, deterministic: bool) -> ActivationRowBuffer {
+    if deterministic {
+        ActivationRowBuffer::from_acts(scale_act_rows(&row_buffer_acts(values), f32_to_act(scalar)))
+    } else {
+        ActivationRowBuffer::from_values(scale_rows(&values.values, scalar))
+    }
+}
+
 fn linear_sequence(inputs: &[Vec<f32>], weight: &MatrixF32) -> Result<Vec<Vec<f32>>> {
     validate_sequence_width(inputs, weight.cols, "linear input")?;
 
@@ -1395,20 +1769,51 @@ fn project_linear_row(
     }
 }
 
-fn det_linear_sequence(inputs: &[Vec<f32>], weight: &DetNumMatrix) -> Result<Vec<Vec<f32>>> {
-    validate_sequence_width(inputs, weight.cols, "deterministic linear input")?;
-    inputs
-        .par_iter()
-        .map(|input| det_linear_row(input, weight))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect()
+fn project_linear_sequence_buffer(
+    inputs: &ActivationSequenceBuffer,
+    weight: &MatrixF32,
+    det_weight: Option<&DetNumMatrix>,
+) -> Result<ActivationSequenceBuffer> {
+    match det_weight {
+        Some(det_weight) => Ok(ActivationSequenceBuffer::from_acts(
+            det_linear_sequence_acts_from_acts(&sequence_buffer_acts(inputs), det_weight)?,
+        )),
+        None => Ok(ActivationSequenceBuffer::from_values(linear_sequence(
+            &inputs.values,
+            weight,
+        )?)),
+    }
 }
 
-fn det_linear_sequence_from_acts(
+fn project_linear_row_buffer(
+    input: &ActivationRowBuffer,
+    weight: &MatrixF32,
+    det_weight: Option<&DetNumMatrix>,
+) -> Result<ActivationRowBuffer> {
+    match det_weight {
+        Some(det_weight) => Ok(ActivationRowBuffer::from_acts(det_linear_row_acts_from_acts(
+            &row_buffer_acts(input),
+            det_weight,
+        )?)),
+        None => Ok(ActivationRowBuffer::from_values(linear_row(&input.values, weight)?)),
+    }
+}
+
+fn quantize_sequence_to_acts(inputs: &[Vec<f32>]) -> Vec<Vec<Act>> {
+    inputs
+        .iter()
+        .map(|row| quantize_row_to_acts(row))
+        .collect::<Vec<_>>()
+}
+
+fn quantize_row_to_acts(input: &[f32]) -> Vec<Act> {
+    input.iter().copied().map(f32_to_act).collect::<Vec<_>>()
+}
+
+fn det_linear_sequence_acts_from_acts(
     quantized_inputs: &[Vec<Act>],
     weight: &DetNumMatrix,
-) -> Result<Vec<Vec<f32>>> {
+) -> Result<Vec<Vec<Act>>> {
     if let Some((row_idx, row)) = quantized_inputs
         .iter()
         .enumerate()
@@ -1423,10 +1828,52 @@ fn det_linear_sequence_from_acts(
 
     quantized_inputs
         .par_iter()
-        .map(|input| det_linear_row_from_acts(input, weight))
+        .map(|input| det_linear_row_acts_from_acts(input, weight))
         .collect::<Vec<_>>()
         .into_iter()
         .collect()
+}
+
+fn det_linear_row_acts_from_acts(quantized_input: &[Act], weight: &DetNumMatrix) -> Result<Vec<Act>> {
+    if quantized_input.len() != weight.cols {
+        bail!(
+            "deterministic linear input width mismatch: {} vs {}",
+            quantized_input.len(),
+            weight.cols
+        );
+    }
+
+    let mut output = Vec::with_capacity(weight.rows);
+    for row_idx in 0..weight.rows {
+        let row_offset = row_idx * weight.cols;
+        let mut acc_bits = 0_i64;
+        for (col_idx, act) in quantized_input.iter().enumerate() {
+            acc_bits = mac_bits(acc_bits, act.to_bits(), weight.values[row_offset + col_idx]);
+        }
+        output.push(requantize(Acc::from_bits(acc_bits)));
+    }
+    Ok(output)
+}
+
+fn det_linear_sequence(inputs: &[Vec<f32>], weight: &DetNumMatrix) -> Result<Vec<Vec<f32>>> {
+    validate_sequence_width(inputs, weight.cols, "deterministic linear input")?;
+    inputs
+        .par_iter()
+        .map(|input| det_linear_row(input, weight))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn det_linear_sequence_from_acts(
+    quantized_inputs: &[Vec<Act>],
+    weight: &DetNumMatrix,
+) -> Result<Vec<Vec<f32>>> {
+    det_linear_sequence_acts_from_acts(quantized_inputs, weight).map(|acts| {
+        acts.into_iter()
+            .map(|row| row.into_iter().map(act_to_f32).collect())
+            .collect()
+    })
 }
 
 fn det_linear_row(input: &[f32], weight: &DetNumMatrix) -> Result<Vec<f32>> {
@@ -1437,28 +1884,8 @@ fn det_linear_row(input: &[f32], weight: &DetNumMatrix) -> Result<Vec<f32>> {
 }
 
 fn det_linear_row_from_acts(quantized_input: &[Act], weight: &DetNumMatrix) -> Result<Vec<f32>> {
-    if quantized_input.len() != weight.cols {
-        bail!(
-            "deterministic linear input width mismatch: {} vs {}",
-            quantized_input.len(),
-            weight.cols
-        );
-    }
-
-    let mut output = vec![0.0; weight.rows];
-    for (row_idx, value) in output.iter_mut().enumerate() {
-        let row_offset = row_idx * weight.cols;
-        let mut acc_bits = 0_i64;
-        for (col_idx, act) in quantized_input.iter().enumerate() {
-            acc_bits = mac_bits(acc_bits, act.to_bits(), weight.values[row_offset + col_idx]);
-        }
-        *value = act_to_f32(requantize(Acc::from_bits(acc_bits)));
-    }
-    Ok(output)
-}
-
-fn act_to_f32(value: crate::shared::det_num::Act) -> f32 {
-    value.to_bits() as f32 / 65_536.0
+    det_linear_row_acts_from_acts(quantized_input, weight)
+        .map(|acts| acts.into_iter().map(act_to_f32).collect())
 }
 
 fn apply_rms_norm_to_sequence(
@@ -1728,10 +2155,11 @@ mod tests {
     };
 
     use super::{
-        append_kv_cache, apply_final_norm, apply_rope_to_rows, compute_prefill_ple_inputs,
-        det_linear_row, det_linear_row_from_acts, det_linear_sequence, embed_input_tokens,
-        extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
+        append_kv_cache, apply_final_norm, apply_rope_to_rows, compute_decode_ple_input,
+        compute_prefill_ple_inputs, det_linear_row, det_linear_row_from_acts, det_linear_sequence,
+        embed_input_tokens, extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
         run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
+        run_gemma4_layer_decode,
         run_text_layers_decode_step, run_text_layers_prefill, run_text_layers_prefill_with_cache,
     };
     use crate::shared::det_num::{
@@ -1743,7 +2171,7 @@ mod tests {
         DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
         Gemma4TransformerModel, GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32,
-        ResolvedGemma4LayerWeights,
+        ResolvedGemma4LayerWeights, ResolvedGemma4PleLayerWeights,
     };
 
     #[test]
@@ -1804,6 +2232,25 @@ mod tests {
             embedded.activations_sha256,
             "209a39e983bfd5b06df628da8981625bd58c1342e1543c3641d9873380b9d310"
         );
+    }
+
+    #[test]
+    fn embed_input_tokens_with_mode_requantizes_scale_on_deterministic_path() {
+        let embedding_table = EmbeddingTable {
+            rows: vec![vec![1.0 / 65_536.0]],
+            scale: 0.5,
+        };
+
+        let fp32 = embed_input_tokens(&[0], &embedding_table).expect("fp32 embedding should succeed");
+        let det = super::embed_input_tokens_with_mode(
+            &[0],
+            &embedding_table,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("det embedding should succeed");
+
+        assert_eq!(det.activations, vec![vec![0.0]]);
+        assert!(fp32.activations[0][0] > det.activations[0][0]);
     }
 
     #[test]
@@ -1922,6 +2369,41 @@ mod tests {
 
         assert_eq!(det_output, vec![0.0]);
         assert!(fp32_output[0] > det_output[0]);
+    }
+
+    #[test]
+    fn add_row_buffers_requantize_float_inputs_on_deterministic_path() {
+        let lhs = super::ActivationRowBuffer::from_values(vec![0.5 / 65_536.0]);
+        let rhs = super::ActivationRowBuffer::from_values(vec![0.5 / 65_536.0]);
+
+        let det = super::add_row_buffers(&lhs, &rhs, true).unwrap();
+        let fp32 = super::add_rows(&lhs.values, &rhs.values).unwrap();
+
+        assert_eq!(det.values, vec![0.0]);
+        assert!(fp32[0] > det.values[0]);
+    }
+
+    #[test]
+    fn mul_row_buffers_requantize_float_inputs_on_deterministic_path() {
+        let lhs = super::ActivationRowBuffer::from_values(vec![1.0 / 65_536.0]);
+        let rhs = super::ActivationRowBuffer::from_values(vec![0.5]);
+
+        let det = super::mul_row_buffers(&lhs, &rhs, true).unwrap();
+        let fp32 = super::elementwise_mul_rows(&lhs.values, &rhs.values).unwrap();
+
+        assert_eq!(det.values, vec![0.0]);
+        assert!(fp32[0] > det.values[0]);
+    }
+
+    #[test]
+    fn scale_row_buffer_requantize_float_inputs_on_deterministic_path() {
+        let values = super::ActivationRowBuffer::from_values(vec![1.0 / 65_536.0]);
+
+        let det = super::scale_row_buffer(&values, 0.5, true);
+        let fp32 = super::scale_row_buffer(&values, 0.5, false);
+
+        assert_eq!(det.values, vec![0.0]);
+        assert!(fp32.values[0] > det.values[0]);
     }
 
     #[test]
@@ -2168,6 +2650,107 @@ mod tests {
     }
 
     #[test]
+    fn run_gemma4_layer_uses_det_down_proj_after_hidden_mul() {
+        let activations = vec![vec![1.0, 0.0, 0.0, 0.0]];
+        let layer = Gemma4LayerWeights {
+            attention_kind: Gemma4AttentionKind::Sliding,
+            hidden_size: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            sliding_window: Some(2),
+            cache_sliding_window: Some(2),
+            rms_norm_eps: 1e-6,
+            rope_base: 10_000.0,
+            partial_rotary_dim: 2,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
+            attention_k_eq_v: false,
+            q_proj: zero_matrix(4, 4).into(),
+            k_proj: zero_matrix(2, 4).into(),
+            v_proj: Some(zero_matrix(2, 4).into()),
+            o_proj: zero_matrix(4, 4).into(),
+            q_norm_weight: vec![1.0, 1.0],
+            k_norm_weight: vec![1.0, 1.0],
+            input_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight: vec![1.0; 4],
+            gate_proj: MatrixF32 {
+                rows: 8,
+                cols: 4,
+                values: vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+            }
+            .into(),
+            up_proj: MatrixF32 {
+                rows: 8,
+                cols: 4,
+                values: vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+            }
+            .into(),
+            down_proj: zero_matrix(4, 8).into(),
+            ple: None,
+            layer_scalar: None,
+        };
+
+        let resolved_without_det =
+            crate::io::resolve_layer_weights(&layer).expect("resolve fp32-only layer");
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.down_proj_det = Some(Arc::new(DetNumMatrix {
+            rows: 4,
+            cols: 8,
+            values: vec![
+                Act::from_num(1.0).to_bits(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        }));
+
+        let without_det =
+            run_gemma4_layer(&activations, &resolved_without_det, None).expect("run fp32 path");
+        let with_det =
+            run_gemma4_layer(&activations, &resolved_with_det, None).expect("run det down_proj");
+
+        assert_eq!(without_det.activations, vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        assert!(with_det.activations[0][0] > without_det.activations[0][0]);
+    }
+
+    #[test]
     fn run_causal_attention_uses_det_q_proj_during_prefill() {
         let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let resolved_without_det = attention_test_layer(
@@ -2256,6 +2839,92 @@ mod tests {
         );
         let mut resolved_with_det = resolved_without_det.clone();
         resolved_with_det.q_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+        let initial_cache = append_kv_cache(
+            LayerKvCache::new(1),
+            &[vec![1.0, 0.0]],
+            &[vec![1.0, 0.0]],
+            None,
+        )
+        .unwrap();
+
+        let without_det = run_causal_attention_decode(
+            &input,
+            &resolved_without_det,
+            initial_cache.clone(),
+            None,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        let with_det = run_causal_attention_decode(
+            &input,
+            &resolved_with_det,
+            initial_cache,
+            None,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(with_det.0[1] > without_det.0[1]);
+    }
+
+    #[test]
+    fn run_causal_attention_decode_uses_det_k_proj() {
+        let input = vec![0.0, 1.0];
+        let resolved_without_det = attention_test_layer(
+            identity_matrix(2),
+            zero_matrix(2, 2),
+            identity_matrix(2),
+            identity_matrix(2),
+        );
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.k_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+        let initial_cache = append_kv_cache(
+            LayerKvCache::new(1),
+            &[vec![1.0, 0.0]],
+            &[vec![1.0, 0.0]],
+            None,
+        )
+        .unwrap();
+
+        let without_det = run_causal_attention_decode(
+            &input,
+            &resolved_without_det,
+            initial_cache.clone(),
+            None,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+        let with_det = run_causal_attention_decode(
+            &input,
+            &resolved_with_det,
+            initial_cache,
+            None,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(with_det.0[1] > without_det.0[1]);
+    }
+
+    #[test]
+    fn run_causal_attention_decode_uses_det_v_proj() {
+        let input = vec![0.0, 1.0];
+        let resolved_without_det = attention_test_layer(
+            identity_matrix(2),
+            identity_matrix(2),
+            zero_matrix(2, 2),
+            identity_matrix(2),
+        );
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.v_proj_det = Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0]));
         let initial_cache = append_kv_cache(
             LayerKvCache::new(1),
             &[vec![1.0, 0.0]],
@@ -2381,6 +3050,224 @@ mod tests {
     }
 
     #[test]
+    fn project_decode_hidden_to_logits_uses_det_untied_lm_head_with_softcap() {
+        let without_det = project_decode_hidden_to_logits(
+            &[1.0, 1.0],
+            &[1.0, 1.0],
+            0.0,
+            &Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(2, 2),
+                det_weight: None,
+            },
+            None,
+            InferenceExecutionMode::Deterministic,
+            Some(0.5),
+        )
+        .unwrap();
+        let with_det = project_decode_hidden_to_logits(
+            &[1.0, 1.0],
+            &[1.0, 1.0],
+            0.0,
+            &Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(2, 2),
+                det_weight: Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0])),
+            },
+            None,
+            InferenceExecutionMode::Deterministic,
+            Some(0.5),
+        )
+        .unwrap();
+
+        assert_eq!(without_det.logits, vec![0.0, 0.0]);
+        assert_eq!(
+            with_det.logits,
+            super::apply_final_logit_softcapping(&[1.0, 1.0], 0.5)
+        );
+    }
+
+    #[test]
+    fn project_decode_hidden_to_logits_uses_det_tied_embedding_source() {
+        let embedding_source = deterministic_embedding_source(
+            "decode-tied-logits",
+            "model.language_model.embed_tokens.weight",
+            2,
+            2,
+            &[1.0, 0.0, 0.0, 1.0],
+        );
+        let logits = project_decode_hidden_to_logits(
+            &[1.0, 1.0],
+            &[1.0, 1.0],
+            0.0,
+            &Gemma4LogitsProjection::TiedEmbedding(zero_matrix(2, 2)),
+            Some(&embedding_source),
+            InferenceExecutionMode::Deterministic,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(logits.logits, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn compute_prefill_ple_inputs_uses_det_model_projection() {
+        let layers = vec![ple_test_layer()];
+        let ple_global = Gemma4PleGlobalWeights::from_det_num_sources(
+            vec![deterministic_tensor_source(
+                "prefill-ple-token",
+                "model.language_model.embed_tokens_per_layer.weight",
+                2,
+                2,
+                &[0.0, 0.0, 0.0, 0.0],
+            )],
+            vec![deterministic_tensor_source(
+                "prefill-ple-proj",
+                "model.language_model.per_layer_model_projection.weight",
+                2,
+                4,
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            )],
+            vec![1.0, 1.0],
+            1.0,
+            1.0,
+            1.0,
+        );
+        let inputs = vec![vec![1.0, 0.0, 0.0, 0.0]];
+
+        let ple_inputs = compute_prefill_ple_inputs(
+            &[0],
+            &inputs,
+            &layers,
+            &ple_global,
+            0.0,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let projected = ple_inputs.per_layer_inputs[0].as_ref().unwrap();
+        assert_eq!(
+            projected[0][0],
+            crate::shared::det_num::act_to_f32(crate::shared::det_num::f32_to_act(2f32.sqrt()))
+        );
+        assert_eq!(projected[0][1], 0.0);
+    }
+
+    #[test]
+    fn compute_decode_ple_input_uses_det_model_projection() {
+        let layer = ple_test_layer();
+        let ple_global = Gemma4PleGlobalWeights::from_det_num_sources(
+            vec![deterministic_tensor_source(
+                "decode-ple-token",
+                "model.language_model.embed_tokens_per_layer.weight",
+                2,
+                2,
+                &[0.0, 0.0, 0.0, 0.0],
+            )],
+            vec![deterministic_tensor_source(
+                "decode-ple-proj",
+                "model.language_model.per_layer_model_projection.weight",
+                2,
+                4,
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            )],
+            vec![1.0, 1.0],
+            1.0,
+            1.0,
+            1.0,
+        );
+
+        let ple_input = compute_decode_ple_input(
+            0,
+            &[1.0, 0.0, 0.0, 0.0],
+            0,
+            &layer,
+            Some(&ple_global),
+            0.0,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let projected = ple_input.expect("decode ple input should exist");
+        assert_eq!(
+            projected[0],
+            crate::shared::det_num::act_to_f32(crate::shared::det_num::f32_to_act(2f32.sqrt()))
+        );
+        assert_eq!(projected[1], 0.0);
+    }
+
+    #[test]
+    fn run_gemma4_layer_uses_det_ple_input_gate() {
+        let activations = vec![vec![1.0, 0.0, 0.0, 0.0]];
+        let mut resolved_without_det = ple_resolved_test_layer();
+        resolved_without_det.ple = Some(ResolvedGemma4PleLayerWeights {
+            input_gate: Arc::new(zero_matrix(2, 4)),
+            layer_projection: Arc::new(MatrixF32 {
+                rows: 4,
+                cols: 2,
+                values: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            }),
+            input_gate_det: None,
+            layer_projection_det: None,
+            post_input_norm_weight: vec![1.0; 4],
+        });
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.ple = Some(ResolvedGemma4PleLayerWeights {
+            input_gate_det: Some(det_matrix(2, 4, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+            ..resolved_without_det.ple.clone().unwrap()
+        });
+
+        let without_det = run_gemma4_layer(&activations, &resolved_without_det, Some(&[vec![1.0, 1.0]]))
+            .expect("run fp32 ple path");
+        let with_det = run_gemma4_layer(&activations, &resolved_with_det, Some(&[vec![1.0, 1.0]]))
+            .expect("run det ple input gate");
+
+        assert_eq!(without_det.activations, vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        assert!(with_det.activations[0][0] > without_det.activations[0][0]);
+    }
+
+    #[test]
+    fn run_gemma4_layer_decode_uses_det_ple_layer_projection() {
+        let mut resolved_without_det = ple_resolved_test_layer();
+        resolved_without_det.ple = Some(ResolvedGemma4PleLayerWeights {
+            input_gate: Arc::new(MatrixF32 {
+                rows: 2,
+                cols: 4,
+                values: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            }),
+            layer_projection: Arc::new(zero_matrix(4, 2)),
+            input_gate_det: None,
+            layer_projection_det: None,
+            post_input_norm_weight: vec![1.0; 4],
+        });
+        let mut resolved_with_det = resolved_without_det.clone();
+        resolved_with_det.ple = Some(ResolvedGemma4PleLayerWeights {
+            layer_projection_det: Some(det_matrix(4, 2, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+            ..resolved_without_det.ple.clone().unwrap()
+        });
+
+        let without_det = run_gemma4_layer_decode(
+            &[1.0, 0.0, 0.0, 0.0],
+            &resolved_without_det,
+            Some(&[1.0, 1.0]),
+            LayerKvCache::new(1),
+            None,
+            0,
+        )
+        .expect("run fp32 decode ple path");
+        let with_det = run_gemma4_layer_decode(
+            &[1.0, 0.0, 0.0, 0.0],
+            &resolved_with_det,
+            Some(&[1.0, 1.0]),
+            LayerKvCache::new(1),
+            None,
+            0,
+        )
+        .expect("run det decode ple projection");
+
+        assert_eq!(without_det.0, vec![1.0, 0.0, 0.0, 0.0]);
+        assert!(with_det.0[0] > without_det.0[0]);
+    }
+
+    #[test]
     fn compute_prefill_ple_inputs_is_stable_for_same_inputs() {
         let layers = vec![Gemma4LayerWeights {
             attention_kind: Gemma4AttentionKind::Sliding,
@@ -2434,10 +3321,24 @@ mod tests {
         );
         let inputs = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
 
-        let first =
-            compute_prefill_ple_inputs(&[0, 1], &inputs, &layers, &ple_global, 1e-6).unwrap();
-        let second =
-            compute_prefill_ple_inputs(&[0, 1], &inputs, &layers, &ple_global, 1e-6).unwrap();
+        let first = compute_prefill_ple_inputs(
+            &[0, 1],
+            &inputs,
+            &layers,
+            &ple_global,
+            1e-6,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let second = compute_prefill_ple_inputs(
+            &[0, 1],
+            &inputs,
+            &layers,
+            &ple_global,
+            1e-6,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
 
         assert_eq!(first, second);
     }
@@ -2811,6 +3712,56 @@ mod tests {
         .expect("resolve attention test layer")
     }
 
+    fn ple_test_layer() -> Gemma4LayerWeights {
+        Gemma4LayerWeights {
+            attention_kind: Gemma4AttentionKind::Full,
+            hidden_size: 4,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            sliding_window: None,
+            cache_sliding_window: None,
+            rms_norm_eps: 1e-6,
+            rope_base: 10_000.0,
+            partial_rotary_dim: 0,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
+            attention_k_eq_v: false,
+            q_proj: zero_matrix(2, 4).into(),
+            k_proj: zero_matrix(2, 4).into(),
+            v_proj: Some(zero_matrix(2, 4).into()),
+            o_proj: zero_matrix(4, 2).into(),
+            q_norm_weight: vec![1.0, 1.0],
+            k_norm_weight: vec![1.0, 1.0],
+            input_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight: vec![1.0; 4],
+            gate_proj: zero_matrix(8, 4).into(),
+            up_proj: zero_matrix(8, 4).into(),
+            down_proj: zero_matrix(4, 8).into(),
+            ple: Some(Gemma4PleLayerWeights {
+                input_gate: zero_matrix(2, 4).into(),
+                layer_projection: zero_matrix(4, 2).into(),
+                post_input_norm_weight: vec![1.0; 4],
+            }),
+            layer_scalar: None,
+        }
+    }
+
+    fn ple_resolved_test_layer() -> ResolvedGemma4LayerWeights {
+        let mut resolved =
+            crate::io::resolve_layer_weights(&ple_test_layer()).expect("resolve ple test layer");
+        resolved.ple = Some(ResolvedGemma4PleLayerWeights {
+            input_gate: Arc::new(zero_matrix(2, 4)),
+            layer_projection: Arc::new(zero_matrix(4, 2)),
+            input_gate_det: None,
+            layer_projection_det: None,
+            post_input_norm_weight: vec![1.0; 4],
+        });
+        resolved
+    }
+
     fn deterministic_embedding_source(
         label: &str,
         tensor_name: &str,
@@ -2859,6 +3810,53 @@ mod tests {
             },
             scale: (cols as f32).sqrt(),
             det_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn deterministic_tensor_source(
+        label: &str,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        values: &[f32],
+    ) -> DetNumTensorSliceSource {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let weights_path =
+            std::env::temp_dir().join(format!("raster-inference-{label}-{unique}.detwgt"));
+        let name_bytes = tensor_name.as_bytes();
+        let payload = values
+            .iter()
+            .flat_map(|value| wgt_to_le_bytes(f32_to_wgt(*value)))
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
+        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name_bytes);
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&(rows as u64).to_le_bytes());
+        bytes.extend_from_slice(&(cols as u64).to_le_bytes());
+        bytes.extend_from_slice(&((rows * cols) as u64).to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        let data_offset = bytes.len();
+        bytes.extend_from_slice(&payload);
+        fs::write(&weights_path, bytes).expect("write det tensor artifact");
+
+        DetNumTensorSliceSource {
+            weights_path,
+            total_rows: rows,
+            total_cols: cols,
+            data_offset,
+            row_offset: 0,
+            row_count: rows,
+            col_offset: 0,
+            col_count: cols,
         }
     }
 }

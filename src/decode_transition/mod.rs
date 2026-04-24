@@ -36,10 +36,17 @@ pub fn run_with_mode(
     } = transformer_decode_state;
     let embedded_token =
         if let Some(ref embedding_table) = model.embedding_table {
-            crate::shared::transformer_kernels::embed_input_token(next_token, embedding_table)?
+            crate::shared::transformer_kernels::embed_input_token_with_mode(
+                next_token,
+                embedding_table,
+                execution_mode,
+            )?
         } else if let Some(ref embedding_source) = model.embedding_source {
-            let embedded =
-                crate::io::embed_input_tokens_from_gemma_source(&[next_token], embedding_source)?;
+            let embedded = crate::io::embed_input_tokens_from_gemma_source_with_mode(
+                &[next_token],
+                embedding_source,
+                execution_mode,
+            )?;
             embedded.activations.into_iter().next().ok_or_else(|| {
                 anyhow::anyhow!("transformer embedding returned no activation rows")
             })?
