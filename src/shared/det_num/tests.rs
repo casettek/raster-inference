@@ -2,9 +2,9 @@ use std::{mem::size_of, panic};
 
 use super::{
     acc_add_sat, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first, clip_act,
-    div_acc_by_u32, f32_to_acc, f32_to_act, f32_to_wgt, mac, mac_bits, mul_sat, mul_wide,
-    requantize, rms_norm, rms_norm_scale, rshift_round_ties_even, scale_act, sub_sat,
-    value_rms_norm,
+    div_acc_by_u32, div_act, f32_to_acc, f32_to_act, f32_to_wgt, mac, mac_bits, mul_sat,
+    mul_wide, requantize, rms_norm, rms_norm_scale, rope_rotate_pairs, rshift_round_ties_even,
+    scale_act, sub_sat, value_rms_norm,
     types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT,
     wgt_to_le_bytes, Acc, Act, Wgt,
 };
@@ -284,6 +284,50 @@ fn scale_act_matches_mul_sat_contract() {
 }
 
 #[test]
+fn div_act_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        numerator_bits: i32,
+        denominator_bits: i32,
+        expected_bits: i32,
+    }
+
+    let cases = [
+        Case {
+            name: "exact_division",
+            numerator_bits: Act::from_num(3.0).to_bits(),
+            denominator_bits: Act::from_num(2.0).to_bits(),
+            expected_bits: Act::from_num(1.5).to_bits(),
+        },
+        Case {
+            name: "half_tie_stays_even",
+            numerator_bits: 1,
+            denominator_bits: Act::from_num(2.0).to_bits(),
+            expected_bits: 0,
+        },
+        Case {
+            name: "negative_rounding",
+            numerator_bits: -3,
+            denominator_bits: Act::from_num(2.0).to_bits(),
+            expected_bits: -2,
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            div_act(
+                Act::from_bits(case.numerator_bits),
+                Act::from_bits(case.denominator_bits),
+            )
+            .to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
 fn div_acc_by_u32_matches_golden_vectors() {
     struct Case {
         name: &'static str,
@@ -419,6 +463,70 @@ fn value_rms_norm_matches_golden_vectors() {
     assert_eq!(
         zero_row.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
         vec![0]
+    );
+}
+
+#[test]
+fn rope_rotate_pairs_matches_golden_vectors() {
+    let rotated = rope_rotate_pairs(
+        &[
+            Act::from_num(1.0),
+            Act::from_num(0.0),
+            Act::from_num(0.5),
+            Act::from_num(-0.5),
+        ],
+        4,
+        4,
+        Acc::from_num(16.0),
+        1,
+    );
+
+    assert_eq!(
+        rotated.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        vec![7_835, 8_107, 72_850, -31_750]
+    );
+}
+
+#[test]
+fn rope_rotate_pairs_preserves_zero_position_and_tail() {
+    let input = vec![
+        Act::from_num(1.0),
+        Act::from_num(0.25),
+        Act::from_num(0.5),
+        Act::from_num(-0.25),
+        Act::from_num(3.0),
+    ];
+
+    let rotated = rope_rotate_pairs(&input, 4, 4, Acc::from_num(16.0), 0);
+    assert_eq!(rotated, input);
+}
+
+#[test]
+fn rope_rotate_pairs_handles_large_base_without_overflow() {
+    let input = vec![
+        Act::from_num(1.0),
+        Act::from_num(0.0),
+        Act::from_num(0.5),
+        Act::from_num(-0.5),
+        Act::from_num(3.0),
+    ];
+
+    let rotated = rope_rotate_pairs(&input, 4, 4, Acc::from_num(1_000_000.0), 4_096);
+
+    assert_eq!(rotated.len(), input.len());
+    assert_eq!(rotated[4], input[4]);
+    assert_ne!(rotated[1], input[1]);
+}
+
+#[test]
+#[should_panic(expected = "rope_rotate_pairs requires an even rotary_dim")]
+fn rope_rotate_pairs_rejects_odd_rotary_dim() {
+    let _ = rope_rotate_pairs(
+        &[Act::from_num(1.0), Act::from_num(0.0), Act::from_num(0.5)],
+        3,
+        4,
+        Acc::from_num(16.0),
+        1,
     );
 }
 

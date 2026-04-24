@@ -170,6 +170,29 @@ Behavior:
 
 This tie-break rule is part of the contract.
 
+### 7. RoPE semantics
+
+Canonical deterministic RoPE is defined on `Act` rows and must not rely on host `f32`
+transcendentals at execution time.
+
+Rule:
+
+- `rope_rotate_pairs(input: &[Act], rotary_dim: usize, freq_base_dim: usize, base: Acc, position: usize) -> Vec<Act>`
+
+Semantics:
+
+- `rotary_dim == 0` is a no-op
+- otherwise, `rotary_dim` must be even and must fit within `input.len()`
+- `freq_base_dim` must be even and at least 2
+- `base` must be strictly positive
+- pair `i` rotates `input[i]` with `input[i + rotary_dim / 2]`
+- the per-pair inverse-frequency step is the canonical Q32.32 reciprocal of the canonical Q32.32 `freq_base_dim / 2`-th root of `base`
+- pair `0` uses inverse frequency `1.0`, and each later pair multiplies by that step using canonical Q32.32 fixed-point multiply semantics
+- the angle is `position * inverse_frequency`, represented canonically in Q32.32
+- `sin` and `cos` are materialized canonically from that Q32.32 angle using only deterministic fixed-point helpers
+- rotated outputs use canonical fixed-point multiply/requantize plus saturating add/sub semantics
+- dimensions beyond `rotary_dim` are copied through unchanged
+
 ---
 
 ## Canonical source conversion rules
@@ -293,6 +316,7 @@ The following are additionally forbidden in the v0 executable inference path:
 - `fn clip_act(x: Acc) -> Act`
 
 - `fn argmax_first(xs: &[Act]) -> usize`
+- `fn rope_rotate_pairs(input: &[Act], rotary_dim: usize, freq_base_dim: usize, base: Acc, position: usize) -> Vec<Act>`
 
 - `fn f32_to_wgt(x: f32) -> Wgt`
 
@@ -321,7 +345,6 @@ Recommended additional helpers:
 - `tanh`
 - `softmax`
 - `rmsnorm`
-- `rope`
 
 Those belong in later layers built on top of `det_num`.
 

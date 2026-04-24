@@ -627,6 +627,43 @@ mod tests {
     }
 
     #[test]
+    fn run_prefill_pass_with_mode_uses_deterministic_rope_contract() {
+        let model = parity_test_model(Gemma4AttentionKind::Full, None, false);
+        let prompt_token_ids = vec![0, 1];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-det-rope-prefill".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+
+        let fp32 = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_ne!(
+            det.transformer_decode_state.layer_caches[0].keys[0][1],
+            fp32.transformer_decode_state.layer_caches[0].keys[0][1]
+        );
+        assert_ne!(
+            det.transformer_state.prefill_logits.logits,
+            fp32.transformer_state.prefill_logits.logits
+        );
+    }
+
+    #[test]
     fn decode_step_with_mode_uses_deterministic_final_norm_contract() {
         let model = deterministic_norm_routing_model();
         let prompt_token_ids = vec![0];
@@ -657,6 +694,54 @@ mod tests {
             step.prefill_logits.logits,
             vec![act_to_f32(Act::from_bits(46_341)), act_to_f32(Act::from_bits(92_682))]
         );
+    }
+
+    #[test]
+    fn decode_step_with_mode_uses_deterministic_rope_contract() {
+        let model = parity_test_model(Gemma4AttentionKind::Sliding, Some(2), false);
+        let prompt_token_ids = vec![0, 1];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-det-rope-decode".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let fp32_prefill = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det_prefill = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let fp32_step = decode_step_with_mode(
+            fp32_prefill.transformer_decode_state,
+            2,
+            &model,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det_step = decode_step_with_mode(
+            det_prefill.transformer_decode_state,
+            2,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_ne!(
+            det_step.transformer_decode_state.layer_caches[0].keys[0][1],
+            fp32_step.transformer_decode_state.layer_caches[0].keys[0][1]
+        );
+        assert_ne!(det_step.prefill_logits.logits, fp32_step.prefill_logits.logits);
     }
 
     fn test_tokenizer() -> tokenizers::Tokenizer {

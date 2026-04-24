@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::shared::det_num::{
     act_to_f32, add_sat, f32_to_acc, f32_to_act, mac_bits, mul_sat, requantize,
     rms_norm as det_rms_norm, scale_act, value_rms_norm as det_value_rms_norm, Acc, Act,
+    rope_rotate_pairs as det_rope_rotate_pairs,
 };
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
@@ -1226,6 +1227,7 @@ fn run_causal_attention(
             layer.partial_rotary_dim,
             layer.rope_freq_base_dim,
             layer.rope_base,
+            execution_mode,
         );
     }
     {
@@ -1235,6 +1237,7 @@ fn run_causal_attention(
             layer.partial_rotary_dim,
             layer.rope_freq_base_dim,
             layer.rope_base,
+            execution_mode,
         );
     }
 
@@ -1387,6 +1390,7 @@ fn run_causal_attention_decode(
         layer.rope_freq_base_dim,
         layer.rope_base,
         position,
+        execution_mode,
     );
     apply_rope_to_rows(
         &mut k,
@@ -1394,6 +1398,7 @@ fn run_causal_attention_decode(
         layer.rope_freq_base_dim,
         layer.rope_base,
         position,
+        execution_mode,
     );
 
     let updated_cache = if donor_cache.is_some() {
@@ -2142,8 +2147,14 @@ fn apply_value_rms_norm_row(
     Ok(())
 }
 
-fn apply_rope(heads: &mut [Vec<Vec<f32>>], rotary_dim: usize, freq_base_dim: usize, base: f32) {
-    apply_rope_with_offset(heads, rotary_dim, freq_base_dim, base, 0);
+fn apply_rope(
+    heads: &mut [Vec<Vec<f32>>],
+    rotary_dim: usize,
+    freq_base_dim: usize,
+    base: f32,
+    execution_mode: InferenceExecutionMode,
+) {
+    apply_rope_with_offset(heads, rotary_dim, freq_base_dim, base, 0, execution_mode);
 }
 
 fn apply_rope_with_offset(
@@ -2152,24 +2163,48 @@ fn apply_rope_with_offset(
     freq_base_dim: usize,
     base: f32,
     position_offset: usize,
+    execution_mode: InferenceExecutionMode,
 ) {
     if rotary_dim == 0 {
         return;
     }
-    let half_dim = rotary_dim / 2;
-    for head in heads {
-        for (position, row) in head.iter_mut().enumerate() {
-            let original = row.clone();
-            for dim_idx in 0..half_dim {
-                let absolute_position = position_offset + position;
-                let angle = absolute_position as f32
-                    / base.powf((2 * dim_idx) as f32 / freq_base_dim as f32);
-                let cos = angle.cos();
-                let sin = angle.sin();
-                let lhs = original[dim_idx];
-                let rhs = original[dim_idx + half_dim];
-                row[dim_idx] = lhs * cos - rhs * sin;
-                row[dim_idx + half_dim] = rhs * cos + lhs * sin;
+
+    match execution_mode {
+        InferenceExecutionMode::Fp32 => {
+            let half_dim = rotary_dim / 2;
+            for head in heads {
+                for (position, row) in head.iter_mut().enumerate() {
+                    let original = row.clone();
+                    for dim_idx in 0..half_dim {
+                        let absolute_position = position_offset + position;
+                        let angle = absolute_position as f32
+                            / base.powf((2 * dim_idx) as f32 / freq_base_dim as f32);
+                        let cos = angle.cos();
+                        let sin = angle.sin();
+                        let lhs = original[dim_idx];
+                        let rhs = original[dim_idx + half_dim];
+                        row[dim_idx] = lhs * cos - rhs * sin;
+                        row[dim_idx + half_dim] = rhs * cos + lhs * sin;
+                    }
+                }
+            }
+        }
+        InferenceExecutionMode::Deterministic => {
+            let quantized_base = f32_to_acc(base);
+            for head in heads {
+                for (position, row) in head.iter_mut().enumerate() {
+                    let quantized = row.iter().copied().map(f32_to_act).collect::<Vec<_>>();
+                    *row = det_rope_rotate_pairs(
+                        &quantized,
+                        rotary_dim,
+                        freq_base_dim,
+                        quantized_base,
+                        position_offset + position,
+                    )
+                    .into_iter()
+                    .map(act_to_f32)
+                    .collect();
+                }
             }
         }
     }
@@ -2181,21 +2216,44 @@ fn apply_rope_to_rows(
     freq_base_dim: usize,
     base: f32,
     position: usize,
+    execution_mode: InferenceExecutionMode,
 ) {
     if rotary_dim == 0 {
         return;
     }
-    let half_dim = rotary_dim / 2;
-    for row in heads {
-        let original = row.clone();
-        for dim_idx in 0..half_dim {
-            let angle = position as f32 / base.powf((2 * dim_idx) as f32 / freq_base_dim as f32);
-            let cos = angle.cos();
-            let sin = angle.sin();
-            let lhs = original[dim_idx];
-            let rhs = original[dim_idx + half_dim];
-            row[dim_idx] = lhs * cos - rhs * sin;
-            row[dim_idx + half_dim] = rhs * cos + lhs * sin;
+
+    match execution_mode {
+        InferenceExecutionMode::Fp32 => {
+            let half_dim = rotary_dim / 2;
+            for row in heads {
+                let original = row.clone();
+                for dim_idx in 0..half_dim {
+                    let angle =
+                        position as f32 / base.powf((2 * dim_idx) as f32 / freq_base_dim as f32);
+                    let cos = angle.cos();
+                    let sin = angle.sin();
+                    let lhs = original[dim_idx];
+                    let rhs = original[dim_idx + half_dim];
+                    row[dim_idx] = lhs * cos - rhs * sin;
+                    row[dim_idx + half_dim] = rhs * cos + lhs * sin;
+                }
+            }
+        }
+        InferenceExecutionMode::Deterministic => {
+            let quantized_base = f32_to_acc(base);
+            for row in heads {
+                let quantized = row.iter().copied().map(f32_to_act).collect::<Vec<_>>();
+                *row = det_rope_rotate_pairs(
+                    &quantized,
+                    rotary_dim,
+                    freq_base_dim,
+                    quantized_base,
+                    position,
+                )
+                .into_iter()
+                .map(act_to_f32)
+                .collect();
+            }
         }
     }
 }
@@ -2403,11 +2461,35 @@ mod tests {
     fn apply_rope_to_rows_uses_full_head_dim_for_frequency_base() {
         let mut heads = vec![vec![0.0, 1.0, 0.0, 0.0, 9.0, 8.0, 7.0, 6.0]];
 
-        apply_rope_to_rows(&mut heads, 4, 8, 16.0, 1);
+        apply_rope_to_rows(&mut heads, 4, 8, 16.0, 1, InferenceExecutionMode::Fp32);
 
         assert!((heads[0][1] - 0.87758255).abs() < 1e-6);
         assert!((heads[0][3] - 0.47942555).abs() < 1e-6);
         assert_eq!(heads[0][4..], [9.0, 8.0, 7.0, 6.0]);
+    }
+
+    #[test]
+    fn apply_rope_to_rows_uses_deterministic_rope_contract() {
+        let mut heads = vec![vec![1.0, 0.0, 0.5, -0.5]];
+
+        apply_rope_to_rows(
+            &mut heads,
+            4,
+            4,
+            16.0,
+            1,
+            InferenceExecutionMode::Deterministic,
+        );
+
+        assert_eq!(
+            heads[0],
+            vec![
+                act_to_f32(Act::from_bits(7_835)),
+                act_to_f32(Act::from_bits(8_107)),
+                act_to_f32(Act::from_bits(72_850)),
+                act_to_f32(Act::from_bits(-31_750)),
+            ]
+        );
     }
 
     #[test]
@@ -3039,6 +3121,42 @@ mod tests {
     }
 
     #[test]
+    fn run_causal_attention_uses_deterministic_rope_during_prefill() {
+        let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let mut resolved = attention_test_layer(
+            identity_matrix(2),
+            identity_matrix(2),
+            identity_matrix(2),
+            identity_matrix(2),
+        );
+        resolved.partial_rotary_dim = 2;
+        resolved.rope_base = 1.0;
+        resolved.rope_freq_base_dim = 2;
+
+        let fp32 = run_causal_attention(
+            &inputs,
+            &resolved,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det = run_causal_attention(
+            &inputs,
+            &resolved,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_ne!(det.0[1], fp32.0[1]);
+        assert_ne!(det.1.keys[0][1], fp32.1.keys[0][1]);
+    }
+
+    #[test]
     fn run_causal_attention_decode_uses_det_q_proj() {
         let input = vec![0.0, 1.0];
         let resolved_without_det = attention_test_layer(
@@ -3210,6 +3328,53 @@ mod tests {
 
         assert_eq!(without_det.0, vec![0.0, 0.0]);
         assert!(with_det.0[0] > 0.0);
+    }
+
+    #[test]
+    fn run_causal_attention_decode_uses_deterministic_rope() {
+        let input = vec![0.0, 1.0];
+        let mut resolved = attention_test_layer(
+            identity_matrix(2),
+            identity_matrix(2),
+            identity_matrix(2),
+            identity_matrix(2),
+        );
+        resolved.partial_rotary_dim = 2;
+        resolved.rope_base = 1.0;
+        resolved.rope_freq_base_dim = 2;
+        let initial_cache = append_kv_cache(
+            LayerKvCache::new(1),
+            &[vec![1.0, 0.0]],
+            &[vec![1.0, 0.0]],
+            None,
+        )
+        .unwrap();
+
+        let fp32 = run_causal_attention_decode(
+            &input,
+            &resolved,
+            initial_cache.clone(),
+            None,
+            1,
+            None,
+            None,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det = run_causal_attention_decode(
+            &input,
+            &resolved,
+            initial_cache,
+            None,
+            1,
+            None,
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_ne!(det.0, fp32.0);
+        assert_ne!(det.1.keys[0][1], fp32.1.keys[0][1]);
     }
 
     #[test]
