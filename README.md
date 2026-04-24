@@ -163,3 +163,9 @@ To validate a converted deterministic artifact against the current baseline:
    - `transformer_state_transition.prefill_logits.final_logits_sha256`
 
 For small deterministic fixtures, exact agreement is the target. For real converted Gemma checkpoints, Phase 1 is meant to show whether the converted weight format preserves output quality closely enough before the repo switches to a full `det_num` arithmetic path.
+
+The automated parity suite now also includes a softcap-sensitive fixture that keeps attention and
+MLP behavior intentionally quiet so logits-tail drift is attributable to final logit softcapping.
+That fixture is a routing/parity check, not a quality verdict. Real-model validation remains manual:
+run representative prompts through both the FP32 baseline and the deterministic path, then compare
+output quality rather than requiring exact token identity once deterministic-only seams are active.

@@ -275,7 +275,31 @@ Semantics:
   4. compute `x * (27 + x^2)`
   5. divide by `27 + 9x^2`
 
-### 12. Deterministic GELU(tanh) semantics
+### 12. Deterministic logits softcap semantics
+
+Canonical deterministic logits softcapping is defined on `Act` logits and must not rely on host
+`f32` transcendental helpers at execution time.
+
+Rule:
+
+- `softcap_act(input: Act, softcap: Act) -> Act`
+
+Semantics:
+
+- `softcap` must be strictly positive
+- the helper implements `softcap * tanh(input / softcap)`
+- division must happen first via canonical `div_act`
+- the nonlinear step must call canonical `tanh_act`
+- the final rescale must use canonical `mul_sat`
+- evaluation order is fixed and part of the contract:
+  1. compute `input / softcap`
+  2. compute `tanh_act(...)`
+  3. compute `softcap * tanh(...)`
+- `input == 0` must materialize exactly to zero
+- callers may quantize host `f32` logits into `Act`, execute this contract canonically, then
+  materialize back to `f32` only at the logits output boundary
+
+### 13. Deterministic GELU(tanh) semantics
 
 Canonical deterministic GELU uses the repo's existing PyTorch tanh structure, but every step is
 defined on canonical fixed-point inputs.

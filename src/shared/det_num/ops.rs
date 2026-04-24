@@ -265,6 +265,17 @@ pub fn tanh_act(input: Act) -> Act {
     div_act(numerator, denominator_scale)
 }
 
+/// Materializes deterministic softcapping as `softcap * tanh(input / softcap)`.
+pub fn softcap_act(input: Act, softcap: Act) -> Act {
+    assert!(
+        softcap.to_bits() > 0,
+        "softcap_act requires a strictly positive softcap"
+    );
+
+    let normalized = div_act(input, softcap);
+    mul_sat(softcap, tanh_act(normalized))
+}
+
 /// Materializes the repo's canonical GELU(tanh) contract over a fixed-point activation.
 pub fn gelu_pytorch_tanh_act(input: Act) -> Act {
     const GELU_HALF_BITS: i32 = 1_i32 << (ACT_FRACTIONAL_BITS - 1);

@@ -404,6 +404,56 @@ mod tests {
     }
 
     #[test]
+    fn decode_step_with_mode_matches_deterministic_softcapped_prefill_replay() {
+        let mut model = test_decode_model();
+        model.final_logit_softcapping = Some(0.5);
+        let prompt_token_ids = vec![0, 1];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-deterministic-softcap".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let prefill = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let decoded = decode_step_with_mode(
+            prefill.transformer_decode_state.clone(),
+            2,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let replay_token_ids = vec![0, 1, 2];
+        let replay_prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: replay_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-deterministic-softcap-replay".to_string(),
+        };
+        let replay_embeddings =
+            embed_input_tokens(&replay_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let replay_prefill = run_prefill_pass_with_mode(
+            &replay_prompt_preparation_state,
+            &model,
+            &replay_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoded.prefill_logits.logits,
+            replay_prefill.transformer_state.prefill_logits.logits
+        );
+    }
+
+    #[test]
     fn validate_sampling_config_rejects_non_default_temperature() {
         let error = validate_sampling_config(&SamplingConfig {
             max_new_tokens: Some(4),

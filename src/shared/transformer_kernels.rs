@@ -8,8 +8,8 @@ use crate::shared::det_num::{
     attention_softmax as det_attention_softmax,
     attention_weighted_sum as det_attention_weighted_sum, f32_to_acc, f32_to_act,
     gelu_pytorch_tanh_act, mac_bits, mul_sat, requantize, rms_norm as det_rms_norm,
-    rope_rotate_pairs as det_rope_rotate_pairs, scale_act, value_rms_norm as det_value_rms_norm,
-    Acc, Act,
+    rope_rotate_pairs as det_rope_rotate_pairs, scale_act, softcap_act,
+    value_rms_norm as det_value_rms_norm, Acc, Act,
 };
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
@@ -995,12 +995,54 @@ pub fn apply_final_logit_softcapping(logits: &[f32], softcap: f32) -> Vec<f32> {
         .collect()
 }
 
+pub fn apply_final_logit_softcapping_with_mode(
+    logits: &[f32],
+    softcap: f32,
+    execution_mode: InferenceExecutionMode,
+) -> Vec<f32> {
+    match execution_mode {
+        InferenceExecutionMode::Fp32 => apply_final_logit_softcapping(logits, softcap),
+        InferenceExecutionMode::Deterministic => {
+            let softcap = f32_to_act(softcap);
+            logits
+                .iter()
+                .copied()
+                .map(f32_to_act)
+                .map(|logit| act_to_f32(softcap_act(logit, softcap)))
+                .collect()
+        }
+    }
+}
+
 pub fn extract_prefill_logits(logits: &[f32]) -> PrefillLogits {
     // let _trace = trace_scope("transformer_state_transition.extract_prefill_logits");
     PrefillLogits {
         logits: logits.to_vec(),
         final_logits_sha256: build_vector_commitment(logits),
     }
+}
+
+pub fn project_hidden_to_prefill_logits(
+    hidden_state: &[f32],
+    final_norm_weight: &[f32],
+    rms_norm_eps: f32,
+    projection: &Gemma4LogitsProjection,
+    embedding_source: Option<&GemmaEmbeddingTensorSource>,
+    execution_mode: InferenceExecutionMode,
+    final_logit_softcapping: Option<f32>,
+) -> Result<PrefillLogits> {
+    let normalized = apply_rms_norm(
+        hidden_state,
+        final_norm_weight,
+        rms_norm_eps,
+        execution_mode,
+    )?;
+    let logits = project_to_logits(&normalized, projection, embedding_source, execution_mode)?;
+    let logits = match final_logit_softcapping {
+        Some(softcap) => apply_final_logit_softcapping_with_mode(&logits, softcap, execution_mode),
+        None => logits,
+    };
+    Ok(extract_prefill_logits(&logits))
 }
 
 pub fn project_decode_hidden_to_logits(
@@ -1013,17 +1055,15 @@ pub fn project_decode_hidden_to_logits(
     final_logit_softcapping: Option<f32>,
 ) -> Result<PrefillLogits> {
     // let _trace = trace_scope("transformer_state_transition.project_decode_hidden_to_logits");
-    let normalized = apply_rms_norm(
+    project_hidden_to_prefill_logits(
         hidden_state,
         final_norm_weight,
         rms_norm_eps,
+        projection,
+        embedding_source,
         execution_mode,
-    )?;
-    let mut logits = project_to_logits(&normalized, projection, embedding_source, execution_mode)?;
-    if let Some(softcap) = final_logit_softcapping {
-        logits = apply_final_logit_softcapping(&logits, softcap);
-    }
-    Ok(extract_prefill_logits(&logits))
+        final_logit_softcapping,
+    )
 }
 
 pub struct ActivationSequenceWithCache {
@@ -2456,19 +2496,21 @@ mod tests {
     };
 
     use super::{
-        append_kv_cache, apply_final_norm, apply_final_norm_with_mode, apply_gelu,
+        append_kv_cache, apply_final_logit_softcapping_with_mode, apply_final_norm,
+        apply_final_norm_with_mode, apply_gelu,
         apply_gelu_to_row_buffer, apply_head_rms_norm, apply_head_rms_norm_row,
         apply_rms_norm_to_sequence, apply_rope_to_rows, apply_value_rms_norm,
         apply_value_rms_norm_row, compute_decode_ple_input, compute_prefill_ple_inputs,
         det_linear_row, det_linear_row_from_acts, det_linear_sequence, embed_input_tokens,
-        extract_prefill_logits, project_decode_hidden_to_logits, project_to_logits,
-        run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
+        extract_prefill_logits, project_decode_hidden_to_logits, project_hidden_to_prefill_logits,
+        project_to_logits, run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
         run_gemma4_layer_decode, run_text_layers_decode_step, run_text_layers_prefill,
         run_text_layers_prefill_with_cache, ActivationRowBuffer,
     };
     use crate::shared::det_num::{
         act_to_f32, attention_score, attention_softmax, attention_weighted_sum, f32_to_act,
-        f32_to_wgt, gelu_pytorch_tanh_act, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
+        f32_to_wgt, gelu_pytorch_tanh_act, softcap_act, wgt_to_le_bytes, Act,
+        DET_NUM_SPEC_VERSION,
         DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
     };
     use crate::shared::input::InferenceExecutionMode;
@@ -3727,7 +3769,57 @@ mod tests {
         assert_eq!(without_det.logits, vec![0.0, 0.0]);
         assert_eq!(
             with_det.logits,
-            super::apply_final_logit_softcapping(&[1.0, 1.0], 0.5)
+            apply_final_logit_softcapping_with_mode(
+                &[1.0, 1.0],
+                0.5,
+                InferenceExecutionMode::Deterministic,
+            )
+        );
+    }
+
+    #[test]
+    fn apply_final_logit_softcapping_with_mode_uses_det_num_contract() {
+        let fp32 =
+            apply_final_logit_softcapping_with_mode(&[1.0, -1.0], 0.5, InferenceExecutionMode::Fp32);
+        let deterministic = apply_final_logit_softcapping_with_mode(
+            &[1.0, -1.0],
+            0.5,
+            InferenceExecutionMode::Deterministic,
+        );
+
+        assert_ne!(deterministic, fp32);
+        assert_eq!(
+            deterministic,
+            vec![
+                act_to_f32(softcap_act(Act::from_num(1.0), Act::from_num(0.5))),
+                act_to_f32(softcap_act(Act::from_num(-1.0), Act::from_num(0.5))),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_hidden_to_prefill_logits_uses_shared_det_softcap_tail() {
+        let logits = project_hidden_to_prefill_logits(
+            &[1.0, 1.0],
+            &[1.0, 1.0],
+            0.0,
+            &Gemma4LogitsProjection::UntiedLmHead {
+                weight: zero_matrix(2, 2),
+                det_weight: Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0])),
+            },
+            None,
+            InferenceExecutionMode::Deterministic,
+            Some(0.5),
+        )
+        .unwrap();
+
+        assert_eq!(
+            logits.logits,
+            apply_final_logit_softcapping_with_mode(
+                &[1.0, 1.0],
+                0.5,
+                InferenceExecutionMode::Deterministic,
+            )
         );
     }
 
@@ -4213,6 +4305,51 @@ mod tests {
         .unwrap();
 
         assert_eq!(decoded_logits.logits, replay_logits);
+    }
+
+    #[test]
+    fn run_text_layers_decode_step_matches_deterministic_softcapped_replay() {
+        let mut model = parity_test_model(Gemma4AttentionKind::Full, None);
+        model.final_logit_softcapping = Some(0.5);
+        let embeddings = model.embedding_table.as_ref().unwrap().rows.clone();
+        let prompt_embeddings = embeddings[..2].to_vec();
+        let next_embedding = embeddings[2].clone();
+
+        let (_, layer_caches) =
+            run_text_layers_prefill_with_cache(&prompt_embeddings, &model, None).unwrap();
+        let decoded = run_text_layers_decode_step(
+            &next_embedding,
+            2,
+            &model,
+            layer_caches,
+            prompt_embeddings.len(),
+        )
+        .unwrap();
+        let replay = run_text_layers_prefill(&embeddings, &model, None).unwrap();
+        let replay_last_hidden = replay.activations.last().cloned().unwrap();
+
+        let decoded_logits = project_hidden_to_prefill_logits(
+            &decoded.activation_state.activations[0],
+            &model.final_norm_weight,
+            model.rms_norm_eps,
+            &model.logits_projection,
+            model.embedding_source.as_ref(),
+            InferenceExecutionMode::Deterministic,
+            model.final_logit_softcapping,
+        )
+        .unwrap();
+        let replay_logits = project_hidden_to_prefill_logits(
+            &replay_last_hidden,
+            &model.final_norm_weight,
+            model.rms_norm_eps,
+            &model.logits_projection,
+            model.embedding_source.as_ref(),
+            InferenceExecutionMode::Deterministic,
+            model.final_logit_softcapping,
+        )
+        .unwrap();
+
+        assert_eq!(decoded_logits.logits, replay_logits.logits);
     }
 
     #[test]

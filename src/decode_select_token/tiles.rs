@@ -47,6 +47,13 @@ mod tests {
     }
 
     #[test]
+    fn select_next_token_resolves_near_ties_by_strictly_higher_logit() {
+        let token_id =
+            select_next_token(&[0.4820099, 0.4820100, 0.4820098]).expect("token selection");
+        assert_eq!(token_id, 1);
+    }
+
+    #[test]
     fn select_next_token_rejects_empty_logits() {
         let error = select_next_token(&[]).expect_err("empty logits should fail");
         assert!(error.to_string().contains("at least one logit"));

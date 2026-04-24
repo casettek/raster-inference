@@ -5,7 +5,7 @@ use super::{
     attention_score, attention_softmax, attention_weighted_sum, clip_act, div_acc_by_u32, div_act,
     f32_to_acc, f32_to_act, f32_to_wgt, gelu_pytorch_tanh_act, mac, mac_bits, mul_sat, mul_wide,
     requantize, rms_norm, rms_norm_scale, rope_rotate_pairs, rshift_round_ties_even, scale_act,
-    sub_sat, tanh_act, types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS,
+    softcap_act, sub_sat, tanh_act, types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS,
     types::REQUANTIZE_SHIFT, value_rms_norm, wgt_to_le_bytes, Acc, Act, Wgt,
 };
 
@@ -600,6 +600,62 @@ fn tanh_act_matches_golden_vectors() {
             case.name
         );
     }
+}
+
+#[test]
+fn softcap_act_matches_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        input_bits: i32,
+        softcap_bits: i32,
+        expected_bits: i32,
+    }
+
+    let cases = [
+        Case {
+            name: "zero_input_stays_zero",
+            input_bits: 0,
+            softcap_bits: Act::from_num(0.5).to_bits(),
+            expected_bits: 0,
+        },
+        Case {
+            name: "unit_softcap_matches_tanh",
+            input_bits: Act::from_num(0.5).to_bits(),
+            softcap_bits: Act::from_num(1.0).to_bits(),
+            expected_bits: 30_527,
+        },
+        Case {
+            name: "negative_input_preserves_sign",
+            input_bits: Act::from_num(-0.5).to_bits(),
+            softcap_bits: Act::from_num(1.0).to_bits(),
+            expected_bits: -30_527,
+        },
+        Case {
+            name: "saturates_at_softcap_boundary",
+            input_bits: Act::from_num(3.0).to_bits(),
+            softcap_bits: Act::from_num(0.5).to_bits(),
+            expected_bits: Act::from_num(0.5).to_bits(),
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            softcap_act(
+                Act::from_bits(case.input_bits),
+                Act::from_bits(case.softcap_bits)
+            )
+            .to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "softcap_act requires a strictly positive softcap")]
+fn softcap_act_rejects_non_positive_softcap() {
+    let _ = softcap_act(Act::from_num(1.0), Act::from_bits(0));
 }
 
 #[test]

@@ -12,7 +12,7 @@ pub use self::ops::{
     acc_add_sat, add_sat, argmax_first, attention_score, attention_softmax, attention_weighted_sum,
     clip_act, div_acc_by_u32, div_act, gelu_pytorch_tanh_act, mac, mac_bits, mul_sat, mul_wide,
     requantize, rms_norm, rms_norm_scale, rope_rotate_pairs, rshift_round_ties_even, scale_act,
-    sub_sat, tanh_act, value_rms_norm,
+    softcap_act, sub_sat, tanh_act, value_rms_norm,
 };
 pub use self::serialize::{acc_to_le_bytes, act_to_le_bytes, wgt_to_le_bytes};
 pub use self::types::{Acc, Act, Wgt};
