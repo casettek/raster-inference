@@ -1,10 +1,11 @@
 use std::{mem::size_of, panic};
 
 use super::{
-    acc_add_sat, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first, clip_act,
-    div_acc_by_u32, div_act, f32_to_acc, f32_to_act, f32_to_wgt, mac, mac_bits, mul_sat,
-    mul_wide, requantize, rms_norm, rms_norm_scale, rope_rotate_pairs, rshift_round_ties_even,
-    scale_act, sub_sat, value_rms_norm,
+    acc_add_sat, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first,
+    attention_score, attention_softmax, attention_weighted_sum, clip_act, div_acc_by_u32, div_act,
+    f32_to_acc, f32_to_act, f32_to_wgt, mac, mac_bits, mul_sat, mul_wide, requantize, rms_norm,
+    rms_norm_scale, rope_rotate_pairs, rshift_round_ties_even, scale_act, sub_sat,
+    value_rms_norm,
     types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS, types::REQUANTIZE_SHIFT,
     wgt_to_le_bytes, Acc, Act, Wgt,
 };
@@ -464,6 +465,69 @@ fn value_rms_norm_matches_golden_vectors() {
         zero_row.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
         vec![0]
     );
+}
+
+#[test]
+fn attention_score_matches_golden_vectors() {
+    let score = attention_score(
+        &[Act::from_num(1.0), Act::from_num(-0.5)],
+        &[Act::from_num(0.5), Act::from_num(0.25)],
+    );
+    assert_eq!(score.to_bits(), Act::from_num(0.375).to_bits());
+
+    let zero_score = attention_score(&[Act::from_num(0.0)], &[Act::from_num(4.0)]);
+    assert_eq!(zero_score.to_bits(), 0);
+}
+
+#[test]
+fn attention_softmax_matches_contract_vectors() {
+    let equal = attention_softmax(&[Act::from_num(0.0), Act::from_num(0.0)]);
+    assert_eq!(
+        equal.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        vec![32_768, 32_768]
+    );
+
+    let ln2_split = attention_softmax(&[Act::from_num(0.0), Act::from_bits(-45_426)]);
+    assert_eq!(
+        ln2_split
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        vec![43_695, 21_841]
+    );
+
+    let stable_tie = attention_softmax(&[Act::from_num(0.0), Act::from_num(0.0), Act::from_num(0.0)]);
+    assert_eq!(
+        stable_tie
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        vec![21_846, 21_845, 21_845]
+    );
+}
+
+#[test]
+fn attention_weighted_sum_matches_golden_vectors() {
+    let mixed = attention_weighted_sum(
+        &[Act::from_num(0.5), Act::from_num(0.5)],
+        &[
+            vec![Act::from_num(1.0), Act::from_num(0.0)],
+            vec![Act::from_num(0.0), Act::from_num(1.0)],
+        ],
+    );
+    assert_eq!(
+        mixed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        vec![32_768, 32_768]
+    );
+
+    let saturated = attention_weighted_sum(
+        &[Act::from_num(1.0), Act::from_num(1.0)],
+        &[
+            vec![Act::from_bits(i32::MAX)],
+            vec![Act::from_bits(i32::MAX)],
+        ],
+    );
+    assert_eq!(saturated, vec![Act::from_bits(i32::MAX)]);
 }
 
 #[test]

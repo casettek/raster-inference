@@ -193,6 +193,64 @@ Semantics:
 - rotated outputs use canonical fixed-point multiply/requantize plus saturating add/sub semantics
 - dimensions beyond `rotary_dim` are copied through unchanged
 
+### 8. Attention score semantics
+
+Canonical deterministic attention scores are defined on `Act` rows and must not rely on host `f32`
+accumulation once deterministic execution is active.
+
+Rule:
+
+- `attention_score(query: &[Act], key: &[Act]) -> Act`
+
+Semantics:
+
+- `query` and `key` must be non-empty and have matching widths
+- reduction order is left-to-right over the row
+- each term uses canonical widening multiply semantics
+- accumulation uses saturating `Acc`
+- score materialization is explicit and uses canonical `requantize`
+- no host-float dot-product fallback is allowed on the deterministic path
+
+### 9. Attention softmax semantics
+
+Canonical deterministic softmax is defined on `Act` logits and emits canonical `Act` weights.
+
+Rule:
+
+- `attention_softmax(logits: &[Act]) -> Vec<Act>`
+
+Semantics:
+
+- `logits` must be non-empty
+- the maximum logit is selected with canonical `argmax_first`, so equal maxima resolve to the
+  lowest index
+- every exponent term is computed from `logit - max_logit`, so the largest shifted logit is exactly
+  zero
+- shifted logits are interpreted canonically in Q32.32 before exponent materialization
+- exponent materialization uses deterministic range reduction by `ln(2)`, then a fixed polynomial on
+  the reduced remainder; no host `exp` is allowed
+- exponent terms smaller than the explicit underflow floor clamp to zero
+- normalization divides each exponent by the canonical sum with ties-to-even rounding
+- the final residual needed to make weights sum to exactly `1.0` in Q16.16 is assigned back to the
+  winning `argmax_first` index
+
+### 10. Attention weighted-value aggregation semantics
+
+Canonical deterministic value mixing applies canonical attention weights to canonical value rows.
+
+Rule:
+
+- `attention_weighted_sum(weights: &[Act], value_rows: &[Vec<Act>]) -> Vec<Act>`
+
+Semantics:
+
+- `weights` and `value_rows` must be non-empty and have matching row counts
+- all value rows must share one width
+- reduction order is row-major and left-to-right within the weight/value pairing
+- each multiply uses canonical widening precision
+- accumulation uses saturating `Acc`
+- each output dimension is materialized with canonical `requantize`
+
 ---
 
 ## Canonical source conversion rules
@@ -317,6 +375,9 @@ The following are additionally forbidden in the v0 executable inference path:
 
 - `fn argmax_first(xs: &[Act]) -> usize`
 - `fn rope_rotate_pairs(input: &[Act], rotary_dim: usize, freq_base_dim: usize, base: Acc, position: usize) -> Vec<Act>`
+- `fn attention_score(query: &[Act], key: &[Act]) -> Act`
+- `fn attention_softmax(logits: &[Act]) -> Vec<Act>`
+- `fn attention_weighted_sum(weights: &[Act], value_rows: &[Vec<Act>]) -> Vec<Act>`
 
 - `fn f32_to_wgt(x: f32) -> Wgt`
 
@@ -343,7 +404,6 @@ Recommended additional helpers:
 - `sin`
 - `cos`
 - `tanh`
-- `softmax`
 - `rmsnorm`
 
 Those belong in later layers built on top of `det_num`.
@@ -370,6 +430,9 @@ Before using `det_num` in model kernels, it must pass:
 - ties-to-even narrowing cases
 - signed shift behavior
 - argmax tie-breaking
+- attention score accumulation
+- attention softmax normalization and tie handling
+- attention weighted-value aggregation
 
 ### Weight-conversion tests
 
@@ -443,3 +506,4 @@ must increment the spec version.
 - argmax ties resolved by lowest index
 - direct canonical Q16.16 compiled weight storage
 - explicit FP32 -> `Wgt` deterministic model compilation
+- deterministic attention score, softmax, and value-mixing semantics

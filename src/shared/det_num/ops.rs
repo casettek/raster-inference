@@ -144,6 +144,95 @@ pub fn rope_rotate_pairs(
     output
 }
 
+/// Computes a deterministic q·k attention score with widening accumulation.
+pub fn attention_score(query: &[Act], key: &[Act]) -> Act {
+    assert!(
+        !query.is_empty(),
+        "attention_score requires a non-empty query slice"
+    );
+    assert_eq!(
+        query.len(),
+        key.len(),
+        "attention_score requires query and key slices to have matching widths"
+    );
+
+    let score_bits = query
+        .iter()
+        .zip(key)
+        .fold(0_i64, |acc_bits, (query_value, key_value)| {
+            mac_bits(acc_bits, query_value.to_bits(), key_value.to_bits())
+        });
+    requantize(Acc::from_bits(score_bits))
+}
+
+/// Computes deterministic softmax weights over attention logits.
+pub fn attention_softmax(logits: &[Act]) -> Vec<Act> {
+    assert!(
+        !logits.is_empty(),
+        "attention_softmax requires a non-empty logits slice"
+    );
+
+    let max_index = argmax_first(logits);
+    let max_logit = logits[max_index];
+    let exp_terms = logits
+        .iter()
+        .map(|logit| softmax_exp_term(act_to_acc(sub_sat(*logit, max_logit))))
+        .collect::<Vec<_>>();
+    let sum_exp = exp_terms
+        .iter()
+        .copied()
+        .fold(Acc::from_bits(0), acc_add_sat);
+
+    let mut weights = exp_terms
+        .iter()
+        .map(|term| requantize(div_acc(*term, sum_exp)))
+        .collect::<Vec<_>>();
+    let summed_weights = weights
+        .iter()
+        .copied()
+        .fold(Act::from_bits(0), add_sat);
+    let residual = sub_sat(one_act(), summed_weights);
+    weights[max_index] = add_sat(weights[max_index], residual);
+    weights
+}
+
+/// Computes a deterministic weighted sum of value rows under canonical attention weights.
+pub fn attention_weighted_sum(weights: &[Act], value_rows: &[Vec<Act>]) -> Vec<Act> {
+    assert!(
+        !weights.is_empty(),
+        "attention_weighted_sum requires a non-empty weights slice"
+    );
+    assert_eq!(
+        weights.len(),
+        value_rows.len(),
+        "attention_weighted_sum requires matching weight and value row counts"
+    );
+
+    let width = value_rows
+        .first()
+        .map(Vec::len)
+        .expect("attention_weighted_sum requires at least one value row");
+    for row in value_rows {
+        assert_eq!(
+            row.len(),
+            width,
+            "attention_weighted_sum requires value rows to share a common width"
+        );
+    }
+
+    (0..width)
+        .map(|dim_idx| {
+            let acc_bits = weights
+                .iter()
+                .zip(value_rows)
+                .fold(0_i64, |acc_bits, (weight, row)| {
+                    mac_bits(acc_bits, row[dim_idx].to_bits(), weight.to_bits())
+                });
+            requantize(Acc::from_bits(acc_bits))
+        })
+        .collect()
+}
+
 /// Returns the canonical deterministic inverse-RMS scale for a row of activations.
 pub fn rms_norm_scale(input: &[Act], eps: Acc) -> Act {
     assert!(
@@ -232,8 +321,62 @@ fn clamp_i128_to_i64(value: i128) -> i64 {
     value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
+fn act_to_acc(value: Act) -> Acc {
+    Acc::from_bits(i64::from(value.to_bits()) << REQUANTIZE_SHIFT)
+}
+
+fn one_act() -> Act {
+    Act::from_bits(1_i32 << ACT_FRACTIONAL_BITS)
+}
+
 fn one_acc() -> Acc {
     Acc::from_bits(1_i64 << ACC_FRACTIONAL_BITS)
+}
+
+fn softmax_exp_term(delta: Acc) -> Acc {
+    const LN_2_BITS: i64 = 2_977_044_472;
+    const MIN_DELTA_BITS: i64 = -(16_i64 << ACC_FRACTIONAL_BITS);
+
+    assert!(
+        delta.to_bits() <= 0,
+        "softmax_exp_term requires max-shifted non-positive logits"
+    );
+    if delta.to_bits() <= MIN_DELTA_BITS {
+        return Acc::from_bits(0);
+    }
+
+    let positive_bits = delta.to_bits().saturating_neg();
+    let shift = positive_bits / LN_2_BITS;
+    let remainder = Acc::from_bits(positive_bits % LN_2_BITS);
+    let remainder_sq = acc_mul(remainder, remainder);
+    let remainder_cu = acc_mul(remainder_sq, remainder);
+    let remainder_qu = acc_mul(remainder_cu, remainder);
+    let remainder_qui = acc_mul(remainder_qu, remainder);
+
+    let approximated = acc_add_sat(
+        acc_add_sat(
+            one_acc(),
+            Acc::from_bits(remainder.to_bits().saturating_neg()),
+        ),
+        acc_add_sat(
+            div_acc_by_u32(remainder_sq, 2),
+            acc_add_sat(
+                Acc::from_bits(div_acc_by_u32(remainder_cu, 6).to_bits().saturating_neg()),
+                acc_add_sat(
+                    div_acc_by_u32(remainder_qu, 24),
+                    Acc::from_bits(div_acc_by_u32(remainder_qui, 120).to_bits().saturating_neg()),
+                ),
+            ),
+        ),
+    );
+    if approximated.to_bits() <= 0 {
+        return Acc::from_bits(0);
+    }
+
+    match u32::try_from(shift) {
+        Ok(shift) if shift < i64::BITS => rshift_round_ties_even(approximated, shift),
+        _ => Acc::from_bits(0),
+    }
 }
 
 fn rope_frequency_step(base: Acc, freq_base_dim: usize) -> Acc {

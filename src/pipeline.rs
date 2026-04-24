@@ -744,6 +744,105 @@ mod tests {
         assert_ne!(det_step.prefill_logits.logits, fp32_step.prefill_logits.logits);
     }
 
+    #[test]
+    fn run_prefill_pass_with_mode_routes_deterministic_attention_core() {
+        let model = deterministic_attention_core_model();
+        let prompt_token_ids = vec![0, 1];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-det-attention-prefill".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+
+        let fp32 = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(det.transformer_state.activation_states[0].activations[0], vec![2.0, 2.0]);
+        assert_ne!(
+            det.transformer_state.activation_states[0].activations[1],
+            fp32.transformer_state.activation_states[0].activations[1]
+        );
+        assert!(!det.transformer_state.prefill_logits.logits.is_empty());
+    }
+
+    #[test]
+    fn decode_step_with_mode_routes_deterministic_attention_core() {
+        let model = deterministic_attention_core_model();
+        let prompt_token_ids = vec![0];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-det-attention-decode".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let fp32_prefill = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det_prefill = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let fp32_step = decode_step_with_mode(
+            fp32_prefill.transformer_decode_state,
+            1,
+            &model,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det_step = decode_step_with_mode(
+            det_prefill.transformer_decode_state,
+            1,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        let replay_prompt = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: vec![0, 1],
+            prompt_token_ids_sha256: "unused-for-det-attention-replay".to_string(),
+        };
+        let replay_embeddings =
+            embed_input_tokens(&replay_prompt.prompt_token_ids, model.embedding_table.as_ref().unwrap())
+                .unwrap();
+        let replay_prefill = run_prefill_pass_with_mode(
+            &replay_prompt,
+            &model,
+            &replay_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(
+            det_step.activation_state.activations[0],
+            replay_prefill.transformer_state.activation_states[0].activations[1]
+        );
+        assert_ne!(det_step.activation_state.activations[0], fp32_step.activation_state.activations[0]);
+        assert!(!det_step.prefill_logits.logits.is_empty());
+    }
+
     fn test_tokenizer() -> tokenizers::Tokenizer {
         let vocab = [
             ("hello".to_string(), 0),
@@ -810,6 +909,80 @@ mod tests {
                     rows: 3,
                     cols: 4,
                     values: vec![0.7, 0.1, 0.2, 0.0, 0.0, 0.8, 0.1, 0.1, 0.2, 0.0, 0.8, 0.2],
+                },
+                det_weight: None,
+            },
+            final_logit_softcapping: None,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    fn deterministic_attention_core_model() -> Gemma4TransformerModel {
+        Gemma4TransformerModel {
+            embedding_table: Some(EmbeddingTable {
+                rows: vec![vec![1.0, 1.0], vec![1.0, -1.0]],
+                scale: 1.0,
+            }),
+            embedding_source: None,
+            layers: vec![Gemma4LayerWeights {
+                attention_kind: Gemma4AttentionKind::Full,
+                hidden_size: 2,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 2,
+                sliding_window: None,
+                cache_sliding_window: None,
+                rms_norm_eps: 1e-6,
+                rope_base: 10_000.0,
+                partial_rotary_dim: 0,
+                rope_freq_base_dim: 2,
+                kv_shared_layer_index: None,
+                attention_k_eq_v: false,
+                q_proj: MatrixF32 {
+                    rows: 2,
+                    cols: 2,
+                    values: vec![0.5, -0.5, 0.5, -0.5],
+                }
+                .into(),
+                k_proj: MatrixF32 {
+                    rows: 2,
+                    cols: 2,
+                    values: vec![0.5, -0.5, 0.5, -0.5],
+                }
+                .into(),
+                v_proj: Some(
+                    MatrixF32 {
+                        rows: 2,
+                        cols: 2,
+                        values: vec![1.0, 0.0, 0.0, 1.0],
+                    }
+                    .into(),
+                ),
+                o_proj: MatrixF32 {
+                    rows: 2,
+                    cols: 2,
+                    values: vec![1.0, 0.0, 0.0, 1.0],
+                }
+                .into(),
+                q_norm_weight: vec![1.0, 1.0],
+                k_norm_weight: vec![1.0, 1.0],
+                input_layernorm_weight: vec![1.0; 2],
+                post_attention_layernorm_weight: vec![1.0; 2],
+                pre_feedforward_layernorm_weight: vec![1.0; 2],
+                post_feedforward_layernorm_weight: vec![1.0; 2],
+                gate_proj: zero_matrix(4, 2).into(),
+                up_proj: zero_matrix(4, 2).into(),
+                down_proj: zero_matrix(2, 4).into(),
+                ple: None,
+                layer_scalar: None,
+            }],
+            ple_global: None,
+            final_norm_weight: vec![1.0; 2],
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: MatrixF32 {
+                    rows: 2,
+                    cols: 2,
+                    values: vec![1.0, 0.0, 0.0, 1.0],
                 },
                 det_weight: None,
             },

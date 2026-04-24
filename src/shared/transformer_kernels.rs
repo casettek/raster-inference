@@ -4,9 +4,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::shared::det_num::{
-    act_to_f32, add_sat, f32_to_acc, f32_to_act, mac_bits, mul_sat, requantize,
-    rms_norm as det_rms_norm, scale_act, value_rms_norm as det_value_rms_norm, Acc, Act,
-    rope_rotate_pairs as det_rope_rotate_pairs,
+    act_to_f32, add_sat, attention_score as det_attention_score,
+    attention_softmax as det_attention_softmax,
+    attention_weighted_sum as det_attention_weighted_sum, f32_to_acc, f32_to_act, mac_bits,
+    mul_sat, requantize, rms_norm as det_rms_norm, rope_rotate_pairs as det_rope_rotate_pairs,
+    scale_act, value_rms_norm as det_value_rms_norm, Acc, Act,
 };
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
@@ -1258,32 +1260,33 @@ fn run_causal_attention(
                     .map(|window| query_idx.saturating_add(1).saturating_sub(window))
                     .unwrap_or(0);
                 if let Some(donor_cache) = donor_cache {
-                    let logits = (start..=query_idx)
-                        .map(|key_idx| {
-                            dot(
-                                &q[head_idx][query_idx],
-                                &donor_cache.keys[kv_head_idx][key_idx],
-                            )
-                        })
+                    let key_rows = donor_cache.keys[kv_head_idx]
+                        .iter()
+                        .skip(start)
+                        .take(query_idx + 1 - start)
+                        .cloned()
                         .collect::<Vec<_>>();
-                    let weights = softmax(&logits);
-
-                    for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
-                        for (dim_idx, value) in output.iter_mut().enumerate() {
-                            *value += weight * donor_cache.values[kv_head_idx][key_idx][dim_idx];
-                        }
-                    }
+                    let value_rows = donor_cache.values[kv_head_idx]
+                        .iter()
+                        .skip(start)
+                        .take(query_idx + 1 - start)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    *output = attention_output(
+                        &q[head_idx][query_idx],
+                        &key_rows,
+                        &value_rows,
+                        execution_mode,
+                    );
                 } else {
-                    let logits = (start..=query_idx)
-                        .map(|key_idx| dot(&q[head_idx][query_idx], &k[kv_head_idx][key_idx]))
-                        .collect::<Vec<_>>();
-                    let weights = softmax(&logits);
-
-                    for (weight, key_idx) in weights.into_iter().zip(start..=query_idx) {
-                        for (dim_idx, value) in output.iter_mut().enumerate() {
-                            *value += weight * v[kv_head_idx][key_idx][dim_idx];
-                        }
-                    }
+                    let key_rows = k[kv_head_idx][start..=query_idx].to_vec();
+                    let value_rows = v[kv_head_idx][start..=query_idx].to_vec();
+                    *output = attention_output(
+                        &q[head_idx][query_idx],
+                        &key_rows,
+                        &value_rows,
+                        execution_mode,
+                    );
                 }
             }
             outputs
@@ -1417,21 +1420,17 @@ fn run_causal_attention_decode(
                     .saturating_sub(window)
             })
             .unwrap_or(0);
-        let logits = attention_cache.keys[kv_head_idx]
+        let key_rows = attention_cache.keys[kv_head_idx]
             .iter()
             .skip(key_start)
-            .map(|key_row| dot(&q[head_idx], key_row))
+            .cloned()
             .collect::<Vec<_>>();
-        let weights = softmax(&logits);
-        let mut output = vec![0.0; layer.head_dim];
-        for (weight, value_row) in weights
-            .into_iter()
-            .zip(attention_cache.values[kv_head_idx].iter().skip(key_start))
-        {
-            for (dim_idx, value) in output.iter_mut().enumerate() {
-                *value += weight * value_row[dim_idx];
-            }
-        }
+        let value_rows = attention_cache.values[kv_head_idx]
+            .iter()
+            .skip(key_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        let output = attention_output(&q[head_idx], &key_rows, &value_rows, execution_mode);
         let dst = &mut combined_heads[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
         dst.copy_from_slice(&output);
     }
@@ -2275,6 +2274,44 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     exps.into_iter().map(|value| value / sum).collect()
 }
 
+fn attention_output(
+    query: &[f32],
+    key_rows: &[Vec<f32>],
+    value_rows: &[Vec<f32>],
+    execution_mode: InferenceExecutionMode,
+) -> Vec<f32> {
+    match execution_mode {
+        InferenceExecutionMode::Fp32 => {
+            let logits = key_rows
+                .iter()
+                .map(|key_row| dot(query, key_row))
+                .collect::<Vec<_>>();
+            let weights = softmax(&logits);
+            let mut output = vec![0.0; query.len()];
+            for (weight, value_row) in weights.iter().zip(value_rows) {
+                for (dim_idx, value) in output.iter_mut().enumerate() {
+                    *value += *weight * value_row[dim_idx];
+                }
+            }
+            output
+        }
+        InferenceExecutionMode::Deterministic => {
+            let quantized_query = quantize_row_to_acts(query);
+            let quantized_keys = quantize_sequence_to_acts(key_rows);
+            let logits = quantized_keys
+                .iter()
+                .map(|key_row| det_attention_score(&quantized_query, key_row))
+                .collect::<Vec<_>>();
+            let weights = det_attention_softmax(&logits);
+            let quantized_values = quantize_sequence_to_acts(value_rows);
+            det_attention_weighted_sum(&weights, &quantized_values)
+                .into_iter()
+                .map(act_to_f32)
+                .collect()
+        }
+    }
+}
+
 fn build_layer_kv_cache(
     keys: &[Vec<Vec<f32>>],
     values: &[Vec<Vec<f32>>],
@@ -2359,16 +2396,18 @@ mod tests {
 
     use super::{
         append_kv_cache, apply_final_norm, apply_final_norm_with_mode, apply_head_rms_norm,
-        apply_rms_norm_to_sequence, apply_rope_to_rows, apply_value_rms_norm,
-        compute_decode_ple_input, compute_prefill_ple_inputs, det_linear_row,
-        det_linear_row_from_acts, det_linear_sequence, embed_input_tokens, extract_prefill_logits,
-        project_decode_hidden_to_logits, project_to_logits, run_causal_attention,
-        run_causal_attention_decode, run_gemma4_layer, run_gemma4_layer_decode,
-        run_text_layers_decode_step, run_text_layers_prefill, run_text_layers_prefill_with_cache,
+        apply_head_rms_norm_row, apply_rms_norm_to_sequence, apply_rope_to_rows,
+        apply_value_rms_norm, apply_value_rms_norm_row, compute_decode_ple_input,
+        compute_prefill_ple_inputs, det_linear_row, det_linear_row_from_acts, det_linear_sequence,
+        embed_input_tokens, extract_prefill_logits, project_decode_hidden_to_logits,
+        project_to_logits, run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
+        run_gemma4_layer_decode, run_text_layers_decode_step, run_text_layers_prefill,
+        run_text_layers_prefill_with_cache,
     };
     use crate::shared::det_num::{
-        act_to_f32, f32_to_wgt, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
-        DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
+        act_to_f32, attention_score, attention_softmax, attention_weighted_sum, f32_to_act,
+        f32_to_wgt, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
+        DET_WGT_ARTIFACT_MAGIC,
     };
     use crate::shared::input::InferenceExecutionMode;
     use crate::shared::transformer::{
@@ -3378,6 +3417,159 @@ mod tests {
     }
 
     #[test]
+    fn run_causal_attention_routes_prefill_through_deterministic_attention_core() {
+        let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let query_proj = MatrixF32 {
+            rows: 2,
+            cols: 2,
+            values: vec![0.0, 1.0, 0.0, 0.0],
+        };
+        let key_proj = MatrixF32 {
+            rows: 2,
+            cols: 2,
+            values: vec![0.0, -0.693_147_2, 0.0, 0.0],
+        };
+        let resolved = attention_test_layer(
+            query_proj,
+            key_proj,
+            identity_matrix(2),
+            identity_matrix(2),
+        );
+
+        let fp32 = run_causal_attention(
+            &inputs,
+            &resolved,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det = run_causal_attention(
+            &inputs,
+            &resolved,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let mut q_rows = vec![vec![vec![0.0, 0.0], vec![1.0, 0.0]]];
+        let mut k_rows = vec![vec![vec![0.0, 0.0], vec![-0.693_147_2, 0.0]]];
+        let mut v_rows = vec![vec![vec![1.0, 0.0], vec![0.0, 1.0]]];
+        apply_head_rms_norm(
+            &mut q_rows,
+            &resolved.q_norm_weight,
+            resolved.rms_norm_eps,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        apply_head_rms_norm(
+            &mut k_rows,
+            &resolved.k_norm_weight,
+            resolved.rms_norm_eps,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        apply_value_rms_norm(
+            &mut v_rows,
+            resolved.rms_norm_eps,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        let expected = expected_det_attention_output(
+            &q_rows[0][1],
+            &k_rows[0],
+            &v_rows[0],
+        );
+        assert_eq!(det.0[1], expected);
+        assert_ne!(det.0[1], fp32.0[1]);
+    }
+
+    #[test]
+    fn run_causal_attention_decode_routes_through_deterministic_attention_core() {
+        let input = vec![0.0, 1.0];
+        let query_proj = MatrixF32 {
+            rows: 2,
+            cols: 2,
+            values: vec![0.0, 1.0, 0.0, 0.0],
+        };
+        let key_proj = MatrixF32 {
+            rows: 2,
+            cols: 2,
+            values: vec![0.0, -0.693_147_2, 0.0, 0.0],
+        };
+        let resolved = attention_test_layer(
+            query_proj,
+            key_proj,
+            identity_matrix(2),
+            identity_matrix(2),
+        );
+        let initial_cache = append_kv_cache(
+            LayerKvCache::new(1),
+            &[vec![0.0, 0.0]],
+            &[vec![1.0, 0.0]],
+            None,
+        )
+        .unwrap();
+
+        let fp32 = run_causal_attention_decode(
+            &input,
+            &resolved,
+            initial_cache.clone(),
+            None,
+            1,
+            None,
+            None,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
+        let det = run_causal_attention_decode(
+            &input,
+            &resolved,
+            initial_cache,
+            None,
+            1,
+            None,
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        let mut q_rows = vec![vec![1.0, 0.0]];
+        let mut k_rows = vec![vec![-0.693_147_2, 0.0]];
+        let mut v_rows = vec![vec![0.0, 1.0]];
+        apply_head_rms_norm_row(
+            &mut q_rows,
+            &resolved.q_norm_weight,
+            resolved.rms_norm_eps,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        apply_head_rms_norm_row(
+            &mut k_rows,
+            &resolved.k_norm_weight,
+            resolved.rms_norm_eps,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        apply_value_rms_norm_row(
+            &mut v_rows,
+            resolved.rms_norm_eps,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+        let expected = expected_det_attention_output(
+            &q_rows[0],
+            &[vec![0.0, 0.0], k_rows[0].clone()],
+            &[vec![1.0, 0.0], v_rows[0].clone()],
+        );
+        assert_eq!(det.0, expected);
+        assert_ne!(det.0, fp32.0);
+    }
+
+    #[test]
     fn project_to_logits_uses_det_untied_lm_head() {
         let without_det = project_to_logits(
             &[1.0, 0.0],
@@ -4075,6 +4267,31 @@ mod tests {
             final_logit_softcapping: None,
             rms_norm_eps: 1e-6,
         }
+    }
+
+    fn expected_det_attention_output(
+        query: &[f32],
+        key_rows: &[Vec<f32>],
+        value_rows: &[Vec<f32>],
+    ) -> Vec<f32> {
+        let quantized_query = query.iter().copied().map(f32_to_act).collect::<Vec<_>>();
+        let quantized_keys = key_rows
+            .iter()
+            .map(|row| row.iter().copied().map(f32_to_act).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let logits = quantized_keys
+            .iter()
+            .map(|key_row| attention_score(&quantized_query, key_row))
+            .collect::<Vec<_>>();
+        let weights = attention_softmax(&logits);
+        let quantized_values = value_rows
+            .iter()
+            .map(|row| row.iter().copied().map(f32_to_act).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        attention_weighted_sum(&weights, &quantized_values)
+            .into_iter()
+            .map(act_to_f32)
+            .collect()
     }
 
     fn zero_matrix(rows: usize, cols: usize) -> MatrixF32 {
