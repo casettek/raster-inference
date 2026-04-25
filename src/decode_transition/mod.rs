@@ -29,6 +29,7 @@ pub fn run_with_mode(
     model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerDecodeStepResult> {
+    model.validate_execution_mode(execution_mode)?;
     let TransformerDecodeState {
         layer_caches,
         position,

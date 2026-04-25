@@ -42,6 +42,7 @@ pub(crate) fn run_with_mode_internal(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    model.validate_execution_mode(execution_mode)?;
     match execution_mode {
         InferenceExecutionMode::Fp32 => {
             tiles::run(input_activations.as_f32_slice(), model, ple_inputs)

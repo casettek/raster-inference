@@ -1,6 +1,8 @@
 use anyhow::{bail, Result};
 
-use crate::shared::{det_num::argmax_first, transformer::InternalLogits};
+use crate::shared::{
+    det_num::argmax_first, input::InferenceExecutionMode, transformer::InternalLogits,
+};
 
 pub fn select_next_token(logits: &[f32]) -> Result<u32> {
     if logits.is_empty() {
@@ -17,12 +19,19 @@ pub fn select_next_token(logits: &[f32]) -> Result<u32> {
     Ok(best_token as u32)
 }
 
-pub(crate) fn select_next_token_internal(logits: &InternalLogits) -> Result<u32> {
+pub(crate) fn select_next_token_internal(
+    logits: &InternalLogits,
+    execution_mode: InferenceExecutionMode,
+) -> Result<u32> {
     if let Some(det_values) = logits.det_values() {
         if det_values.is_empty() {
             bail!("output decode requires at least one logit to select the next token");
         }
         return Ok(argmax_first(det_values) as u32);
+    }
+
+    if execution_mode == InferenceExecutionMode::Deterministic {
+        bail!("deterministic token selection requires canonical logits");
     }
 
     select_next_token(logits.as_f32_slice())
@@ -48,7 +57,8 @@ mod tests {
         append_token, check_stop_condition, select_next_token, select_next_token_internal,
     };
     use crate::shared::{
-        det_num::Act, output::OutputDecodeStopReason, transformer::InternalLogits,
+        det_num::Act, input::InferenceExecutionMode, output::OutputDecodeStopReason,
+        transformer::InternalLogits,
     };
 
     #[test]
@@ -78,11 +88,14 @@ mod tests {
 
     #[test]
     fn select_next_token_internal_prefers_canonical_deterministic_values() {
-        let token_id = select_next_token_internal(&InternalLogits::from_det_values(vec![
-            Act::from_bits(3),
-            Act::from_bits(5),
-            Act::from_bits(5),
-        ]))
+        let token_id = select_next_token_internal(
+            &InternalLogits::from_det_values(vec![
+                Act::from_bits(3),
+                Act::from_bits(5),
+                Act::from_bits(5),
+            ]),
+            InferenceExecutionMode::Deterministic,
+        )
         .expect("token selection");
         assert_eq!(token_id, 1);
     }

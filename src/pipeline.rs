@@ -48,6 +48,7 @@ pub fn run_prefill_pass_with_mode(
     token_embeddings: &ActivationSequence,
     execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerPrefillResult> {
+    model.validate_execution_mode(execution_mode)?;
     run_prefill_pass_for_token_ids(
         &prompt_preparation_state.prompt_token_ids,
         model,
@@ -181,6 +182,7 @@ pub fn decode_step_with_mode(
     model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerDecodeStepResult> {
+    model.validate_execution_mode(execution_mode)?;
     let _trace = trace_scope("decode.step");
     let TransformerDecodeState {
         layer_caches,
@@ -305,8 +307,9 @@ pub fn run_output_decode_with_mode(
         }
 
         trace_event("decode.select_token");
-        let next_token = crate::decode_select_token::run(&mut decode_state, max_new_tokens)?
-            .expect("stop condition should have returned earlier");
+        let next_token =
+            crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
+                .expect("stop condition should have returned earlier");
 
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
@@ -342,8 +345,8 @@ mod tests {
             transformer_kernels::{build_activation_commitment, embed_input_tokens},
         },
         EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
-        Gemma4PleGlobalWeights, Gemma4PleLayerWeights, Gemma4TransformerModel, MatrixF32,
-        PromptPreparationState, SamplingConfig,
+        Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+        Gemma4TransformerModel, MatrixF32, PromptPreparationState, SamplingConfig,
     };
 
     #[test]
@@ -522,6 +525,7 @@ mod tests {
     #[test]
     fn run_transformer_state_transition_for_token_ids_preserves_missing_embedding_error() {
         let model = Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::Fp32,
             embedding_table: None,
             embedding_source: None,
             layers: vec![],
@@ -1086,6 +1090,7 @@ mod tests {
 
     fn test_decode_model() -> Gemma4TransformerModel {
         Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::Fp32,
             embedding_table: Some(EmbeddingTable {
                 rows: vec![
                     vec![1.0, 0.0, 0.5, 0.0],
@@ -1142,6 +1147,7 @@ mod tests {
 
     fn deterministic_mlp_core_model() -> Gemma4TransformerModel {
         Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::Fp32,
             embedding_table: Some(EmbeddingTable {
                 rows: vec![vec![1.0, 1.0], vec![1.0, 1.0]],
                 scale: 1.0,
@@ -1209,6 +1215,7 @@ mod tests {
 
     fn deterministic_attention_core_model() -> Gemma4TransformerModel {
         Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::Fp32,
             embedding_table: Some(EmbeddingTable {
                 rows: vec![vec![1.0, 1.0], vec![1.0, -1.0]],
                 scale: 1.0,
@@ -1283,6 +1290,7 @@ mod tests {
 
     fn deterministic_norm_routing_model() -> Gemma4TransformerModel {
         Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::Fp32,
             embedding_table: Some(EmbeddingTable {
                 rows: vec![vec![1.0, 1.0, 0.0, 0.0], vec![1.0, 1.0, 0.0, 0.0]],
                 scale: 1.0,
@@ -1344,6 +1352,7 @@ mod tests {
 
     fn test_transformer_model() -> Gemma4TransformerModel {
         Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::Fp32,
             embedding_table: Some(EmbeddingTable {
                 rows: vec![vec![0.0, 0.5, 0.0, 0.0], vec![1.0, 1.5, 0.0, 0.0]],
                 scale: 1.0,
@@ -1430,6 +1439,7 @@ mod tests {
         });
 
         Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::Fp32,
             embedding_table: Some(EmbeddingTable {
                 rows: vec![
                     vec![1.0, 0.0, 0.5, 0.0],

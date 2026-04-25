@@ -4,11 +4,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use anyhow::Result;
 use memmap2::Mmap;
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 
 use crate::shared::det_num::{act_to_f32, Act};
+use crate::shared::input::InferenceExecutionMode;
 
 fn default_embedding_scale() -> f32 {
     1.0
@@ -92,6 +94,8 @@ pub struct ActivationSequence {
     #[serde(skip, default)]
     pub(crate) internal: InternalActivationSequence,
     pub activations_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub det_activations_sha256: Option<String>,
 }
 
 impl ActivationSequence {
@@ -103,6 +107,7 @@ impl ActivationSequence {
             activations: internal.clone_f32(),
             internal,
             activations_sha256,
+            det_activations_sha256: None,
         }
     }
 
@@ -684,6 +689,8 @@ pub struct PrefillLogits {
     #[serde(skip, default)]
     pub(crate) internal: InternalLogits,
     pub final_logits_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub det_final_logits_sha256: Option<String>,
 }
 
 impl PrefillLogits {
@@ -692,6 +699,7 @@ impl PrefillLogits {
             logits: internal.clone_f32(),
             internal,
             final_logits_sha256,
+            det_final_logits_sha256: None,
         }
     }
 
@@ -804,8 +812,15 @@ impl PartialEq for GemmaEmbeddingTensorSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4ModelProvenance {
+    Fp32,
+    DetNumWgt,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gemma4TransformerModel {
+    pub provenance: Gemma4ModelProvenance,
     pub embedding_table: Option<EmbeddingTable>,
     pub embedding_source: Option<GemmaEmbeddingTensorSource>,
     pub layers: Vec<Gemma4LayerWeights>,
@@ -814,4 +829,18 @@ pub struct Gemma4TransformerModel {
     pub logits_projection: Gemma4LogitsProjection,
     pub final_logit_softcapping: Option<f32>,
     pub rms_norm_eps: f32,
+}
+
+impl Gemma4TransformerModel {
+    pub fn validate_execution_mode(&self, execution_mode: InferenceExecutionMode) -> Result<()> {
+        if execution_mode == InferenceExecutionMode::Deterministic
+            && self.provenance != Gemma4ModelProvenance::DetNumWgt
+        {
+            anyhow::bail!(
+                "deterministic execution requires a model loaded from a .detwgt artifact"
+            );
+        }
+
+        Ok(())
+    }
 }

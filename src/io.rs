@@ -933,6 +933,7 @@ pub fn load_transformer_state_model_from_gemma_model_path<P: AsRef<Path>>(
     let embedding_source = build_embedding_source(&reader, &embedding_tensor_name, hidden_size);
 
     Ok(Gemma4TransformerModel {
+        provenance: crate::shared::transformer::Gemma4ModelProvenance::Fp32,
         embedding_table: None,
         embedding_source: Some(embedding_source),
         layers,
@@ -1005,6 +1006,7 @@ pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
     };
 
     Ok(Gemma4TransformerModel {
+        provenance: crate::shared::transformer::Gemma4ModelProvenance::DetNumWgt,
         embedding_table: None,
         embedding_source: Some(embedding_source),
         layers,
@@ -1880,6 +1882,9 @@ pub fn embed_input_tokens_from_gemma_source_with_mode(
                 execution_mode,
             )?
         }
+        _ if execution_mode == InferenceExecutionMode::Deterministic => {
+            bail!("deterministic embedding requires a .detwgt embedding source")
+        }
         _ => with_embedding_tensor(source, |tensor| {
             decode_embedding_rows_for_token_ids(
                 tensor,
@@ -1892,11 +1897,13 @@ pub fn embed_input_tokens_from_gemma_source_with_mode(
     };
     let activations = internal.clone_f32();
     let activations_sha256 = build_activation_commitment(&activations);
+    let det_activations_sha256 = internal
+        .det_values()
+        .map(crate::shared::transformer_kernels::build_det_activation_commitment);
 
-    Ok(ActivationSequence::from_internal(
-        internal,
-        activations_sha256,
-    ))
+    let mut activation_sequence = ActivationSequence::from_internal(internal, activations_sha256);
+    activation_sequence.det_activations_sha256 = det_activations_sha256;
+    Ok(activation_sequence)
 }
 
 fn build_det_num_embedding_source(

@@ -44,10 +44,10 @@ pub use shared::input::{
 pub use shared::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
 pub use shared::transformer::{
     ActivationSequence, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-    Gemma4PrefillPleInputs, Gemma4TransformerModel, GemmaEmbeddingTensorSource, LayerKvCache,
-    MatrixF32, PrefillLogits, TransformerDecodeState, TransformerDecodeStepResult,
-    TransformerPrefillResult, TransformerStateTransitionState,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
+    Gemma4PleLayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
+    GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, PrefillLogits, TransformerDecodeState,
+    TransformerDecodeStepResult, TransformerPrefillResult, TransformerStateTransitionState,
 };
 pub use shared::transformer_kernels::{
     append_kv_cache, apply_final_logit_softcapping, apply_final_norm, compute_decode_ple_input,
@@ -121,6 +121,7 @@ pub fn run_inference_with_controls(
     controls: &InferenceControls,
 ) -> Result<InferenceRunOutcome> {
     trace::with_checkpointing_enabled(controls.commit_checkpoints, || {
+        transformer_model.validate_execution_mode(request.execution_mode)?;
         trace::start_inference_trace(&json!({
             "model_id": model.model_id,
             "execution_mode": request.execution_mode,
@@ -289,9 +290,9 @@ mod tests {
         run_decode_transition, run_inference, run_inference_with_controls, run_output_finalize,
         run_prefill_finalize, run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare,
         DecodeState, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
-        Gemma4LogitsProjection, Gemma4TransformerModel, InferenceControls, InferenceExecutionMode,
-        InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec, OutputDecodeStopReason,
-        SamplingConfig, TextDecodingPolicy,
+        Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel, InferenceControls,
+        InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec,
+        OutputDecodeStopReason, SamplingConfig, TextDecodingPolicy,
     };
 
     #[test]
@@ -620,7 +621,8 @@ mod tests {
         );
         decode_state.set_internal_logits(prefill.transformer_state.prefill_logits.clone_internal());
         let next_token =
-            run_decode_select_token(&mut decode_state, 1).expect("decode select token");
+            run_decode_select_token(&mut decode_state, 1, InferenceExecutionMode::Fp32)
+                .expect("decode select token");
         let next_token = next_token.expect("should select a token");
         let decode_transition = run_decode_transition(
             std::mem::take(&mut decode_state.transformer_decode_state),
@@ -669,6 +671,7 @@ mod tests {
 
     fn test_transformer_model() -> Gemma4TransformerModel {
         Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::Fp32,
             embedding_table: Some(EmbeddingTable {
                 rows: vec![
                     vec![0.0, 0.0, 0.0, 0.0],
