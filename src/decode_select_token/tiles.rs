@@ -1,5 +1,7 @@
 use anyhow::{bail, Result};
 
+use crate::shared::{det_num::argmax_first, transformer::InternalLogits};
+
 pub fn select_next_token(logits: &[f32]) -> Result<u32> {
     if logits.is_empty() {
         bail!("output decode requires at least one logit to select the next token");
@@ -13,6 +15,17 @@ pub fn select_next_token(logits: &[f32]) -> Result<u32> {
     }
 
     Ok(best_token as u32)
+}
+
+pub(crate) fn select_next_token_internal(logits: &InternalLogits) -> Result<u32> {
+    if let Some(det_values) = logits.det_values() {
+        if det_values.is_empty() {
+            bail!("output decode requires at least one logit to select the next token");
+        }
+        return Ok(argmax_first(det_values) as u32);
+    }
+
+    select_next_token(logits.as_f32_slice())
 }
 
 pub fn append_token(token_ids: &[u32], next_token: u32) -> Vec<u32> {
@@ -31,8 +44,12 @@ pub fn check_stop_condition(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_token, check_stop_condition, select_next_token};
-    use crate::shared::output::OutputDecodeStopReason;
+    use super::{
+        append_token, check_stop_condition, select_next_token, select_next_token_internal,
+    };
+    use crate::shared::{
+        det_num::Act, output::OutputDecodeStopReason, transformer::InternalLogits,
+    };
 
     #[test]
     fn select_next_token_returns_highest_logit_token_id() {
@@ -57,6 +74,17 @@ mod tests {
     fn select_next_token_rejects_empty_logits() {
         let error = select_next_token(&[]).expect_err("empty logits should fail");
         assert!(error.to_string().contains("at least one logit"));
+    }
+
+    #[test]
+    fn select_next_token_internal_prefers_canonical_deterministic_values() {
+        let token_id = select_next_token_internal(&InternalLogits::from_det_values(vec![
+            Act::from_bits(3),
+            Act::from_bits(5),
+            Act::from_bits(5),
+        ]))
+        .expect("token selection");
+        assert_eq!(token_id, 1);
     }
 
     #[test]

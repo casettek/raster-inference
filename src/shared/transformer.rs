@@ -8,6 +8,8 @@ use memmap2::Mmap;
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 
+use crate::shared::det_num::{act_to_f32, Act};
+
 fn default_embedding_scale() -> f32 {
     1.0
 }
@@ -87,7 +89,37 @@ pub struct EmbeddingTable {
 pub struct ActivationSequence {
     #[serde(skip_serializing, default)]
     pub activations: Vec<Vec<f32>>,
+    #[serde(skip, default)]
+    pub(crate) internal: InternalActivationSequence,
     pub activations_sha256: String,
+}
+
+impl ActivationSequence {
+    pub(crate) fn from_internal(
+        internal: InternalActivationSequence,
+        activations_sha256: String,
+    ) -> Self {
+        Self {
+            activations: internal.clone_f32(),
+            internal,
+            activations_sha256,
+        }
+    }
+
+    pub(crate) fn from_values(activations: Vec<Vec<f32>>, activations_sha256: String) -> Self {
+        Self::from_internal(
+            InternalActivationSequence::from_values(activations),
+            activations_sha256,
+        )
+    }
+
+    pub(crate) fn clone_internal(&self) -> InternalActivationSequence {
+        if self.internal.as_f32_slice().is_empty() && !self.activations.is_empty() {
+            // Older deserialized payloads only carry the public f32 view.
+            return InternalActivationSequence::from_values(self.activations.clone());
+        }
+        self.internal.clone()
+    }
 }
 
 pub type EmbeddedTokenSequence = ActivationSequence;
@@ -103,6 +135,8 @@ pub struct TransformerStateTransitionState {
 pub struct LayerKvCache {
     pub keys: Vec<VecDeque<Vec<f32>>>,
     pub values: Vec<VecDeque<Vec<f32>>>,
+    pub(crate) det_keys: Option<Vec<VecDeque<Vec<Act>>>>,
+    pub(crate) det_values: Option<Vec<VecDeque<Vec<Act>>>>,
 }
 
 impl LayerKvCache {
@@ -110,12 +144,91 @@ impl LayerKvCache {
         Self {
             keys: vec![VecDeque::new(); num_kv_heads],
             values: vec![VecDeque::new(); num_kv_heads],
+            det_keys: None,
+            det_values: None,
+        }
+    }
+
+    pub(crate) fn from_f32_heads(
+        keys: Vec<VecDeque<Vec<f32>>>,
+        values: Vec<VecDeque<Vec<f32>>>,
+    ) -> Self {
+        Self {
+            keys,
+            values,
+            det_keys: None,
+            det_values: None,
+        }
+    }
+
+    pub(crate) fn from_det_heads(
+        det_keys: Vec<VecDeque<Vec<Act>>>,
+        det_values: Vec<VecDeque<Vec<Act>>>,
+    ) -> Self {
+        Self {
+            keys: det_heads_to_f32(&det_keys),
+            values: det_heads_to_f32(&det_values),
+            det_keys: Some(det_keys),
+            det_values: Some(det_values),
         }
     }
 
     pub fn current_len(&self) -> usize {
         self.keys.first().map(VecDeque::len).unwrap_or(0)
     }
+
+    pub(crate) fn det_key_rows_from(&self, head_idx: usize, start: usize) -> Option<Vec<Vec<Act>>> {
+        self.det_keys
+            .as_ref()
+            .and_then(|heads| heads.get(head_idx))
+            .map(|rows| rows.iter().skip(start).cloned().collect())
+    }
+
+    pub(crate) fn det_key_rows_window(
+        &self,
+        head_idx: usize,
+        start: usize,
+        len: usize,
+    ) -> Option<Vec<Vec<Act>>> {
+        self.det_keys
+            .as_ref()
+            .and_then(|heads| heads.get(head_idx))
+            .map(|rows| rows.iter().skip(start).take(len).cloned().collect())
+    }
+
+    pub(crate) fn det_value_rows_from(
+        &self,
+        head_idx: usize,
+        start: usize,
+    ) -> Option<Vec<Vec<Act>>> {
+        self.det_values
+            .as_ref()
+            .and_then(|heads| heads.get(head_idx))
+            .map(|rows| rows.iter().skip(start).cloned().collect())
+    }
+
+    pub(crate) fn det_value_rows_window(
+        &self,
+        head_idx: usize,
+        start: usize,
+        len: usize,
+    ) -> Option<Vec<Vec<Act>>> {
+        self.det_values
+            .as_ref()
+            .and_then(|heads| heads.get(head_idx))
+            .map(|rows| rows.iter().skip(start).take(len).cloned().collect())
+    }
+}
+
+fn det_heads_to_f32(det_heads: &[VecDeque<Vec<Act>>]) -> Vec<VecDeque<Vec<f32>>> {
+    det_heads
+        .iter()
+        .map(|head| {
+            head.iter()
+                .map(|row| row.iter().copied().map(act_to_f32).collect())
+                .collect()
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -406,11 +519,136 @@ pub enum Gemma4LogitsProjection {
     TiedEmbedding(MatrixF32),
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct InternalActivationRow {
+    values: Vec<f32>,
+    det_values: Option<Vec<Act>>,
+}
+
+impl InternalActivationRow {
+    pub(crate) fn from_values(values: Vec<f32>) -> Self {
+        Self {
+            values,
+            det_values: None,
+        }
+    }
+
+    pub(crate) fn from_det_values(det_values: Vec<Act>) -> Self {
+        Self {
+            values: det_values.iter().copied().map(act_to_f32).collect(),
+            det_values: Some(det_values),
+        }
+    }
+
+    pub(crate) fn as_f32_slice(&self) -> &[f32] {
+        &self.values
+    }
+
+    pub(crate) fn clone_f32(&self) -> Vec<f32> {
+        self.values.clone()
+    }
+
+    pub(crate) fn det_values(&self) -> Option<&[Act]> {
+        self.det_values.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct InternalActivationSequence {
+    values: Vec<Vec<f32>>,
+    det_values: Option<Vec<Vec<Act>>>,
+}
+
+impl InternalActivationSequence {
+    pub(crate) fn from_values(values: Vec<Vec<f32>>) -> Self {
+        Self {
+            values,
+            det_values: None,
+        }
+    }
+
+    pub(crate) fn from_det_values(det_values: Vec<Vec<Act>>) -> Self {
+        Self {
+            values: det_values
+                .iter()
+                .map(|row| row.iter().copied().map(act_to_f32).collect())
+                .collect(),
+            det_values: Some(det_values),
+        }
+    }
+
+    pub(crate) fn as_f32_slice(&self) -> &[Vec<f32>] {
+        &self.values
+    }
+
+    pub(crate) fn clone_f32(&self) -> Vec<Vec<f32>> {
+        self.values.clone()
+    }
+
+    pub(crate) fn det_values(&self) -> Option<&[Vec<Act>]> {
+        self.det_values.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct InternalLogits {
+    values: Vec<f32>,
+    det_values: Option<Vec<Act>>,
+}
+
+impl InternalLogits {
+    pub(crate) fn from_values(values: Vec<f32>) -> Self {
+        Self {
+            values,
+            det_values: None,
+        }
+    }
+
+    pub(crate) fn from_det_values(det_values: Vec<Act>) -> Self {
+        Self {
+            values: det_values.iter().copied().map(act_to_f32).collect(),
+            det_values: Some(det_values),
+        }
+    }
+
+    pub(crate) fn as_f32_slice(&self) -> &[f32] {
+        &self.values
+    }
+
+    pub(crate) fn clone_f32(&self) -> Vec<f32> {
+        self.values.clone()
+    }
+
+    pub(crate) fn det_values(&self) -> Option<&[Act]> {
+        self.det_values.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PrefillLogits {
     #[serde(skip_serializing, default)]
     pub logits: Vec<f32>,
+    #[serde(skip, default)]
+    pub(crate) internal: InternalLogits,
     pub final_logits_sha256: String,
+}
+
+impl PrefillLogits {
+    pub(crate) fn from_internal(internal: InternalLogits, final_logits_sha256: String) -> Self {
+        Self {
+            logits: internal.clone_f32(),
+            internal,
+            final_logits_sha256,
+        }
+    }
+
+    pub(crate) fn clone_internal(&self) -> InternalLogits {
+        if self.internal.as_f32_slice().is_empty() && !self.logits.is_empty() {
+            // Older deserialized payloads only carry the public f32 view.
+            return InternalLogits::from_values(self.logits.clone());
+        }
+        self.internal.clone()
+    }
 }
 
 #[derive(Debug, Clone)]

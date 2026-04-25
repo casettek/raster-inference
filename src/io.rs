@@ -1880,10 +1880,10 @@ pub fn embed_input_tokens_from_gemma_source_with_mode(
     };
     let activations_sha256 = build_activation_commitment(&activations);
 
-    Ok(ActivationSequence {
+    Ok(ActivationSequence::from_values(
         activations,
         activations_sha256,
-    })
+    ))
 }
 
 fn build_det_num_embedding_source(

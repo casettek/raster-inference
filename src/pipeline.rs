@@ -279,6 +279,12 @@ pub fn run_output_decode_with_mode(
             .clone(),
         initial_transformer_state.transformer_decode_state.clone(),
     );
+    decode_state.set_internal_logits(
+        initial_transformer_state
+            .transformer_state
+            .prefill_logits
+            .clone_internal(),
+    );
 
     loop {
         if crate::decode_select_token::tiles::check_stop_condition(
@@ -306,7 +312,7 @@ pub fn run_output_decode_with_mode(
             execution_mode,
         )?;
         decode_transition_states.push(decode_transition.activation_state.clone());
-        decode_state.current_logits = decode_transition.prefill_logits.logits;
+        decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
         crate::decode_transition::finalize(&decode_state)?;
     }

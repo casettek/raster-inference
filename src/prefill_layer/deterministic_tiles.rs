@@ -3,7 +3,7 @@ use serde_json::json;
 
 use crate::shared::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
-    LayerKvCache,
+    InternalActivationSequence, LayerKvCache,
 };
 use crate::trace::trace_scope;
 
@@ -24,13 +24,14 @@ pub fn run_text_layers_prefill_with_cache(
         bail!("transformer prefill requires at least one layer");
     }
 
-    let mut xs = input_activations.to_vec();
+    let mut xs = InternalActivationSequence::from_values(input_activations.to_vec());
     let mut layer_caches = Vec::with_capacity(model.layers.len());
     let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
+        let xs_values = xs.clone_f32();
         let _trace = trace_scope(format!(
             "prefill.layer.det layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
-            xs.len(),
+            xs_values.len(),
             layer.attention_kind,
             layer.ple.is_some(),
             layer.kv_shared_layer_index
@@ -41,14 +42,15 @@ pub fn run_text_layers_prefill_with_cache(
         let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, layer_cache) =
-            crate::shared::transformer_kernels::run_gemma4_layer_with_cache(
-                &xs,
+            crate::shared::transformer_kernels::run_gemma4_layer_with_cache_internal(
+                xs,
                 &resolved_layer,
                 per_layer_input,
                 donor_cache,
                 crate::shared::input::InferenceExecutionMode::Deterministic,
             )?;
-        xs = layer_output.activations;
+        xs = layer_output.clone_internal();
+        let xs_values = xs.clone_f32();
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
         crate::trace::trace_checkpoint(
@@ -56,33 +58,32 @@ pub fn run_text_layers_prefill_with_cache(
             &json!({
                 "execution_mode": "deterministic",
                 "next_layer_idx": layer_idx + 1,
-                "current_activations": xs.clone(),
-                "current_activations_sha256": crate::shared::transformer_kernels::build_activation_commitment(&xs),
+                "current_activations": xs_values.clone(),
+                "current_activations_sha256": crate::shared::transformer_kernels::build_activation_commitment(&xs_values),
                 "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
                 "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
             }),
         );
-        for (token_idx, token_activation) in xs.iter().enumerate() {
+        for (token_idx, token_activation) in xs_values.iter().enumerate() {
             crate::trace::trace_checkpoint(
                 &format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}"),
                 &json!({
                     "execution_mode": "deterministic",
                     "layer_idx": layer_idx,
                     "token_idx": token_idx,
-                    "token_count": xs.len(),
+                    "token_count": xs_values.len(),
                     "token_activation": token_activation,
                 }),
             );
         }
     }
 
+    let xs_values = xs.clone_f32();
     Ok((
-        ActivationSequence {
-            activations_sha256: crate::shared::transformer_kernels::build_activation_commitment(
-                &xs,
-            ),
-            activations: xs,
-        },
+        ActivationSequence::from_internal(
+            xs,
+            crate::shared::transformer_kernels::build_activation_commitment(&xs_values),
+        ),
         layer_caches,
     ))
 }

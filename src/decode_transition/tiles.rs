@@ -88,12 +88,10 @@ pub fn run_text_layers_decode_step(
     }
 
     Ok(ActivationSequenceWithCache {
-        activation_state: ActivationSequence {
-            activations_sha256: crate::shared::transformer_kernels::build_activation_commitment(&[
-                xs.clone(),
-            ]),
-            activations: vec![xs],
-        },
+        activation_state: ActivationSequence::from_values(
+            vec![xs.clone()],
+            crate::shared::transformer_kernels::build_activation_commitment(&[xs]),
+        ),
         layer_caches: updated_layer_caches,
     })
 }

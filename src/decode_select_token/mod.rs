@@ -11,7 +11,7 @@ pub fn run(decode_state: &mut DecodeState, max_new_tokens: usize) -> Result<Opti
         return Ok(None);
     }
 
-    let next_token = tiles::select_next_token(&decode_state.current_logits)?;
+    let next_token = tiles::select_next_token_internal(&decode_state.clone_internal_logits())?;
     decode_state.full_token_ids = tiles::append_token(&decode_state.full_token_ids, next_token);
     decode_state.generated_token_ids =
         tiles::append_token(&decode_state.generated_token_ids, next_token);

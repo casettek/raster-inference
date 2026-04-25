@@ -126,7 +126,7 @@ When `--deterministic` is set, the model path must point to either:
 - a directory containing `config.json` and `model.detwgt`
 - a direct path to a `model.detwgt` file with a sibling `config.json`
 
-This Phase 1 deterministic path is a **converted-weight parity path**, not the final end-to-end `det_num` runtime. It loads canonical `Wgt` bytes from `model.detwgt`, reconstructs runtime matrices, and then runs the same high-level inference routine structure so you can compare the converted artifact against the existing FP32 baseline.
+This Phase 1 deterministic path is a **converted-weight parity path** with a canonical-state runtime core. It loads canonical `Wgt` bytes from `model.detwgt`, keeps deterministic KV cache rows and layer activations in canonical `Act` form across deterministic prefill/decode boundaries, and derives the existing `f32` views for public API, JSON, and trace compatibility. It is not yet a full public `det_num` API redesign: checkpoint payloads, `InferenceState`, and the existing digest field names still use the current compatibility shape.
 
 The CLI prints the resulting `InferenceState` as formatted JSON with:
 
@@ -164,8 +164,4 @@ To validate a converted deterministic artifact against the current baseline:
 
 For small deterministic fixtures, exact agreement is the target. For real converted Gemma checkpoints, Phase 1 is meant to show whether the converted weight format preserves output quality closely enough before the repo switches to a full `det_num` arithmetic path.
 
-The automated parity suite now also includes a softcap-sensitive fixture that keeps attention and
-MLP behavior intentionally quiet so logits-tail drift is attributable to final logit softcapping.
-That fixture is a routing/parity check, not a quality verdict. Real-model validation remains manual:
-run representative prompts through both the FP32 baseline and the deterministic path, then compare
-output quality rather than requiring exact token identity once deterministic-only seams are active.
+The automated parity suite now also includes softcap-sensitive and cache-sensitive fixtures that keep unrelated behavior quiet so drift is attributable to deterministic routing, canonical KV reuse, activation carryover, or final logit softcapping. These fixtures are routing/parity checks, not quality verdicts. Real-model validation remains manual: run representative prompts through both the FP32 baseline and the deterministic path, then compare output quality rather than requiring exact token identity once deterministic-only seams are active.

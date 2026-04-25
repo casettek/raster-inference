@@ -16,6 +16,18 @@ In v0, `det_num` also defines the canonical numeric representation of compiled m
 
 ---
 
+## Runtime state boundary
+
+Deterministic execution stores runtime state internally in canonical fixed-point form:
+
+- layer activation rows that continue through deterministic prefill and decode use canonical `Act` rows as the source of truth
+- deterministic KV cache keys and values retain canonical `Act` rows across decode steps
+- logits can carry canonical `Act` values through deterministic token selection
+
+The current public API and trace/checkpoint payloads still expose compatibility `f32` views. Existing fields such as `activations_sha256`, `final_logits_sha256`, and serialized `layer_caches` are therefore compatibility commitments over those `f32` views, not newly versioned canonical commitments. Replacing or versioning those public digests is deferred until the external trace contract is updated deliberately.
+
+---
+
 ## Design goals
 
 - deterministic and portable

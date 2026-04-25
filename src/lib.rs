@@ -618,6 +618,7 @@ mod tests {
             prefill.transformer_state.prefill_logits.logits.clone(),
             prefill.transformer_decode_state.clone(),
         );
+        decode_state.set_internal_logits(prefill.transformer_state.prefill_logits.clone_internal());
         let next_token =
             run_decode_select_token(&mut decode_state, 1).expect("decode select token");
         let next_token = next_token.expect("should select a token");
@@ -627,7 +628,7 @@ mod tests {
             &transformer_model,
         )
         .expect("decode transition");
-        decode_state.current_logits = decode_transition.prefill_logits.logits;
+        decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
         finalize_decode_transition(&decode_state).expect("decode finalize trace");
 

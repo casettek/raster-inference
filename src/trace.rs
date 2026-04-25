@@ -149,6 +149,9 @@ pub fn abort_inference_trace(error: &anyhow::Error) {
 pub fn serialize_layer_caches(
     layer_caches: &[crate::shared::transformer::LayerKvCache],
 ) -> Vec<SerializableLayerKvCache> {
+    // Trace/checkpoint payloads intentionally keep the existing f32 cache shape.
+    // Deterministic mode may carry canonical rows internally, but public trace
+    // commitments stay anchored to this compatibility view until versioned.
     layer_caches
         .iter()
         .map(|cache| SerializableLayerKvCache {

@@ -75,12 +75,10 @@ pub fn run_text_layers_prefill_with_cache(
     }
 
     Ok((
-        ActivationSequence {
-            activations_sha256: crate::shared::transformer_kernels::build_activation_commitment(
-                &xs,
-            ),
-            activations: xs,
-        },
+        ActivationSequence::from_values(
+            xs.clone(),
+            crate::shared::transformer_kernels::build_activation_commitment(&xs),
+        ),
         layer_caches,
     ))
 }
