@@ -221,15 +221,19 @@ pub fn decode_step_with_mode(
         }
     };
     trace_event("decode.project_to_logits");
-    let prefill_logits = crate::shared::transformer_kernels::project_decode_hidden_to_logits(
-        &final_hidden_state.activation_state.activations[0],
-        &model.final_norm_weight,
-        model.rms_norm_eps,
-        &model.logits_projection,
-        model.embedding_source.as_ref(),
-        execution_mode,
-        model.final_logit_softcapping,
+    let final_position = crate::shared::transformer_kernels::select_final_position_internal(
+        &final_hidden_state.activation_state.clone_internal(),
     )?;
+    let prefill_logits =
+        crate::shared::transformer_kernels::project_internal_decode_hidden_to_logits(
+            final_position,
+            &model.final_norm_weight,
+            model.rms_norm_eps,
+            &model.logits_projection,
+            model.embedding_source.as_ref(),
+            execution_mode,
+            model.final_logit_softcapping,
+        )?;
 
     Ok(TransformerDecodeStepResult {
         transformer_decode_state: TransformerDecodeState {
@@ -333,8 +337,8 @@ mod tests {
         shared::{
             det_num::{act_to_f32, Act},
             input::InferenceExecutionMode,
-            transformer::DetNumMatrix,
-            transformer_kernels::embed_input_tokens,
+            transformer::{ActivationSequence, DetNumMatrix, InternalActivationSequence},
+            transformer_kernels::{build_activation_commitment, embed_input_tokens},
         },
         EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
         Gemma4PleGlobalWeights, Gemma4PleLayerWeights, Gemma4TransformerModel, MatrixF32,
@@ -686,6 +690,39 @@ mod tests {
                 act_to_f32(Act::from_bits(92_682))
             ]
         );
+    }
+
+    #[test]
+    fn prefill_finalize_projects_internal_final_row_not_public_f32_view() {
+        let model = deterministic_norm_routing_model();
+        let mut final_hidden_states = ActivationSequence::from_internal(
+            InternalActivationSequence::from_det_values(vec![vec![
+                Act::from_num(1.0),
+                Act::from_num(0.0),
+                Act::from_num(0.0),
+                Act::from_num(0.0),
+            ]]),
+            build_activation_commitment(&[vec![1.0, 0.0, 0.0, 0.0]]),
+        );
+        final_hidden_states.activations = vec![vec![0.0, 1.0, 0.0, 0.0]];
+
+        let prefill = crate::prefill_finalize::run(
+            &[0],
+            &model,
+            final_hidden_states,
+            vec![],
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert!(prefill.transformer_state.prefill_logits.logits[0] > 0.0);
+        assert_eq!(prefill.transformer_state.prefill_logits.logits[1], 0.0);
+        assert!(prefill
+            .transformer_state
+            .prefill_logits
+            .clone_internal()
+            .det_values()
+            .is_some());
     }
 
     #[test]

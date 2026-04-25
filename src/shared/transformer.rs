@@ -588,6 +588,15 @@ impl InternalActivationSequence {
     pub(crate) fn det_values(&self) -> Option<&[Vec<Act>]> {
         self.det_values.as_deref()
     }
+
+    pub(crate) fn last_row(&self) -> Option<InternalActivationRow> {
+        let values = self.values.last()?.clone();
+        let det_values = self
+            .det_values
+            .as_ref()
+            .and_then(|rows| rows.last().cloned());
+        Some(InternalActivationRow { values, det_values })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

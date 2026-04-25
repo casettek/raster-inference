@@ -71,15 +71,19 @@ pub fn run_with_mode(
             position,
         )?,
     };
-    let prefill_logits = crate::shared::transformer_kernels::project_decode_hidden_to_logits(
-        &final_hidden_state.activation_state.activations[0],
-        &model.final_norm_weight,
-        model.rms_norm_eps,
-        &model.logits_projection,
-        model.embedding_source.as_ref(),
-        execution_mode,
-        model.final_logit_softcapping,
+    let final_position = crate::shared::transformer_kernels::select_final_position_internal(
+        &final_hidden_state.activation_state.clone_internal(),
     )?;
+    let prefill_logits =
+        crate::shared::transformer_kernels::project_internal_decode_hidden_to_logits(
+            final_position,
+            &model.final_norm_weight,
+            model.rms_norm_eps,
+            &model.logits_projection,
+            model.embedding_source.as_ref(),
+            execution_mode,
+            model.final_logit_softcapping,
+        )?;
 
     Ok(TransformerDecodeStepResult {
         transformer_decode_state: TransformerDecodeState {

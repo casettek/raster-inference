@@ -16,19 +16,20 @@ pub fn run(
     execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerPrefillResult> {
     trace_event("prefill.select_final_position");
-    let final_position = crate::shared::transformer_kernels::select_final_position(
-        &final_hidden_states.activations,
+    let final_position = crate::shared::transformer_kernels::select_final_position_internal(
+        &final_hidden_states.clone_internal(),
     )?;
     trace_event("prefill.project_to_logits");
-    let prefill_logits = crate::shared::transformer_kernels::project_hidden_to_prefill_logits(
-        &final_position,
-        &model.final_norm_weight,
-        model.rms_norm_eps,
-        &model.logits_projection,
-        model.embedding_source.as_ref(),
-        execution_mode,
-        model.final_logit_softcapping,
-    )?;
+    let prefill_logits =
+        crate::shared::transformer_kernels::project_internal_hidden_to_prefill_logits(
+            final_position,
+            &model.final_norm_weight,
+            model.rms_norm_eps,
+            &model.logits_projection,
+            model.embedding_source.as_ref(),
+            execution_mode,
+            model.final_logit_softcapping,
+        )?;
     crate::trace::trace_checkpoint(
         "prefill.finalize",
         &json!({

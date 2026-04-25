@@ -980,6 +980,15 @@ pub fn select_final_position(input_activations: &[Vec<f32>]) -> Result<Vec<f32>>
     })
 }
 
+pub(crate) fn select_final_position_internal(
+    input_activations: &InternalActivationSequence,
+) -> Result<InternalActivationRow> {
+    // let _trace = trace_scope("transformer_state_transition.select_final_position");
+    input_activations.last_row().ok_or_else(|| {
+        anyhow!("transformer final-position selection requires at least one activation row")
+    })
+}
+
 pub fn project_to_logits(
     last_hidden_state: &[f32],
     projection: &Gemma4LogitsProjection,
@@ -1118,8 +1127,28 @@ pub fn project_hidden_to_prefill_logits(
     execution_mode: InferenceExecutionMode,
     final_logit_softcapping: Option<f32>,
 ) -> Result<PrefillLogits> {
-    let normalized = apply_rms_norm_buffer(
-        hidden_state,
+    project_internal_hidden_to_prefill_logits(
+        InternalActivationRow::from_values(hidden_state.to_vec()),
+        final_norm_weight,
+        rms_norm_eps,
+        projection,
+        embedding_source,
+        execution_mode,
+        final_logit_softcapping,
+    )
+}
+
+pub(crate) fn project_internal_hidden_to_prefill_logits(
+    hidden_state: InternalActivationRow,
+    final_norm_weight: &[f32],
+    rms_norm_eps: f32,
+    projection: &Gemma4LogitsProjection,
+    embedding_source: Option<&GemmaEmbeddingTensorSource>,
+    execution_mode: InferenceExecutionMode,
+    final_logit_softcapping: Option<f32>,
+) -> Result<PrefillLogits> {
+    let normalized = apply_rms_norm_row_buffer(
+        &ActivationRowBuffer::from_internal(hidden_state),
         final_norm_weight,
         rms_norm_eps,
         execution_mode,
@@ -1143,7 +1172,28 @@ pub fn project_decode_hidden_to_logits(
     final_logit_softcapping: Option<f32>,
 ) -> Result<PrefillLogits> {
     // let _trace = trace_scope("transformer_state_transition.project_decode_hidden_to_logits");
-    project_hidden_to_prefill_logits(
+    project_internal_decode_hidden_to_logits(
+        InternalActivationRow::from_values(hidden_state.to_vec()),
+        final_norm_weight,
+        rms_norm_eps,
+        projection,
+        embedding_source,
+        execution_mode,
+        final_logit_softcapping,
+    )
+}
+
+pub(crate) fn project_internal_decode_hidden_to_logits(
+    hidden_state: InternalActivationRow,
+    final_norm_weight: &[f32],
+    rms_norm_eps: f32,
+    projection: &Gemma4LogitsProjection,
+    embedding_source: Option<&GemmaEmbeddingTensorSource>,
+    execution_mode: InferenceExecutionMode,
+    final_logit_softcapping: Option<f32>,
+) -> Result<PrefillLogits> {
+    // let _trace = trace_scope("transformer_state_transition.project_decode_hidden_to_logits");
+    project_internal_hidden_to_prefill_logits(
         hidden_state,
         final_norm_weight,
         rms_norm_eps,
@@ -1316,15 +1366,15 @@ fn run_causal_attention_buffer(
     };
     let mut q = {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.reshape_q");
-        reshape_sequence_heads(&q_projected.values, layer.num_heads, layer.head_dim)?
+        reshape_sequence_head_buffer(&q_projected, layer.num_heads, layer.head_dim)?
     };
     let mut k = {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.reshape_k");
-        reshape_sequence_heads(&raw_k.values, layer.num_kv_heads, layer.head_dim)?
+        reshape_sequence_head_buffer(&raw_k, layer.num_kv_heads, layer.head_dim)?
     };
     let mut v = {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.reshape_v");
-        reshape_sequence_heads(&raw_v.values, layer.num_kv_heads, layer.head_dim)?
+        reshape_sequence_head_buffer(&raw_v, layer.num_kv_heads, layer.head_dim)?
     };
 
     {
@@ -1382,11 +1432,12 @@ fn run_causal_attention_buffer(
         .map(|head_idx| {
             // let _trace = trace_scope(format!("transformer_state_transition.run_causal_attention.head={head_idx}"));
             let kv_head_idx = head_idx / kv_groups;
-            let mut outputs = vec![vec![0.0; layer.head_dim]; seq_len];
-            for (query_idx, output) in outputs.iter_mut().enumerate() {
+            let mut outputs = Vec::with_capacity(seq_len);
+            for query_idx in 0..seq_len {
                 let start = attention_window
                     .map(|window| query_idx.saturating_add(1).saturating_sub(window))
                     .unwrap_or(0);
+                let query = q.row(head_idx, query_idx);
                 if let Some(donor_cache) = donor_cache {
                     let key_rows = donor_cache.keys[kv_head_idx]
                         .iter()
@@ -1405,25 +1456,33 @@ fn run_causal_attention_buffer(
                         donor_cache.det_key_rows_window(kv_head_idx, start, row_count);
                     let det_value_rows =
                         donor_cache.det_value_rows_window(kv_head_idx, start, row_count);
-                    *output = attention_output(
-                        &q[head_idx][query_idx],
+                    outputs.push(attention_output(
+                        &query,
                         &key_rows,
                         det_key_rows.as_deref(),
                         &value_rows,
                         det_value_rows.as_deref(),
                         execution_mode,
-                    );
+                    ));
                 } else {
-                    let key_rows = k[kv_head_idx][start..=query_idx].to_vec();
-                    let value_rows = v[kv_head_idx][start..=query_idx].to_vec();
-                    *output = attention_output(
-                        &q[head_idx][query_idx],
+                    let key_rows = k.values[kv_head_idx][start..=query_idx].to_vec();
+                    let value_rows = v.values[kv_head_idx][start..=query_idx].to_vec();
+                    let det_key_rows = k
+                        .acts
+                        .as_ref()
+                        .map(|heads| heads[kv_head_idx][start..=query_idx].to_vec());
+                    let det_value_rows = v
+                        .acts
+                        .as_ref()
+                        .map(|heads| heads[kv_head_idx][start..=query_idx].to_vec());
+                    outputs.push(attention_output(
+                        &query,
                         &key_rows,
-                        None,
+                        det_key_rows.as_deref(),
                         &value_rows,
-                        None,
+                        det_value_rows.as_deref(),
                         execution_mode,
-                    );
+                    ));
                 }
             }
             outputs
@@ -1431,21 +1490,28 @@ fn run_causal_attention_buffer(
         .collect::<Vec<_>>();
 
     let mut combined_heads = vec![vec![0.0; layer.num_heads * layer.head_dim]; seq_len];
+    let mut combined_head_acts = head_outputs
+        .iter()
+        .all(|outputs| outputs.iter().all(|output| output.acts.is_some()))
+        .then(|| vec![vec![Act::from_bits(0); layer.num_heads * layer.head_dim]; seq_len]);
     for (head_idx, outputs) in head_outputs.into_iter().enumerate() {
         for (query_idx, output) in outputs.into_iter().enumerate() {
             let dst = &mut combined_heads[query_idx]
                 [head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
-            dst.copy_from_slice(&output);
+            dst.copy_from_slice(&output.values);
+            if let (Some(combined_head_acts), Some(output_acts)) =
+                (&mut combined_head_acts, output.acts)
+            {
+                let dst = &mut combined_head_acts[query_idx]
+                    [head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
+                dst.copy_from_slice(&output_acts);
+            }
         }
     }
 
-    let quantized_combined_heads = layer
-        .o_proj_det
-        .as_ref()
-        .map(|_| quantize_sequence_to_acts(&combined_heads));
     {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.o_proj");
-        let combined_heads = match quantized_combined_heads {
+        let combined_heads = match combined_head_acts {
             Some(acts) => ActivationSequenceBuffer::from_acts(acts),
             None => ActivationSequenceBuffer::from_values(combined_heads),
         };
@@ -1525,9 +1591,9 @@ fn run_causal_attention_decode_buffer(
         bail!("Gemma layer is missing v_proj without attention_k_eq_v enabled");
     };
 
-    let mut q = reshape_row_heads(&q_projected.values, layer.num_heads, layer.head_dim)?;
-    let mut k = reshape_row_heads(&raw_k.values, layer.num_kv_heads, layer.head_dim)?;
-    let mut v = reshape_row_heads(&raw_v.values, layer.num_kv_heads, layer.head_dim)?;
+    let mut q = reshape_row_head_buffer(&q_projected, layer.num_heads, layer.head_dim)?;
+    let mut k = reshape_row_head_buffer(&raw_k, layer.num_kv_heads, layer.head_dim)?;
+    let mut v = reshape_row_head_buffer(&raw_v, layer.num_kv_heads, layer.head_dim)?;
 
     apply_head_rms_norm_row(
         &mut q,
@@ -1562,10 +1628,12 @@ fn run_causal_attention_decode_buffer(
     let updated_cache = if donor_cache.is_some() {
         cache
     } else {
-        append_kv_cache_with_mode(cache, &k, &v, cache_window, execution_mode)?
+        append_kv_cache_head_buffer_with_mode(cache, &k, &v, cache_window, execution_mode)?
     };
     let attention_cache = donor_cache.unwrap_or(&updated_cache);
     let mut combined_heads = vec![0.0; layer.num_heads * layer.head_dim];
+    let mut combined_head_acts = matches!(execution_mode, InferenceExecutionMode::Deterministic)
+        .then(|| vec![Act::from_bits(0); layer.num_heads * layer.head_dim]);
     for head_idx in 0..layer.num_heads {
         let kv_head_idx = head_idx / kv_groups;
         let key_start = attention_window
@@ -1588,7 +1656,7 @@ fn run_causal_attention_decode_buffer(
         let det_key_rows = attention_cache.det_key_rows_from(kv_head_idx, key_start);
         let det_value_rows = attention_cache.det_value_rows_from(kv_head_idx, key_start);
         let output = attention_output(
-            &q[head_idx],
+            &q.row(head_idx),
             &key_rows,
             det_key_rows.as_deref(),
             &value_rows,
@@ -1596,14 +1664,17 @@ fn run_causal_attention_decode_buffer(
             execution_mode,
         );
         let dst = &mut combined_heads[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
-        dst.copy_from_slice(&output);
+        dst.copy_from_slice(&output.values);
+        if let (Some(combined_head_acts), Some(output_acts)) =
+            (&mut combined_head_acts, output.acts)
+        {
+            let dst =
+                &mut combined_head_acts[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
+            dst.copy_from_slice(&output_acts);
+        }
     }
 
-    let quantized_combined_heads = layer
-        .o_proj_det
-        .as_ref()
-        .map(|_| quantize_row_to_acts(&combined_heads));
-    let combined_heads = match quantized_combined_heads {
+    let combined_heads = match combined_head_acts {
         Some(acts) => ActivationRowBuffer::from_acts(acts),
         None => ActivationRowBuffer::from_values(combined_heads),
     };
@@ -1735,6 +1806,71 @@ impl ActivationRowBuffer {
             Some(det_values) => InternalActivationRow::from_det_values(det_values),
             None => InternalActivationRow::from_values(self.values),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AttentionHeadSequenceBuffer {
+    values: Vec<Vec<Vec<f32>>>,
+    acts: Option<Vec<Vec<Vec<Act>>>>,
+}
+
+impl AttentionHeadSequenceBuffer {
+    fn from_values(values: Vec<Vec<Vec<f32>>>) -> Self {
+        Self { values, acts: None }
+    }
+
+    fn from_acts(acts: Vec<Vec<Vec<Act>>>) -> Self {
+        let values = acts
+            .iter()
+            .map(|head| {
+                head.iter()
+                    .map(|row| row.iter().copied().map(act_to_f32).collect())
+                    .collect()
+            })
+            .collect();
+        Self {
+            values,
+            acts: Some(acts),
+        }
+    }
+
+    fn row(&self, head_idx: usize, seq_idx: usize) -> ActivationRowBuffer {
+        let values = self.values[head_idx][seq_idx].clone();
+        let acts = self
+            .acts
+            .as_ref()
+            .map(|heads| heads[head_idx][seq_idx].clone());
+        ActivationRowBuffer { values, acts }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AttentionHeadRowBuffer {
+    values: Vec<Vec<f32>>,
+    acts: Option<Vec<Vec<Act>>>,
+}
+
+impl AttentionHeadRowBuffer {
+    fn from_values(values: Vec<Vec<f32>>) -> Self {
+        Self { values, acts: None }
+    }
+
+    fn from_acts(acts: Vec<Vec<Act>>) -> Self {
+        let values = acts
+            .iter()
+            .map(|row| row.iter().copied().map(act_to_f32).collect())
+            .collect();
+        Self {
+            values,
+            acts: Some(acts),
+        }
+    }
+
+    fn row(&self, head_idx: usize) -> ActivationRowBuffer {
+        let values = self.values[head_idx].clone();
+        let acts = self.acts.as_ref().map(|heads| heads[head_idx].clone());
+        ActivationRowBuffer { values, acts }
     }
 }
 
@@ -1895,6 +2031,26 @@ fn row_buffer_acts(buffer: &ActivationRowBuffer) -> Vec<Act> {
         .acts
         .clone()
         .unwrap_or_else(|| quantize_row_to_acts(&buffer.values))
+}
+
+fn head_sequence_buffer_acts(buffer: &AttentionHeadSequenceBuffer) -> Vec<Vec<Vec<Act>>> {
+    buffer.acts.clone().unwrap_or_else(|| {
+        buffer
+            .values
+            .iter()
+            .map(|head| quantize_sequence_to_acts(head))
+            .collect()
+    })
+}
+
+fn head_row_buffer_acts(buffer: &AttentionHeadRowBuffer) -> Vec<Vec<Act>> {
+    buffer.acts.clone().unwrap_or_else(|| {
+        buffer
+            .values
+            .iter()
+            .map(|row| quantize_row_to_acts(row))
+            .collect()
+    })
 }
 
 fn add_sequence_buffers(
@@ -2320,71 +2476,196 @@ fn reshape_row_heads(
     Ok(heads)
 }
 
+fn reshape_sequence_head_buffer(
+    projected: &ActivationSequenceBuffer,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<AttentionHeadSequenceBuffer> {
+    let values = reshape_sequence_heads(&projected.values, num_heads, head_dim)?;
+    let Some(acts) = &projected.acts else {
+        return Ok(AttentionHeadSequenceBuffer::from_values(values));
+    };
+
+    let expected_width = num_heads * head_dim;
+    if let Some((row_idx, row)) = acts
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.len() != expected_width)
+    {
+        bail!(
+            "projected attention state acts row {row_idx} has width {}, expected {expected_width}",
+            row.len()
+        );
+    }
+
+    let mut head_acts = vec![vec![vec![Act::from_bits(0); head_dim]; acts.len()]; num_heads];
+    for (seq_idx, row) in acts.iter().enumerate() {
+        for (head_idx, head) in head_acts.iter_mut().enumerate() {
+            let start = head_idx * head_dim;
+            let end = start + head_dim;
+            head[seq_idx].copy_from_slice(&row[start..end]);
+        }
+    }
+    Ok(AttentionHeadSequenceBuffer {
+        values,
+        acts: Some(head_acts),
+    })
+}
+
+fn reshape_row_head_buffer(
+    projected: &ActivationRowBuffer,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<AttentionHeadRowBuffer> {
+    let values = reshape_row_heads(&projected.values, num_heads, head_dim)?;
+    let Some(acts) = &projected.acts else {
+        return Ok(AttentionHeadRowBuffer::from_values(values));
+    };
+
+    let expected_width = num_heads * head_dim;
+    if acts.len() != expected_width {
+        bail!(
+            "projected attention state acts width mismatch: {} vs {expected_width}",
+            acts.len()
+        );
+    }
+
+    let mut head_acts = vec![vec![Act::from_bits(0); head_dim]; num_heads];
+    for (head_idx, head) in head_acts.iter_mut().enumerate() {
+        let start = head_idx * head_dim;
+        let end = start + head_dim;
+        head.copy_from_slice(&acts[start..end]);
+    }
+    Ok(AttentionHeadRowBuffer {
+        values,
+        acts: Some(head_acts),
+    })
+}
+
 fn apply_head_rms_norm(
-    heads: &mut [Vec<Vec<f32>>],
+    heads: &mut AttentionHeadSequenceBuffer,
     weight: &[f32],
     eps: f32,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
-    heads.par_iter_mut().try_for_each(|head| -> Result<()> {
-        for row in head {
-            *row = apply_rms_norm(row, weight, eps, execution_mode)?;
+    match execution_mode {
+        InferenceExecutionMode::Fp32 => {
+            heads
+                .values
+                .par_iter_mut()
+                .try_for_each(|head| -> Result<()> {
+                    for row in head {
+                        *row = apply_rms_norm(row, weight, eps, execution_mode)?;
+                    }
+                    Ok(())
+                })?;
+            heads.acts = None;
         }
-        Ok(())
-    })?;
+        InferenceExecutionMode::Deterministic => {
+            let acts = head_sequence_buffer_acts(heads)
+                .into_par_iter()
+                .map(|head| {
+                    head.into_iter()
+                        .map(|row| {
+                            apply_rms_norm_row_buffer(
+                                &ActivationRowBuffer::from_acts(row),
+                                weight,
+                                eps,
+                                execution_mode,
+                            )
+                            .map(|row| row.acts.expect("deterministic head RMSNorm row"))
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            *heads = AttentionHeadSequenceBuffer::from_acts(acts);
+        }
+    }
     Ok(())
 }
 
 fn apply_head_rms_norm_row(
-    heads: &mut [Vec<f32>],
+    heads: &mut AttentionHeadRowBuffer,
     weight: &[f32],
     eps: f32,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
-    for head in heads {
-        *head = apply_rms_norm(head, weight, eps, execution_mode)?;
+    match execution_mode {
+        InferenceExecutionMode::Fp32 => {
+            for head in &mut heads.values {
+                *head = apply_rms_norm(head, weight, eps, execution_mode)?;
+            }
+            heads.acts = None;
+        }
+        InferenceExecutionMode::Deterministic => {
+            let acts = head_row_buffer_acts(heads)
+                .into_iter()
+                .map(|row| {
+                    apply_rms_norm_row_buffer(
+                        &ActivationRowBuffer::from_acts(row),
+                        weight,
+                        eps,
+                        execution_mode,
+                    )
+                    .map(|row| row.acts.expect("deterministic head RMSNorm row"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            *heads = AttentionHeadRowBuffer::from_acts(acts);
+        }
     }
     Ok(())
 }
 
 fn apply_value_rms_norm(
-    heads: &mut [Vec<Vec<f32>>],
+    heads: &mut AttentionHeadSequenceBuffer,
     eps: f32,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
-    heads.par_iter_mut().try_for_each(|head| -> Result<()> {
-        for row in head {
-            match execution_mode {
-                InferenceExecutionMode::Fp32 => {
-                    let mean_square =
-                        row.iter().map(|value| value * value).sum::<f32>() / row.len() as f32;
-                    let scale = (mean_square + eps).sqrt().recip();
-                    for value in row {
-                        *value *= scale;
+    match execution_mode {
+        InferenceExecutionMode::Fp32 => {
+            heads
+                .values
+                .par_iter_mut()
+                .try_for_each(|head| -> Result<()> {
+                    for row in head {
+                        let mean_square =
+                            row.iter().map(|value| value * value).sum::<f32>() / row.len() as f32;
+                        let scale = (mean_square + eps).sqrt().recip();
+                        for value in row {
+                            *value *= scale;
+                        }
                     }
-                }
-                InferenceExecutionMode::Deterministic => {
-                    let quantized = row.iter().copied().map(f32_to_act).collect::<Vec<_>>();
-                    *row = det_value_rms_norm(&quantized, f32_to_acc(eps))
-                        .into_iter()
-                        .map(act_to_f32)
-                        .collect();
-                }
-            }
+                    Ok(())
+                })?;
+            heads.acts = None;
         }
-        Ok(())
-    })?;
+        InferenceExecutionMode::Deterministic => {
+            let acts = head_sequence_buffer_acts(heads)
+                .into_par_iter()
+                .map(|head| {
+                    head.into_iter()
+                        .map(|row| det_value_rms_norm(&row, f32_to_acc(eps)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            *heads = AttentionHeadSequenceBuffer::from_acts(acts);
+        }
+    }
     Ok(())
 }
 
 fn apply_value_rms_norm_row(
-    heads: &mut [Vec<f32>],
+    heads: &mut AttentionHeadRowBuffer,
     eps: f32,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
-    for head in heads {
-        match execution_mode {
-            InferenceExecutionMode::Fp32 => {
+    match execution_mode {
+        InferenceExecutionMode::Fp32 => {
+            for head in &mut heads.values {
                 let mean_square =
                     head.iter().map(|value| value * value).sum::<f32>() / head.len() as f32;
                 let scale = (mean_square + eps).sqrt().recip();
@@ -2392,20 +2673,21 @@ fn apply_value_rms_norm_row(
                     *value *= scale;
                 }
             }
-            InferenceExecutionMode::Deterministic => {
-                let quantized = head.iter().copied().map(f32_to_act).collect::<Vec<_>>();
-                *head = det_value_rms_norm(&quantized, f32_to_acc(eps))
-                    .into_iter()
-                    .map(act_to_f32)
-                    .collect();
-            }
+            heads.acts = None;
+        }
+        InferenceExecutionMode::Deterministic => {
+            let acts = head_row_buffer_acts(heads)
+                .into_iter()
+                .map(|row| det_value_rms_norm(&row, f32_to_acc(eps)))
+                .collect();
+            *heads = AttentionHeadRowBuffer::from_acts(acts);
         }
     }
     Ok(())
 }
 
 fn apply_rope(
-    heads: &mut [Vec<Vec<f32>>],
+    heads: &mut AttentionHeadSequenceBuffer,
     rotary_dim: usize,
     freq_base_dim: usize,
     base: f32,
@@ -2415,7 +2697,7 @@ fn apply_rope(
 }
 
 fn apply_rope_with_offset(
-    heads: &mut [Vec<Vec<f32>>],
+    heads: &mut AttentionHeadSequenceBuffer,
     rotary_dim: usize,
     freq_base_dim: usize,
     base: f32,
@@ -2429,7 +2711,7 @@ fn apply_rope_with_offset(
     match execution_mode {
         InferenceExecutionMode::Fp32 => {
             let half_dim = rotary_dim / 2;
-            for head in heads {
+            for head in &mut heads.values {
                 for (position, row) in head.iter_mut().enumerate() {
                     let original = row.clone();
                     for dim_idx in 0..half_dim {
@@ -2445,30 +2727,34 @@ fn apply_rope_with_offset(
                     }
                 }
             }
+            heads.acts = None;
         }
         InferenceExecutionMode::Deterministic => {
             let quantized_base = f32_to_acc(base);
-            for head in heads {
-                for (position, row) in head.iter_mut().enumerate() {
-                    let quantized = row.iter().copied().map(f32_to_act).collect::<Vec<_>>();
-                    *row = det_rope_rotate_pairs(
-                        &quantized,
-                        rotary_dim,
-                        freq_base_dim,
-                        quantized_base,
-                        position_offset + position,
-                    )
-                    .into_iter()
-                    .map(act_to_f32)
-                    .collect();
-                }
-            }
+            let acts = head_sequence_buffer_acts(heads)
+                .into_iter()
+                .map(|head| {
+                    head.into_iter()
+                        .enumerate()
+                        .map(|(position, row)| {
+                            det_rope_rotate_pairs(
+                                &row,
+                                rotary_dim,
+                                freq_base_dim,
+                                quantized_base,
+                                position_offset + position,
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            *heads = AttentionHeadSequenceBuffer::from_acts(acts);
         }
     }
 }
 
 fn apply_rope_to_rows(
-    heads: &mut [Vec<f32>],
+    heads: &mut AttentionHeadRowBuffer,
     rotary_dim: usize,
     freq_base_dim: usize,
     base: f32,
@@ -2482,7 +2768,7 @@ fn apply_rope_to_rows(
     match execution_mode {
         InferenceExecutionMode::Fp32 => {
             let half_dim = rotary_dim / 2;
-            for row in heads {
+            for row in &mut heads.values {
                 let original = row.clone();
                 for dim_idx in 0..half_dim {
                     let angle =
@@ -2495,22 +2781,17 @@ fn apply_rope_to_rows(
                     row[dim_idx + half_dim] = rhs * cos + lhs * sin;
                 }
             }
+            heads.acts = None;
         }
         InferenceExecutionMode::Deterministic => {
             let quantized_base = f32_to_acc(base);
-            for row in heads {
-                let quantized = row.iter().copied().map(f32_to_act).collect::<Vec<_>>();
-                *row = det_rope_rotate_pairs(
-                    &quantized,
-                    rotary_dim,
-                    freq_base_dim,
-                    quantized_base,
-                    position,
-                )
+            let acts = head_row_buffer_acts(heads)
                 .into_iter()
-                .map(act_to_f32)
+                .map(|row| {
+                    det_rope_rotate_pairs(&row, rotary_dim, freq_base_dim, quantized_base, position)
+                })
                 .collect();
-            }
+            *heads = AttentionHeadRowBuffer::from_acts(acts);
         }
     }
 }
@@ -2533,30 +2814,30 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 }
 
 fn attention_output(
-    query: &[f32],
+    query: &ActivationRowBuffer,
     key_rows: &[Vec<f32>],
     det_key_rows: Option<&[Vec<Act>]>,
     value_rows: &[Vec<f32>],
     det_value_rows: Option<&[Vec<Act>]>,
     execution_mode: InferenceExecutionMode,
-) -> Vec<f32> {
+) -> ActivationRowBuffer {
     match execution_mode {
         InferenceExecutionMode::Fp32 => {
             let logits = key_rows
                 .iter()
-                .map(|key_row| dot(query, key_row))
+                .map(|key_row| dot(&query.values, key_row))
                 .collect::<Vec<_>>();
             let weights = softmax(&logits);
-            let mut output = vec![0.0; query.len()];
+            let mut output = vec![0.0; query.values.len()];
             for (weight, value_row) in weights.iter().zip(value_rows) {
                 for (dim_idx, value) in output.iter_mut().enumerate() {
                     *value += *weight * value_row[dim_idx];
                 }
             }
-            output
+            ActivationRowBuffer::from_values(output)
         }
         InferenceExecutionMode::Deterministic => {
-            let quantized_query = quantize_row_to_acts(query);
+            let quantized_query = row_buffer_acts(query);
             let quantized_keys = det_key_rows
                 .map(|rows| rows.to_vec())
                 .unwrap_or_else(|| quantize_sequence_to_acts(key_rows));
@@ -2568,51 +2849,42 @@ fn attention_output(
             let quantized_values = det_value_rows
                 .map(|rows| rows.to_vec())
                 .unwrap_or_else(|| quantize_sequence_to_acts(value_rows));
-            det_attention_weighted_sum(&weights, &quantized_values)
-                .into_iter()
-                .map(act_to_f32)
-                .collect()
+            ActivationRowBuffer::from_acts(det_attention_weighted_sum(&weights, &quantized_values))
         }
     }
 }
 
 fn build_layer_kv_cache(
-    keys: &[Vec<Vec<f32>>],
-    values: &[Vec<Vec<f32>>],
+    keys: &AttentionHeadSequenceBuffer,
+    values: &AttentionHeadSequenceBuffer,
     sliding_window: Option<usize>,
     execution_mode: InferenceExecutionMode,
 ) -> LayerKvCache {
     let retained = sliding_window.map_or(0, |window| {
-        keys.first()
+        keys.values
+            .first()
             .map_or(0, |head| head.len().saturating_sub(window))
     });
     match execution_mode {
         InferenceExecutionMode::Fp32 => LayerKvCache::from_f32_heads(
-            keys.iter()
+            keys.values
+                .iter()
                 .map(|head| head[retained..].iter().cloned().collect())
                 .collect(),
             values
+                .values
                 .iter()
                 .map(|head| head[retained..].iter().cloned().collect())
                 .collect(),
         ),
         InferenceExecutionMode::Deterministic => LayerKvCache::from_det_heads(
-            keys.iter()
-                .map(|head| {
-                    head[retained..]
-                        .iter()
-                        .map(|row| quantize_row_to_acts(row))
-                        .collect()
-                })
+            head_sequence_buffer_acts(keys)
+                .into_iter()
+                .map(|head| head[retained..].iter().cloned().collect())
                 .collect(),
-            values
-                .iter()
-                .map(|head| {
-                    head[retained..]
-                        .iter()
-                        .map(|row| quantize_row_to_acts(row))
-                        .collect()
-                })
+            head_sequence_buffer_acts(values)
+                .into_iter()
+                .map(|head| head[retained..].iter().cloned().collect())
                 .collect(),
         ),
     }
@@ -2634,18 +2906,34 @@ pub fn append_kv_cache(
 }
 
 fn append_kv_cache_with_mode(
-    mut cache: LayerKvCache,
+    cache: LayerKvCache,
     new_keys: &[Vec<f32>],
     new_values: &[Vec<f32>],
     sliding_window: Option<usize>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<LayerKvCache> {
-    if new_keys.len() != cache.keys.len() || new_values.len() != cache.values.len() {
+    append_kv_cache_head_buffer_with_mode(
+        cache,
+        &AttentionHeadRowBuffer::from_values(new_keys.to_vec()),
+        &AttentionHeadRowBuffer::from_values(new_values.to_vec()),
+        sliding_window,
+        execution_mode,
+    )
+}
+
+fn append_kv_cache_head_buffer_with_mode(
+    mut cache: LayerKvCache,
+    new_keys: &AttentionHeadRowBuffer,
+    new_values: &AttentionHeadRowBuffer,
+    sliding_window: Option<usize>,
+    execution_mode: InferenceExecutionMode,
+) -> Result<LayerKvCache> {
+    if new_keys.values.len() != cache.keys.len() || new_values.values.len() != cache.values.len() {
         bail!(
             "layer cache append head count mismatch: cache {} keys {} values {}",
             cache.keys.len(),
-            new_keys.len(),
-            new_values.len()
+            new_keys.values.len(),
+            new_values.values.len()
         );
     }
 
@@ -2676,14 +2964,24 @@ fn append_kv_cache_with_mode(
         .keys
         .iter_mut()
         .zip(cache.values.iter_mut())
-        .zip(new_keys.iter().zip(new_values))
+        .zip(new_keys.values.iter().zip(&new_values.values))
         .enumerate()
     {
         head_keys.push_back(new_key.clone());
         head_values.push_back(new_value.clone());
         if let (Some(det_keys), Some(det_values)) = (&mut det_keys, &mut det_values) {
-            det_keys[head_idx].push_back(quantize_row_to_acts(new_key));
-            det_values[head_idx].push_back(quantize_row_to_acts(new_value));
+            let new_key_acts = new_keys
+                .acts
+                .as_ref()
+                .map(|heads| heads[head_idx].clone())
+                .unwrap_or_else(|| quantize_row_to_acts(new_key));
+            let new_value_acts = new_values
+                .acts
+                .as_ref()
+                .map(|heads| heads[head_idx].clone())
+                .unwrap_or_else(|| quantize_row_to_acts(new_value));
+            det_keys[head_idx].push_back(new_key_acts);
+            det_values[head_idx].push_back(new_value_acts);
         }
         if let Some(window) = sliding_window {
             while head_keys.len() > window {
@@ -2771,17 +3069,20 @@ mod tests {
     };
 
     use super::{
-        append_kv_cache, apply_final_logit_softcapping_with_mode, apply_final_norm,
-        apply_final_norm_with_mode, apply_gelu, apply_gelu_to_row_buffer, apply_head_rms_norm,
-        apply_head_rms_norm_row, apply_rms_norm_to_sequence, apply_rope_to_rows,
-        apply_value_rms_norm, apply_value_rms_norm_row, build_layer_kv_cache,
-        compute_decode_ple_input, compute_prefill_ple_inputs, det_linear_row,
-        det_linear_row_from_acts, det_linear_sequence, embed_input_tokens, extract_prefill_logits,
-        project_decode_hidden_to_logits, project_hidden_to_prefill_logits, project_to_logits,
+        append_kv_cache, append_kv_cache_head_buffer_with_mode,
+        apply_final_logit_softcapping_with_mode, apply_final_norm, apply_final_norm_with_mode,
+        apply_gelu, apply_gelu_to_row_buffer, apply_head_rms_norm, apply_head_rms_norm_row,
+        apply_rms_norm_to_sequence, apply_rope_to_rows, apply_value_rms_norm,
+        apply_value_rms_norm_row, build_layer_kv_cache, compute_decode_ple_input,
+        compute_prefill_ple_inputs, det_linear_row, det_linear_row_from_acts, det_linear_sequence,
+        embed_input_tokens, extract_prefill_logits, project_decode_hidden_to_logits,
+        project_hidden_to_prefill_logits, project_internal_hidden_to_prefill_logits,
+        project_to_logits, reshape_row_head_buffer, reshape_sequence_head_buffer,
         run_causal_attention, run_causal_attention_decode, run_gemma4_layer,
         run_gemma4_layer_decode, run_gemma4_layer_decode_with_mode_internal,
         run_gemma4_layer_with_cache_internal, run_text_layers_decode_step, run_text_layers_prefill,
-        run_text_layers_prefill_with_cache, ActivationRowBuffer,
+        run_text_layers_prefill_with_cache, select_final_position_internal, ActivationRowBuffer,
+        ActivationSequenceBuffer, AttentionHeadRowBuffer, AttentionHeadSequenceBuffer,
     };
     use crate::shared::det_num::{
         act_to_f32, attention_score, attention_softmax, attention_weighted_sum, f32_to_act,
@@ -2879,18 +3180,19 @@ mod tests {
 
     #[test]
     fn apply_rope_to_rows_uses_full_head_dim_for_frequency_base() {
-        let mut heads = vec![vec![0.0, 1.0, 0.0, 0.0, 9.0, 8.0, 7.0, 6.0]];
+        let mut heads =
+            AttentionHeadRowBuffer::from_values(vec![vec![0.0, 1.0, 0.0, 0.0, 9.0, 8.0, 7.0, 6.0]]);
 
         apply_rope_to_rows(&mut heads, 4, 8, 16.0, 1, InferenceExecutionMode::Fp32);
 
-        assert!((heads[0][1] - 0.87758255).abs() < 1e-6);
-        assert!((heads[0][3] - 0.47942555).abs() < 1e-6);
-        assert_eq!(heads[0][4..], [9.0, 8.0, 7.0, 6.0]);
+        assert!((heads.values[0][1] - 0.87758255).abs() < 1e-6);
+        assert!((heads.values[0][3] - 0.47942555).abs() < 1e-6);
+        assert_eq!(heads.values[0][4..], [9.0, 8.0, 7.0, 6.0]);
     }
 
     #[test]
     fn apply_rope_to_rows_uses_deterministic_rope_contract() {
-        let mut heads = vec![vec![1.0, 0.0, 0.5, -0.5]];
+        let mut heads = AttentionHeadRowBuffer::from_values(vec![vec![1.0, 0.0, 0.5, -0.5]]);
 
         apply_rope_to_rows(
             &mut heads,
@@ -2902,7 +3204,7 @@ mod tests {
         );
 
         assert_eq!(
-            heads[0],
+            heads.values[0],
             vec![
                 act_to_f32(Act::from_bits(7_835)),
                 act_to_f32(Act::from_bits(8_107)),
@@ -2910,6 +3212,88 @@ mod tests {
                 act_to_f32(Act::from_bits(-31_750)),
             ]
         );
+    }
+
+    #[test]
+    fn reshape_sequence_head_buffer_preserves_non_round_tripping_act_bits() {
+        let canonical = non_round_tripping_act();
+        let projected = ActivationSequenceBuffer::from_acts(vec![vec![
+            canonical,
+            Act::from_bits(2),
+            Act::from_bits(3),
+            Act::from_bits(4),
+        ]]);
+
+        let heads = reshape_sequence_head_buffer(&projected, 2, 2).unwrap();
+
+        assert_eq!(
+            heads.acts.expect("canonical heads"),
+            vec![
+                vec![vec![canonical, Act::from_bits(2)]],
+                vec![vec![Act::from_bits(3), Act::from_bits(4)]],
+            ]
+        );
+        assert_ne!(f32_to_act(heads.values[0][0][0]), canonical);
+    }
+
+    #[test]
+    fn reshape_sequence_head_buffer_preserves_f32_only_behavior() {
+        let projected = ActivationSequenceBuffer::from_values(vec![vec![1.0, 2.0, 3.0, 4.0]]);
+
+        let heads = reshape_sequence_head_buffer(&projected, 2, 2).unwrap();
+
+        assert_eq!(
+            heads.values,
+            vec![vec![vec![1.0, 2.0]], vec![vec![3.0, 4.0]]]
+        );
+        assert!(heads.acts.is_none());
+    }
+
+    #[test]
+    fn reshape_sequence_head_buffer_preserves_width_errors() {
+        let projected = ActivationSequenceBuffer::from_values(vec![vec![1.0, 2.0, 3.0]]);
+
+        let error = reshape_sequence_head_buffer(&projected, 2, 2).expect_err("width mismatch");
+
+        assert!(error.to_string().contains("projected attention states"));
+    }
+
+    #[test]
+    fn reshape_row_head_buffer_preserves_non_round_tripping_act_bits() {
+        let canonical = non_round_tripping_act();
+        let projected = ActivationRowBuffer::from_acts(vec![
+            canonical,
+            Act::from_bits(2),
+            Act::from_bits(3),
+            Act::from_bits(4),
+        ]);
+
+        let heads = reshape_row_head_buffer(&projected, 2, 2).unwrap();
+
+        assert_eq!(
+            heads.acts.expect("canonical heads"),
+            vec![
+                vec![canonical, Act::from_bits(2)],
+                vec![Act::from_bits(3), Act::from_bits(4)],
+            ]
+        );
+        assert_ne!(f32_to_act(heads.values[0][0]), canonical);
+    }
+
+    #[test]
+    fn attention_output_preserves_canonical_value_bits() {
+        let canonical = non_round_tripping_act();
+        let output = super::attention_output(
+            &ActivationRowBuffer::from_acts(vec![Act::from_bits(0)]),
+            &[vec![0.0]],
+            Some(&[vec![Act::from_bits(0)]]),
+            &[vec![act_to_f32(canonical)]],
+            Some(&[vec![canonical]]),
+            InferenceExecutionMode::Deterministic,
+        );
+
+        assert_eq!(output.acts, Some(vec![canonical]));
+        assert_ne!(f32_to_act(output.values[0]), canonical);
     }
 
     #[test]
@@ -3852,9 +4236,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut q_rows = vec![vec![vec![0.0, 0.0], vec![1.0, 0.0]]];
-        let mut k_rows = vec![vec![vec![0.0, 0.0], vec![-0.693_147_2, 0.0]]];
-        let mut v_rows = vec![vec![vec![1.0, 0.0], vec![0.0, 1.0]]];
+        let mut q_rows =
+            AttentionHeadSequenceBuffer::from_values(vec![vec![vec![0.0, 0.0], vec![1.0, 0.0]]]);
+        let mut k_rows = AttentionHeadSequenceBuffer::from_values(vec![vec![
+            vec![0.0, 0.0],
+            vec![-0.693_147_2, 0.0],
+        ]]);
+        let mut v_rows =
+            AttentionHeadSequenceBuffer::from_values(vec![vec![vec![1.0, 0.0], vec![0.0, 1.0]]]);
         apply_head_rms_norm(
             &mut q_rows,
             &resolved.q_norm_weight,
@@ -3875,7 +4264,11 @@ mod tests {
             InferenceExecutionMode::Deterministic,
         )
         .unwrap();
-        let expected = expected_det_attention_output(&q_rows[0][1], &k_rows[0], &v_rows[0]);
+        let expected = expected_det_attention_output(
+            &q_rows.values[0][1],
+            &k_rows.values[0],
+            &v_rows.values[0],
+        );
         assert_eq!(det.0[1], expected);
         assert_ne!(det.0[1], fp32.0[1]);
     }
@@ -3926,9 +4319,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut q_rows = vec![vec![1.0, 0.0]];
-        let mut k_rows = vec![vec![-0.693_147_2, 0.0]];
-        let mut v_rows = vec![vec![0.0, 1.0]];
+        let mut q_rows = AttentionHeadRowBuffer::from_values(vec![vec![1.0, 0.0]]);
+        let mut k_rows = AttentionHeadRowBuffer::from_values(vec![vec![-0.693_147_2, 0.0]]);
+        let mut v_rows = AttentionHeadRowBuffer::from_values(vec![vec![0.0, 1.0]]);
         apply_head_rms_norm_row(
             &mut q_rows,
             &resolved.q_norm_weight,
@@ -3950,9 +4343,9 @@ mod tests {
         )
         .unwrap();
         let expected = expected_det_attention_output(
-            &q_rows[0],
-            &[vec![0.0, 0.0], k_rows[0].clone()],
-            &[vec![1.0, 0.0], v_rows[0].clone()],
+            &q_rows.values[0],
+            &[vec![0.0, 0.0], k_rows.values[0].clone()],
+            &[vec![1.0, 0.0], v_rows.values[0].clone()],
         );
         assert_eq!(det.0, expected);
         assert_ne!(det.0, fp32.0);
@@ -4011,6 +4404,46 @@ mod tests {
 
         assert_eq!(without_det, vec![0.0, 0.0]);
         assert_eq!(with_det, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn select_final_position_internal_preserves_det_values() {
+        let input = InternalActivationSequence::from_det_values(vec![
+            vec![Act::from_num(0.25), Act::from_num(0.5)],
+            vec![Act::from_num(1.0), Act::from_num(-0.5)],
+        ]);
+
+        let selected = select_final_position_internal(&input).unwrap();
+
+        assert_eq!(
+            selected.as_f32_slice(),
+            &[
+                act_to_f32(Act::from_num(1.0)),
+                act_to_f32(Act::from_num(-0.5))
+            ]
+        );
+        assert_eq!(
+            selected.det_values().unwrap(),
+            &[Act::from_num(1.0), Act::from_num(-0.5)]
+        );
+    }
+
+    #[test]
+    fn select_final_position_internal_preserves_f32_only_rows() {
+        let input = InternalActivationSequence::from_values(vec![vec![0.25, 0.5], vec![1.0, -0.5]]);
+
+        let selected = select_final_position_internal(&input).unwrap();
+
+        assert_eq!(selected.as_f32_slice(), &[1.0, -0.5]);
+        assert!(selected.det_values().is_none());
+    }
+
+    #[test]
+    fn select_final_position_internal_rejects_empty_sequences() {
+        let error = select_final_position_internal(&InternalActivationSequence::default())
+            .expect_err("empty sequence should fail");
+
+        assert!(error.to_string().contains("at least one activation row"));
     }
 
     #[test]
@@ -4123,6 +4556,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(logits.logits, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn project_internal_hidden_to_prefill_logits_uses_preserved_det_row() {
+        let projection = Gemma4LogitsProjection::UntiedLmHead {
+            weight: zero_matrix(2, 2),
+            det_weight: Some(det_matrix(2, 2, &[1.0, 0.0, 0.0, 1.0])),
+        };
+        let internal = project_internal_hidden_to_prefill_logits(
+            InternalActivationRow::from_det_values(vec![Act::from_num(1.0), Act::from_num(0.0)]),
+            &[1.0, 1.0],
+            0.0,
+            &projection,
+            None,
+            InferenceExecutionMode::Deterministic,
+            None,
+        )
+        .unwrap();
+        let public_f32 = project_hidden_to_prefill_logits(
+            &[0.0, 1.0],
+            &[1.0, 1.0],
+            0.0,
+            &projection,
+            None,
+            InferenceExecutionMode::Deterministic,
+            None,
+        )
+        .unwrap();
+
+        assert_ne!(internal.logits, public_f32.logits);
+        assert_eq!(internal.logits[1], 0.0);
+        assert_eq!(public_f32.logits[0], 0.0);
+        assert!(internal.clone_internal().det_values().is_some());
     }
 
     #[test]
@@ -4404,7 +4870,7 @@ mod tests {
 
     #[test]
     fn apply_head_and_value_norms_use_det_num_contract_in_deterministic_mode() {
-        let mut head_normed = vec![vec![vec![1.0, 0.0]]];
+        let mut head_normed = AttentionHeadSequenceBuffer::from_values(vec![vec![vec![1.0, 0.0]]]);
         apply_head_rms_norm(
             &mut head_normed,
             &[1.0, 1.0],
@@ -4413,11 +4879,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            head_normed,
+            head_normed.values,
             vec![vec![vec![act_to_f32(Act::from_bits(92_682)), 0.0]]]
         );
 
-        let mut value_normed = vec![vec![vec![1.0, 0.0]]];
+        let mut value_normed = AttentionHeadSequenceBuffer::from_values(vec![vec![vec![1.0, 0.0]]]);
         apply_value_rms_norm(
             &mut value_normed,
             0.0,
@@ -4425,7 +4891,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            value_normed,
+            value_normed.values,
             vec![vec![vec![act_to_f32(Act::from_bits(92_682)), 0.0]]]
         );
     }
@@ -4537,8 +5003,16 @@ mod tests {
     #[test]
     fn deterministic_layer_kv_cache_stores_canonical_rows_with_f32_view() {
         let cache = build_layer_kv_cache(
-            &[vec![vec![1.25], vec![2.5], vec![3.75]]],
-            &[vec![vec![10.0], vec![20.0], vec![30.0]]],
+            &AttentionHeadSequenceBuffer::from_values(vec![vec![
+                vec![1.25],
+                vec![2.5],
+                vec![3.75],
+            ]]),
+            &AttentionHeadSequenceBuffer::from_values(vec![vec![
+                vec![10.0],
+                vec![20.0],
+                vec![30.0],
+            ]]),
             Some(2),
             InferenceExecutionMode::Deterministic,
         );
@@ -4556,6 +5030,25 @@ mod tests {
             cache.det_value_rows_from(0, 1).expect("canonical values"),
             vec![vec![f32_to_act(30.0)]]
         );
+    }
+
+    #[test]
+    fn deterministic_layer_kv_cache_uses_preserved_canonical_rows() {
+        let key = non_round_tripping_act();
+        let value = Act::from_bits((1 << 24) + 3);
+        assert_ne!(f32_to_act(act_to_f32(value)), value);
+
+        let cache = build_layer_kv_cache(
+            &AttentionHeadSequenceBuffer::from_acts(vec![vec![vec![key]]]),
+            &AttentionHeadSequenceBuffer::from_acts(vec![vec![vec![value]]]),
+            None,
+            InferenceExecutionMode::Deterministic,
+        );
+
+        assert_eq!(cache.det_key_rows_from(0, 0), Some(vec![vec![key]]));
+        assert_eq!(cache.det_value_rows_from(0, 0), Some(vec![vec![value]]));
+        assert_ne!(f32_to_act(cache.keys[0][0][0]), key);
+        assert_ne!(f32_to_act(cache.values[0][0][0]), value);
     }
 
     #[test]
@@ -4582,6 +5075,25 @@ mod tests {
             updated.keys[0].iter().cloned().collect::<Vec<_>>(),
             vec![vec![act_to_f32(Act::from_bits(7))], vec![1.0]]
         );
+    }
+
+    #[test]
+    fn deterministic_kv_append_uses_preserved_new_canonical_rows() {
+        let key = non_round_tripping_act();
+        let value = Act::from_bits((1 << 24) + 5);
+        assert_ne!(f32_to_act(act_to_f32(value)), value);
+
+        let updated = append_kv_cache_head_buffer_with_mode(
+            LayerKvCache::new(1),
+            &AttentionHeadRowBuffer::from_acts(vec![vec![key]]),
+            &AttentionHeadRowBuffer::from_acts(vec![vec![value]]),
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("append deterministic kv");
+
+        assert_eq!(updated.det_key_rows_from(0, 0), Some(vec![vec![key]]));
+        assert_eq!(updated.det_value_rows_from(0, 0), Some(vec![vec![value]]));
     }
 
     #[test]
@@ -4926,6 +5438,12 @@ mod tests {
                 .map(|value| Act::from_num(value).to_bits())
                 .collect(),
         })
+    }
+
+    fn non_round_tripping_act() -> Act {
+        let act = Act::from_bits((1 << 24) + 1);
+        assert_ne!(f32_to_act(act_to_f32(act)), act);
+        act
     }
 
     fn attention_test_layer(
