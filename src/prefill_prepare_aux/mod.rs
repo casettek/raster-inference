@@ -16,9 +16,9 @@ pub fn run(
         .ple_global
         .as_ref()
         .map(|ple_global| {
-            crate::shared::transformer_kernels::compute_prefill_ple_inputs(
+            crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
                 prompt_token_ids,
-                &token_embeddings.activations,
+                token_embeddings.clone_internal(),
                 &model.layers,
                 ple_global,
                 model.rms_norm_eps,

@@ -13,7 +13,7 @@ use sha2::Digest;
 use tokenizers::Tokenizer;
 
 use crate::shared::det_num::{
-    act_to_f32, f32_to_act, scale_act, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
+    f32_to_act, scale_act, Act, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
     DET_WGT_ARTIFACT_MAGIC,
 };
 use crate::shared::input::InferenceExecutionMode;
@@ -21,7 +21,8 @@ use crate::shared::transformer::{
     ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
     Gemma4PleLayerWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
-    GemmaEmbeddingTensorSource, GemmaTensorSliceSource, MatrixF32, ResolvedGemma4LayerWeights,
+    GemmaEmbeddingTensorSource, GemmaTensorSliceSource, InternalActivationRow,
+    InternalActivationSequence, MatrixF32, ResolvedGemma4LayerWeights,
     ResolvedGemma4PleLayerWeights,
 };
 // use crate::trace::{trace_event, trace_scope};
@@ -1104,42 +1105,53 @@ fn load_det_num_ple_global_weights(
     )))
 }
 
-pub(crate) fn load_ple_token_embedding_row(
+pub(crate) fn load_ple_token_embedding_row_internal(
     ple_global: &Gemma4PleGlobalWeights,
     layer_idx: usize,
     token_id: u32,
-) -> Result<Vec<f32>> {
+) -> Result<InternalActivationRow> {
     let row_idx = usize::try_from(token_id).expect("u32 should fit into usize");
     let cache_key = (layer_idx, row_idx);
-    if let Some(cached_row) = ple_global
-        .token_row_cache
-        .lock()
-        .map_err(|_| anyhow!("PLE token row cache is poisoned"))?
-        .get(&cache_key)
-        .cloned()
-    {
-        return Ok(cached_row);
-    }
-
     let source = ple_global.token_embeddings.get(layer_idx).ok_or_else(|| {
         anyhow!("transformer PLE token embedding slice count mismatch at layer {layer_idx}")
     })?;
+    if !matches!(source, Gemma4PleMatrixSource::DetNumLazy(_)) {
+        if let Some(cached_row) = ple_global
+            .token_row_cache
+            .lock()
+            .map_err(|_| anyhow!("PLE token row cache is poisoned"))?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(InternalActivationRow::from_values(cached_row));
+        }
+    }
     let row = match source {
-        Gemma4PleMatrixSource::Materialized(matrix) => matrix_row(matrix, row_idx)?,
+        Gemma4PleMatrixSource::Materialized(matrix) => {
+            InternalActivationRow::from_values(matrix_row(matrix, row_idx)?)
+        }
         Gemma4PleMatrixSource::Lazy(source) => {
             let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
-            decode_matrix_row_from_source(source, row_idx, mmap.as_ref())?
+            InternalActivationRow::from_values(decode_matrix_row_from_source(
+                source,
+                row_idx,
+                mmap.as_ref(),
+            )?)
         }
         Gemma4PleMatrixSource::DetNumLazy(source) => {
             let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
-            decode_matrix_row_from_det_num_source(source, row_idx, mmap.as_ref())?
+            InternalActivationRow::from_det_values(decode_matrix_row_acts_from_det_num_source(
+                source,
+                row_idx,
+                mmap.as_ref(),
+            )?)
         }
     };
     ple_global
         .token_row_cache
         .lock()
         .map_err(|_| anyhow!("PLE token row cache is poisoned"))?
-        .insert(cache_key, row.clone());
+        .insert(cache_key, row.clone_f32());
     Ok(row)
 }
 
@@ -1479,11 +1491,11 @@ fn decode_matrix_slice_from_source(
     })
 }
 
-fn decode_matrix_row_from_det_num_source(
+fn decode_matrix_row_acts_from_det_num_source(
     source: &DetNumTensorSliceSource,
     row_idx: usize,
     mmap: &Mmap,
-) -> Result<Vec<f32>> {
+) -> Result<Vec<Act>> {
     if row_idx >= source.row_count {
         bail!(
             "matrix row {row_idx} is out of bounds for slice with {} rows",
@@ -1508,7 +1520,7 @@ fn decode_matrix_row_from_det_num_source(
         .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
     let mut row = Vec::with_capacity(source.col_count);
     for encoded_value in encoded_row.chunks_exact(4) {
-        row.push(det_wgt_to_f32(i32::from_le_bytes(
+        row.push(Act::from_bits(i32::from_le_bytes(
             encoded_value
                 .try_into()
                 .expect("i32 byte width should match"),
@@ -1845,7 +1857,7 @@ pub fn embed_input_tokens_from_gemma_source_with_mode(
         bail!("transformer embedding requires at least one token id");
     }
 
-    let activations = match source {
+    let internal = match source {
         GemmaEmbeddingTensorSource::Deterministic { source, scale, .. } => {
             let file = File::open(&source.weights_path).with_context(|| {
                 format!(
@@ -1878,10 +1890,11 @@ pub fn embed_input_tokens_from_gemma_source_with_mode(
             )
         })?,
     };
+    let activations = internal.clone_f32();
     let activations_sha256 = build_activation_commitment(&activations);
 
-    Ok(ActivationSequence::from_values(
-        activations,
+    Ok(ActivationSequence::from_internal(
+        internal,
         activations_sha256,
     ))
 }
@@ -2159,7 +2172,7 @@ fn decode_embedding_rows_for_token_ids(
     hidden_size: usize,
     scale: f32,
     execution_mode: InferenceExecutionMode,
-) -> Result<Vec<Vec<f32>>> {
+) -> Result<InternalActivationSequence> {
     let shape = tensor.shape();
     if shape.len() != 2 {
         bail!("expected rank-2 embedding tensor, got shape {shape:?}");
@@ -2177,6 +2190,7 @@ fn decode_embedding_rows_for_token_ids(
         .ok_or_else(|| anyhow!("embedding row byte size overflowed"))?;
 
     let mut activations = Vec::with_capacity(token_ids.len());
+    let mut acts = Vec::with_capacity(token_ids.len());
     for token_id in token_ids {
         let row_idx = usize::try_from(*token_id).expect("u32 should fit into usize");
         if row_idx >= shape[0] {
@@ -2192,10 +2206,23 @@ fn decode_embedding_rows_for_token_ids(
             }
             row
         };
-        activations.push(apply_embedding_scale(row, scale, execution_mode));
+        match execution_mode {
+            InferenceExecutionMode::Fp32 => {
+                activations.push(row.into_iter().map(|value| value * scale).collect());
+            }
+            InferenceExecutionMode::Deterministic => {
+                acts.push(scale_act_row(
+                    row.into_iter().map(f32_to_act).collect(),
+                    scale,
+                ));
+            }
+        }
     }
 
-    Ok(activations)
+    Ok(match execution_mode {
+        InferenceExecutionMode::Fp32 => InternalActivationSequence::from_values(activations),
+        InferenceExecutionMode::Deterministic => InternalActivationSequence::from_det_values(acts),
+    })
 }
 
 fn decode_embedding_rows_for_token_ids_from_det_num(
@@ -2205,7 +2232,7 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
     scale: f32,
     mmap: &Mmap,
     execution_mode: InferenceExecutionMode,
-) -> Result<Vec<Vec<f32>>> {
+) -> Result<InternalActivationSequence> {
     if source.row_offset != 0
         || source.row_count != source.total_rows
         || source.col_offset != 0
@@ -2224,6 +2251,7 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
         .checked_mul(4)
         .ok_or_else(|| anyhow!("embedding row byte size overflowed"))?;
     let mut activations = Vec::with_capacity(token_ids.len());
+    let mut acts = Vec::with_capacity(token_ids.len());
     for token_id in token_ids {
         let row_idx = usize::try_from(*token_id).expect("u32 should fit into usize");
         if row_idx >= source.total_rows {
@@ -2239,33 +2267,43 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
         let encoded_row = mmap
             .get(start..end)
             .ok_or_else(|| anyhow!("embedding row byte range is out of bounds"))?;
-        let mut row = Vec::with_capacity(hidden_size);
-        for encoded_value in encoded_row.chunks_exact(4) {
-            row.push(det_wgt_to_f32(i32::from_le_bytes(
-                encoded_value
-                    .try_into()
-                    .expect("i32 byte width should match"),
-            )));
+        match execution_mode {
+            InferenceExecutionMode::Fp32 => {
+                let mut row = Vec::with_capacity(hidden_size);
+                for encoded_value in encoded_row.chunks_exact(4) {
+                    row.push(det_wgt_to_f32(i32::from_le_bytes(
+                        encoded_value
+                            .try_into()
+                            .expect("i32 byte width should match"),
+                    )));
+                }
+                activations.push(row.into_iter().map(|value| value * scale).collect());
+            }
+            InferenceExecutionMode::Deterministic => {
+                let mut row = Vec::with_capacity(hidden_size);
+                for encoded_value in encoded_row.chunks_exact(4) {
+                    row.push(Act::from_bits(i32::from_le_bytes(
+                        encoded_value
+                            .try_into()
+                            .expect("i32 byte width should match"),
+                    )));
+                }
+                acts.push(scale_act_row(row, scale));
+            }
         }
-        activations.push(apply_embedding_scale(row, scale, execution_mode));
     }
 
-    Ok(activations)
+    Ok(match execution_mode {
+        InferenceExecutionMode::Fp32 => InternalActivationSequence::from_values(activations),
+        InferenceExecutionMode::Deterministic => InternalActivationSequence::from_det_values(acts),
+    })
 }
 
-fn apply_embedding_scale(
-    row: Vec<f32>,
-    scale: f32,
-    execution_mode: InferenceExecutionMode,
-) -> Vec<f32> {
-    if execution_mode == InferenceExecutionMode::Deterministic {
-        let scale = f32_to_act(scale);
-        row.into_iter()
-            .map(|value| act_to_f32(scale_act(f32_to_act(value), scale)))
-            .collect()
-    } else {
-        row.into_iter().map(|value| value * scale).collect()
-    }
+fn scale_act_row(row: Vec<Act>, scale: f32) -> Vec<Act> {
+    let scale = f32_to_act(scale);
+    row.into_iter()
+        .map(|value| scale_act(value, scale))
+        .collect()
 }
 
 fn build_activation_commitment(activations: &[Vec<f32>]) -> String {
@@ -2445,17 +2483,18 @@ fn decode_scalar(bytes: &[u8], dtype: Dtype) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_embedding_rows_for_token_ids, decode_matrix_row_from_source, decode_matrix_slice,
-        decode_matrix_slice_from_source, decode_single_scalar, decode_vector,
-        load_ple_model_projection, load_ple_token_embedding_row,
-        load_transformer_state_model_from_det_num_wgt_path,
+        decode_embedding_rows_for_token_ids, decode_embedding_rows_for_token_ids_from_det_num,
+        decode_matrix_row_from_source, decode_matrix_slice, decode_matrix_slice_from_source,
+        decode_single_scalar, decode_vector, load_ple_model_projection,
+        load_ple_token_embedding_row_internal, load_transformer_state_model_from_det_num_wgt_path,
         load_transformer_state_model_from_gemma_model_path, parse_safetensors_metadata,
     };
     use crate::shared::det_num::{
-        f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-        DET_WGT_ARTIFACT_MAGIC,
+        f32_to_act, f32_to_wgt, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
+        DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
     };
     use crate::shared::input::InferenceExecutionMode;
+    use crate::shared::transformer::DetNumTensorSliceSource;
     use crate::{Gemma4AttentionKind, Gemma4LogitsProjection};
     use memmap2::Mmap;
     use safetensors::tensor::{serialize_to_file, TensorView};
@@ -2512,7 +2551,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rows, vec![vec![2.5, -3.0], vec![0.5, 1.0]]);
+        assert_eq!(rows.clone_f32(), vec![vec![2.5, -3.0], vec![0.5, 1.0]]);
     }
 
     #[test]
@@ -2537,8 +2576,41 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(det, vec![vec![0.0]]);
-        assert!(fp32[0][0] > det[0][0]);
+        assert_eq!(det.clone_f32(), vec![vec![0.0]]);
+        assert!(fp32.as_f32_slice()[0][0] > det.as_f32_slice()[0][0]);
+    }
+
+    #[test]
+    fn decode_det_num_embedding_rows_preserves_raw_act_bits() {
+        let model_dir = create_test_model_dir("det-embedding-raw-act");
+        let weights_path = model_dir.join("embedding.detwgt");
+        let canonical = Act::from_bits((1 << 24) + 1);
+        fs::write(&weights_path, canonical.to_bits().to_le_bytes()).unwrap();
+        let file = File::open(&weights_path).unwrap();
+        let mmap = unsafe { Mmap::map(&file) }.unwrap();
+        let source = DetNumTensorSliceSource {
+            weights_path,
+            total_rows: 1,
+            total_cols: 1,
+            data_offset: 0,
+            row_offset: 0,
+            row_count: 1,
+            col_offset: 0,
+            col_count: 1,
+        };
+
+        let decoded = decode_embedding_rows_for_token_ids_from_det_num(
+            &source,
+            &[0],
+            1,
+            1.0,
+            &mmap,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.det_values().unwrap()[0][0], canonical);
+        assert_ne!(f32_to_act(decoded.as_f32_slice()[0][0]), canonical);
     }
 
     #[test]
@@ -3317,7 +3389,9 @@ mod tests {
         assert_eq!(ple_global.projection_norm_weight, vec![1.0, 1.0]);
         assert_eq!(ple_global.embedding_scale, 2f32.sqrt());
         assert_eq!(
-            load_ple_token_embedding_row(ple_global, 0, 1).unwrap(),
+            load_ple_token_embedding_row_internal(ple_global, 0, 1)
+                .unwrap()
+                .clone_f32(),
             vec![0.3, 0.4]
         );
         let projection = load_ple_model_projection(ple_global, 0).unwrap();

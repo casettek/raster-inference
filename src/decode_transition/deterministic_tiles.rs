@@ -16,6 +16,22 @@ pub fn run_text_layers_decode_step(
     layer_caches: Vec<LayerKvCache>,
     position: usize,
 ) -> Result<ActivationSequenceWithCache> {
+    run_text_layers_decode_step_internal(
+        InternalActivationRow::from_values(input_activation.to_vec()),
+        token_id,
+        model,
+        layer_caches,
+        position,
+    )
+}
+
+pub(crate) fn run_text_layers_decode_step_internal(
+    input_activation: InternalActivationRow,
+    token_id: u32,
+    model: &Gemma4TransformerModel,
+    layer_caches: Vec<LayerKvCache>,
+    position: usize,
+) -> Result<ActivationSequenceWithCache> {
     if model.layers.is_empty() {
         bail!("transformer decode requires at least one layer");
     }
@@ -27,7 +43,9 @@ pub fn run_text_layers_decode_step(
         );
     }
 
-    let mut xs = InternalActivationRow::from_values(input_activation.to_vec());
+    let decode_input = input_activation;
+    let decode_input_values = decode_input.clone_f32();
+    let mut xs = decode_input.clone();
     let mut updated_layer_caches = Vec::with_capacity(model.layers.len());
     let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
@@ -40,22 +58,23 @@ pub fn run_text_layers_decode_step(
             layer.ple.is_some(),
             layer.kv_shared_layer_index
         ));
-        let per_layer_input = crate::shared::transformer_kernels::compute_decode_ple_input(
-            token_id,
-            input_activation,
-            layer_idx,
-            layer,
-            model.ple_global.as_ref(),
-            model.rms_norm_eps,
-            InferenceExecutionMode::Deterministic,
-        )?;
+        let per_layer_input =
+            crate::shared::transformer_kernels::compute_decode_ple_input_internal(
+                token_id,
+                decode_input.clone(),
+                layer_idx,
+                layer,
+                model.ple_global.as_ref(),
+                model.rms_norm_eps,
+                InferenceExecutionMode::Deterministic,
+            )?;
         let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, updated_cache) =
             crate::shared::transformer_kernels::run_gemma4_layer_decode_with_mode_internal(
                 xs,
                 &resolved_layer,
-                per_layer_input.as_deref(),
+                per_layer_input,
                 cache,
                 donor_cache,
                 position,
@@ -76,8 +95,8 @@ pub fn run_text_layers_decode_step(
                 "token_id": token_id,
                 "position": position,
                 "next_layer_idx": layer_idx + 1,
-                "decode_input_activation": input_activation,
-                "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(input_activation),
+                "decode_input_activation": decode_input_values.clone(),
+                "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&decode_input_values),
                 "current_activation": xs_values.clone(),
                 "current_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&xs_values),
                 "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),

@@ -508,6 +508,7 @@ pub struct ResolvedGemma4LayerWeights {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gemma4PrefillPleInputs {
     pub per_layer_inputs: Vec<Option<Vec<Vec<f32>>>>,
+    pub(crate) internal_per_layer_inputs: Vec<Option<InternalActivationSequence>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -596,6 +597,49 @@ impl InternalActivationSequence {
             .as_ref()
             .and_then(|rows| rows.last().cloned());
         Some(InternalActivationRow { values, det_values })
+    }
+}
+
+impl Gemma4PrefillPleInputs {
+    pub fn from_per_layer_inputs(per_layer_inputs: Vec<Option<Vec<Vec<f32>>>>) -> Self {
+        Self {
+            internal_per_layer_inputs: per_layer_inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .as_ref()
+                        .map(|rows| InternalActivationSequence::from_values(rows.clone()))
+                })
+                .collect(),
+            per_layer_inputs,
+        }
+    }
+
+    pub(crate) fn from_internal(
+        internal_per_layer_inputs: Vec<Option<InternalActivationSequence>>,
+    ) -> Self {
+        Self {
+            per_layer_inputs: internal_per_layer_inputs
+                .iter()
+                .map(|input| input.as_ref().map(InternalActivationSequence::clone_f32))
+                .collect(),
+            internal_per_layer_inputs,
+        }
+    }
+
+    pub(crate) fn clone_layer_internal(
+        &self,
+        layer_idx: usize,
+    ) -> Option<InternalActivationSequence> {
+        self.internal_per_layer_inputs
+            .get(layer_idx)
+            .and_then(Clone::clone)
+            .or_else(|| {
+                self.per_layer_inputs
+                    .get(layer_idx)
+                    .and_then(|input| input.as_ref())
+                    .map(|rows| InternalActivationSequence::from_values(rows.clone()))
+            })
     }
 }
 

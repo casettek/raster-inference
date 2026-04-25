@@ -20,11 +20,23 @@ pub fn run_text_layers_prefill_with_cache(
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_text_layers_prefill_with_cache_internal(
+        InternalActivationSequence::from_values(input_activations.to_vec()),
+        model,
+        ple_inputs,
+    )
+}
+
+pub(crate) fn run_text_layers_prefill_with_cache_internal(
+    input_activations: InternalActivationSequence,
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     if model.layers.is_empty() {
         bail!("transformer prefill requires at least one layer");
     }
 
-    let mut xs = InternalActivationSequence::from_values(input_activations.to_vec());
+    let mut xs = input_activations;
     let mut layer_caches = Vec::with_capacity(model.layers.len());
     let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
@@ -36,9 +48,7 @@ pub fn run_text_layers_prefill_with_cache(
             layer.ple.is_some(),
             layer.kv_shared_layer_index
         ));
-        let per_layer_input = ple_inputs
-            .and_then(|inputs| inputs.per_layer_inputs.get(layer_idx))
-            .and_then(|input| input.as_deref());
+        let per_layer_input = ple_inputs.and_then(|inputs| inputs.clone_layer_internal(layer_idx));
         let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, layer_cache) =
@@ -94,6 +104,14 @@ pub fn run(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     run_text_layers_prefill_with_cache(input_activations, model, ple_inputs)
+}
+
+pub(crate) fn run_internal(
+    input_activations: InternalActivationSequence,
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_text_layers_prefill_with_cache_internal(input_activations, model, ple_inputs)
 }
 
 fn resolve_prefill_donor_cache<'a>(

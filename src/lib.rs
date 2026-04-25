@@ -193,8 +193,8 @@ pub fn run_inference_with_controls(
                     output_decode: None,
                 }));
             }
-            let (final_hidden_states, layer_caches) = run_prefill_layer_with_mode(
-                &token_embeddings.activations,
+            let (final_hidden_states, layer_caches) = prefill_layer::run_with_mode_internal(
+                token_embeddings.clone_internal(),
                 transformer_model,
                 ple_inputs.as_ref(),
                 request.execution_mode,

@@ -71,8 +71,8 @@ fn run_prefill_pass_for_token_ids(
     let ple_inputs =
         crate::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     trace_event("prefill.layer_stack");
-    let (final_hidden_states, layer_caches) = crate::prefill_layer::run_with_mode(
-        &token_embeddings.activations,
+    let (final_hidden_states, layer_caches) = crate::prefill_layer::run_with_mode_internal(
+        token_embeddings.clone_internal(),
         model,
         ple_inputs.as_ref(),
         execution_mode,
@@ -112,28 +112,23 @@ fn embed_token_ids(
     }
 }
 
-fn embed_token_id_with_mode(
+fn embed_token_id_sequence_with_mode(
     token_id: u32,
     model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
-) -> Result<Vec<f32>> {
+) -> Result<ActivationSequence> {
     if let Some(ref embedding_table) = model.embedding_table {
-        crate::shared::transformer_kernels::embed_input_token_with_mode(
-            token_id,
+        crate::shared::transformer_kernels::embed_input_tokens_with_mode(
+            &[token_id],
             embedding_table,
             execution_mode,
         )
     } else if let Some(ref embedding_source) = model.embedding_source {
-        let embedded = crate::io::embed_input_tokens_from_gemma_source_with_mode(
+        crate::io::embed_input_tokens_from_gemma_source_with_mode(
             &[token_id],
             embedding_source,
             execution_mode,
-        )?;
-        embedded
-            .activations
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("transformer embedding returned no activation rows"))
+        )
     } else {
         anyhow::bail!(
             "transformer state model is missing both embedding_table and embedding_source"
@@ -198,12 +193,15 @@ pub fn decode_step_with_mode(
         position,
         model.layers.len()
     ));
-    let embedded_token = embed_token_id_with_mode(next_token, model, execution_mode)?;
+    let embedded_token = embed_token_id_sequence_with_mode(next_token, model, execution_mode)?;
     trace_event("decode.layer_stack");
     let final_hidden_state = match execution_mode {
         InferenceExecutionMode::Fp32 => {
+            let embedded_token = embedded_token.activations.first().ok_or_else(|| {
+                anyhow::anyhow!("transformer embedding returned no activation rows")
+            })?;
             crate::decode_transition::tiles::run_text_layers_decode_step(
-                &embedded_token,
+                embedded_token,
                 next_token,
                 model,
                 layer_caches,
@@ -211,8 +209,11 @@ pub fn decode_step_with_mode(
             )?
         }
         InferenceExecutionMode::Deterministic => {
-            crate::decode_transition::deterministic_tiles::run_text_layers_decode_step(
-                &embedded_token,
+            let embedded_token = embedded_token.clone_internal().last_row().ok_or_else(|| {
+                anyhow::anyhow!("transformer embedding returned no activation rows")
+            })?;
+            crate::decode_transition::deterministic_tiles::run_text_layers_decode_step_internal(
+                embedded_token,
                 next_token,
                 model,
                 layer_caches,

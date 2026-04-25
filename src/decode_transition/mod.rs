@@ -34,42 +34,48 @@ pub fn run_with_mode(
         position,
         token_count,
     } = transformer_decode_state;
-    let embedded_token =
-        if let Some(ref embedding_table) = model.embedding_table {
-            crate::shared::transformer_kernels::embed_input_token_with_mode(
-                next_token,
-                embedding_table,
-                execution_mode,
-            )?
-        } else if let Some(ref embedding_source) = model.embedding_source {
-            let embedded = crate::io::embed_input_tokens_from_gemma_source_with_mode(
-                &[next_token],
-                embedding_source,
-                execution_mode,
-            )?;
-            embedded.activations.into_iter().next().ok_or_else(|| {
-                anyhow::anyhow!("transformer embedding returned no activation rows")
-            })?
-        } else {
-            anyhow::bail!(
-                "transformer state model is missing both embedding_table and embedding_source"
-            )
-        };
+    let embedded_token = if let Some(ref embedding_table) = model.embedding_table {
+        crate::shared::transformer_kernels::embed_input_tokens_with_mode(
+            &[next_token],
+            embedding_table,
+            execution_mode,
+        )?
+    } else if let Some(ref embedding_source) = model.embedding_source {
+        crate::io::embed_input_tokens_from_gemma_source_with_mode(
+            &[next_token],
+            embedding_source,
+            execution_mode,
+        )?
+    } else {
+        anyhow::bail!(
+            "transformer state model is missing both embedding_table and embedding_source"
+        )
+    };
     let final_hidden_state = match execution_mode {
-        InferenceExecutionMode::Fp32 => tiles::run_text_layers_decode_step(
-            &embedded_token,
-            next_token,
-            model,
-            layer_caches,
-            position,
-        )?,
-        InferenceExecutionMode::Deterministic => deterministic_tiles::run_text_layers_decode_step(
-            &embedded_token,
-            next_token,
-            model,
-            layer_caches,
-            position,
-        )?,
+        InferenceExecutionMode::Fp32 => {
+            let embedded_token = embedded_token.activations.first().ok_or_else(|| {
+                anyhow::anyhow!("transformer embedding returned no activation rows")
+            })?;
+            tiles::run_text_layers_decode_step(
+                embedded_token,
+                next_token,
+                model,
+                layer_caches,
+                position,
+            )?
+        }
+        InferenceExecutionMode::Deterministic => {
+            let embedded_token = embedded_token.clone_internal().last_row().ok_or_else(|| {
+                anyhow::anyhow!("transformer embedding returned no activation rows")
+            })?;
+            deterministic_tiles::run_text_layers_decode_step_internal(
+                embedded_token,
+                next_token,
+                model,
+                layer_caches,
+                position,
+            )?
+        }
     };
     let final_position = crate::shared::transformer_kernels::select_final_position_internal(
         &final_hidden_state.activation_state.clone_internal(),

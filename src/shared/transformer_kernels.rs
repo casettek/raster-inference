@@ -59,24 +59,34 @@ pub fn embed_input_tokens_with_mode(
         );
     }
 
-    let mut activations = Vec::with_capacity(token_ids.len());
+    let mut activation_rows = Vec::with_capacity(token_ids.len());
     for token_id in token_ids {
         let row_idx = usize::try_from(*token_id).expect("u32 should fit into usize");
         let row = embedding_table.rows.get(row_idx).ok_or_else(|| {
             anyhow::anyhow!("token id {token_id} is out of bounds for embedding table")
         })?;
-        let activation = scale_row_buffer(
+        activation_rows.push(scale_row_buffer(
             &ActivationRowBuffer::from_values(row.clone()),
             embedding_table.scale,
             execution_mode == InferenceExecutionMode::Deterministic,
-        );
-        activations.push(activation.values);
+        ));
     }
 
+    let activations = activation_rows
+        .iter()
+        .map(|row| row.values.clone())
+        .collect::<Vec<_>>();
     let activations_sha256 = build_activation_commitment(&activations);
+    let acts = activation_rows
+        .iter()
+        .map(|row| row.acts.clone())
+        .collect::<Option<Vec<_>>>();
 
-    Ok(ActivationSequence::from_values(
-        activations,
+    Ok(ActivationSequence::from_internal(
+        match acts {
+            Some(acts) => InternalActivationSequence::from_det_values(acts),
+            None => InternalActivationSequence::from_values(activations),
+        },
         activations_sha256,
     ))
 }
@@ -106,17 +116,36 @@ pub fn compute_prefill_ple_inputs(
     rms_norm_eps: f32,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Gemma4PrefillPleInputs> {
+    compute_prefill_ple_inputs_internal(
+        token_ids,
+        InternalActivationSequence::from_values(input_activations.to_vec()),
+        layers,
+        ple_global,
+        rms_norm_eps,
+        execution_mode,
+    )
+}
+
+pub(crate) fn compute_prefill_ple_inputs_internal(
+    token_ids: &[u32],
+    input_activations: InternalActivationSequence,
+    layers: &[Gemma4LayerWeights],
+    ple_global: &Gemma4PleGlobalWeights,
+    rms_norm_eps: f32,
+    execution_mode: InferenceExecutionMode,
+) -> Result<Gemma4PrefillPleInputs> {
     // let _trace = trace_scope("transformer_state_transition.compute_prefill_ple_inputs");
-    if input_activations.is_empty() {
+    let input_values = input_activations.as_f32_slice();
+    if input_values.is_empty() {
         bail!("transformer PLE computation requires at least one activation row");
     }
     if layers.is_empty() {
         bail!("transformer PLE computation requires at least one layer");
     }
     let hidden_size = layers[0].hidden_size;
-    validate_sequence_width(input_activations, hidden_size, "input activations")?;
+    validate_sequence_width(input_values, hidden_size, "input activations")?;
 
-    if token_ids.len() != input_activations.len() {
+    if token_ids.len() != input_values.len() {
         bail!(
             "transformer PLE computation requires token ids and activations to have matching lengths"
         );
@@ -136,6 +165,7 @@ pub fn compute_prefill_ple_inputs(
         );
     }
 
+    let input_buffer = ActivationSequenceBuffer::from_internal(input_activations);
     let mut per_layer_inputs = Vec::with_capacity(layers.len());
     for (layer_idx, layer) in layers.iter().enumerate() {
         // trace_event(format!("transformer_state_transition.compute_prefill_ple_inputs layer={layer_idx}"));
@@ -146,12 +176,12 @@ pub fn compute_prefill_ple_inputs(
 
         let mut embedded = Vec::with_capacity(token_ids.len());
         for token_id in token_ids {
-            embedded.push(crate::io::load_ple_token_embedding_row(
-                ple_global, layer_idx, *token_id,
-            )?);
+            embedded.push(ActivationRowBuffer::from_internal(
+                crate::io::load_ple_token_embedding_row_internal(ple_global, layer_idx, *token_id)?,
+            ));
         }
         let embedded = scale_sequence_buffer(
-            &ActivationSequenceBuffer::from_values(embedded),
+            &activation_sequence_buffer_from_rows(embedded),
             ple_global.embedding_scale,
             execution_mode == InferenceExecutionMode::Deterministic,
         );
@@ -160,19 +190,19 @@ pub fn compute_prefill_ple_inputs(
         let model_projection_det =
             crate::io::materialize_det_num_ple_model_projection(ple_global, layer_idx)?;
         let projected = project_linear_sequence_buffer(
-            &ActivationSequenceBuffer::from_values(input_activations.to_vec()),
+            &input_buffer,
             &model_projection,
             model_projection_det.as_deref(),
         )?;
         let projected_uses_det = projected.acts.is_some();
         let projected =
             scale_sequence_buffer(&projected, ple_global.projection_scalar, projected_uses_det);
-        let projected = ActivationSequenceBuffer::from_values(apply_rms_norm_to_sequence(
-            &projected.values,
+        let projected = apply_rms_norm_to_sequence_buffer(
+            &projected,
             &ple_global.projection_norm_weight,
             rms_norm_eps,
             execution_mode,
-        )?);
+        )?;
 
         let combined = add_sequence_buffers(
             &embedded,
@@ -184,10 +214,10 @@ pub fn compute_prefill_ple_inputs(
             ple_global.input_scale,
             execution_mode == InferenceExecutionMode::Deterministic || combined.acts.is_some(),
         );
-        per_layer_inputs.push(Some(combined.values));
+        per_layer_inputs.push(Some(combined.into_internal()));
     }
 
-    Ok(Gemma4PrefillPleInputs { per_layer_inputs })
+    Ok(Gemma4PrefillPleInputs::from_internal(per_layer_inputs))
 }
 
 pub fn compute_decode_ple_input(
@@ -199,6 +229,27 @@ pub fn compute_decode_ple_input(
     rms_norm_eps: f32,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Option<Vec<f32>>> {
+    compute_decode_ple_input_internal(
+        token_id,
+        InternalActivationRow::from_values(input_activation.to_vec()),
+        layer_idx,
+        layer,
+        ple_global,
+        rms_norm_eps,
+        execution_mode,
+    )
+    .map(|input| input.map(|row| row.clone_f32()))
+}
+
+pub(crate) fn compute_decode_ple_input_internal(
+    token_id: u32,
+    input_activation: InternalActivationRow,
+    layer_idx: usize,
+    layer: &Gemma4LayerWeights,
+    ple_global: Option<&Gemma4PleGlobalWeights>,
+    rms_norm_eps: f32,
+    execution_mode: InferenceExecutionMode,
+) -> Result<Option<InternalActivationRow>> {
     let Some(ple_global) = ple_global else {
         return Ok(None);
     };
@@ -206,13 +257,14 @@ pub fn compute_decode_ple_input(
         return Ok(None);
     }
 
+    let input_values = input_activation.as_f32_slice();
     validate_vector_width(
-        input_activation,
+        input_values,
         layer.hidden_size,
         "decode PLE input activation",
     )?;
     let embedded = scale_row_buffer(
-        &ActivationRowBuffer::from_values(crate::io::load_ple_token_embedding_row(
+        &ActivationRowBuffer::from_internal(crate::io::load_ple_token_embedding_row_internal(
             ple_global, layer_idx, token_id,
         )?),
         ple_global.embedding_scale,
@@ -222,18 +274,18 @@ pub fn compute_decode_ple_input(
     let model_projection_det =
         crate::io::materialize_det_num_ple_model_projection(ple_global, layer_idx)?;
     let projected = project_linear_row_buffer(
-        &ActivationRowBuffer::from_values(input_activation.to_vec()),
+        &ActivationRowBuffer::from_internal(input_activation),
         &model_projection,
         model_projection_det.as_deref(),
     )?;
     let projected_uses_det = projected.acts.is_some();
     let projected = scale_row_buffer(&projected, ple_global.projection_scalar, projected_uses_det);
-    let projected = ActivationRowBuffer::from_values(apply_rms_norm(
-        &projected.values,
+    let projected = apply_rms_norm_row_buffer(
+        &projected,
         &ple_global.projection_norm_weight,
         rms_norm_eps,
         execution_mode,
-    )?);
+    )?;
 
     if embedded.values.len() != projected.values.len() {
         bail!(
@@ -254,7 +306,7 @@ pub fn compute_decode_ple_input(
         execution_mode == InferenceExecutionMode::Deterministic || combined.acts.is_some(),
     );
 
-    Ok(Some(combined.values))
+    Ok(Some(combined.into_internal()))
 }
 
 pub fn run_gemma4_layer(
@@ -282,7 +334,7 @@ pub(crate) fn run_gemma4_layer_with_cache(
     run_gemma4_layer_with_cache_internal(
         InternalActivationSequence::from_values(input_activations.to_vec()),
         layer,
-        per_layer_input,
+        per_layer_input.map(|input| InternalActivationSequence::from_values(input.to_vec())),
         donor_cache,
         execution_mode,
     )
@@ -291,7 +343,7 @@ pub(crate) fn run_gemma4_layer_with_cache(
 pub(crate) fn run_gemma4_layer_with_cache_internal(
     input_activations: InternalActivationSequence,
     layer: &ResolvedGemma4LayerWeights,
-    per_layer_input: Option<&[Vec<f32>]>,
+    per_layer_input: Option<InternalActivationSequence>,
     donor_cache: Option<&LayerKvCache>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<(ActivationSequence, LayerKvCache)> {
@@ -304,9 +356,9 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
         bail!("transformer layer execution requires at least one activation row");
     }
     validate_sequence_width(input_values, layer.hidden_size, "input activations")?;
-    if let Some(per_layer_input) = per_layer_input {
+    if let Some(per_layer_input) = per_layer_input.as_ref() {
         validate_sequence_width(
-            per_layer_input,
+            per_layer_input.as_f32_slice(),
             layer
                 .ple
                 .as_ref()
@@ -318,7 +370,7 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
                 .rows,
             "per-layer inputs",
         )?;
-        if per_layer_input.len() != input_values.len() {
+        if per_layer_input.as_f32_slice().len() != input_values.len() {
             bail!(
                 "transformer layer execution requires per-layer inputs and activations to have matching lengths"
             );
@@ -469,7 +521,7 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
         let gated = {
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.input_gate_gelu");
             let gate_preactivation = project_linear_sequence_buffer(
-                &ActivationSequenceBuffer::from_values(xs.values.clone()),
+                &xs,
                 ple.input_gate.as_ref(),
                 ple.input_gate_det.as_deref(),
             )?;
@@ -479,7 +531,7 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
             // let _trace = trace_scope("transformer_state_transition.run_gemma4_layer.ple.input_mul");
             mul_sequence_buffers(
                 &gated,
-                &ActivationSequenceBuffer::from_values(per_layer_input.to_vec()),
+                &ActivationSequenceBuffer::from_internal(per_layer_input),
                 execution_mode == InferenceExecutionMode::Deterministic || gated.acts.is_some(),
             )?
         };
@@ -550,7 +602,7 @@ pub fn run_gemma4_layer_decode_with_mode(
     let (activation, cache) = run_gemma4_layer_decode_with_mode_internal(
         InternalActivationRow::from_values(input_activation.to_vec()),
         layer,
-        per_layer_input,
+        per_layer_input.map(|input| InternalActivationRow::from_values(input.to_vec())),
         cache,
         donor_cache,
         position,
@@ -562,7 +614,7 @@ pub fn run_gemma4_layer_decode_with_mode(
 pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
     input_activation: InternalActivationRow,
     layer: &ResolvedGemma4LayerWeights,
-    per_layer_input: Option<&[f32]>,
+    per_layer_input: Option<InternalActivationRow>,
     cache: LayerKvCache,
     donor_cache: Option<&LayerKvCache>,
     position: usize,
@@ -574,9 +626,9 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
     // ));
     let input_values = input_activation.as_f32_slice();
     validate_vector_width(input_values, layer.hidden_size, "decode input activation")?;
-    if let Some(per_layer_input) = per_layer_input {
+    if let Some(per_layer_input) = per_layer_input.as_ref() {
         validate_vector_width(
-            per_layer_input,
+            per_layer_input.as_f32_slice(),
             layer
                 .ple
                 .as_ref()
@@ -702,7 +754,7 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
         let residual = xs.clone();
         let gated = apply_gelu_to_row_buffer(
             &project_linear_row_buffer(
-                &ActivationRowBuffer::from_values(xs.values.clone()),
+                &xs,
                 ple.input_gate.as_ref(),
                 ple.input_gate_det.as_deref(),
             )?,
@@ -710,7 +762,7 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
         );
         let gated = mul_row_buffers(
             &gated,
-            &ActivationRowBuffer::from_values(per_layer_input.to_vec()),
+            &ActivationRowBuffer::from_internal(per_layer_input),
             execution_mode == InferenceExecutionMode::Deterministic || gated.acts.is_some(),
         )?;
         let projected = project_linear_row_buffer(
@@ -1807,6 +1859,17 @@ impl ActivationRowBuffer {
             None => InternalActivationRow::from_values(self.values),
         }
     }
+}
+
+fn activation_sequence_buffer_from_rows(
+    rows: Vec<ActivationRowBuffer>,
+) -> ActivationSequenceBuffer {
+    let values = rows.iter().map(|row| row.values.clone()).collect();
+    let acts = rows
+        .iter()
+        .map(|row| row.acts.clone())
+        .collect::<Option<Vec<_>>>();
+    ActivationSequenceBuffer { values, acts }
 }
 
 #[derive(Clone, Debug)]
@@ -3175,6 +3238,7 @@ mod tests {
         .expect("det embedding should succeed");
 
         assert_eq!(det.activations, vec![vec![0.0]]);
+        assert!(det.clone_internal().det_values().is_some());
         assert!(fp32.activations[0][0] > det.activations[0][0]);
     }
 
@@ -4627,6 +4691,10 @@ mod tests {
         .unwrap();
 
         let projected = ple_inputs.per_layer_inputs[0].as_ref().unwrap();
+        assert!(ple_inputs
+            .clone_layer_internal(0)
+            .and_then(|input| input.det_values().map(|values| values.to_vec()))
+            .is_some());
         assert_eq!(
             projected[0][0],
             crate::shared::det_num::act_to_f32(crate::shared::det_num::f32_to_act(2f32.sqrt()))
@@ -4678,6 +4746,50 @@ mod tests {
     }
 
     #[test]
+    fn compute_decode_ple_input_internal_preserves_det_values() {
+        let layer = ple_test_layer();
+        let ple_global = Gemma4PleGlobalWeights::from_det_num_sources(
+            vec![deterministic_tensor_source(
+                "decode-ple-token-internal",
+                "model.language_model.embed_tokens_per_layer.weight",
+                2,
+                2,
+                &[0.0, 0.0, 0.0, 0.0],
+            )],
+            vec![deterministic_tensor_source(
+                "decode-ple-proj-internal",
+                "model.language_model.per_layer_model_projection.weight",
+                2,
+                4,
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            )],
+            vec![1.0, 1.0],
+            1.0,
+            1.0,
+            1.0,
+        );
+
+        let ple_input = super::compute_decode_ple_input_internal(
+            0,
+            InternalActivationRow::from_det_values(vec![
+                non_round_tripping_act(),
+                Act::from_bits(0),
+                Act::from_bits(0),
+                Act::from_bits(0),
+            ]),
+            0,
+            &layer,
+            Some(&ple_global),
+            0.0,
+            InferenceExecutionMode::Deterministic,
+        )
+        .unwrap()
+        .expect("decode ple input should exist");
+
+        assert!(ple_input.det_values().is_some());
+    }
+
+    #[test]
     fn run_gemma4_layer_uses_det_ple_input_gate() {
         let activations = vec![vec![1.0, 0.0, 0.0, 0.0]];
         let mut resolved_without_det = ple_resolved_test_layer();
@@ -4706,6 +4818,21 @@ mod tests {
 
         assert_eq!(without_det.activations, vec![vec![1.0, 0.0, 0.0, 0.0]]);
         assert!(with_det.activations[0][0] > without_det.activations[0][0]);
+    }
+
+    #[test]
+    fn deterministic_projection_uses_preserved_internal_inputs() {
+        let canonical = non_round_tripping_act();
+        let projected = super::project_linear_sequence_buffer(
+            &ActivationSequenceBuffer::from_internal(InternalActivationSequence::from_det_values(
+                vec![vec![canonical]],
+            )),
+            &zero_matrix(1, 1),
+            Some(det_matrix(1, 1, &[1.0]).as_ref()),
+        )
+        .expect("project canonical input");
+
+        assert_eq!(projected.acts.unwrap()[0][0], canonical);
     }
 
     #[test]
