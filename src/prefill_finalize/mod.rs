@@ -24,22 +24,28 @@ pub fn run(
         crate::shared::transformer_kernels::project_internal_hidden_to_prefill_logits(
             final_position,
             &model.final_norm_weight,
+            model.final_norm_weight_det.as_deref(),
             model.rms_norm_eps,
+            model.rms_norm_eps_det,
             &model.logits_projection,
             model.embedding_source.as_ref(),
             execution_mode,
             model.final_logit_softcapping,
+            model.final_logit_softcapping_det,
         )?;
     crate::trace::trace_checkpoint(
         "prefill.finalize",
         &json!({
             "final_hidden_states": final_hidden_states.activations.clone(),
             "final_hidden_states_sha256": final_hidden_states.activations_sha256.clone(),
+            "det_final_hidden_states_sha256": final_hidden_states.det_activations_sha256.clone(),
             "prefill_logits": prefill_logits.logits.clone(),
             "prefill_logits_sha256": prefill_logits.final_logits_sha256.clone(),
+            "det_prefill_logits_sha256": prefill_logits.det_final_logits_sha256.clone(),
             "decode_position": prompt_token_ids.len(),
             "decode_token_count": prompt_token_ids.len(),
             "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
+            "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
         }),
     );
 

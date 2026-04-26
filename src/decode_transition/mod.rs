@@ -85,11 +85,14 @@ pub fn run_with_mode(
         crate::shared::transformer_kernels::project_internal_decode_hidden_to_logits(
             final_position,
             &model.final_norm_weight,
+            model.final_norm_weight_det.as_deref(),
             model.rms_norm_eps,
+            model.rms_norm_eps_det,
             &model.logits_projection,
             model.embedding_source.as_ref(),
             execution_mode,
             model.final_logit_softcapping,
+            model.final_logit_softcapping_det,
         )?;
 
     Ok(TransformerDecodeStepResult {

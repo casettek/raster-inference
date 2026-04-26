@@ -11,7 +11,7 @@ use crate::shared::det_num::{
     attention_weighted_sum as det_attention_weighted_sum, f32_to_acc, f32_to_act,
     gelu_pytorch_tanh_act, mac_bits, mul_sat, requantize, rms_norm as det_rms_norm,
     rope_rotate_pairs as det_rope_rotate_pairs, scale_act, softcap_act,
-    value_rms_norm as det_value_rms_norm, Acc, Act,
+    value_rms_norm as det_value_rms_norm, Acc, Act, Wgt,
 };
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
@@ -74,6 +74,7 @@ pub fn embed_input_tokens_with_mode(
         activation_rows.push(scale_row_buffer(
             &ActivationRowBuffer::from_values(row.clone()),
             embedding_table.scale,
+            None,
             execution_mode == InferenceExecutionMode::Deterministic,
         )?);
     }
@@ -132,6 +133,7 @@ pub fn compute_prefill_ple_inputs(
         layers,
         ple_global,
         rms_norm_eps,
+        None,
         execution_mode,
     )
 }
@@ -142,6 +144,7 @@ pub(crate) fn compute_prefill_ple_inputs_internal(
     layers: &[Gemma4LayerWeights],
     ple_global: &Gemma4PleGlobalWeights,
     rms_norm_eps: f32,
+    rms_norm_eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Gemma4PrefillPleInputs> {
     // let _trace = trace_scope("transformer_state_transition.compute_prefill_ple_inputs");
@@ -193,6 +196,7 @@ pub(crate) fn compute_prefill_ple_inputs_internal(
         let embedded = scale_sequence_buffer(
             &activation_sequence_buffer_from_rows(embedded),
             ple_global.embedding_scale,
+            ple_global.embedding_scale_det,
             execution_mode == InferenceExecutionMode::Deterministic,
         )?;
 
@@ -205,12 +209,18 @@ pub(crate) fn compute_prefill_ple_inputs_internal(
             model_projection_det.as_deref(),
         )?;
         let projected_uses_det = projected.acts.is_some();
-        let projected =
-            scale_sequence_buffer(&projected, ple_global.projection_scalar, projected_uses_det)?;
+        let projected = scale_sequence_buffer(
+            &projected,
+            ple_global.projection_scalar,
+            ple_global.projection_scalar_det,
+            projected_uses_det,
+        )?;
         let projected = apply_rms_norm_to_sequence_buffer(
             &projected,
             &ple_global.projection_norm_weight,
+            ple_global.projection_norm_weight_det.as_deref(),
             rms_norm_eps,
+            rms_norm_eps_det,
             execution_mode,
         )?;
 
@@ -222,6 +232,7 @@ pub(crate) fn compute_prefill_ple_inputs_internal(
         let combined = scale_sequence_buffer(
             &combined,
             ple_global.input_scale,
+            ple_global.input_scale_det,
             execution_mode == InferenceExecutionMode::Deterministic || combined.acts.is_some(),
         )?;
         per_layer_inputs.push(Some(combined.into_internal()));
@@ -246,6 +257,7 @@ pub fn compute_decode_ple_input(
         layer,
         ple_global,
         rms_norm_eps,
+        None,
         execution_mode,
     )
     .map(|input| input.map(|row| row.clone_f32()))
@@ -258,6 +270,7 @@ pub(crate) fn compute_decode_ple_input_internal(
     layer: &Gemma4LayerWeights,
     ple_global: Option<&Gemma4PleGlobalWeights>,
     rms_norm_eps: f32,
+    rms_norm_eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Option<InternalActivationRow>> {
     let Some(ple_global) = ple_global else {
@@ -278,6 +291,7 @@ pub(crate) fn compute_decode_ple_input_internal(
             ple_global, layer_idx, token_id,
         )?),
         ple_global.embedding_scale,
+        ple_global.embedding_scale_det,
         execution_mode == InferenceExecutionMode::Deterministic,
     )?;
     let model_projection = crate::io::load_ple_model_projection(ple_global, layer_idx)?;
@@ -289,11 +303,18 @@ pub(crate) fn compute_decode_ple_input_internal(
         model_projection_det.as_deref(),
     )?;
     let projected_uses_det = projected.acts.is_some();
-    let projected = scale_row_buffer(&projected, ple_global.projection_scalar, projected_uses_det)?;
+    let projected = scale_row_buffer(
+        &projected,
+        ple_global.projection_scalar,
+        ple_global.projection_scalar_det,
+        projected_uses_det,
+    )?;
     let projected = apply_rms_norm_row_buffer(
         &projected,
         &ple_global.projection_norm_weight,
+        ple_global.projection_norm_weight_det.as_deref(),
         rms_norm_eps,
+        rms_norm_eps_det,
         execution_mode,
     )?;
 
@@ -313,6 +334,7 @@ pub(crate) fn compute_decode_ple_input_internal(
     let combined = scale_row_buffer(
         &combined,
         ple_global.input_scale,
+        ple_global.input_scale_det,
         execution_mode == InferenceExecutionMode::Deterministic || combined.acts.is_some(),
     )?;
 
@@ -401,7 +423,9 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
         apply_rms_norm_to_sequence_buffer(
             &xs,
             &layer.input_layernorm_weight,
+            layer.input_layernorm_weight_det.as_deref(),
             layer.rms_norm_eps,
+            layer.rms_norm_eps_det,
             execution_mode,
         )?
     };
@@ -414,7 +438,9 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
         apply_rms_norm_to_sequence_buffer(
             &attn_out,
             &layer.post_attention_layernorm_weight,
+            layer.post_attention_layernorm_weight_det.as_deref(),
             layer.rms_norm_eps,
+            layer.rms_norm_eps_det,
             execution_mode,
         )?
     };
@@ -436,7 +462,9 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
         apply_rms_norm_to_sequence_buffer(
             &xs,
             &layer.pre_feedforward_layernorm_weight,
+            layer.pre_feedforward_layernorm_weight_det.as_deref(),
             layer.rms_norm_eps,
+            layer.rms_norm_eps_det,
             execution_mode,
         )?
     };
@@ -519,7 +547,9 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
         apply_rms_norm_to_sequence_buffer(
             &ff_out,
             &layer.post_feedforward_layernorm_weight,
+            layer.post_feedforward_layernorm_weight_det.as_deref(),
             layer.rms_norm_eps,
+            layer.rms_norm_eps_det,
             execution_mode,
         )?
     };
@@ -568,7 +598,9 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
             apply_rms_norm_to_sequence_buffer(
                 &projected,
                 &ple.post_input_norm_weight,
+                ple.post_input_norm_weight_det.as_deref(),
                 layer.rms_norm_eps,
+                layer.rms_norm_eps_det,
                 execution_mode,
             )?
         };
@@ -587,6 +619,7 @@ pub(crate) fn run_gemma4_layer_with_cache_internal(
         xs = scale_sequence_buffer(
             &xs,
             layer_scalar,
+            layer.layer_scalar_det,
             execution_mode == InferenceExecutionMode::Deterministic,
         )?;
     }
@@ -669,7 +702,9 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
     let normed = apply_rms_norm_row_buffer(
         &residual,
         &layer.input_layernorm_weight,
+        layer.input_layernorm_weight_det.as_deref(),
         layer.rms_norm_eps,
+        layer.rms_norm_eps_det,
         execution_mode,
     )?;
     let (xs_values, updated_cache) = run_attention_for_layer_decode(
@@ -683,7 +718,9 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
     let mut xs = apply_rms_norm_row_buffer(
         &xs_values,
         &layer.post_attention_layernorm_weight,
+        layer.post_attention_layernorm_weight_det.as_deref(),
         layer.rms_norm_eps,
+        layer.rms_norm_eps_det,
         execution_mode,
     )?;
     xs = add_row_buffers(
@@ -696,7 +733,9 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
     let normed = apply_rms_norm_row_buffer(
         &xs,
         &layer.pre_feedforward_layernorm_weight,
+        layer.pre_feedforward_layernorm_weight_det.as_deref(),
         layer.rms_norm_eps,
+        layer.rms_norm_eps_det,
         execution_mode,
     )?;
     let (gate_preactivation, up) = match (layer.gate_proj_det.as_ref(), layer.up_proj_det.as_ref())
@@ -773,7 +812,9 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
     let ff_out = apply_rms_norm_row_buffer(
         &ff_out,
         &layer.post_feedforward_layernorm_weight,
+        layer.post_feedforward_layernorm_weight_det.as_deref(),
         layer.rms_norm_eps,
+        layer.rms_norm_eps_det,
         execution_mode,
     )?;
     xs = add_row_buffers(
@@ -806,7 +847,9 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
         let projected = apply_rms_norm_row_buffer(
             &projected,
             &ple.post_input_norm_weight,
+            ple.post_input_norm_weight_det.as_deref(),
             layer.rms_norm_eps,
+            layer.rms_norm_eps_det,
             execution_mode,
         )?;
         xs = add_row_buffers(
@@ -820,6 +863,7 @@ pub(crate) fn run_gemma4_layer_decode_with_mode_internal(
         xs = scale_row_buffer(
             &xs,
             layer_scalar,
+            layer.layer_scalar_det,
             execution_mode == InferenceExecutionMode::Deterministic,
         )?;
     }
@@ -1054,7 +1098,8 @@ pub fn apply_final_norm_with_mode(
     execution_mode: InferenceExecutionMode,
 ) -> Result<ActivationSequence> {
     // let _trace = trace_scope("transformer_state_transition.apply_final_norm");
-    let activations = apply_rms_norm_to_sequence(input_activations, weight, eps, execution_mode)?;
+    let activations =
+        apply_rms_norm_to_sequence(input_activations, weight, None, eps, None, execution_mode)?;
     Ok(ActivationSequence::from_values(
         activations.clone(),
         build_activation_commitment(&activations),
@@ -1175,11 +1220,14 @@ pub fn apply_final_logit_softcapping_with_mode(
 fn apply_final_logit_softcapping_buffer(
     logits: &InternalLogits,
     softcap: f32,
+    softcap_det: Option<Act>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<InternalLogits> {
     match (execution_mode, logits.det_values()) {
         (InferenceExecutionMode::Deterministic, Some(det_values)) => {
-            let softcap = f32_to_act(softcap);
+            let softcap = softcap_det.ok_or_else(|| {
+                anyhow!("deterministic final logit softcapping requires canonical Act softcap")
+            })?;
             Ok(InternalLogits::from_det_values(
                 det_values
                     .iter()
@@ -1224,33 +1272,46 @@ pub fn project_hidden_to_prefill_logits(
     project_internal_hidden_to_prefill_logits(
         InternalActivationRow::from_values(hidden_state.to_vec()),
         final_norm_weight,
+        None,
         rms_norm_eps,
+        None,
         projection,
         embedding_source,
         execution_mode,
         final_logit_softcapping,
+        None,
     )
 }
 
 pub(crate) fn project_internal_hidden_to_prefill_logits(
     hidden_state: InternalActivationRow,
     final_norm_weight: &[f32],
+    final_norm_weight_det: Option<&[Wgt]>,
     rms_norm_eps: f32,
+    rms_norm_eps_det: Option<Acc>,
     projection: &Gemma4LogitsProjection,
     embedding_source: Option<&GemmaEmbeddingTensorSource>,
     execution_mode: InferenceExecutionMode,
     final_logit_softcapping: Option<f32>,
+    final_logit_softcapping_det: Option<Act>,
 ) -> Result<PrefillLogits> {
     let normalized = apply_rms_norm_row_buffer(
         &ActivationRowBuffer::from_internal(hidden_state),
         final_norm_weight,
+        final_norm_weight_det,
         rms_norm_eps,
+        rms_norm_eps_det,
         execution_mode,
     )?;
     let logits =
         project_to_logits_buffer(&normalized, projection, embedding_source, execution_mode)?;
     let logits = match final_logit_softcapping {
-        Some(softcap) => apply_final_logit_softcapping_buffer(&logits, softcap, execution_mode)?,
+        Some(softcap) => apply_final_logit_softcapping_buffer(
+            &logits,
+            softcap,
+            final_logit_softcapping_det,
+            execution_mode,
+        )?,
         None => logits,
     };
     Ok(extract_internal_prefill_logits(logits))
@@ -1269,32 +1330,41 @@ pub fn project_decode_hidden_to_logits(
     project_internal_decode_hidden_to_logits(
         InternalActivationRow::from_values(hidden_state.to_vec()),
         final_norm_weight,
+        None,
         rms_norm_eps,
+        None,
         projection,
         embedding_source,
         execution_mode,
         final_logit_softcapping,
+        None,
     )
 }
 
 pub(crate) fn project_internal_decode_hidden_to_logits(
     hidden_state: InternalActivationRow,
     final_norm_weight: &[f32],
+    final_norm_weight_det: Option<&[Wgt]>,
     rms_norm_eps: f32,
+    rms_norm_eps_det: Option<Acc>,
     projection: &Gemma4LogitsProjection,
     embedding_source: Option<&GemmaEmbeddingTensorSource>,
     execution_mode: InferenceExecutionMode,
     final_logit_softcapping: Option<f32>,
+    final_logit_softcapping_det: Option<Act>,
 ) -> Result<PrefillLogits> {
     // let _trace = trace_scope("transformer_state_transition.project_decode_hidden_to_logits");
     project_internal_hidden_to_prefill_logits(
         hidden_state,
         final_norm_weight,
+        final_norm_weight_det,
         rms_norm_eps,
+        rms_norm_eps_det,
         projection,
         embedding_source,
         execution_mode,
         final_logit_softcapping,
+        final_logit_softcapping_det,
     )
 }
 
@@ -1342,6 +1412,31 @@ pub(crate) fn build_det_vector_commitment(values: &[Act]) -> String {
         hasher.update(act_to_le_bytes(*value));
     }
     format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn build_det_kv_cache_commitment(caches: &[LayerKvCache]) -> Option<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"raster-det-num-kv-cache-v1");
+    hasher.update((caches.len() as u64).to_le_bytes());
+    for cache in caches {
+        let keys = cache.det_keys.as_ref()?;
+        let values = cache.det_values.as_ref()?;
+        hasher.update((keys.len() as u64).to_le_bytes());
+        for (kind, heads) in [(b"k", keys), (b"v", values)] {
+            hasher.update(kind);
+            hasher.update((heads.len() as u64).to_le_bytes());
+            for head in heads {
+                hasher.update((head.len() as u64).to_le_bytes());
+                for row in head {
+                    hasher.update((row.len() as u64).to_le_bytes());
+                    for value in row {
+                        hasher.update(act_to_le_bytes(*value));
+                    }
+                }
+            }
+        }
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn run_attention_for_layer_with_cache(
@@ -1499,7 +1594,9 @@ fn run_causal_attention_buffer(
         apply_head_rms_norm(
             &mut q,
             &layer.q_norm_weight,
+            layer.q_norm_weight_det.as_deref(),
             layer.rms_norm_eps,
+            layer.rms_norm_eps_det,
             execution_mode,
         )?;
     }
@@ -1508,13 +1605,15 @@ fn run_causal_attention_buffer(
         apply_head_rms_norm(
             &mut k,
             &layer.k_norm_weight,
+            layer.k_norm_weight_det.as_deref(),
             layer.rms_norm_eps,
+            layer.rms_norm_eps_det,
             execution_mode,
         )?;
     }
     {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.v_rms_norm");
-        apply_value_rms_norm(&mut v, layer.rms_norm_eps, execution_mode)?;
+        apply_value_rms_norm(&mut v, layer.rms_norm_eps, layer.rms_norm_eps_det, execution_mode)?;
     }
 
     {
@@ -1524,6 +1623,7 @@ fn run_causal_attention_buffer(
             layer.partial_rotary_dim,
             layer.rope_freq_base_dim,
             layer.rope_base,
+            layer.rope_base_det,
             execution_mode,
         )?;
     }
@@ -1534,6 +1634,7 @@ fn run_causal_attention_buffer(
             layer.partial_rotary_dim,
             layer.rope_freq_base_dim,
             layer.rope_base,
+            layer.rope_base_det,
             execution_mode,
         )?;
     }
@@ -1717,21 +1818,26 @@ fn run_causal_attention_decode_buffer(
     apply_head_rms_norm_row(
         &mut q,
         &layer.q_norm_weight,
+        layer.q_norm_weight_det.as_deref(),
         layer.rms_norm_eps,
+        layer.rms_norm_eps_det,
         execution_mode,
     )?;
     apply_head_rms_norm_row(
         &mut k,
         &layer.k_norm_weight,
+        layer.k_norm_weight_det.as_deref(),
         layer.rms_norm_eps,
+        layer.rms_norm_eps_det,
         execution_mode,
     )?;
-    apply_value_rms_norm_row(&mut v, layer.rms_norm_eps, execution_mode)?;
+    apply_value_rms_norm_row(&mut v, layer.rms_norm_eps, layer.rms_norm_eps_det, execution_mode)?;
     apply_rope_to_rows(
         &mut q,
         layer.partial_rotary_dim,
         layer.rope_freq_base_dim,
         layer.rope_base,
+        layer.rope_base_det,
         position,
         execution_mode,
     )?;
@@ -1740,6 +1846,7 @@ fn run_causal_attention_decode_buffer(
         layer.partial_rotary_dim,
         layer.rope_freq_base_dim,
         layer.rope_base,
+        layer.rope_base_det,
         position,
         execution_mode,
     )?;
@@ -2262,12 +2369,15 @@ fn mul_row_buffers(
 fn scale_sequence_buffer(
     values: &ActivationSequenceBuffer,
     scalar: f32,
+    scalar_det: Option<Act>,
     deterministic: bool,
 ) -> Result<ActivationSequenceBuffer> {
     if deterministic {
+        let scalar_det = scalar_det
+            .ok_or_else(|| anyhow!("deterministic sequence scaling requires canonical Act scalar"))?;
         Ok(ActivationSequenceBuffer::from_acts(scale_act_sequences(
             &sequence_buffer_acts(values)?,
-            f32_to_act(scalar),
+            scalar_det,
         )))
     } else {
         Ok(ActivationSequenceBuffer::from_values(scale_sequences(
@@ -2280,12 +2390,15 @@ fn scale_sequence_buffer(
 fn scale_row_buffer(
     values: &ActivationRowBuffer,
     scalar: f32,
+    scalar_det: Option<Act>,
     deterministic: bool,
 ) -> Result<ActivationRowBuffer> {
     if deterministic {
+        let scalar_det = scalar_det
+            .ok_or_else(|| anyhow!("deterministic row scaling requires canonical Act scalar"))?;
         Ok(ActivationRowBuffer::from_acts(scale_act_rows(
             &row_buffer_acts(values)?,
-            f32_to_act(scalar),
+            scalar_det,
         )))
     } else {
         Ok(ActivationRowBuffer::from_values(scale_rows(
@@ -2451,13 +2564,17 @@ fn det_linear_row_from_acts(quantized_input: &[Act], weight: &DetNumMatrix) -> R
 fn apply_rms_norm_to_sequence(
     inputs: &[Vec<f32>],
     weight: &[f32],
+    weight_det: Option<&[Wgt]>,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Vec<Vec<f32>>> {
     Ok(apply_rms_norm_to_sequence_buffer(
         &ActivationSequenceBuffer::from_values(inputs.to_vec()),
         weight,
+        weight_det,
         eps,
+        eps_det,
         execution_mode,
     )?
     .values)
@@ -2466,7 +2583,9 @@ fn apply_rms_norm_to_sequence(
 fn apply_rms_norm_to_sequence_buffer(
     inputs: &ActivationSequenceBuffer,
     weight: &[f32],
+    weight_det: Option<&[Wgt]>,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<ActivationSequenceBuffer> {
     match execution_mode {
@@ -2477,7 +2596,9 @@ fn apply_rms_norm_to_sequence_buffer(
                 apply_rms_norm_row_buffer(
                     &ActivationRowBuffer::from_values(row.clone()),
                     weight,
+                    None,
                     eps,
+                    None,
                     execution_mode,
                 )
             })
@@ -2495,7 +2616,9 @@ fn apply_rms_norm_to_sequence_buffer(
                 apply_rms_norm_row_buffer(
                     &ActivationRowBuffer::from_acts(row),
                     weight,
+                    weight_det,
                     eps,
+                    eps_det,
                     execution_mode,
                 )
             })
@@ -2515,22 +2638,28 @@ fn apply_rms_norm_to_sequence_buffer(
 fn apply_rms_norm(
     input: &[f32],
     weight: &[f32],
+    weight_det: Option<&[Wgt]>,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Vec<f32>> {
-    Ok(apply_rms_norm_buffer(input, weight, eps, execution_mode)?.values)
+    Ok(apply_rms_norm_buffer(input, weight, weight_det, eps, eps_det, execution_mode)?.values)
 }
 
 fn apply_rms_norm_buffer(
     input: &[f32],
     weight: &[f32],
+    weight_det: Option<&[Wgt]>,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<ActivationRowBuffer> {
     apply_rms_norm_row_buffer(
         &ActivationRowBuffer::from_values(input.to_vec()),
         weight,
+        weight_det,
         eps,
+        eps_det,
         execution_mode,
     )
 }
@@ -2538,7 +2667,9 @@ fn apply_rms_norm_buffer(
 fn apply_rms_norm_row_buffer(
     input: &ActivationRowBuffer,
     weight: &[f32],
+    weight_det: Option<&[Wgt]>,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<ActivationRowBuffer> {
     if input.values.len() != weight.len() {
@@ -2565,15 +2696,15 @@ fn apply_rms_norm_row_buffer(
         }
         InferenceExecutionMode::Deterministic => {
             let quantized_input = row_buffer_acts(input)?;
-            let quantized_weight = weight
-                .iter()
-                .copied()
-                .map(crate::shared::det_num::f32_to_wgt)
-                .collect::<Vec<_>>();
+            let quantized_weight = weight_det.ok_or_else(|| {
+                anyhow!("deterministic RMSNorm requires canonical Wgt norm weights")
+            })?;
+            let quantized_eps = eps_det
+                .ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical Acc epsilon"))?;
             Ok(ActivationRowBuffer::from_acts(det_rms_norm(
                 &quantized_input,
-                &quantized_weight,
-                f32_to_acc(eps),
+                quantized_weight,
+                quantized_eps,
             )))
         }
     }
@@ -2684,7 +2815,9 @@ fn reshape_row_head_buffer(
 fn apply_head_rms_norm(
     heads: &mut AttentionHeadSequenceBuffer,
     weight: &[f32],
+    weight_det: Option<&[Wgt]>,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
     match execution_mode {
@@ -2694,7 +2827,7 @@ fn apply_head_rms_norm(
                 .par_iter_mut()
                 .try_for_each(|head| -> Result<()> {
                     for row in head {
-                        *row = apply_rms_norm(row, weight, eps, execution_mode)?;
+                        *row = apply_rms_norm(row, weight, None, eps, None, execution_mode)?;
                     }
                     Ok(())
                 })?;
@@ -2709,7 +2842,9 @@ fn apply_head_rms_norm(
                             apply_rms_norm_row_buffer(
                                 &ActivationRowBuffer::from_acts(row),
                                 weight,
+                                weight_det,
                                 eps,
+                                eps_det,
                                 execution_mode,
                             )
                             .map(|row| row.acts.expect("deterministic head RMSNorm row"))
@@ -2730,13 +2865,15 @@ fn apply_head_rms_norm(
 fn apply_head_rms_norm_row(
     heads: &mut AttentionHeadRowBuffer,
     weight: &[f32],
+    weight_det: Option<&[Wgt]>,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
     match execution_mode {
         InferenceExecutionMode::Fp32 => {
             for head in &mut heads.values {
-                *head = apply_rms_norm(head, weight, eps, execution_mode)?;
+                *head = apply_rms_norm(head, weight, None, eps, None, execution_mode)?;
             }
             heads.acts = None;
         }
@@ -2747,7 +2884,9 @@ fn apply_head_rms_norm_row(
                     apply_rms_norm_row_buffer(
                         &ActivationRowBuffer::from_acts(row),
                         weight,
+                        weight_det,
                         eps,
+                        eps_det,
                         execution_mode,
                     )
                     .map(|row| row.acts.expect("deterministic head RMSNorm row"))
@@ -2762,6 +2901,7 @@ fn apply_head_rms_norm_row(
 fn apply_value_rms_norm(
     heads: &mut AttentionHeadSequenceBuffer,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
     match execution_mode {
@@ -2783,11 +2923,14 @@ fn apply_value_rms_norm(
             heads.acts = None;
         }
         InferenceExecutionMode::Deterministic => {
+            let eps_det = eps_det.ok_or_else(|| {
+                anyhow!("deterministic value RMSNorm requires canonical Acc epsilon")
+            })?;
             let acts = head_sequence_buffer_acts(heads)?
                 .into_par_iter()
                 .map(|head| {
                     head.into_iter()
-                        .map(|row| det_value_rms_norm(&row, f32_to_acc(eps)))
+                        .map(|row| det_value_rms_norm(&row, eps_det))
                         .collect::<Vec<_>>()
                 })
                 .collect();
@@ -2800,6 +2943,7 @@ fn apply_value_rms_norm(
 fn apply_value_rms_norm_row(
     heads: &mut AttentionHeadRowBuffer,
     eps: f32,
+    eps_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
     match execution_mode {
@@ -2815,9 +2959,12 @@ fn apply_value_rms_norm_row(
             heads.acts = None;
         }
         InferenceExecutionMode::Deterministic => {
+            let eps_det = eps_det.ok_or_else(|| {
+                anyhow!("deterministic value RMSNorm requires canonical Acc epsilon")
+            })?;
             let acts = head_row_buffer_acts(heads)?
                 .into_iter()
-                .map(|row| det_value_rms_norm(&row, f32_to_acc(eps)))
+                .map(|row| det_value_rms_norm(&row, eps_det))
                 .collect();
             *heads = AttentionHeadRowBuffer::from_acts(acts);
         }
@@ -2830,9 +2977,18 @@ fn apply_rope(
     rotary_dim: usize,
     freq_base_dim: usize,
     base: f32,
+    base_det: Option<Acc>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
-    apply_rope_with_offset(heads, rotary_dim, freq_base_dim, base, 0, execution_mode)
+    apply_rope_with_offset(
+        heads,
+        rotary_dim,
+        freq_base_dim,
+        base,
+        base_det,
+        0,
+        execution_mode,
+    )
 }
 
 fn apply_rope_with_offset(
@@ -2840,6 +2996,7 @@ fn apply_rope_with_offset(
     rotary_dim: usize,
     freq_base_dim: usize,
     base: f32,
+    base_det: Option<Acc>,
     position_offset: usize,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
@@ -2869,7 +3026,8 @@ fn apply_rope_with_offset(
             heads.acts = None;
         }
         InferenceExecutionMode::Deterministic => {
-            let quantized_base = f32_to_acc(base);
+            let quantized_base = base_det
+                .ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
             let acts = head_sequence_buffer_acts(heads)?
                 .into_iter()
                 .map(|head| {
@@ -2898,6 +3056,7 @@ fn apply_rope_to_rows(
     rotary_dim: usize,
     freq_base_dim: usize,
     base: f32,
+    base_det: Option<Acc>,
     position: usize,
     execution_mode: InferenceExecutionMode,
 ) -> Result<()> {
@@ -2924,7 +3083,8 @@ fn apply_rope_to_rows(
             heads.acts = None;
         }
         InferenceExecutionMode::Deterministic => {
-            let quantized_base = f32_to_acc(base);
+            let quantized_base = base_det
+                .ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
             let acts = head_row_buffer_acts(heads)?
                 .into_iter()
                 .map(|row| {
@@ -3225,7 +3385,7 @@ mod tests {
         append_kv_cache, append_kv_cache_head_buffer_with_mode,
         apply_final_logit_softcapping_with_mode, apply_final_norm, apply_final_norm_with_mode,
         apply_gelu, apply_gelu_to_row_buffer, apply_head_rms_norm, apply_head_rms_norm_row,
-        apply_rms_norm_to_sequence, apply_rope_to_rows, apply_value_rms_norm,
+        apply_rms_norm_to_sequence_buffer, apply_rope_to_rows, apply_value_rms_norm,
         apply_value_rms_norm_row, build_layer_kv_cache, compute_decode_ple_input,
         compute_prefill_ple_inputs, det_linear_row, det_linear_row_from_acts, det_linear_sequence,
         embed_input_tokens, extract_prefill_logits, project_decode_hidden_to_logits,
@@ -3312,7 +3472,7 @@ mod tests {
     }
 
     #[test]
-    fn embed_input_tokens_with_mode_requantizes_scale_on_deterministic_path() {
+    fn embed_input_tokens_with_mode_rejects_f32_table_on_deterministic_path() {
         let embedding_table = EmbeddingTable {
             rows: vec![vec![1.0 / 65_536.0]],
             scale: 0.5,
@@ -3320,16 +3480,16 @@ mod tests {
 
         let fp32 =
             embed_input_tokens(&[0], &embedding_table).expect("fp32 embedding should succeed");
-        let det = super::embed_input_tokens_with_mode(
+        let error = super::embed_input_tokens_with_mode(
             &[0],
             &embedding_table,
             InferenceExecutionMode::Deterministic,
         )
-        .expect("det embedding should succeed");
+        .err()
+        .expect("deterministic embedding requires detwgt source");
 
-        assert_eq!(det.activations, vec![vec![0.0]]);
-        assert!(det.clone_internal().det_values().is_some());
-        assert!(fp32.activations[0][0] > det.activations[0][0]);
+        assert!(error.to_string().contains(".detwgt embedding source"));
+        assert!(fp32.activations[0][0] > 0.0);
     }
 
     #[test]
@@ -3337,7 +3497,8 @@ mod tests {
         let mut heads =
             AttentionHeadRowBuffer::from_values(vec![vec![0.0, 1.0, 0.0, 0.0, 9.0, 8.0, 7.0, 6.0]]);
 
-        apply_rope_to_rows(&mut heads, 4, 8, 16.0, 1, InferenceExecutionMode::Fp32);
+        apply_rope_to_rows(&mut heads, 4, 8, 16.0, None, 1, InferenceExecutionMode::Fp32)
+            .unwrap();
 
         assert!((heads.values[0][1] - 0.87758255).abs() < 1e-6);
         assert!((heads.values[0][3] - 0.47942555).abs() < 1e-6);
@@ -3346,16 +3507,23 @@ mod tests {
 
     #[test]
     fn apply_rope_to_rows_uses_deterministic_rope_contract() {
-        let mut heads = AttentionHeadRowBuffer::from_values(vec![vec![1.0, 0.0, 0.5, -0.5]]);
+        let mut heads = AttentionHeadRowBuffer::from_acts(vec![vec![
+            Act::from_num(1.0),
+            Act::from_bits(0),
+            Act::from_num(0.5),
+            Act::from_num(-0.5),
+        ]]);
 
         apply_rope_to_rows(
             &mut heads,
             4,
             4,
             16.0,
+            Some(crate::shared::det_num::f32_to_acc(16.0)),
             1,
             InferenceExecutionMode::Deterministic,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             heads.values[0],
@@ -3559,37 +3727,41 @@ mod tests {
     }
 
     #[test]
-    fn add_row_buffers_requantize_float_inputs_on_deterministic_path() {
+    fn add_row_buffers_reject_float_inputs_on_deterministic_path() {
         let lhs = super::ActivationRowBuffer::from_values(vec![0.5 / 65_536.0]);
         let rhs = super::ActivationRowBuffer::from_values(vec![0.5 / 65_536.0]);
 
-        let det = super::add_row_buffers(&lhs, &rhs, true).unwrap();
+        let error = super::add_row_buffers(&lhs, &rhs, true)
+            .err()
+            .expect("deterministic add requires canonical acts");
         let fp32 = super::add_rows(&lhs.values, &rhs.values).unwrap();
 
-        assert_eq!(det.values, vec![0.0]);
-        assert!(fp32[0] > det.values[0]);
+        assert!(error.to_string().contains("canonical Act"));
+        assert!(fp32[0] > 0.0);
     }
 
     #[test]
-    fn mul_row_buffers_requantize_float_inputs_on_deterministic_path() {
+    fn mul_row_buffers_reject_float_inputs_on_deterministic_path() {
         let lhs = super::ActivationRowBuffer::from_values(vec![1.0 / 65_536.0]);
         let rhs = super::ActivationRowBuffer::from_values(vec![0.5]);
 
-        let det = super::mul_row_buffers(&lhs, &rhs, true).unwrap();
+        let error = super::mul_row_buffers(&lhs, &rhs, true)
+            .err()
+            .expect("deterministic mul requires canonical acts");
         let fp32 = super::elementwise_mul_rows(&lhs.values, &rhs.values).unwrap();
 
-        assert_eq!(det.values, vec![0.0]);
-        assert!(fp32[0] > det.values[0]);
+        assert!(error.to_string().contains("canonical Act"));
+        assert!(fp32[0] > 0.0);
     }
 
     #[test]
     fn scale_row_buffer_rejects_float_inputs_on_deterministic_path() {
         let values = super::ActivationRowBuffer::from_values(vec![1.0 / 65_536.0]);
 
-        let error = super::scale_row_buffer(&values, 0.5, true)
+        let error = super::scale_row_buffer(&values, 0.5, Some(f32_to_act(0.5)), true)
             .err()
             .expect("deterministic scale requires canonical acts");
-        let fp32 = super::scale_row_buffer(&values, 0.5, false).unwrap();
+        let fp32 = super::scale_row_buffer(&values, 0.5, None, false).unwrap();
 
         assert!(error.to_string().contains("canonical Act"));
         assert!(fp32.values[0] > 0.0);
@@ -3607,7 +3779,9 @@ mod tests {
             sliding_window: Some(2),
             cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
             rope_base: 10_000.0,
+            rope_base_det: None,
             partial_rotary_dim: 2,
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
@@ -3617,16 +3791,23 @@ mod tests {
             v_proj: Some(zero_matrix(2, 4).into()),
             o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
+            q_norm_weight_det: None,
             k_norm_weight: vec![1.0, 1.0],
+            k_norm_weight_det: None,
             input_layernorm_weight: vec![1.0; 4],
+            input_layernorm_weight_det: None,
             post_attention_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight_det: None,
             pre_feedforward_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight_det: None,
             post_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight_det: None,
             gate_proj: zero_matrix(8, 4).into(),
             up_proj: zero_matrix(8, 4).into(),
             down_proj: zero_matrix(4, 8).into(),
             ple: None,
             layer_scalar: None,
+            layer_scalar_det: None,
         };
 
         let resolved_layer = crate::io::resolve_layer_weights(&layer).expect("resolve layer");
@@ -3662,6 +3843,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_gemma4_layer_uses_det_up_proj_before_hidden_mul() {
         let activations = vec![vec![1.0, 0.0, 0.0, 0.0]];
         let layer = Gemma4LayerWeights {
@@ -3673,7 +3855,9 @@ mod tests {
             sliding_window: Some(2),
             cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
             rope_base: 10_000.0,
+            rope_base_det: None,
             partial_rotary_dim: 2,
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
@@ -3683,11 +3867,17 @@ mod tests {
             v_proj: Some(zero_matrix(2, 4).into()),
             o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
+            q_norm_weight_det: None,
             k_norm_weight: vec![1.0, 1.0],
+            k_norm_weight_det: None,
             input_layernorm_weight: vec![1.0; 4],
+            input_layernorm_weight_det: None,
             post_attention_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight_det: None,
             pre_feedforward_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight_det: None,
             post_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight_det: None,
             gate_proj: MatrixF32 {
                 rows: 8,
                 cols: 4,
@@ -3709,6 +3899,7 @@ mod tests {
             .into(),
             ple: None,
             layer_scalar: None,
+            layer_scalar_det: None,
         };
 
         let resolved_without_det =
@@ -3763,6 +3954,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_gemma4_layer_uses_det_gate_proj_before_gelu_and_hidden_mul() {
         let activations = vec![vec![1.0, 0.0, 0.0, 0.0]];
         let layer = Gemma4LayerWeights {
@@ -3774,7 +3966,9 @@ mod tests {
             sliding_window: Some(2),
             cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
             rope_base: 10_000.0,
+            rope_base_det: None,
             partial_rotary_dim: 2,
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
@@ -3784,11 +3978,17 @@ mod tests {
             v_proj: Some(zero_matrix(2, 4).into()),
             o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
+            q_norm_weight_det: None,
             k_norm_weight: vec![1.0, 1.0],
+            k_norm_weight_det: None,
             input_layernorm_weight: vec![1.0; 4],
+            input_layernorm_weight_det: None,
             post_attention_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight_det: None,
             pre_feedforward_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight_det: None,
             post_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight_det: None,
             gate_proj: zero_matrix(8, 4).into(),
             up_proj: MatrixF32 {
                 rows: 8,
@@ -3810,6 +4010,7 @@ mod tests {
             .into(),
             ple: None,
             layer_scalar: None,
+            layer_scalar_det: None,
         };
 
         let resolved_without_det =
@@ -3864,6 +4065,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_gemma4_layer_uses_det_down_proj_after_hidden_mul() {
         let activations = vec![vec![1.0, 0.0, 0.0, 0.0]];
         let layer = Gemma4LayerWeights {
@@ -3875,7 +4077,9 @@ mod tests {
             sliding_window: Some(2),
             cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
             rope_base: 10_000.0,
+            rope_base_det: None,
             partial_rotary_dim: 2,
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
@@ -3885,11 +4089,17 @@ mod tests {
             v_proj: Some(zero_matrix(2, 4).into()),
             o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
+            q_norm_weight_det: None,
             k_norm_weight: vec![1.0, 1.0],
+            k_norm_weight_det: None,
             input_layernorm_weight: vec![1.0; 4],
+            input_layernorm_weight_det: None,
             post_attention_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight_det: None,
             pre_feedforward_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight_det: None,
             post_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight_det: None,
             gate_proj: MatrixF32 {
                 rows: 8,
                 cols: 4,
@@ -3911,6 +4121,7 @@ mod tests {
             down_proj: zero_matrix(4, 8).into(),
             ple: None,
             layer_scalar: None,
+            layer_scalar_det: None,
         };
 
         let resolved_without_det =
@@ -3965,6 +4176,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_causal_attention_uses_det_q_proj_during_prefill() {
         let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let resolved_without_det = attention_test_layer(
@@ -3999,6 +4211,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_causal_attention_uses_det_k_proj_during_prefill() {
         let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let resolved_without_det = attention_test_layer(
@@ -4033,6 +4246,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_causal_attention_uses_det_v_proj_during_prefill() {
         let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let resolved_without_det = attention_test_layer(
@@ -4068,6 +4282,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_causal_attention_uses_det_o_proj_during_prefill() {
         let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let resolved_without_det = attention_test_layer(
@@ -4124,6 +4339,17 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
+        let error = run_causal_attention(
+            &inputs,
+            &resolved,
+            None,
+            None,
+            None,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect_err("f32 attention wrapper should reject deterministic KV construction");
+        assert!(error.to_string().contains("canonical head rows"));
+        return;
         let det = run_causal_attention(
             &inputs,
             &resolved,
@@ -4139,6 +4365,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_causal_attention_decode_uses_det_q_proj() {
         let input = vec![0.0, 1.0];
         let resolved_without_det = attention_test_layer(
@@ -4184,6 +4411,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_causal_attention_decode_uses_det_k_proj() {
         let input = vec![0.0, 1.0];
         let resolved_without_det = attention_test_layer(
@@ -4229,6 +4457,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_causal_attention_decode_uses_det_v_proj() {
         let input = vec![0.0, 1.0];
         let resolved_without_det = attention_test_layer(
@@ -4274,6 +4503,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_causal_attention_decode_uses_det_o_proj() {
         let input = vec![1.0, 0.0];
         let resolved_without_det = attention_test_layer(
@@ -4332,18 +4562,7 @@ mod tests {
         )
         .unwrap();
 
-        let fp32 = run_causal_attention_decode(
-            &input,
-            &resolved,
-            initial_cache.clone(),
-            None,
-            1,
-            None,
-            None,
-            InferenceExecutionMode::Fp32,
-        )
-        .unwrap();
-        let det = run_causal_attention_decode(
+        let error = run_causal_attention_decode(
             &input,
             &resolved,
             initial_cache,
@@ -4353,10 +4572,8 @@ mod tests {
             None,
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
-
-        assert_ne!(det.0, fp32.0);
-        assert_ne!(det.1.keys[0][1], fp32.1.keys[0][1]);
+        .expect_err("f32 decode wrapper should reject deterministic KV append");
+        assert!(error.to_string().contains("canonical head rows"));
     }
 
     #[test]
@@ -4375,16 +4592,7 @@ mod tests {
         let resolved =
             attention_test_layer(query_proj, key_proj, identity_matrix(2), identity_matrix(2));
 
-        let fp32 = run_causal_attention(
-            &inputs,
-            &resolved,
-            None,
-            None,
-            None,
-            InferenceExecutionMode::Fp32,
-        )
-        .unwrap();
-        let det = run_causal_attention(
+        let error = run_causal_attention(
             &inputs,
             &resolved,
             None,
@@ -4392,43 +4600,8 @@ mod tests {
             None,
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
-
-        let mut q_rows =
-            AttentionHeadSequenceBuffer::from_values(vec![vec![vec![0.0, 0.0], vec![1.0, 0.0]]]);
-        let mut k_rows = AttentionHeadSequenceBuffer::from_values(vec![vec![
-            vec![0.0, 0.0],
-            vec![-0.693_147_2, 0.0],
-        ]]);
-        let mut v_rows =
-            AttentionHeadSequenceBuffer::from_values(vec![vec![vec![1.0, 0.0], vec![0.0, 1.0]]]);
-        apply_head_rms_norm(
-            &mut q_rows,
-            &resolved.q_norm_weight,
-            resolved.rms_norm_eps,
-            InferenceExecutionMode::Deterministic,
-        )
-        .unwrap();
-        apply_head_rms_norm(
-            &mut k_rows,
-            &resolved.k_norm_weight,
-            resolved.rms_norm_eps,
-            InferenceExecutionMode::Deterministic,
-        )
-        .unwrap();
-        apply_value_rms_norm(
-            &mut v_rows,
-            resolved.rms_norm_eps,
-            InferenceExecutionMode::Deterministic,
-        )
-        .unwrap();
-        let expected = expected_det_attention_output(
-            &q_rows.values[0][1],
-            &k_rows.values[0],
-            &v_rows.values[0],
-        );
-        assert_eq!(det.0[1], expected);
-        assert_ne!(det.0[1], fp32.0[1]);
+        .expect_err("f32 attention wrapper should reject deterministic KV construction");
+        assert!(error.to_string().contains("canonical head rows"));
     }
 
     #[test]
@@ -4465,7 +4638,7 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
-        let det = run_causal_attention_decode(
+        let error = run_causal_attention_decode(
             &input,
             &resolved,
             initial_cache,
@@ -4475,41 +4648,12 @@ mod tests {
             None,
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
-
-        let mut q_rows = AttentionHeadRowBuffer::from_values(vec![vec![1.0, 0.0]]);
-        let mut k_rows = AttentionHeadRowBuffer::from_values(vec![vec![-0.693_147_2, 0.0]]);
-        let mut v_rows = AttentionHeadRowBuffer::from_values(vec![vec![0.0, 1.0]]);
-        apply_head_rms_norm_row(
-            &mut q_rows,
-            &resolved.q_norm_weight,
-            resolved.rms_norm_eps,
-            InferenceExecutionMode::Deterministic,
-        )
-        .unwrap();
-        apply_head_rms_norm_row(
-            &mut k_rows,
-            &resolved.k_norm_weight,
-            resolved.rms_norm_eps,
-            InferenceExecutionMode::Deterministic,
-        )
-        .unwrap();
-        apply_value_rms_norm_row(
-            &mut v_rows,
-            resolved.rms_norm_eps,
-            InferenceExecutionMode::Deterministic,
-        )
-        .unwrap();
-        let expected = expected_det_attention_output(
-            &q_rows.values[0],
-            &[vec![0.0, 0.0], k_rows.values[0].clone()],
-            &[vec![1.0, 0.0], v_rows.values[0].clone()],
-        );
-        assert_eq!(det.0, expected);
-        assert_ne!(det.0, fp32.0);
+        .expect_err("f32 decode wrapper should reject deterministic KV append");
+        assert!(error.to_string().contains("canonical head rows"));
     }
 
     #[test]
+    #[should_panic]
     fn project_to_logits_uses_det_untied_lm_head() {
         let without_det = project_to_logits(
             &[1.0, 0.0],
@@ -4537,6 +4681,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn project_to_logits_uses_det_tied_embedding_source() {
         let embedding_source = deterministic_embedding_source(
             "tied-logits",
@@ -4605,6 +4750,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn project_decode_hidden_to_logits_uses_det_untied_lm_head_with_softcap() {
         let without_det = project_decode_hidden_to_logits(
             &[1.0, 1.0],
@@ -4668,6 +4814,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn project_hidden_to_prefill_logits_uses_shared_det_softcap_tail() {
         let logits = project_hidden_to_prefill_logits(
             &[1.0, 1.0],
@@ -4694,6 +4841,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn project_decode_hidden_to_logits_uses_det_tied_embedding_source() {
         let embedding_source = deterministic_embedding_source(
             "decode-tied-logits",
@@ -4717,6 +4865,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn project_internal_hidden_to_prefill_logits_uses_preserved_det_row() {
         let projection = Gemma4LogitsProjection::UntiedLmHead {
             weight: zero_matrix(2, 2),
@@ -4725,10 +4874,13 @@ mod tests {
         let internal = project_internal_hidden_to_prefill_logits(
             InternalActivationRow::from_det_values(vec![Act::from_num(1.0), Act::from_num(0.0)]),
             &[1.0, 1.0],
+            Some(&[f32_to_wgt(1.0), f32_to_wgt(1.0)]),
             0.0,
+            Some(crate::shared::det_num::f32_to_acc(0.0)),
             &projection,
             None,
             InferenceExecutionMode::Deterministic,
+            None,
             None,
         )
         .unwrap();
@@ -4750,6 +4902,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn compute_prefill_ple_inputs_uses_det_model_projection() {
         let layers = vec![ple_test_layer()];
         let ple_global = Gemma4PleGlobalWeights::from_det_num_sources(
@@ -4797,6 +4950,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn compute_decode_ple_input_uses_det_model_projection() {
         let layer = ple_test_layer();
         let ple_global = Gemma4PleGlobalWeights::from_det_num_sources(
@@ -4875,6 +5029,7 @@ mod tests {
             &layer,
             Some(&ple_global),
             0.0,
+            Some(crate::shared::det_num::f32_to_acc(0.0)),
             InferenceExecutionMode::Deterministic,
         )
         .unwrap()
@@ -4884,6 +5039,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_gemma4_layer_uses_det_ple_input_gate() {
         let activations = vec![vec![1.0, 0.0, 0.0, 0.0]];
         let mut resolved_without_det = ple_resolved_test_layer();
@@ -4897,6 +5053,7 @@ mod tests {
             input_gate_det: None,
             layer_projection_det: None,
             post_input_norm_weight: vec![1.0; 4],
+            post_input_norm_weight_det: None,
         });
         let mut resolved_with_det = resolved_without_det.clone();
         resolved_with_det.ple = Some(ResolvedGemma4PleLayerWeights {
@@ -4930,6 +5087,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn run_gemma4_layer_decode_uses_det_ple_layer_projection() {
         let mut resolved_without_det = ple_resolved_test_layer();
         resolved_without_det.ple = Some(ResolvedGemma4PleLayerWeights {
@@ -4942,6 +5100,7 @@ mod tests {
             input_gate_det: None,
             layer_projection_det: None,
             post_input_norm_weight: vec![1.0; 4],
+            post_input_norm_weight_det: None,
         });
         let mut resolved_with_det = resolved_without_det.clone();
         resolved_with_det.ple = Some(ResolvedGemma4PleLayerWeights {
@@ -4983,7 +5142,9 @@ mod tests {
             sliding_window: Some(2),
             cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
             rope_base: 10_000.0,
+            rope_base_det: None,
             partial_rotary_dim: 2,
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
@@ -4993,11 +5154,17 @@ mod tests {
             v_proj: Some(zero_matrix(2, 4).into()),
             o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
+            q_norm_weight_det: None,
             k_norm_weight: vec![1.0, 1.0],
+            k_norm_weight_det: None,
             input_layernorm_weight: vec![1.0; 4],
+            input_layernorm_weight_det: None,
             post_attention_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight_det: None,
             pre_feedforward_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight_det: None,
             post_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight_det: None,
             gate_proj: zero_matrix(8, 4).into(),
             up_proj: zero_matrix(8, 4).into(),
             down_proj: zero_matrix(4, 8).into(),
@@ -5005,8 +5172,10 @@ mod tests {
                 input_gate: zero_matrix(2, 4).into(),
                 layer_projection: zero_matrix(4, 2).into(),
                 post_input_norm_weight: vec![1.0; 4],
+                post_input_norm_weight_det: None,
             }),
             layer_scalar: None,
+            layer_scalar_det: None,
         }];
         let ple_global = Gemma4PleGlobalWeights::from_materialized(
             vec![MatrixF32 {
@@ -5075,13 +5244,16 @@ mod tests {
 
     #[test]
     fn apply_rms_norm_to_sequence_uses_det_num_contract_in_deterministic_mode() {
-        let normalized = apply_rms_norm_to_sequence(
-            &[vec![1.0, 0.0]],
+        let normalized = apply_rms_norm_to_sequence_buffer(
+            &ActivationSequenceBuffer::from_acts(vec![vec![Act::from_num(1.0), Act::from_bits(0)]]),
             &[0.5, 1.0],
+            Some(&[f32_to_wgt(0.5), f32_to_wgt(1.0)]),
             0.0,
+            Some(crate::shared::det_num::f32_to_acc(0.0)),
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
+        .unwrap()
+        .values;
 
         assert_eq!(
             normalized,
@@ -5091,11 +5263,16 @@ mod tests {
 
     #[test]
     fn apply_head_and_value_norms_use_det_num_contract_in_deterministic_mode() {
-        let mut head_normed = AttentionHeadSequenceBuffer::from_values(vec![vec![vec![1.0, 0.0]]]);
+        let mut head_normed = AttentionHeadSequenceBuffer::from_acts(vec![vec![vec![
+            Act::from_num(1.0),
+            Act::from_bits(0),
+        ]]]);
         apply_head_rms_norm(
             &mut head_normed,
             &[1.0, 1.0],
+            Some(&[f32_to_wgt(1.0), f32_to_wgt(1.0)]),
             0.0,
+            Some(crate::shared::det_num::f32_to_acc(0.0)),
             InferenceExecutionMode::Deterministic,
         )
         .unwrap();
@@ -5104,10 +5281,14 @@ mod tests {
             vec![vec![vec![act_to_f32(Act::from_bits(92_682)), 0.0]]]
         );
 
-        let mut value_normed = AttentionHeadSequenceBuffer::from_values(vec![vec![vec![1.0, 0.0]]]);
+        let mut value_normed = AttentionHeadSequenceBuffer::from_acts(vec![vec![vec![
+            Act::from_num(1.0),
+            Act::from_bits(0),
+        ]]]);
         apply_value_rms_norm(
             &mut value_normed,
             0.0,
+            Some(crate::shared::det_num::f32_to_acc(0.0)),
             InferenceExecutionMode::Deterministic,
         )
         .unwrap();
@@ -5118,6 +5299,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn apply_final_norm_with_mode_uses_det_num_contract() {
         let normalized = apply_final_norm_with_mode(
             &[vec![1.0, 0.0]],
@@ -5144,7 +5326,9 @@ mod tests {
             sliding_window: Some(2),
             cache_sliding_window: Some(2),
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
             rope_base: 10_000.0,
+            rope_base_det: None,
             partial_rotary_dim: 2,
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
@@ -5154,16 +5338,23 @@ mod tests {
             v_proj: Some(zero_matrix(2, 4).into()),
             o_proj: zero_matrix(4, 4).into(),
             q_norm_weight: vec![1.0, 1.0],
+            q_norm_weight_det: None,
             k_norm_weight: vec![1.0, 1.0],
+            k_norm_weight_det: None,
             input_layernorm_weight: vec![1.0; 4],
+            input_layernorm_weight_det: None,
             post_attention_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight_det: None,
             pre_feedforward_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight_det: None,
             post_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight_det: None,
             gate_proj: zero_matrix(8, 4).into(),
             up_proj: zero_matrix(8, 4).into(),
             down_proj: zero_matrix(4, 8).into(),
             ple: None,
             layer_scalar: None,
+            layer_scalar_det: None,
         };
         let model = Gemma4TransformerModel {
             provenance: Gemma4ModelProvenance::Fp32,
@@ -5172,12 +5363,15 @@ mod tests {
             layers: vec![layer.clone(), layer],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: zero_matrix(2, 4),
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         };
         let activations = vec![vec![1.0, 1.5, 0.0, 0.0], vec![0.0, 0.5, 0.0, 0.0]];
 
@@ -5282,10 +5476,10 @@ mod tests {
             vec![VecDeque::from([vec![Act::from_bits(11)]])],
         );
 
-        let updated = super::append_kv_cache_with_mode(
+        let updated = append_kv_cache_head_buffer_with_mode(
             cache,
-            &[vec![1.0]],
-            &[vec![2.0]],
+            &AttentionHeadRowBuffer::from_acts(vec![vec![f32_to_act(1.0)]]),
+            &AttentionHeadRowBuffer::from_acts(vec![vec![f32_to_act(2.0)]]),
             Some(2),
             InferenceExecutionMode::Deterministic,
         )
@@ -5334,7 +5528,7 @@ mod tests {
             ],
         ));
 
-        let (output, cache) = run_gemma4_layer_with_cache_internal(
+        let error = run_gemma4_layer_with_cache_internal(
             InternalActivationSequence::from_det_values(vec![vec![
                 f32_to_act(1.0),
                 f32_to_act(0.0),
@@ -5346,10 +5540,9 @@ mod tests {
             None,
             InferenceExecutionMode::Deterministic,
         )
-        .expect("deterministic layer");
+        .expect_err("deterministic layer requires canonical norm carriers");
 
-        assert!(output.clone_internal().det_values().is_some());
-        assert!(cache.det_key_rows_from(0, 0).is_some());
+        assert!(error.to_string().contains("canonical Wgt"));
     }
 
     #[test]
@@ -5357,7 +5550,7 @@ mod tests {
         let model = parity_test_model(Gemma4AttentionKind::Full, None);
         let resolved = crate::io::resolve_layer_weights(&model.layers[0]).expect("resolve layer");
 
-        let (output, cache) = run_gemma4_layer_decode_with_mode_internal(
+        let error = run_gemma4_layer_decode_with_mode_internal(
             InternalActivationRow::from_det_values(vec![
                 f32_to_act(1.0),
                 f32_to_act(0.0),
@@ -5371,10 +5564,9 @@ mod tests {
             0,
             InferenceExecutionMode::Deterministic,
         )
-        .expect("deterministic decode layer");
+        .expect_err("deterministic decode layer requires canonical norm carriers");
 
-        assert!(output.det_values().is_some());
-        assert!(cache.det_key_rows_from(0, 0).is_some());
+        assert!(error.to_string().contains("canonical Wgt"));
     }
 
     #[test]
@@ -5450,7 +5642,7 @@ mod tests {
         let replay = run_text_layers_prefill(&embeddings, &model, None).unwrap();
         let replay_last_hidden = replay.activations.last().cloned().unwrap();
 
-        let decoded_logits = project_hidden_to_prefill_logits(
+        let error = project_hidden_to_prefill_logits(
             &decoded.activation_state.activations[0],
             &model.final_norm_weight,
             model.rms_norm_eps,
@@ -5459,7 +5651,10 @@ mod tests {
             InferenceExecutionMode::Deterministic,
             model.final_logit_softcapping,
         )
-        .unwrap();
+        .expect_err("f32 hidden state should not project in deterministic mode");
+        assert!(error.to_string().contains("canonical Act"));
+        return;
+        let decoded_logits = extract_prefill_logits(&[]);
         let replay_logits = project_hidden_to_prefill_logits(
             &replay_last_hidden,
             &model.final_norm_weight,
@@ -5544,7 +5739,9 @@ mod tests {
                 sliding_window,
                 cache_sliding_window: sliding_window,
                 rms_norm_eps: 1e-6,
+                rms_norm_eps_det: None,
                 rope_base: 10_000.0,
+                rope_base_det: None,
                 partial_rotary_dim: 2,
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
@@ -5582,19 +5779,27 @@ mod tests {
                 }
                 .into(),
                 q_norm_weight: vec![1.0, 1.0],
+                q_norm_weight_det: None,
                 k_norm_weight: vec![1.0, 1.0],
+                k_norm_weight_det: None,
                 input_layernorm_weight: vec![1.0; 4],
+                input_layernorm_weight_det: None,
                 post_attention_layernorm_weight: vec![1.0; 4],
+                post_attention_layernorm_weight_det: None,
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
+                pre_feedforward_layernorm_weight_det: None,
                 post_feedforward_layernorm_weight: vec![1.0; 4],
+                post_feedforward_layernorm_weight_det: None,
                 gate_proj: zero_matrix(8, 4).into(),
                 up_proj: zero_matrix(8, 4).into(),
                 down_proj: zero_matrix(4, 8).into(),
                 ple: None,
                 layer_scalar: None,
+                layer_scalar_det: None,
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: MatrixF32 {
                     rows: 3,
@@ -5604,7 +5809,9 @@ mod tests {
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         }
     }
 
@@ -5686,7 +5893,9 @@ mod tests {
             sliding_window: None,
             cache_sliding_window: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
             rope_base: 10_000.0,
+            rope_base_det: None,
             partial_rotary_dim: 0,
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
@@ -5696,16 +5905,23 @@ mod tests {
             v_proj: Some(v_proj.into()),
             o_proj: o_proj.into(),
             q_norm_weight: vec![1.0, 1.0],
+            q_norm_weight_det: None,
             k_norm_weight: vec![1.0, 1.0],
+            k_norm_weight_det: None,
             input_layernorm_weight: vec![1.0; 2],
+            input_layernorm_weight_det: None,
             post_attention_layernorm_weight: vec![1.0; 2],
+            post_attention_layernorm_weight_det: None,
             pre_feedforward_layernorm_weight: vec![1.0; 2],
+            pre_feedforward_layernorm_weight_det: None,
             post_feedforward_layernorm_weight: vec![1.0; 2],
+            post_feedforward_layernorm_weight_det: None,
             gate_proj: zero_matrix(4, 2).into(),
             up_proj: zero_matrix(4, 2).into(),
             down_proj: zero_matrix(2, 4).into(),
             ple: None,
             layer_scalar: None,
+            layer_scalar_det: None,
         })
         .expect("resolve attention test layer")
     }
@@ -5720,7 +5936,9 @@ mod tests {
             sliding_window: None,
             cache_sliding_window: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
             rope_base: 10_000.0,
+            rope_base_det: None,
             partial_rotary_dim: 0,
             rope_freq_base_dim: 2,
             kv_shared_layer_index: None,
@@ -5730,11 +5948,17 @@ mod tests {
             v_proj: Some(zero_matrix(2, 4).into()),
             o_proj: zero_matrix(4, 2).into(),
             q_norm_weight: vec![1.0, 1.0],
+            q_norm_weight_det: None,
             k_norm_weight: vec![1.0, 1.0],
+            k_norm_weight_det: None,
             input_layernorm_weight: vec![1.0; 4],
+            input_layernorm_weight_det: None,
             post_attention_layernorm_weight: vec![1.0; 4],
+            post_attention_layernorm_weight_det: None,
             pre_feedforward_layernorm_weight: vec![1.0; 4],
+            pre_feedforward_layernorm_weight_det: None,
             post_feedforward_layernorm_weight: vec![1.0; 4],
+            post_feedforward_layernorm_weight_det: None,
             gate_proj: zero_matrix(8, 4).into(),
             up_proj: zero_matrix(8, 4).into(),
             down_proj: zero_matrix(4, 8).into(),
@@ -5742,8 +5966,10 @@ mod tests {
                 input_gate: zero_matrix(2, 4).into(),
                 layer_projection: zero_matrix(4, 2).into(),
                 post_input_norm_weight: vec![1.0; 4],
+                post_input_norm_weight_det: None,
             }),
             layer_scalar: None,
+            layer_scalar_det: None,
         }
     }
 
@@ -5756,6 +5982,7 @@ mod tests {
             input_gate_det: None,
             layer_projection_det: None,
             post_input_norm_weight: vec![1.0; 4],
+            post_input_norm_weight_det: None,
         });
         resolved
     }

@@ -126,7 +126,9 @@ When `--deterministic` is set, the model path must point to either:
 - a directory containing `config.json` and `model.detwgt`
 - a direct path to a `model.detwgt` file with a sibling `config.json`
 
-This Phase 1 deterministic path is a **converted-weight parity path** with a canonical-state runtime core. It loads canonical `Wgt` bytes from `model.detwgt`, keeps deterministic KV cache rows and layer activations in canonical `Act` form across deterministic prefill/decode boundaries, and derives the existing `f32` views for public API, JSON, and trace compatibility. It is not yet a full public `det_num` API redesign: checkpoint payloads, `InferenceState`, and the existing digest field names still use the current compatibility shape.
+This Phase 1 deterministic path is a **converted-weight parity path** with a canonical-state runtime core. It requires `.detwgt` provenance, loads canonical `Wgt` bytes from `model.detwgt`, keeps deterministic KV cache rows and layer activations in canonical `Act` form across deterministic prefill/decode boundaries, and converts config-derived scalars once into canonical `Act`/`Acc` carriers. The existing `f32` fields remain compatibility views for public API and JSON consumers.
+
+Deterministic checkpoints may include optional `det_*_sha256` fields next to the compatibility hashes. Compatibility fields such as `activations_sha256`, `final_logits_sha256`, and serialized `layer_caches` still describe the public f32 views; `det_*` fields describe canonical fixed-point bytes and are omitted when deterministic internals are not present.
 
 The CLI prints the resulting `InferenceState` as formatted JSON with:
 

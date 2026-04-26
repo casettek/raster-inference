@@ -18,13 +18,18 @@ In v0, `det_num` also defines the canonical numeric representation of compiled m
 
 ## Runtime state boundary
 
+Deterministic execution requires a model loaded from `model.detwgt`. Mixed-mode inputs such as safetensors/f32 model provenance with `InferenceExecutionMode::Deterministic` are invalid and must fail closed instead of requantizing public f32 mirrors.
+
 Deterministic execution stores runtime state internally in canonical fixed-point form:
 
 - layer activation rows that continue through deterministic prefill and decode use canonical `Act` rows as the source of truth
 - deterministic KV cache keys and values retain canonical `Act` rows across decode steps
 - logits can carry canonical `Act` values through deterministic token selection
+- norm vectors loaded from `model.detwgt` are carried as canonical `Wgt` values alongside their compatibility f32 views
+- config-derived deterministic scalars such as RMS epsilon and RoPE bases are converted once at load time into canonical `Acc` values
+- deterministic scale/softcap scalars are converted once at load time into canonical `Act` values
 
-The current public API and trace/checkpoint payloads still expose compatibility `f32` views. Existing fields such as `activations_sha256`, `final_logits_sha256`, and serialized `layer_caches` are therefore compatibility commitments over those `f32` views, not newly versioned canonical commitments. Replacing or versioning those public digests is deferred until the external trace contract is updated deliberately.
+The current public API still exposes compatibility `f32` views. Existing fields such as `activations_sha256`, `final_logits_sha256`, and serialized `layer_caches` remain compatibility commitments over those `f32` views. Optional `det_*_sha256` fields are canonical commitments over fixed-point bytes and are emitted only when deterministic internals are present; f32-only internals must not fabricate them.
 
 ---
 

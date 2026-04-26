@@ -22,6 +22,7 @@ pub fn run(
                 &model.layers,
                 ple_global,
                 model.rms_norm_eps,
+                model.rms_norm_eps_det,
                 execution_mode,
             )
         })
@@ -33,6 +34,7 @@ pub fn run(
             "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
             "embedded_prompt_activations": token_embeddings.activations.clone(),
             "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
+            "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
             "per_layer_prefill_inputs": ple_inputs.as_ref().map(|inputs| inputs.per_layer_inputs.clone()),
             "per_layer_prefill_input_sha256s": ple_inputs.as_ref().map(|inputs| {
                 inputs

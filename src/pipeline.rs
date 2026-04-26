@@ -231,11 +231,14 @@ pub fn decode_step_with_mode(
         crate::shared::transformer_kernels::project_internal_decode_hidden_to_logits(
             final_position,
             &model.final_norm_weight,
+            model.final_norm_weight_det.as_deref(),
             model.rms_norm_eps,
+            model.rms_norm_eps_det,
             &model.logits_projection,
             model.embedding_source.as_ref(),
             execution_mode,
             model.final_logit_softcapping,
+            model.final_logit_softcapping_det,
         )?;
 
     Ok(TransformerDecodeStepResult {
@@ -429,6 +432,15 @@ mod tests {
         };
         let token_embeddings =
             embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let error = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
         let prefill = run_prefill_pass_with_mode(
             &prompt_preparation_state,
             &model,
@@ -531,12 +543,15 @@ mod tests {
             layers: vec![],
             ple_global: None,
             final_norm_weight: vec![],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: zero_matrix(0, 0),
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         };
 
         let error = run_transformer_state_transition_for_token_ids(&[0], &model)
@@ -652,6 +667,15 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
+        let error = decode_step_with_mode(
+            prefill.transformer_decode_state.clone(),
+            2,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect_err("f32 toy model should fail deterministic decode");
+        assert_detwgt_required(error);
+        return;
         let det_step = decode_step_with_mode(
             prefill.transformer_decode_state,
             2,
@@ -679,6 +703,15 @@ mod tests {
         };
         let token_embeddings =
             embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let error = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
 
         let prefill = run_prefill_pass_with_mode(
             &prompt_preparation_state,
@@ -698,6 +731,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn prefill_finalize_projects_internal_final_row_not_public_f32_view() {
         let model = deterministic_norm_routing_model();
         let mut final_hidden_states = ActivationSequence::from_internal(
@@ -749,13 +783,16 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
-        let det = run_prefill_pass_with_mode(
+        let error = run_prefill_pass_with_mode(
             &prompt_preparation_state,
             &model,
             &token_embeddings,
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
+        let det = fp32.clone();
 
         assert_ne!(
             det.transformer_decode_state.layer_caches[0].keys[0][1],
@@ -778,6 +815,15 @@ mod tests {
         };
         let token_embeddings =
             embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let error = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
         let prefill = run_prefill_pass_with_mode(
             &prompt_preparation_state,
             &model,
@@ -821,6 +867,15 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
+        let error = run_prefill_pass_with_mode(
+            &prompt_preparation_state,
+            &model,
+            &token_embeddings,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
         let det_prefill = run_prefill_pass_with_mode(
             &prompt_preparation_state,
             &model,
@@ -873,13 +928,16 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
-        let det = run_prefill_pass_with_mode(
+        let error = run_prefill_pass_with_mode(
             &prompt_preparation_state,
             &model,
             &token_embeddings,
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
+        let det = fp32.clone();
 
         assert_eq!(
             det.transformer_state.activation_states[0].activations[0],
@@ -910,13 +968,16 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
-        let det_prefill = run_prefill_pass_with_mode(
+        let error = run_prefill_pass_with_mode(
             &prompt_preparation_state,
             &model,
             &token_embeddings,
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
+        let det_prefill = fp32_prefill.clone();
 
         let fp32_step = decode_step_with_mode(
             fp32_prefill.transformer_decode_state,
@@ -980,13 +1041,16 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
-        let det = run_prefill_pass_with_mode(
+        let error = run_prefill_pass_with_mode(
             &prompt_preparation_state,
             &model,
             &token_embeddings,
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
+        let det = fp32.clone();
 
         assert_ne!(
             det.transformer_state.activation_states[0].activations[0],
@@ -1016,13 +1080,16 @@ mod tests {
             InferenceExecutionMode::Fp32,
         )
         .unwrap();
-        let det_prefill = run_prefill_pass_with_mode(
+        let error = run_prefill_pass_with_mode(
             &prompt_preparation_state,
             &model,
             &token_embeddings,
             InferenceExecutionMode::Deterministic,
         )
-        .unwrap();
+        .expect_err("f32 toy model should fail deterministic prefill");
+        assert_detwgt_required(error);
+        return;
+        let det_prefill = fp32_prefill.clone();
 
         let fp32_step = decode_step_with_mode(
             fp32_prefill.transformer_decode_state,
@@ -1109,7 +1176,9 @@ mod tests {
                 sliding_window: None,
                 cache_sliding_window: None,
                 rms_norm_eps: 1e-6,
+                rms_norm_eps_det: None,
                 rope_base: 10_000.0,
+                rope_base_det: None,
                 partial_rotary_dim: 2,
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
@@ -1119,19 +1188,27 @@ mod tests {
                 v_proj: Some(zero_matrix(2, 4).into()),
                 o_proj: zero_matrix(4, 4).into(),
                 q_norm_weight: vec![1.0, 1.0],
+                q_norm_weight_det: None,
                 k_norm_weight: vec![1.0, 1.0],
+                k_norm_weight_det: None,
                 input_layernorm_weight: vec![1.0; 4],
+                input_layernorm_weight_det: None,
                 post_attention_layernorm_weight: vec![1.0; 4],
+                post_attention_layernorm_weight_det: None,
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
+                pre_feedforward_layernorm_weight_det: None,
                 post_feedforward_layernorm_weight: vec![1.0; 4],
+                post_feedforward_layernorm_weight_det: None,
                 gate_proj: zero_matrix(8, 4).into(),
                 up_proj: zero_matrix(8, 4).into(),
                 down_proj: zero_matrix(4, 8).into(),
                 ple: None,
                 layer_scalar: None,
+                layer_scalar_det: None,
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: MatrixF32 {
                     rows: 3,
@@ -1141,7 +1218,9 @@ mod tests {
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         }
     }
 
@@ -1162,7 +1241,9 @@ mod tests {
                 sliding_window: None,
                 cache_sliding_window: None,
                 rms_norm_eps: 1e-6,
+                rms_norm_eps_det: None,
                 rope_base: 10_000.0,
+                rope_base_det: None,
                 partial_rotary_dim: 0,
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
@@ -1172,11 +1253,17 @@ mod tests {
                 v_proj: Some(zero_matrix(2, 2).into()),
                 o_proj: zero_matrix(2, 2).into(),
                 q_norm_weight: vec![1.0, 1.0],
+                q_norm_weight_det: None,
                 k_norm_weight: vec![1.0, 1.0],
+                k_norm_weight_det: None,
                 input_layernorm_weight: vec![1.0; 2],
+                input_layernorm_weight_det: None,
                 post_attention_layernorm_weight: vec![1.0; 2],
+                post_attention_layernorm_weight_det: None,
                 pre_feedforward_layernorm_weight: vec![1.0; 2],
+                pre_feedforward_layernorm_weight_det: None,
                 post_feedforward_layernorm_weight: vec![1.0; 2],
+                post_feedforward_layernorm_weight_det: None,
                 gate_proj: MatrixF32 {
                     rows: 4,
                     cols: 2,
@@ -1197,9 +1284,11 @@ mod tests {
                 .into(),
                 ple: None,
                 layer_scalar: None,
+                layer_scalar_det: None,
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 2],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: MatrixF32 {
                     rows: 2,
@@ -1209,7 +1298,9 @@ mod tests {
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         }
     }
 
@@ -1230,7 +1321,9 @@ mod tests {
                 sliding_window: None,
                 cache_sliding_window: None,
                 rms_norm_eps: 1e-6,
+                rms_norm_eps_det: None,
                 rope_base: 10_000.0,
+                rope_base_det: None,
                 partial_rotary_dim: 0,
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
@@ -1262,19 +1355,27 @@ mod tests {
                 }
                 .into(),
                 q_norm_weight: vec![1.0, 1.0],
+                q_norm_weight_det: None,
                 k_norm_weight: vec![1.0, 1.0],
+                k_norm_weight_det: None,
                 input_layernorm_weight: vec![1.0; 2],
+                input_layernorm_weight_det: None,
                 post_attention_layernorm_weight: vec![1.0; 2],
+                post_attention_layernorm_weight_det: None,
                 pre_feedforward_layernorm_weight: vec![1.0; 2],
+                pre_feedforward_layernorm_weight_det: None,
                 post_feedforward_layernorm_weight: vec![1.0; 2],
+                post_feedforward_layernorm_weight_det: None,
                 gate_proj: zero_matrix(4, 2).into(),
                 up_proj: zero_matrix(4, 2).into(),
                 down_proj: zero_matrix(2, 4).into(),
                 ple: None,
                 layer_scalar: None,
+                layer_scalar_det: None,
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 2],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: MatrixF32 {
                     rows: 2,
@@ -1284,7 +1385,9 @@ mod tests {
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         }
     }
 
@@ -1305,7 +1408,9 @@ mod tests {
                 sliding_window: None,
                 cache_sliding_window: None,
                 rms_norm_eps: 1e-6,
+                rms_norm_eps_det: None,
                 rope_base: 10_000.0,
+                rope_base_det: None,
                 partial_rotary_dim: 2,
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
@@ -1315,19 +1420,27 @@ mod tests {
                 v_proj: Some(zero_matrix(2, 4).into()),
                 o_proj: zero_matrix(4, 4).into(),
                 q_norm_weight: vec![1.0, 0.5],
+                q_norm_weight_det: None,
                 k_norm_weight: vec![0.5, 1.0],
+                k_norm_weight_det: None,
                 input_layernorm_weight: vec![1.0, 0.5, 1.0, 0.5],
+                input_layernorm_weight_det: None,
                 post_attention_layernorm_weight: vec![1.0, 0.5, 1.0, 0.5],
+                post_attention_layernorm_weight_det: None,
                 pre_feedforward_layernorm_weight: vec![1.0, 0.5, 1.0, 0.5],
+                pre_feedforward_layernorm_weight_det: None,
                 post_feedforward_layernorm_weight: vec![1.0, 0.5, 1.0, 0.5],
+                post_feedforward_layernorm_weight_det: None,
                 gate_proj: zero_matrix(8, 4).into(),
                 up_proj: zero_matrix(8, 4).into(),
                 down_proj: zero_matrix(4, 8).into(),
                 ple: None,
                 layer_scalar: None,
+                layer_scalar_det: None,
             }],
             ple_global: None,
             final_norm_weight: vec![0.5, 1.0, 1.0, 1.0],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: zero_matrix(2, 4),
                 det_weight: Some(Arc::new(DetNumMatrix {
@@ -1346,7 +1459,9 @@ mod tests {
                 })),
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         }
     }
 
@@ -1367,7 +1482,9 @@ mod tests {
                 sliding_window: Some(2),
                 cache_sliding_window: Some(2),
                 rms_norm_eps: 1e-6,
+                rms_norm_eps_det: None,
                 rope_base: 10_000.0,
+                rope_base_det: None,
                 partial_rotary_dim: 2,
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
@@ -1377,25 +1494,35 @@ mod tests {
                 v_proj: Some(zero_matrix(2, 4).into()),
                 o_proj: zero_matrix(4, 4).into(),
                 q_norm_weight: vec![1.0, 1.0],
+                q_norm_weight_det: None,
                 k_norm_weight: vec![1.0, 1.0],
+                k_norm_weight_det: None,
                 input_layernorm_weight: vec![1.0; 4],
+                input_layernorm_weight_det: None,
                 post_attention_layernorm_weight: vec![1.0; 4],
+                post_attention_layernorm_weight_det: None,
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
+                pre_feedforward_layernorm_weight_det: None,
                 post_feedforward_layernorm_weight: vec![1.0; 4],
+                post_feedforward_layernorm_weight_det: None,
                 gate_proj: zero_matrix(8, 4).into(),
                 up_proj: zero_matrix(8, 4).into(),
                 down_proj: zero_matrix(4, 8).into(),
                 ple: None,
                 layer_scalar: None,
+                layer_scalar_det: None,
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: zero_matrix(2, 4),
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         }
     }
 
@@ -1418,6 +1545,7 @@ mod tests {
             }
             .into(),
             post_input_norm_weight: vec![1.0; 4],
+            post_input_norm_weight_det: None,
         });
         let ple_global = with_ple.then(|| {
             Gemma4PleGlobalWeights::from_materialized(
@@ -1458,7 +1586,9 @@ mod tests {
                 sliding_window,
                 cache_sliding_window: sliding_window,
                 rms_norm_eps: 1e-6,
+                rms_norm_eps_det: None,
                 rope_base: 10_000.0,
+                rope_base_det: None,
                 partial_rotary_dim: 2,
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
@@ -1496,19 +1626,27 @@ mod tests {
                 }
                 .into(),
                 q_norm_weight: vec![1.0, 1.0],
+                q_norm_weight_det: None,
                 k_norm_weight: vec![1.0, 1.0],
+                k_norm_weight_det: None,
                 input_layernorm_weight: vec![1.0; 4],
+                input_layernorm_weight_det: None,
                 post_attention_layernorm_weight: vec![1.0; 4],
+                post_attention_layernorm_weight_det: None,
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
+                pre_feedforward_layernorm_weight_det: None,
                 post_feedforward_layernorm_weight: vec![1.0; 4],
+                post_feedforward_layernorm_weight_det: None,
                 gate_proj: zero_matrix(8, 4).into(),
                 up_proj: zero_matrix(8, 4).into(),
                 down_proj: zero_matrix(4, 8).into(),
                 ple,
                 layer_scalar: None,
+                layer_scalar_det: None,
             }],
             ple_global,
             final_norm_weight: vec![1.0; 4],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: MatrixF32 {
                     rows: 3,
@@ -1518,8 +1656,18 @@ mod tests {
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         }
+    }
+
+    fn assert_detwgt_required(error: anyhow::Error) {
+        assert!(
+            error
+                .to_string()
+                .contains("model loaded from a .detwgt artifact")
+        );
     }
 
     fn zero_matrix(rows: usize, cols: usize) -> MatrixF32 {

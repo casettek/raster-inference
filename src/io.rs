@@ -13,7 +13,7 @@ use sha2::Digest;
 use tokenizers::Tokenizer;
 
 use crate::shared::det_num::{
-    f32_to_act, scale_act, Act, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
+    f32_to_acc, f32_to_act, scale_act, Act, Wgt, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
     DET_WGT_ARTIFACT_MAGIC,
 };
 use crate::shared::input::InferenceExecutionMode;
@@ -389,6 +389,14 @@ impl DetNumTensorReader {
     }
 
     fn load_vector(&self, tensor_name: &str) -> Result<Vec<f32>> {
+        Ok(self
+            .load_vector_wgt(tensor_name)?
+            .into_iter()
+            .map(|value| det_wgt_to_f32(value.to_bits()))
+            .collect())
+    }
+
+    fn load_vector_wgt(&self, tensor_name: &str) -> Result<Vec<Wgt>> {
         let tensor = self.tensors.get(tensor_name).ok_or_else(|| {
             anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact")
         })?;
@@ -401,15 +409,19 @@ impl DetNumTensorReader {
         let payload = self.payload_slice(tensor_name, tensor)?;
         Ok(payload
             .chunks_exact(4)
-            .map(|chunk| {
-                det_wgt_to_f32(i32::from_le_bytes(
-                    chunk.try_into().expect("i32 byte width should match"),
-                ))
-            })
+            .map(|chunk| Wgt::from_bits(i32::from_le_bytes(
+                chunk.try_into().expect("i32 byte width should match"),
+            )))
             .collect())
     }
 
     fn load_optional_scalar(&self, tensor_name: &str) -> Result<Option<f32>> {
+        Ok(self
+            .load_optional_scalar_wgt(tensor_name)?
+            .map(|value| det_wgt_to_f32(value.to_bits())))
+    }
+
+    fn load_optional_scalar_wgt(&self, tensor_name: &str) -> Result<Option<Wgt>> {
         let Some(tensor) = self.tensors.get(tensor_name) else {
             return Ok(None);
         };
@@ -423,7 +435,7 @@ impl DetNumTensorReader {
         let bytes = payload
             .get(..4)
             .ok_or_else(|| anyhow!("tensor `{tensor_name}` is missing its scalar payload"))?;
-        Ok(Some(det_wgt_to_f32(i32::from_le_bytes(
+        Ok(Some(Wgt::from_bits(i32::from_le_bytes(
             bytes.try_into().expect("i32 byte width should match"),
         ))))
     }
@@ -939,9 +951,12 @@ pub fn load_transformer_state_model_from_gemma_model_path<P: AsRef<Path>>(
         layers,
         ple_global,
         final_norm_weight,
+        final_norm_weight_det: None,
         logits_projection,
         final_logit_softcapping: config.final_logit_softcapping,
+        final_logit_softcapping_det: None,
         rms_norm_eps: config.rms_norm_eps,
+        rms_norm_eps_det: None,
     })
 }
 
@@ -992,7 +1007,11 @@ pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
         )?);
     }
     let ple_global = load_det_num_ple_global_weights(&reader, &config)?;
-    let final_norm_weight = reader.load_vector("model.language_model.norm.weight")?;
+    let final_norm_weight_det = reader.load_vector_wgt("model.language_model.norm.weight")?;
+    let final_norm_weight = final_norm_weight_det
+        .iter()
+        .map(|value| det_wgt_to_f32(value.to_bits()))
+        .collect();
     let logits_projection = if config.tie_word_embeddings() {
         Gemma4LogitsProjection::TiedEmbedding(reader.load_matrix(&embedding_tensor_name)?)
     } else {
@@ -1012,14 +1031,28 @@ pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
         layers,
         ple_global,
         final_norm_weight,
+        final_norm_weight_det: Some(final_norm_weight_det),
         logits_projection,
         final_logit_softcapping: config.final_logit_softcapping,
+        final_logit_softcapping_det: config.final_logit_softcapping.map(f32_to_act),
         rms_norm_eps: config.rms_norm_eps,
+        rms_norm_eps_det: Some(f32_to_acc(config.rms_norm_eps)),
     })
 }
 
 fn det_wgt_to_f32(value: i32) -> f32 {
     value as f32 / 65_536.0
+}
+
+fn det_wgt_vec_to_f32(values: &[Wgt]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|value| det_wgt_to_f32(value.to_bits()))
+        .collect()
+}
+
+fn det_wgt_to_act(value: Wgt) -> Act {
+    Act::from_bits(value.to_bits())
 }
 
 fn load_ple_global_weights(
@@ -1097,13 +1130,22 @@ fn load_det_num_ple_global_weights(
         )?);
     }
 
-    Ok(Some(Gemma4PleGlobalWeights::from_det_num_sources(
+    let projection_norm_weight_det =
+        reader.load_vector_wgt("model.language_model.per_layer_projection_norm.weight")?;
+    Ok(Some(Gemma4PleGlobalWeights::from_det_num_sources_with_canonical(
         token_embeddings,
         model_projections,
-        reader.load_vector("model.language_model.per_layer_projection_norm.weight")?,
+        projection_norm_weight_det
+            .iter()
+            .map(|value| det_wgt_to_f32(value.to_bits()))
+            .collect(),
+        projection_norm_weight_det,
         (ple_dim as f32).sqrt(),
+        f32_to_act((ple_dim as f32).sqrt()),
         (hidden_size as f32).powf(-0.5),
+        f32_to_act((hidden_size as f32).powf(-0.5)),
         2f32.powf(-0.5),
+        f32_to_act(2f32.powf(-0.5)),
     )))
 }
 
@@ -1235,7 +1277,9 @@ pub(crate) fn resolve_layer_weights(
         sliding_window: layer.sliding_window,
         cache_sliding_window: layer.cache_sliding_window,
         rms_norm_eps: layer.rms_norm_eps,
+        rms_norm_eps_det: layer.rms_norm_eps_det,
         rope_base: layer.rope_base,
+        rope_base_det: layer.rope_base_det,
         partial_rotary_dim: layer.partial_rotary_dim,
         rope_freq_base_dim: layer.rope_freq_base_dim,
         kv_shared_layer_index: layer.kv_shared_layer_index,
@@ -1258,11 +1302,19 @@ pub(crate) fn resolve_layer_weights(
             .flatten(),
         o_proj_det: materialize_det_num_layer_matrix_source(&layer.o_proj)?,
         q_norm_weight: layer.q_norm_weight.clone(),
+        q_norm_weight_det: layer.q_norm_weight_det.clone(),
         k_norm_weight: layer.k_norm_weight.clone(),
+        k_norm_weight_det: layer.k_norm_weight_det.clone(),
         input_layernorm_weight: layer.input_layernorm_weight.clone(),
+        input_layernorm_weight_det: layer.input_layernorm_weight_det.clone(),
         post_attention_layernorm_weight: layer.post_attention_layernorm_weight.clone(),
+        post_attention_layernorm_weight_det: layer.post_attention_layernorm_weight_det.clone(),
         pre_feedforward_layernorm_weight: layer.pre_feedforward_layernorm_weight.clone(),
+        pre_feedforward_layernorm_weight_det: layer.pre_feedforward_layernorm_weight_det.clone(),
         post_feedforward_layernorm_weight: layer.post_feedforward_layernorm_weight.clone(),
+        post_feedforward_layernorm_weight_det: layer
+            .post_feedforward_layernorm_weight_det
+            .clone(),
         gate_proj: materialize_layer_matrix_source(&layer.gate_proj)?,
         up_proj: materialize_layer_matrix_source(&layer.up_proj)?,
         down_proj: materialize_layer_matrix_source(&layer.down_proj)?,
@@ -1275,6 +1327,7 @@ pub(crate) fn resolve_layer_weights(
             .map(resolve_ple_layer_weights)
             .transpose()?,
         layer_scalar: layer.layer_scalar,
+        layer_scalar_det: layer.layer_scalar_det,
     })
 }
 
@@ -1285,6 +1338,7 @@ fn resolve_ple_layer_weights(ple: &Gemma4PleLayerWeights) -> Result<ResolvedGemm
         input_gate_det: materialize_det_num_layer_matrix_source(&ple.input_gate)?,
         layer_projection_det: materialize_det_num_layer_matrix_source(&ple.layer_projection)?,
         post_input_norm_weight: ple.post_input_norm_weight.clone(),
+        post_input_norm_weight_det: ple.post_input_norm_weight_det.clone(),
     })
 }
 
@@ -1660,6 +1714,7 @@ fn load_gemma4_layer_weights(
                 .resolve_matrix_source(&format!("{layer_prefix}.per_layer_projection.weight"))?,
             post_input_norm_weight: reader
                 .load_vector(&format!("{layer_prefix}.post_per_layer_input_norm.weight"))?,
+            post_input_norm_weight_det: None,
         })
     } else {
         None
@@ -1678,11 +1733,13 @@ fn load_gemma4_layer_weights(
             None
         },
         rms_norm_eps: config.rms_norm_eps,
+        rms_norm_eps_det: None,
         rope_base: if is_sliding {
             config.rope_local_base_freq()
         } else {
             config.rope_full_base_freq()
         },
+        rope_base_det: None,
         partial_rotary_dim,
         rope_freq_base_dim: head_dim,
         kv_shared_layer_index,
@@ -1698,20 +1755,27 @@ fn load_gemma4_layer_weights(
         },
         o_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
         q_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.q_norm.weight"))?,
+        q_norm_weight_det: None,
         k_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.k_norm.weight"))?,
+        k_norm_weight_det: None,
         input_layernorm_weight: reader
             .load_vector(&format!("{layer_prefix}.input_layernorm.weight"))?,
+        input_layernorm_weight_det: None,
         post_attention_layernorm_weight: reader
             .load_vector(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
+        post_attention_layernorm_weight_det: None,
         pre_feedforward_layernorm_weight: reader
             .load_vector(&format!("{layer_prefix}.pre_feedforward_layernorm.weight"))?,
+        pre_feedforward_layernorm_weight_det: None,
         post_feedforward_layernorm_weight: reader
             .load_vector(&format!("{layer_prefix}.post_feedforward_layernorm.weight"))?,
+        post_feedforward_layernorm_weight_det: None,
         gate_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.gate_proj.weight"))?,
         up_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.up_proj.weight"))?,
         down_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.down_proj.weight"))?,
         ple,
         layer_scalar: reader.load_optional_scalar(&format!("{layer_prefix}.layer_scalar"))?,
+        layer_scalar_det: None,
     })
 }
 
@@ -1746,6 +1810,8 @@ fn load_det_num_gemma4_layer_weights(
     let kv_shared_layer_index = kv_shared_layer_index(config, layer_idx)?;
     let effective_sliding_window = config.effective_sliding_window();
     let ple = if config.hidden_size_per_layer_input.unwrap_or(0) > 0 {
+        let post_input_norm_weight_det =
+            reader.load_vector_wgt(&format!("{layer_prefix}.post_per_layer_input_norm.weight"))?;
         Some(Gemma4PleLayerWeights {
             input_gate: Gemma4LayerMatrixSource::from_det_num_source(
                 reader.resolve_full_matrix_source(&format!(
@@ -1757,12 +1823,30 @@ fn load_det_num_gemma4_layer_weights(
                     "{layer_prefix}.per_layer_projection.weight"
                 ))?,
             ),
-            post_input_norm_weight: reader
-                .load_vector(&format!("{layer_prefix}.post_per_layer_input_norm.weight"))?,
+            post_input_norm_weight: det_wgt_vec_to_f32(&post_input_norm_weight_det),
+            post_input_norm_weight_det: Some(post_input_norm_weight_det),
         })
     } else {
         None
     };
+    let rope_base = if is_sliding {
+        config.rope_local_base_freq()
+    } else {
+        config.rope_full_base_freq()
+    };
+    let q_norm_weight_det =
+        reader.load_vector_wgt(&format!("{layer_prefix}.self_attn.q_norm.weight"))?;
+    let k_norm_weight_det =
+        reader.load_vector_wgt(&format!("{layer_prefix}.self_attn.k_norm.weight"))?;
+    let input_layernorm_weight_det =
+        reader.load_vector_wgt(&format!("{layer_prefix}.input_layernorm.weight"))?;
+    let post_attention_layernorm_weight_det =
+        reader.load_vector_wgt(&format!("{layer_prefix}.post_attention_layernorm.weight"))?;
+    let pre_feedforward_layernorm_weight_det =
+        reader.load_vector_wgt(&format!("{layer_prefix}.pre_feedforward_layernorm.weight"))?;
+    let post_feedforward_layernorm_weight_det =
+        reader.load_vector_wgt(&format!("{layer_prefix}.post_feedforward_layernorm.weight"))?;
+    let layer_scalar_det = reader.load_optional_scalar_wgt(&format!("{layer_prefix}.layer_scalar"))?;
 
     Ok(Gemma4LayerWeights {
         attention_kind,
@@ -1777,11 +1861,9 @@ fn load_det_num_gemma4_layer_weights(
             None
         },
         rms_norm_eps: config.rms_norm_eps,
-        rope_base: if is_sliding {
-            config.rope_local_base_freq()
-        } else {
-            config.rope_full_base_freq()
-        },
+        rms_norm_eps_det: Some(f32_to_acc(config.rms_norm_eps)),
+        rope_base,
+        rope_base_det: Some(f32_to_acc(rope_base)),
         partial_rotary_dim,
         rope_freq_base_dim: head_dim,
         kv_shared_layer_index,
@@ -1818,16 +1900,20 @@ fn load_det_num_gemma4_layer_weights(
             reader
                 .resolve_full_matrix_source(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
         ),
-        q_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.q_norm.weight"))?,
-        k_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.k_norm.weight"))?,
-        input_layernorm_weight: reader
-            .load_vector(&format!("{layer_prefix}.input_layernorm.weight"))?,
-        post_attention_layernorm_weight: reader
-            .load_vector(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
-        pre_feedforward_layernorm_weight: reader
-            .load_vector(&format!("{layer_prefix}.pre_feedforward_layernorm.weight"))?,
-        post_feedforward_layernorm_weight: reader
-            .load_vector(&format!("{layer_prefix}.post_feedforward_layernorm.weight"))?,
+        q_norm_weight: det_wgt_vec_to_f32(&q_norm_weight_det),
+        q_norm_weight_det: Some(q_norm_weight_det),
+        k_norm_weight: det_wgt_vec_to_f32(&k_norm_weight_det),
+        k_norm_weight_det: Some(k_norm_weight_det),
+        input_layernorm_weight: det_wgt_vec_to_f32(&input_layernorm_weight_det),
+        input_layernorm_weight_det: Some(input_layernorm_weight_det),
+        post_attention_layernorm_weight: det_wgt_vec_to_f32(&post_attention_layernorm_weight_det),
+        post_attention_layernorm_weight_det: Some(post_attention_layernorm_weight_det),
+        pre_feedforward_layernorm_weight: det_wgt_vec_to_f32(&pre_feedforward_layernorm_weight_det),
+        pre_feedforward_layernorm_weight_det: Some(pre_feedforward_layernorm_weight_det),
+        post_feedforward_layernorm_weight: det_wgt_vec_to_f32(
+            &post_feedforward_layernorm_weight_det,
+        ),
+        post_feedforward_layernorm_weight_det: Some(post_feedforward_layernorm_weight_det),
         gate_proj: Gemma4LayerMatrixSource::from_det_num_source(
             reader.resolve_full_matrix_source(&format!("{layer_prefix}.mlp.gate_proj.weight"))?,
         ),
@@ -1838,7 +1924,8 @@ fn load_det_num_gemma4_layer_weights(
             reader.resolve_full_matrix_source(&format!("{layer_prefix}.mlp.down_proj.weight"))?,
         ),
         ple,
-        layer_scalar: reader.load_optional_scalar(&format!("{layer_prefix}.layer_scalar"))?,
+        layer_scalar: layer_scalar_det.map(|value| det_wgt_to_f32(value.to_bits())),
+        layer_scalar_det: layer_scalar_det.map(det_wgt_to_act),
     })
 }
 

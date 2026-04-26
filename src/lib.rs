@@ -61,6 +61,8 @@ pub struct InputEmbeddingState {
     #[serde(flatten)]
     pub prompt_preparation: PromptPreparationState,
     pub embedded_prompt_activations_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub det_embedded_prompt_activations_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -125,6 +127,8 @@ pub fn run_inference_with_controls(
         trace::start_inference_trace(&json!({
             "model_id": model.model_id,
             "execution_mode": request.execution_mode,
+            "det_num_spec_version": crate::shared::det_num::DET_NUM_SPEC_VERSION,
+            "model_provenance": format!("{:?}", transformer_model.provenance),
             "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
             "max_new_tokens": request.sampling.max_new_tokens,
             "transformer_layer_count": transformer_model.layers.len(),
@@ -156,6 +160,9 @@ pub fn run_inference_with_controls(
             let input_embedding = InputEmbeddingState {
                 prompt_preparation: prompt_preparation.clone(),
                 embedded_prompt_activations_sha256: token_embeddings.activations_sha256.clone(),
+                det_embedded_prompt_activations_sha256: token_embeddings
+                    .det_activations_sha256
+                    .clone(),
             };
             trace::trace_checkpoint(
                 "prompt.prepare",
@@ -165,6 +172,7 @@ pub fn run_inference_with_controls(
                     "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
                     "embedded_prompt_activations": token_embeddings.activations.clone(),
                     "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
+                    "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
                     "sampling": request.sampling.clone(),
                 }),
             );
@@ -690,7 +698,9 @@ mod tests {
                 sliding_window: Some(2),
                 cache_sliding_window: Some(2),
                 rms_norm_eps: 1e-6,
+                rms_norm_eps_det: None,
                 rope_base: 10_000.0,
+                rope_base_det: None,
                 partial_rotary_dim: 2,
                 rope_freq_base_dim: 2,
                 kv_shared_layer_index: None,
@@ -700,25 +710,35 @@ mod tests {
                 v_proj: Some(zero_matrix(2, 4).into()),
                 o_proj: zero_matrix(4, 4).into(),
                 q_norm_weight: vec![1.0, 1.0],
+                q_norm_weight_det: None,
                 k_norm_weight: vec![1.0, 1.0],
+                k_norm_weight_det: None,
                 input_layernorm_weight: vec![1.0; 4],
+                input_layernorm_weight_det: None,
                 post_attention_layernorm_weight: vec![1.0; 4],
+                post_attention_layernorm_weight_det: None,
                 pre_feedforward_layernorm_weight: vec![1.0; 4],
+                pre_feedforward_layernorm_weight_det: None,
                 post_feedforward_layernorm_weight: vec![1.0; 4],
+                post_feedforward_layernorm_weight_det: None,
                 gate_proj: zero_matrix(8, 4).into(),
                 up_proj: zero_matrix(8, 4).into(),
                 down_proj: zero_matrix(4, 8).into(),
                 ple: None,
                 layer_scalar: None,
+                layer_scalar_det: None,
             }],
             ple_global: None,
             final_norm_weight: vec![1.0; 4],
+            final_norm_weight_det: None,
             logits_projection: Gemma4LogitsProjection::UntiedLmHead {
                 weight: zero_matrix(3, 4),
                 det_weight: None,
             },
             final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
             rms_norm_eps: 1e-6,
+            rms_norm_eps_det: None,
         }
     }
 

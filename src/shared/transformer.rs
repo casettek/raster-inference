@@ -9,7 +9,7 @@ use memmap2::Mmap;
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 
-use crate::shared::det_num::{act_to_f32, Act};
+use crate::shared::det_num::{act_to_f32, f32_to_act, f32_to_wgt, Acc, Act, Wgt};
 use crate::shared::input::InferenceExecutionMode;
 
 fn default_embedding_scale() -> f32 {
@@ -293,9 +293,13 @@ pub struct Gemma4PleGlobalWeights {
     pub(crate) token_embeddings: Vec<Gemma4PleMatrixSource>,
     pub(crate) model_projections: Vec<Gemma4PleMatrixSource>,
     pub projection_norm_weight: Vec<f32>,
+    pub projection_norm_weight_det: Option<Vec<Wgt>>,
     pub embedding_scale: f32,
+    pub embedding_scale_det: Option<Act>,
     pub projection_scalar: f32,
+    pub projection_scalar_det: Option<Act>,
     pub input_scale: f32,
+    pub input_scale_det: Option<Act>,
     pub(crate) mmap_cache: Arc<Mutex<HashMap<PathBuf, Arc<Mmap>>>>,
     pub(crate) token_row_cache: Arc<Mutex<HashMap<(usize, usize), Vec<f32>>>>,
     pub(crate) model_projection_cache: Arc<Mutex<HashMap<usize, MatrixF32>>>,
@@ -321,9 +325,13 @@ impl Gemma4PleGlobalWeights {
                 .map(Gemma4PleMatrixSource::Materialized)
                 .collect(),
             projection_norm_weight,
+            None,
             embedding_scale,
+            None,
             projection_scalar,
+            None,
             input_scale,
+            None,
         )
     }
 
@@ -345,9 +353,13 @@ impl Gemma4PleGlobalWeights {
                 .map(Gemma4PleMatrixSource::Lazy)
                 .collect(),
             projection_norm_weight,
+            None,
             embedding_scale,
+            None,
             projection_scalar,
+            None,
             input_scale,
+            None,
         )
     }
 
@@ -359,6 +371,37 @@ impl Gemma4PleGlobalWeights {
         projection_scalar: f32,
         input_scale: f32,
     ) -> Self {
+        let projection_norm_weight_det = projection_norm_weight
+            .iter()
+            .copied()
+            .map(f32_to_wgt)
+            .collect();
+        Self::from_det_num_sources_with_canonical(
+            token_embeddings,
+            model_projections,
+            projection_norm_weight,
+            projection_norm_weight_det,
+            embedding_scale,
+            f32_to_act(embedding_scale),
+            projection_scalar,
+            f32_to_act(projection_scalar),
+            input_scale,
+            f32_to_act(input_scale),
+        )
+    }
+
+    pub(crate) fn from_det_num_sources_with_canonical(
+        token_embeddings: Vec<DetNumTensorSliceSource>,
+        model_projections: Vec<DetNumTensorSliceSource>,
+        projection_norm_weight: Vec<f32>,
+        projection_norm_weight_det: Vec<Wgt>,
+        embedding_scale: f32,
+        embedding_scale_det: Act,
+        projection_scalar: f32,
+        projection_scalar_det: Act,
+        input_scale: f32,
+        input_scale_det: Act,
+    ) -> Self {
         Self::new(
             token_embeddings
                 .into_iter()
@@ -369,9 +412,13 @@ impl Gemma4PleGlobalWeights {
                 .map(Gemma4PleMatrixSource::DetNumLazy)
                 .collect(),
             projection_norm_weight,
+            Some(projection_norm_weight_det),
             embedding_scale,
+            Some(embedding_scale_det),
             projection_scalar,
+            Some(projection_scalar_det),
             input_scale,
+            Some(input_scale_det),
         )
     }
 
@@ -379,17 +426,25 @@ impl Gemma4PleGlobalWeights {
         token_embeddings: Vec<Gemma4PleMatrixSource>,
         model_projections: Vec<Gemma4PleMatrixSource>,
         projection_norm_weight: Vec<f32>,
+        projection_norm_weight_det: Option<Vec<Wgt>>,
         embedding_scale: f32,
+        embedding_scale_det: Option<Act>,
         projection_scalar: f32,
+        projection_scalar_det: Option<Act>,
         input_scale: f32,
+        input_scale_det: Option<Act>,
     ) -> Self {
         Self {
             token_embeddings,
             model_projections,
             projection_norm_weight,
+            projection_norm_weight_det,
             embedding_scale,
+            embedding_scale_det,
             projection_scalar,
+            projection_scalar_det,
             input_scale,
+            input_scale_det,
             mmap_cache: Arc::new(Mutex::new(HashMap::new())),
             token_row_cache: Arc::new(Mutex::new(HashMap::new())),
             model_projection_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -411,9 +466,13 @@ impl PartialEq for Gemma4PleGlobalWeights {
         self.token_embeddings == other.token_embeddings
             && self.model_projections == other.model_projections
             && self.projection_norm_weight == other.projection_norm_weight
+            && self.projection_norm_weight_det == other.projection_norm_weight_det
             && self.embedding_scale == other.embedding_scale
+            && self.embedding_scale_det == other.embedding_scale_det
             && self.projection_scalar == other.projection_scalar
+            && self.projection_scalar_det == other.projection_scalar_det
             && self.input_scale == other.input_scale
+            && self.input_scale_det == other.input_scale_det
     }
 }
 
@@ -422,6 +481,7 @@ pub struct Gemma4PleLayerWeights {
     pub input_gate: Gemma4LayerMatrixSource,
     pub layer_projection: Gemma4LayerMatrixSource,
     pub post_input_norm_weight: Vec<f32>,
+    pub post_input_norm_weight_det: Option<Vec<Wgt>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -431,6 +491,7 @@ pub struct ResolvedGemma4PleLayerWeights {
     pub input_gate_det: Option<Arc<DetNumMatrix>>,
     pub layer_projection_det: Option<Arc<DetNumMatrix>>,
     pub post_input_norm_weight: Vec<f32>,
+    pub post_input_norm_weight_det: Option<Vec<Wgt>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,7 +510,9 @@ pub struct Gemma4LayerWeights {
     pub sliding_window: Option<usize>,
     pub cache_sliding_window: Option<usize>,
     pub rms_norm_eps: f32,
+    pub rms_norm_eps_det: Option<Acc>,
     pub rope_base: f32,
+    pub rope_base_det: Option<Acc>,
     pub partial_rotary_dim: usize,
     pub rope_freq_base_dim: usize,
     pub kv_shared_layer_index: Option<usize>,
@@ -459,16 +522,23 @@ pub struct Gemma4LayerWeights {
     pub v_proj: Option<Gemma4LayerMatrixSource>,
     pub o_proj: Gemma4LayerMatrixSource,
     pub q_norm_weight: Vec<f32>,
+    pub q_norm_weight_det: Option<Vec<Wgt>>,
     pub k_norm_weight: Vec<f32>,
+    pub k_norm_weight_det: Option<Vec<Wgt>>,
     pub input_layernorm_weight: Vec<f32>,
+    pub input_layernorm_weight_det: Option<Vec<Wgt>>,
     pub post_attention_layernorm_weight: Vec<f32>,
+    pub post_attention_layernorm_weight_det: Option<Vec<Wgt>>,
     pub pre_feedforward_layernorm_weight: Vec<f32>,
+    pub pre_feedforward_layernorm_weight_det: Option<Vec<Wgt>>,
     pub post_feedforward_layernorm_weight: Vec<f32>,
+    pub post_feedforward_layernorm_weight_det: Option<Vec<Wgt>>,
     pub gate_proj: Gemma4LayerMatrixSource,
     pub up_proj: Gemma4LayerMatrixSource,
     pub down_proj: Gemma4LayerMatrixSource,
     pub ple: Option<Gemma4PleLayerWeights>,
     pub layer_scalar: Option<f32>,
+    pub layer_scalar_det: Option<Act>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -481,7 +551,9 @@ pub struct ResolvedGemma4LayerWeights {
     pub sliding_window: Option<usize>,
     pub cache_sliding_window: Option<usize>,
     pub rms_norm_eps: f32,
+    pub rms_norm_eps_det: Option<Acc>,
     pub rope_base: f32,
+    pub rope_base_det: Option<Acc>,
     pub partial_rotary_dim: usize,
     pub rope_freq_base_dim: usize,
     pub kv_shared_layer_index: Option<usize>,
@@ -495,11 +567,17 @@ pub struct ResolvedGemma4LayerWeights {
     pub v_proj_det: Option<Arc<DetNumMatrix>>,
     pub o_proj_det: Option<Arc<DetNumMatrix>>,
     pub q_norm_weight: Vec<f32>,
+    pub q_norm_weight_det: Option<Vec<Wgt>>,
     pub k_norm_weight: Vec<f32>,
+    pub k_norm_weight_det: Option<Vec<Wgt>>,
     pub input_layernorm_weight: Vec<f32>,
+    pub input_layernorm_weight_det: Option<Vec<Wgt>>,
     pub post_attention_layernorm_weight: Vec<f32>,
+    pub post_attention_layernorm_weight_det: Option<Vec<Wgt>>,
     pub pre_feedforward_layernorm_weight: Vec<f32>,
+    pub pre_feedforward_layernorm_weight_det: Option<Vec<Wgt>>,
     pub post_feedforward_layernorm_weight: Vec<f32>,
+    pub post_feedforward_layernorm_weight_det: Option<Vec<Wgt>>,
     pub gate_proj: Arc<MatrixF32>,
     pub up_proj: Arc<MatrixF32>,
     pub down_proj: Arc<MatrixF32>,
@@ -508,6 +586,7 @@ pub struct ResolvedGemma4LayerWeights {
     pub down_proj_det: Option<Arc<DetNumMatrix>>,
     pub ple: Option<ResolvedGemma4PleLayerWeights>,
     pub layer_scalar: Option<f32>,
+    pub layer_scalar_det: Option<Act>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -826,9 +905,12 @@ pub struct Gemma4TransformerModel {
     pub layers: Vec<Gemma4LayerWeights>,
     pub ple_global: Option<Gemma4PleGlobalWeights>,
     pub final_norm_weight: Vec<f32>,
+    pub final_norm_weight_det: Option<Vec<Wgt>>,
     pub logits_projection: Gemma4LogitsProjection,
     pub final_logit_softcapping: Option<f32>,
+    pub final_logit_softcapping_det: Option<Act>,
     pub rms_norm_eps: f32,
+    pub rms_norm_eps_det: Option<Acc>,
 }
 
 impl Gemma4TransformerModel {

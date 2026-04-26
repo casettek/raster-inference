@@ -48,6 +48,7 @@ pub(crate) fn run_text_layers_decode_step_internal(
     let mut xs = decode_input.clone();
     let mut updated_layer_caches = Vec::with_capacity(model.layers.len());
     let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
+    let mut completed_layer_output_det_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         let cache = layer_caches[layer_idx].clone();
         let _trace = trace_scope(format!(
@@ -66,6 +67,7 @@ pub(crate) fn run_text_layers_decode_step_internal(
                 layer,
                 model.ple_global.as_ref(),
                 model.rms_norm_eps,
+                model.rms_norm_eps_det,
                 InferenceExecutionMode::Deterministic,
             )?;
         let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
@@ -82,10 +84,14 @@ pub(crate) fn run_text_layers_decode_step_internal(
             )?;
         xs = layer_output;
         let xs_values = xs.clone_f32();
+        let det_current_activation_sha256 = xs
+            .det_values()
+            .map(crate::shared::transformer_kernels::build_det_vector_commitment);
         updated_layer_caches.push(updated_cache);
         completed_layer_output_sha256s.push(
             crate::shared::transformer_kernels::build_vector_commitment(&xs_values),
         );
+        completed_layer_output_det_sha256s.push(det_current_activation_sha256.clone());
         let mut checkpoint_layer_caches = updated_layer_caches.clone();
         checkpoint_layer_caches.extend(layer_caches.iter().skip(layer_idx + 1).cloned());
         crate::trace::trace_checkpoint(
@@ -97,10 +103,14 @@ pub(crate) fn run_text_layers_decode_step_internal(
                 "next_layer_idx": layer_idx + 1,
                 "decode_input_activation": decode_input_values.clone(),
                 "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&decode_input_values),
+                "det_decode_input_activation_sha256": decode_input.det_values().map(crate::shared::transformer_kernels::build_det_vector_commitment),
                 "current_activation": xs_values.clone(),
                 "current_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&xs_values),
+                "det_current_activation_sha256": det_current_activation_sha256,
                 "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
+                "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
                 "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
+                "completed_layer_output_det_sha256s": completed_layer_output_det_sha256s.clone(),
             }),
         );
     }
@@ -110,11 +120,16 @@ pub(crate) fn run_text_layers_decode_step_internal(
         Some(det_values) => InternalActivationSequence::from_det_values(vec![det_values.to_vec()]),
         None => InternalActivationSequence::from_values(vec![xs_values.clone()]),
     };
+    let det_activations_sha256 = activation_internal
+        .det_values()
+        .map(crate::shared::transformer_kernels::build_det_activation_commitment);
+    let mut activation_state = ActivationSequence::from_internal(
+        activation_internal,
+        crate::shared::transformer_kernels::build_activation_commitment(&[xs_values]),
+    );
+    activation_state.det_activations_sha256 = det_activations_sha256;
     Ok(ActivationSequenceWithCache {
-        activation_state: ActivationSequence::from_internal(
-            activation_internal,
-            crate::shared::transformer_kernels::build_activation_commitment(&[xs_values]),
-        ),
+        activation_state,
         layer_caches: updated_layer_caches,
     })
 }
