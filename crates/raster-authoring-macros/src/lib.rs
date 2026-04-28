@@ -10,20 +10,11 @@ pub fn sequence(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn tile(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
-    let fn_name = &item_fn.sig.ident;
 
-    if !is_recursive_tile(attr) {
-        return TokenStream::from(quote! { #item_fn });
-    }
+    let _recursive_tile = is_recursive_tile(attr);
 
     TokenStream::from(quote! {
         #item_fn
-
-        macro_rules! #fn_name {
-            ($($args:expr),* $(,)?) => {
-                $crate::__raster_authoring_run_recur_tile!(#fn_name, $($args),*)
-            };
-        }
     })
 }
 
@@ -32,5 +23,5 @@ fn is_recursive_tile(attr: TokenStream) -> bool {
 
     attr.split(',')
         .map(|part| part.replace([' ', '"'], ""))
-        .any(|part| part == "kind=recur")
+        .any(|part| part == "kind=recursive" || part == "kind=recur")
 }
