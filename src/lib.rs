@@ -77,6 +77,7 @@ pub struct InferenceState {
 pub struct InferenceControls {
     pub commit_checkpoints: bool,
     pub terminal_checkpoint: Option<String>,
+    pub raster_tiles: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -135,11 +136,16 @@ pub fn run_inference_with_controls(
             "transformer_layer_count": transformer_model.layers.len(),
             "terminal_checkpoint": controls.terminal_checkpoint,
             "commit_checkpoints": controls.commit_checkpoints,
+            "tile_authoring_mode": if controls.raster_tiles { "raster" } else { "native" },
         }));
 
         let result = (|| {
             trace::phase_started(PhaseId::InputEmbedding);
-            let prompt_preparation = run_prompt_prepare(request, model, tokenizer)?;
+            let prompt_preparation = if controls.raster_tiles {
+                prompt_prepare::run_raster(request, model, tokenizer)?
+            } else {
+                run_prompt_prepare(request, model, tokenizer)?
+            };
             let token_embeddings =
                 if let Some(embedding_table) = transformer_model.embedding_table.as_ref() {
                     embed_input_tokens_with_mode(
@@ -177,7 +183,7 @@ pub fn run_inference_with_controls(
                     "sampling": request.sampling.clone(),
                 }),
             );
-            if should_stop_at_checkpoint(controls, "prompt.prepare") {
+            if controls.raster_tiles || should_stop_at_checkpoint(controls, "prompt.prepare") {
                 return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
                     terminal_checkpoint_id: "prompt.prepare".to_string(),
                     input_embedding,
@@ -423,6 +429,7 @@ mod tests {
             &InferenceControls {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prompt.prepare".to_string()),
+                raster_tiles: false,
             },
         )
         .expect("inference should pause");
@@ -438,6 +445,52 @@ mod tests {
                 assert!(state.output_decode.is_none());
             }
             InferenceRunOutcome::Completed(_) => panic!("expected paused inference"),
+        }
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_stop_after_prompt_prepare() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_model = test_transformer_model();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+            },
+        )
+        .expect("raster inference should pause after prompt prepare");
+
+        match paused {
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
+                assert_eq!(
+                    state.input_embedding.prompt_preparation.prompt_token_ids,
+                    vec![1]
+                );
+                assert!(state.transformer_state_transition.is_none());
+                assert!(state.output_decode.is_none());
+            }
+            InferenceRunOutcome::Completed(_) => panic!("expected paused raster inference"),
         }
     }
 
@@ -468,6 +521,7 @@ mod tests {
             &InferenceControls {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
+                raster_tiles: false,
             },
         )
         .expect("inference should pause");

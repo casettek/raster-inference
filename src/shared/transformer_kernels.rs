@@ -1613,7 +1613,12 @@ fn run_causal_attention_buffer(
     }
     {
         // let _trace = trace_scope("transformer_state_transition.run_causal_attention.v_rms_norm");
-        apply_value_rms_norm(&mut v, layer.rms_norm_eps, layer.rms_norm_eps_det, execution_mode)?;
+        apply_value_rms_norm(
+            &mut v,
+            layer.rms_norm_eps,
+            layer.rms_norm_eps_det,
+            execution_mode,
+        )?;
     }
 
     {
@@ -1831,7 +1836,12 @@ fn run_causal_attention_decode_buffer(
         layer.rms_norm_eps_det,
         execution_mode,
     )?;
-    apply_value_rms_norm_row(&mut v, layer.rms_norm_eps, layer.rms_norm_eps_det, execution_mode)?;
+    apply_value_rms_norm_row(
+        &mut v,
+        layer.rms_norm_eps,
+        layer.rms_norm_eps_det,
+        execution_mode,
+    )?;
     apply_rope_to_rows(
         &mut q,
         layer.partial_rotary_dim,
@@ -2373,8 +2383,9 @@ fn scale_sequence_buffer(
     deterministic: bool,
 ) -> Result<ActivationSequenceBuffer> {
     if deterministic {
-        let scalar_det = scalar_det
-            .ok_or_else(|| anyhow!("deterministic sequence scaling requires canonical Act scalar"))?;
+        let scalar_det = scalar_det.ok_or_else(|| {
+            anyhow!("deterministic sequence scaling requires canonical Act scalar")
+        })?;
         Ok(ActivationSequenceBuffer::from_acts(scale_act_sequences(
             &sequence_buffer_acts(values)?,
             scalar_det,
@@ -3497,8 +3508,16 @@ mod tests {
         let mut heads =
             AttentionHeadRowBuffer::from_values(vec![vec![0.0, 1.0, 0.0, 0.0, 9.0, 8.0, 7.0, 6.0]]);
 
-        apply_rope_to_rows(&mut heads, 4, 8, 16.0, None, 1, InferenceExecutionMode::Fp32)
-            .unwrap();
+        apply_rope_to_rows(
+            &mut heads,
+            4,
+            8,
+            16.0,
+            None,
+            1,
+            InferenceExecutionMode::Fp32,
+        )
+        .unwrap();
 
         assert!((heads.values[0][1] - 0.87758255).abs() < 1e-6);
         assert!((heads.values[0][3] - 0.47942555).abs() < 1e-6);

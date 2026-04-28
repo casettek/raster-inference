@@ -121,6 +121,20 @@ cargo run -- \
 
 To stop after a specific checkpoint, pass `--terminal-checkpoint <checkpoint-id>`. For example, `--terminal-checkpoint prefill.finalize` stops after the prefill finalize checkpoint has been emitted.
 
+The raster-authored path is opt-in while routines are ported one at a time:
+
+```bash
+cargo run -- \
+  --raster \
+  google/gemma-4-test \
+  /path/to/tokenizer.json \
+  /path/to/chat_template.jinja \
+  /path/to/converted-det-model \
+  "Hello from Raster"
+```
+
+For now, `--raster` implies the deterministic model/runtime path, routes prompt preparation through duplicated raster-authored tiles, and then stops after the `prompt.prepare` checkpoint. The CLI prints the same paused-state JSON shape used by `--terminal-checkpoint prompt.prepare`.
+
 When `--deterministic` is set, the model path must point to either:
 
 - a directory containing `config.json` and `model.detwgt`

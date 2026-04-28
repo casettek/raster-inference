@@ -3,7 +3,12 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use crate::shared::input::{Gemma4Prompt, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage};
+use crate::raster_authoring::prelude::{call, sequence, tile};
+use crate::shared::input::{
+    Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, PromptPreparationState,
+    TextDecodingPolicy, TextMessage,
+};
+use crate::trace::{trace_event, trace_scope};
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct TemplateMessage {
@@ -20,6 +25,7 @@ impl From<&TextMessage> for TemplateMessage {
     }
 }
 
+#[tile]
 pub fn decode_prompt_bytes(prompt_bytes: &[u8], policy: TextDecodingPolicy) -> Result<String> {
     match policy {
         TextDecodingPolicy::Utf8 => String::from_utf8(prompt_bytes.to_vec())
@@ -27,6 +33,7 @@ pub fn decode_prompt_bytes(prompt_bytes: &[u8], policy: TextDecodingPolicy) -> R
     }
 }
 
+#[tile]
 pub fn build_gemma4_messages(
     prompt_text: &str,
     add_generation_prompt: bool,
@@ -44,6 +51,7 @@ pub fn build_gemma4_messages(
     })
 }
 
+#[tile]
 pub fn render_prompt(prompt: &Gemma4Prompt, model: &ModelSpec) -> Result<String> {
     let mut environment = Environment::new();
     environment
@@ -53,7 +61,6 @@ pub fn render_prompt(prompt: &Gemma4Prompt, model: &ModelSpec) -> Result<String>
     let template = environment
         .get_template("chat")
         .context("failed to load chat template")?;
-
     let messages = prompt
         .messages
         .iter()
@@ -71,6 +78,7 @@ pub fn render_prompt(prompt: &Gemma4Prompt, model: &ModelSpec) -> Result<String>
         .context("failed to render chat template")
 }
 
+#[tile]
 pub fn tokenize_prompt(
     prompt: &str,
     tokenizer: &Tokenizer,
@@ -84,12 +92,51 @@ pub fn tokenize_prompt(
     Ok(encoding.get_ids().to_vec())
 }
 
+#[tile]
 pub fn build_prompt_commitment(prompt_token_ids: &[u32]) -> Result<String> {
     let payload = serde_json::to_vec(prompt_token_ids)
         .context("failed to serialize input-embedding prompt token ids")?;
 
     let digest = Sha256::digest(payload);
     Ok(format!("{digest:x}"))
+}
+
+#[sequence]
+pub fn run(
+    request: &InferenceRequest,
+    model: &ModelSpec,
+    tokenizer: &Tokenizer,
+) -> Result<PromptPreparationState> {
+    let _trace = trace_scope("prompt.prepare");
+    trace_event("prompt.decode_bytes");
+    let prompt_text = call!(
+        decode_prompt_bytes,
+        &request.prompt_bytes,
+        request.text_decoding_policy
+    )?;
+    trace_event("prompt.build_messages");
+    let gemma4_prompt = call!(
+        build_gemma4_messages,
+        &prompt_text,
+        request.add_generation_prompt
+    )?;
+    trace_event("prompt.render");
+    let rendered_prompt = call!(render_prompt, &gemma4_prompt, model)?;
+    trace_event("prompt.tokenize");
+    let prompt_token_ids = call!(
+        tokenize_prompt,
+        &rendered_prompt,
+        tokenizer,
+        request.add_special_tokens
+    )?;
+    trace_event("prompt.commitment");
+    let prompt_token_ids_sha256 = call!(build_prompt_commitment, &prompt_token_ids)?;
+
+    Ok(PromptPreparationState {
+        prompt_text,
+        prompt_token_ids,
+        prompt_token_ids_sha256,
+    })
 }
 
 #[cfg(test)]

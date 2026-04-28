@@ -84,9 +84,8 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
         );
         for (token_idx, token_activation) in xs_values.iter().enumerate() {
             let det_token_activation_sha256 = xs.det_values().and_then(|rows| {
-                rows.get(token_idx).map(|row| {
-                    crate::shared::transformer_kernels::build_det_vector_commitment(row)
-                })
+                rows.get(token_idx)
+                    .map(|row| crate::shared::transformer_kernels::build_det_vector_commitment(row))
             });
             crate::trace::trace_checkpoint(
                 &format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}"),

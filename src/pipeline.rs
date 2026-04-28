@@ -1663,11 +1663,9 @@ mod tests {
     }
 
     fn assert_detwgt_required(error: anyhow::Error) {
-        assert!(
-            error
-                .to_string()
-                .contains("model loaded from a .detwgt artifact")
-        );
+        assert!(error
+            .to_string()
+            .contains("model loaded from a .detwgt artifact"));
     }
 
     fn zero_matrix(rows: usize, cols: usize) -> MatrixF32 {

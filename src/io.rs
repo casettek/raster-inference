@@ -13,8 +13,8 @@ use sha2::Digest;
 use tokenizers::Tokenizer;
 
 use crate::shared::det_num::{
-    f32_to_acc, f32_to_act, scale_act, Act, Wgt, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-    DET_WGT_ARTIFACT_MAGIC,
+    f32_to_acc, f32_to_act, scale_act, Act, Wgt, DET_NUM_SPEC_VERSION,
+    DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
@@ -409,9 +409,11 @@ impl DetNumTensorReader {
         let payload = self.payload_slice(tensor_name, tensor)?;
         Ok(payload
             .chunks_exact(4)
-            .map(|chunk| Wgt::from_bits(i32::from_le_bytes(
-                chunk.try_into().expect("i32 byte width should match"),
-            )))
+            .map(|chunk| {
+                Wgt::from_bits(i32::from_le_bytes(
+                    chunk.try_into().expect("i32 byte width should match"),
+                ))
+            })
             .collect())
     }
 
@@ -1132,21 +1134,23 @@ fn load_det_num_ple_global_weights(
 
     let projection_norm_weight_det =
         reader.load_vector_wgt("model.language_model.per_layer_projection_norm.weight")?;
-    Ok(Some(Gemma4PleGlobalWeights::from_det_num_sources_with_canonical(
-        token_embeddings,
-        model_projections,
-        projection_norm_weight_det
-            .iter()
-            .map(|value| det_wgt_to_f32(value.to_bits()))
-            .collect(),
-        projection_norm_weight_det,
-        (ple_dim as f32).sqrt(),
-        f32_to_act((ple_dim as f32).sqrt()),
-        (hidden_size as f32).powf(-0.5),
-        f32_to_act((hidden_size as f32).powf(-0.5)),
-        2f32.powf(-0.5),
-        f32_to_act(2f32.powf(-0.5)),
-    )))
+    Ok(Some(
+        Gemma4PleGlobalWeights::from_det_num_sources_with_canonical(
+            token_embeddings,
+            model_projections,
+            projection_norm_weight_det
+                .iter()
+                .map(|value| det_wgt_to_f32(value.to_bits()))
+                .collect(),
+            projection_norm_weight_det,
+            (ple_dim as f32).sqrt(),
+            f32_to_act((ple_dim as f32).sqrt()),
+            (hidden_size as f32).powf(-0.5),
+            f32_to_act((hidden_size as f32).powf(-0.5)),
+            2f32.powf(-0.5),
+            f32_to_act(2f32.powf(-0.5)),
+        ),
+    ))
 }
 
 pub(crate) fn load_ple_token_embedding_row_internal(
@@ -1312,9 +1316,7 @@ pub(crate) fn resolve_layer_weights(
         pre_feedforward_layernorm_weight: layer.pre_feedforward_layernorm_weight.clone(),
         pre_feedforward_layernorm_weight_det: layer.pre_feedforward_layernorm_weight_det.clone(),
         post_feedforward_layernorm_weight: layer.post_feedforward_layernorm_weight.clone(),
-        post_feedforward_layernorm_weight_det: layer
-            .post_feedforward_layernorm_weight_det
-            .clone(),
+        post_feedforward_layernorm_weight_det: layer.post_feedforward_layernorm_weight_det.clone(),
         gate_proj: materialize_layer_matrix_source(&layer.gate_proj)?,
         up_proj: materialize_layer_matrix_source(&layer.up_proj)?,
         down_proj: materialize_layer_matrix_source(&layer.down_proj)?,
@@ -1846,7 +1848,8 @@ fn load_det_num_gemma4_layer_weights(
         reader.load_vector_wgt(&format!("{layer_prefix}.pre_feedforward_layernorm.weight"))?;
     let post_feedforward_layernorm_weight_det =
         reader.load_vector_wgt(&format!("{layer_prefix}.post_feedforward_layernorm.weight"))?;
-    let layer_scalar_det = reader.load_optional_scalar_wgt(&format!("{layer_prefix}.layer_scalar"))?;
+    let layer_scalar_det =
+        reader.load_optional_scalar_wgt(&format!("{layer_prefix}.layer_scalar"))?;
 
     Ok(Gemma4LayerWeights {
         attention_kind,
