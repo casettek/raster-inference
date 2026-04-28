@@ -581,6 +581,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "raster-authoring-macros"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "raster-inference"
 version = "0.1.0"
 dependencies = [
@@ -589,6 +597,7 @@ dependencies = [
  "half",
  "memmap2",
  "minijinja",
+ "raster-authoring-macros",
  "rayon",
  "safetensors",
  "serde",

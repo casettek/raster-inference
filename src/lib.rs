@@ -13,6 +13,7 @@ pub mod prefill_finalize;
 pub mod prefill_layer;
 pub mod prefill_prepare_aux;
 pub mod prompt_prepare;
+pub mod raster_authoring;
 pub mod shared;
 pub mod trace;
 

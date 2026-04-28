@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
+use crate::raster_authoring::prelude::call;
 use crate::shared::input::{InferenceRequest, PromptPreparationState};
 use crate::trace::{trace_event, trace_scope};
 
@@ -18,7 +19,11 @@ pub fn run(
 ) -> Result<PromptPreparationState> {
     let _trace = trace_scope("prompt.prepare");
     trace_event("prompt.decode_bytes");
-    let prompt_text = decode_prompt_bytes(&request.prompt_bytes, request.text_decoding_policy)?;
+    let prompt_text = call!(
+        decode_prompt_bytes,
+        &request.prompt_bytes,
+        request.text_decoding_policy
+    )?;
     trace_event("prompt.build_messages");
     let gemma4_prompt = build_gemma4_messages(&prompt_text, request.add_generation_prompt)?;
     trace_event("prompt.render");

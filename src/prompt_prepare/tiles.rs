@@ -3,6 +3,7 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
+use crate::raster_authoring::prelude::tile;
 use crate::shared::input::{Gemma4Prompt, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -20,6 +21,7 @@ impl From<&TextMessage> for TemplateMessage {
     }
 }
 
+#[tile]
 pub fn decode_prompt_bytes(prompt_bytes: &[u8], policy: TextDecodingPolicy) -> Result<String> {
     match policy {
         TextDecodingPolicy::Utf8 => String::from_utf8(prompt_bytes.to_vec())
