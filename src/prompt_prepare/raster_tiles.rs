@@ -3,7 +3,7 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use crate::raster_authoring::prelude::{call, sequence, tile};
+use crate::raster_authoring::prelude::{call_tile, sequence, tile};
 use crate::shared::input::{
     Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, PromptPreparationState,
     TextDecodingPolicy, TextMessage,
@@ -109,28 +109,28 @@ pub fn run(
 ) -> Result<PromptPreparationState> {
     let _trace = trace_scope("prompt.prepare");
     trace_event("prompt.decode_bytes");
-    let prompt_text = call!(
+    let prompt_text = call_tile!(
         decode_prompt_bytes,
         &request.prompt_bytes,
         request.text_decoding_policy
     )?;
     trace_event("prompt.build_messages");
-    let gemma4_prompt = call!(
+    let gemma4_prompt = call_tile!(
         build_gemma4_messages,
         &prompt_text,
         request.add_generation_prompt
     )?;
     trace_event("prompt.render");
-    let rendered_prompt = call!(render_prompt, &gemma4_prompt, model)?;
+    let rendered_prompt = call_tile!(render_prompt, &gemma4_prompt, model)?;
     trace_event("prompt.tokenize");
-    let prompt_token_ids = call!(
+    let prompt_token_ids = call_tile!(
         tokenize_prompt,
         &rendered_prompt,
         tokenizer,
         request.add_special_tokens
     )?;
     trace_event("prompt.commitment");
-    let prompt_token_ids_sha256 = call!(build_prompt_commitment, &prompt_token_ids)?;
+    let prompt_token_ids_sha256 = call_tile!(build_prompt_commitment, &prompt_token_ids)?;
 
     Ok(PromptPreparationState {
         prompt_text,
