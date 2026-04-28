@@ -6,6 +6,8 @@ use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel,
 };
 
+pub mod raster_tiles;
+
 pub fn run(
     prompt_token_ids: &[u32],
     model: &Gemma4TransformerModel,

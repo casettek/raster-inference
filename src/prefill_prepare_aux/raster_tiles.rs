@@ -1,0 +1,663 @@
+use anyhow::{anyhow, bail, Result};
+
+use crate::raster_authoring::prelude::{
+    auth_read, call_recur_tile_result, call_tile, sequence, tile,
+};
+use crate::shared::raster_prefill_ple::{
+    AuthenticatedGemmaPleSource, GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest,
+    GemmaPleProjectionNormWeightsRequest, GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
+};
+use crate::shared::raster_transformer_kernels::{
+    add_sequences, project_sequence_with_source, rms_norm_sequence, scale_sequence,
+    RasterActivationRow, RasterActivationSequence,
+};
+use crate::shared::transformer::{
+    ActivationSequence, Gemma4PrefillPleInputs, InternalActivationSequence,
+};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PrefillPleRasterState {
+    token_ids: Vec<u32>,
+    input_activations: Option<RasterActivationSequence>,
+    next_layer_idx: usize,
+    layer_count: usize,
+    per_layer_inputs: Vec<Option<RasterActivationSequence>>,
+    has_ple_global: bool,
+}
+
+#[tile]
+pub fn init_prefill_ple_state(
+    token_ids: &[u32],
+    input_activations: &ActivationSequence,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<PrefillPleRasterState> {
+    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
+    if !metadata.has_ple_global {
+        return Ok(PrefillPleRasterState {
+            token_ids: token_ids.to_vec(),
+            input_activations: None,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            per_layer_inputs: Vec::with_capacity(metadata.layer_count),
+            has_ple_global: false,
+        });
+    }
+
+    if metadata.layer_count == 0 {
+        bail!("transformer PLE computation requires at least one layer");
+    }
+    if metadata.token_embedding_layer_count != metadata.layer_count {
+        bail!(
+            "transformer PLE token embedding slice count mismatch: {} vs {}",
+            metadata.token_embedding_layer_count,
+            metadata.layer_count
+        );
+    }
+    if metadata.model_projection_layer_count != metadata.layer_count {
+        bail!(
+            "transformer PLE model projection slice count mismatch: {} vs {}",
+            metadata.model_projection_layer_count,
+            metadata.layer_count
+        );
+    }
+
+    let input_activations = raster_activation_sequence_from_embedding(input_activations)?;
+    if input_activations.is_empty() {
+        bail!("transformer PLE computation requires at least one activation row");
+    }
+    if token_ids.len() != input_activations.len() {
+        bail!(
+            "transformer PLE computation requires token ids and activations to have matching lengths"
+        );
+    }
+
+    let first_layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx: 0 })?;
+    let activation_width = input_activations.width()?;
+    if activation_width != first_layer.hidden_width {
+        bail!(
+            "input activations row 0 has width {}, expected {}",
+            activation_width,
+            first_layer.hidden_width
+        );
+    }
+
+    Ok(PrefillPleRasterState {
+        token_ids: token_ids.to_vec(),
+        input_activations: Some(input_activations),
+        next_layer_idx: 0,
+        layer_count: metadata.layer_count,
+        per_layer_inputs: Vec::with_capacity(metadata.layer_count),
+        has_ple_global: true,
+    })
+}
+
+#[tile(kind = recursive)]
+pub fn compute_next_prefill_ple_layer(
+    mut state: PrefillPleRasterState,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<(bool, PrefillPleRasterState)> {
+    if !state.has_ple_global || state.next_layer_idx >= state.layer_count {
+        return Ok((true, state));
+    }
+
+    let layer_idx = state.next_layer_idx;
+    let layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx })?;
+    if !layer.has_ple {
+        state.per_layer_inputs.push(None);
+        state.next_layer_idx += 1;
+        return Ok((false, state));
+    }
+
+    let input_activations = state
+        .input_activations
+        .as_ref()
+        .ok_or_else(|| anyhow!("raster PLE state is missing input activations"))?;
+    let projection_rows = layer.model_projection_rows.ok_or_else(|| {
+        anyhow!("Gemma PLE layer {layer_idx} is missing model projection row metadata")
+    })?;
+    let scalars = auth_read!(ple_source, GemmaPleScalarsRequest)?;
+    let norm_weights = auth_read!(ple_source, GemmaPleProjectionNormWeightsRequest)?;
+
+    let embedded = gather_token_embedding_sequence(&state.token_ids, layer_idx, ple_source)?;
+    let embedded = scale_sequence(&embedded, Some(scalars.embedding_scale))?;
+
+    let projected =
+        project_sequence_with_source(input_activations, ple_source, layer_idx, projection_rows)?;
+    let projected = scale_sequence(&projected, Some(scalars.projection_scalar))?;
+    let projected = rms_norm_sequence(&projected, Some(&norm_weights), Some(scalars.rms_norm_eps))?;
+
+    let combined = add_sequences(&embedded, &projected)?;
+    let combined = scale_sequence(&combined, Some(scalars.input_scale))?;
+
+    state.per_layer_inputs.push(Some(combined));
+    state.next_layer_idx += 1;
+    Ok((false, state))
+}
+
+#[tile]
+pub fn finalize_prefill_ple_inputs(
+    state: PrefillPleRasterState,
+) -> Result<Option<Gemma4PrefillPleInputs>> {
+    if !state.has_ple_global {
+        return Ok(None);
+    }
+    if state.per_layer_inputs.len() != state.layer_count {
+        bail!(
+            "raster PLE finalized with {} layers, expected {}",
+            state.per_layer_inputs.len(),
+            state.layer_count
+        );
+    }
+
+    Ok(Some(Gemma4PrefillPleInputs::from_internal(
+        state
+            .per_layer_inputs
+            .into_iter()
+            .map(|input| input.map(internal_sequence_from_raster))
+            .collect(),
+    )))
+}
+
+#[sequence]
+pub fn run(
+    token_ids: &[u32],
+    input_activations: &ActivationSequence,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<Option<Gemma4PrefillPleInputs>> {
+    let state = call_tile!(
+        init_prefill_ple_state,
+        token_ids,
+        input_activations,
+        ple_source
+    )?;
+    let state = call_recur_tile_result!(compute_next_prefill_ple_layer, state, ple_source)?;
+    call_tile!(finalize_prefill_ple_inputs, state)
+}
+
+fn raster_activation_sequence_from_embedding(
+    input_activations: &ActivationSequence,
+) -> Result<RasterActivationSequence> {
+    let internal = input_activations.clone_internal();
+    let det_rows = internal.det_values().ok_or_else(|| {
+        anyhow!("deterministic raster PLE input requires canonical embedded prompt activations")
+    })?;
+    Ok(RasterActivationSequence::from_acts(det_rows.to_vec()))
+}
+
+fn gather_token_embedding_sequence(
+    token_ids: &[u32],
+    layer_idx: usize,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<RasterActivationSequence> {
+    let rows = token_ids
+        .iter()
+        .copied()
+        .map(|token_id| {
+            auth_read!(
+                ple_source,
+                GemmaPleTokenEmbeddingRowRequest {
+                    layer_idx,
+                    token_id,
+                },
+            )
+            .map(RasterActivationRow::from_acts)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RasterActivationSequence::from_rows(rows))
+}
+
+fn internal_sequence_from_raster(sequence: RasterActivationSequence) -> InternalActivationSequence {
+    InternalActivationSequence::from_det_values(
+        sequence
+            .into_rows()
+            .into_iter()
+            .map(|row| row.acts())
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    use crate::shared::det_num::{f32_to_acc, Act, Wgt};
+    use crate::shared::raster_prefill_ple::{
+        AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleScalars,
+    };
+    use crate::shared::transformer::{
+        ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
+        Gemma4LayerWeights, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+        InternalActivationSequence, MatrixF32,
+    };
+    use crate::shared::{det_num::act_to_f32, input::InferenceExecutionMode};
+    use anyhow::{Context, Result};
+    use std::path::PathBuf;
+
+    #[test]
+    fn no_ple_globals_return_none_without_requiring_deterministic_inputs() {
+        let source = AuthenticatedGemmaPleSource::no_ple(
+            "no-ple",
+            vec![GemmaPleLayerConfig {
+                has_ple: false,
+                hidden_width: 2,
+            }],
+        )
+        .expect("source should build");
+        let input = ActivationSequence::from_values(vec![vec![1.0, 2.0]], "digest".to_string());
+
+        let output = run(&[0], &input, &source).expect("raster PLE should run");
+
+        assert!(output.is_none());
+    }
+
+    #[test]
+    fn one_layer_fixture_matches_native_prefill_ple_computation() {
+        let fixture = PleFixture::new(
+            vec![true],
+            vec![vec![
+                vec![Act::from_num(0.25), Act::from_num(-0.5)],
+                vec![Act::from_num(1.0), Act::from_num(0.5)],
+            ]],
+            vec![vec![
+                vec![Wgt::from_num(0.5), Wgt::from_num(1.0)],
+                vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)],
+            ]],
+        )
+        .expect("fixture should build");
+        let input = activation_sequence(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.5)],
+            vec![Act::from_num(-1.0), Act::from_num(2.0)],
+        ]);
+
+        let raster = run(&[0, 1], &input, &fixture.source)
+            .expect("raster PLE should run")
+            .expect("PLE inputs");
+        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
+            &[0, 1],
+            input.clone_internal(),
+            &fixture.layers,
+            &fixture.native_ple_global,
+            0.0,
+            Some(f32_to_acc(0.0)),
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("native PLE should run");
+
+        assert_eq!(raster.per_layer_inputs, native.per_layer_inputs);
+        assert_eq!(
+            raster
+                .clone_layer_internal(0)
+                .expect("raster layer")
+                .det_values(),
+            native
+                .clone_layer_internal(0)
+                .expect("native layer")
+                .det_values()
+        );
+    }
+
+    #[test]
+    fn mixed_ple_and_non_ple_layers_preserve_native_layout() {
+        let fixture = PleFixture::new(
+            vec![true, false],
+            vec![
+                vec![
+                    vec![Act::from_num(0.25), Act::from_num(-0.5)],
+                    vec![Act::from_num(1.0), Act::from_num(0.5)],
+                ],
+                vec![
+                    vec![Act::from_num(0.0), Act::from_num(0.0)],
+                    vec![Act::from_num(0.0), Act::from_num(0.0)],
+                ],
+            ],
+            vec![
+                vec![
+                    vec![Wgt::from_num(0.5), Wgt::from_num(1.0)],
+                    vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)],
+                ],
+                vec![
+                    vec![Wgt::from_num(1.0), Wgt::from_num(0.0)],
+                    vec![Wgt::from_num(0.0), Wgt::from_num(1.0)],
+                ],
+            ],
+        )
+        .expect("fixture should build");
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+
+        let output = run(&[0], &input, &fixture.source)
+            .expect("raster PLE should run")
+            .expect("PLE inputs");
+
+        assert_eq!(output.per_layer_inputs.len(), 2);
+        assert!(output.per_layer_inputs[0].is_some());
+        assert!(output.per_layer_inputs[1].is_none());
+        assert!(output
+            .clone_layer_internal(0)
+            .expect("layer 0")
+            .det_values()
+            .is_some());
+        assert!(output.clone_layer_internal(1).is_none());
+    }
+
+    #[test]
+    fn empty_activation_sequence_fails_like_native_ple_computation() {
+        let fixture = PleFixture::single_layer().expect("fixture should build");
+        let input = activation_sequence(Vec::new());
+
+        let error = run(&[], &input, &fixture.source).expect_err("empty activations should fail");
+
+        assert!(error
+            .to_string()
+            .contains("requires at least one activation row"));
+    }
+
+    #[test]
+    fn token_and_activation_count_mismatch_fails_clearly() {
+        let fixture = PleFixture::single_layer().expect("fixture should build");
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+
+        let error = run(&[0, 1], &input, &fixture.source).expect_err("mismatch should fail");
+
+        assert!(error
+            .to_string()
+            .contains("token ids and activations to have matching lengths"));
+    }
+
+    #[test]
+    fn source_construction_reports_token_embedding_layer_mismatch() {
+        let error = AuthenticatedGemmaPleSource::from_canonical_parts(
+            "bad-token-layers",
+            vec![
+                GemmaPleLayerConfig {
+                    has_ple: true,
+                    hidden_width: 2,
+                },
+                GemmaPleLayerConfig {
+                    has_ple: true,
+                    hidden_width: 2,
+                },
+            ],
+            vec![vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]],
+            vec![identity_projection(), identity_projection()],
+            vec![Wgt::from_num(1.0), Wgt::from_num(1.0)],
+            test_scalars(),
+        )
+        .expect_err("token embedding layer mismatch should fail");
+
+        assert!(error
+            .to_string()
+            .contains("token embedding slice count mismatch"));
+    }
+
+    #[test]
+    fn source_construction_reports_model_projection_layer_mismatch() {
+        let error = AuthenticatedGemmaPleSource::from_canonical_parts(
+            "bad-projection-layers",
+            vec![
+                GemmaPleLayerConfig {
+                    has_ple: true,
+                    hidden_width: 2,
+                },
+                GemmaPleLayerConfig {
+                    has_ple: true,
+                    hidden_width: 2,
+                },
+            ],
+            vec![
+                vec![vec![Act::from_num(1.0), Act::from_num(0.0)]],
+                vec![vec![Act::from_num(0.0), Act::from_num(1.0)]],
+            ],
+            vec![identity_projection()],
+            vec![Wgt::from_num(1.0), Wgt::from_num(1.0)],
+            test_scalars(),
+        )
+        .expect_err("projection layer mismatch should fail");
+
+        assert!(error
+            .to_string()
+            .contains("model projection slice count mismatch"));
+    }
+
+    struct PleFixture {
+        source: AuthenticatedGemmaPleSource,
+        native_ple_global: Gemma4PleGlobalWeights,
+        layers: Vec<Gemma4LayerWeights>,
+        _weights_file: PathBuf,
+    }
+
+    impl Drop for PleFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self._weights_file);
+        }
+    }
+
+    impl PleFixture {
+        fn single_layer() -> Result<Self> {
+            Self::new(
+                vec![true],
+                vec![vec![
+                    vec![Act::from_num(0.25), Act::from_num(-0.5)],
+                    vec![Act::from_num(1.0), Act::from_num(0.5)],
+                ]],
+                vec![vec![
+                    vec![Wgt::from_num(0.5), Wgt::from_num(1.0)],
+                    vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)],
+                ]],
+            )
+        }
+
+        fn new(
+            has_ple_layers: Vec<bool>,
+            token_embeddings: Vec<Vec<Vec<Act>>>,
+            model_projections: Vec<Vec<Vec<Wgt>>>,
+        ) -> Result<Self> {
+            let hidden_width = model_projections
+                .first()
+                .and_then(|layer| layer.first())
+                .map(Vec::len)
+                .context("fixture requires at least one projection row")?;
+            let ple_width = token_embeddings
+                .first()
+                .and_then(|layer| layer.first())
+                .map(Vec::len)
+                .context("fixture requires at least one token embedding row")?;
+            let layer_configs = has_ple_layers
+                .iter()
+                .copied()
+                .map(|has_ple| GemmaPleLayerConfig {
+                    has_ple,
+                    hidden_width,
+                })
+                .collect::<Vec<_>>();
+            let source = AuthenticatedGemmaPleSource::from_canonical_parts(
+                "ple-raster-fixture",
+                layer_configs,
+                token_embeddings.clone(),
+                model_projections.clone(),
+                vec![Wgt::from_num(1.0); ple_width],
+                test_scalars(),
+            )?;
+            let (weights_file, token_sources, projection_sources) =
+                write_det_weights(token_embeddings.clone(), model_projections.clone())?;
+            let native_ple_global = Gemma4PleGlobalWeights::from_det_num_sources_with_canonical(
+                token_sources,
+                projection_sources,
+                vec![1.0; ple_width],
+                vec![Wgt::from_num(1.0); ple_width],
+                1.0,
+                Act::from_num(1.0),
+                1.0,
+                Act::from_num(1.0),
+                1.0,
+                Act::from_num(1.0),
+            );
+            let layers = has_ple_layers
+                .into_iter()
+                .map(|has_ple| test_layer(hidden_width, has_ple))
+                .collect();
+
+            Ok(Self {
+                source,
+                native_ple_global,
+                layers,
+                _weights_file: weights_file,
+            })
+        }
+    }
+
+    fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {
+        let values = rows
+            .iter()
+            .map(|row| row.iter().copied().map(act_to_f32).collect())
+            .collect::<Vec<Vec<f32>>>();
+        ActivationSequence::from_internal(
+            InternalActivationSequence::from_det_values(rows),
+            crate::shared::transformer_kernels::build_activation_commitment(&values),
+        )
+    }
+
+    fn test_scalars() -> GemmaPleScalars {
+        GemmaPleScalars {
+            embedding_scale: Act::from_num(1.0),
+            projection_scalar: Act::from_num(1.0),
+            input_scale: Act::from_num(1.0),
+            rms_norm_eps: f32_to_acc(0.0),
+        }
+    }
+
+    fn identity_projection() -> Vec<Vec<Wgt>> {
+        vec![
+            vec![Wgt::from_num(1.0), Wgt::from_num(0.0)],
+            vec![Wgt::from_num(0.0), Wgt::from_num(1.0)],
+        ]
+    }
+
+    fn write_det_weights(
+        token_embeddings: Vec<Vec<Vec<Act>>>,
+        model_projections: Vec<Vec<Vec<Wgt>>>,
+    ) -> Result<(
+        PathBuf,
+        Vec<DetNumTensorSliceSource>,
+        Vec<DetNumTensorSliceSource>,
+    )> {
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "raster-prefill-ple-{}-{}-{}.detwgt",
+            std::process::id(),
+            unique_suffix,
+            crate::trace::sha256_hex(&format!("{:?}{:?}", token_embeddings, model_projections))
+        ));
+        let mut bytes = Vec::new();
+        let mut token_sources = Vec::new();
+        let mut projection_sources = Vec::new();
+
+        for matrix in &token_embeddings {
+            let data_offset = bytes.len();
+            for row in matrix {
+                for value in row {
+                    bytes.extend(value.to_bits().to_le_bytes());
+                }
+            }
+            token_sources.push(det_source(
+                &path,
+                matrix.len(),
+                matrix[0].len(),
+                data_offset,
+            ));
+        }
+
+        for matrix in &model_projections {
+            let data_offset = bytes.len();
+            for row in matrix {
+                for value in row {
+                    bytes.extend(value.to_bits().to_le_bytes());
+                }
+            }
+            projection_sources.push(det_source(
+                &path,
+                matrix.len(),
+                matrix[0].len(),
+                data_offset,
+            ));
+        }
+
+        std::fs::write(&path, bytes)
+            .with_context(|| format!("failed to write fixture weights {}", path.display()))?;
+        Ok((path, token_sources, projection_sources))
+    }
+
+    fn det_source(
+        path: &std::path::Path,
+        rows: usize,
+        cols: usize,
+        data_offset: usize,
+    ) -> DetNumTensorSliceSource {
+        DetNumTensorSliceSource {
+            weights_path: path.to_path_buf(),
+            total_rows: rows,
+            total_cols: cols,
+            data_offset,
+            row_offset: 0,
+            row_count: rows,
+            col_offset: 0,
+            col_count: cols,
+        }
+    }
+
+    fn test_layer(hidden_width: usize, has_ple: bool) -> Gemma4LayerWeights {
+        Gemma4LayerWeights {
+            attention_kind: Gemma4AttentionKind::Full,
+            hidden_size: hidden_width,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: hidden_width,
+            sliding_window: None,
+            cache_sliding_window: None,
+            rms_norm_eps: 0.0,
+            rms_norm_eps_det: Some(f32_to_acc(0.0)),
+            rope_base: 10_000.0,
+            rope_base_det: None,
+            partial_rotary_dim: 0,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
+            attention_k_eq_v: false,
+            q_proj: zero_layer_matrix(hidden_width),
+            k_proj: zero_layer_matrix(hidden_width),
+            v_proj: Some(zero_layer_matrix(hidden_width)),
+            o_proj: zero_layer_matrix(hidden_width),
+            q_norm_weight: vec![1.0; hidden_width],
+            q_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            k_norm_weight: vec![1.0; hidden_width],
+            k_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            input_layernorm_weight: vec![1.0; hidden_width],
+            input_layernorm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            post_attention_layernorm_weight: vec![1.0; hidden_width],
+            post_attention_layernorm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            pre_feedforward_layernorm_weight: vec![1.0; hidden_width],
+            pre_feedforward_layernorm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            post_feedforward_layernorm_weight: vec![1.0; hidden_width],
+            post_feedforward_layernorm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            gate_proj: zero_layer_matrix(hidden_width),
+            up_proj: zero_layer_matrix(hidden_width),
+            down_proj: zero_layer_matrix(hidden_width),
+            ple: has_ple.then(|| Gemma4PleLayerWeights {
+                input_gate: zero_layer_matrix(hidden_width),
+                layer_projection: zero_layer_matrix(hidden_width),
+                post_input_norm_weight: vec![1.0; hidden_width],
+                post_input_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            }),
+            layer_scalar: None,
+            layer_scalar_det: None,
+        }
+    }
+
+    fn zero_layer_matrix(width: usize) -> Gemma4LayerMatrixSource {
+        Gemma4LayerMatrixSource::from(MatrixF32 {
+            rows: width,
+            cols: width,
+            values: vec![0.0; width * width],
+        })
+    }
+}
