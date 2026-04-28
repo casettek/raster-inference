@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-use crate::shared::gemma_tokenizer::GemmaTokenizerSpec;
+use crate::shared::gemma_tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::input::{InferenceRequest, PromptPreparationState};
 use crate::trace::{trace_event, trace_scope};
 
@@ -41,7 +41,7 @@ pub fn run(
 pub fn run_raster(
     request: &InferenceRequest,
     model: &crate::shared::input::ModelSpec,
-    tokenizer: &GemmaTokenizerSpec,
+    tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<PromptPreparationState> {
     raster_tiles::run(request, model, tokenizer)
 }

@@ -2,9 +2,13 @@ use anyhow::{bail, Context, Result};
 use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 
-use crate::raster_authoring::prelude::{call_recur_tile, call_seq, call_tile, sequence, tile};
+use crate::raster_authoring::prelude::{
+    auth_read, call_recur_tile_result, call_seq, call_tile, sequence, tile,
+};
 use crate::shared::gemma_tokenizer::{
-    GemmaBpeOutput, GemmaBpeState, GemmaNormalizedText, GemmaPreTokenizedText, GemmaTokenizerSpec,
+    AuthenticatedGemmaTokenizer, GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest, GemmaBpeOutput,
+    GemmaBpeState, GemmaNormalizedText, GemmaPreTokenizedText, GemmaSpecialTokenAtRequest,
+    GemmaTokenIdRequest, GemmaTokenizerMetadata, GemmaTokenizerMetadataRequest, GemmaTokenizerSpec,
 };
 use crate::shared::input::{
     Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, PromptPreparationState,
@@ -96,12 +100,14 @@ pub fn init_tokenize_prompt(prompt: &str, add_special_tokens: bool) -> Result<To
 #[tile]
 pub fn normalize_tokenize_prompt(
     input: &TokenizePromptInput,
-    tokenizer: &GemmaTokenizerSpec,
+    tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<GemmaNormalizedText> {
+    let metadata = auth_read!(tokenizer, GemmaTokenizerMetadataRequest)?;
+
     Ok(GemmaNormalizedText {
         text: input
             .rendered_prompt
-            .replace(' ', &tokenizer.space_replacement),
+            .replace(' ', &metadata.space_replacement),
         add_special_tokens: input.add_special_tokens,
     })
 }
@@ -109,17 +115,18 @@ pub fn normalize_tokenize_prompt(
 #[tile]
 pub fn split_tokenize_prompt(
     normalized: GemmaNormalizedText,
-    tokenizer: &GemmaTokenizerSpec,
+    tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<GemmaPreTokenizedText> {
-    if tokenizer.split_pattern != " " {
+    let metadata = auth_read!(tokenizer, GemmaTokenizerMetadataRequest)?;
+    if metadata.split_pattern != " " {
         bail!(
             "Gemma tokenizer split pattern {} is not supported",
-            tokenizer.split_pattern
+            metadata.split_pattern
         );
     }
 
     Ok(GemmaPreTokenizedText {
-        segments: split_merged_with_previous(&normalized.text, &tokenizer.split_pattern),
+        segments: split_merged_with_previous(&normalized.text, &metadata.split_pattern),
         add_special_tokens: normalized.add_special_tokens,
     })
 }
@@ -127,29 +134,29 @@ pub fn split_tokenize_prompt(
 #[tile]
 pub fn init_bpe_tokenize_prompt(
     pre_tokenized: GemmaPreTokenizedText,
-    tokenizer: &GemmaTokenizerSpec,
+    tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<GemmaBpeState> {
+    let metadata = auth_read!(tokenizer, GemmaTokenizerMetadataRequest)?;
     let mut pieces = Vec::new();
     for segment in pre_tokenized.segments {
-        pieces.extend(initial_bpe_pieces(&segment, tokenizer)?);
+        pieces.extend(initial_bpe_pieces(&segment, tokenizer, &metadata)?);
     }
 
-    Ok(GemmaBpeState::new(
-        pieces,
-        tokenizer.merges.clone(),
-        pre_tokenized.add_special_tokens,
-    ))
+    Ok(GemmaBpeState::new(pieces, pre_tokenized.add_special_tokens))
 }
 
 #[tile(kind = recursive)]
-pub fn merge_bpe_tokenize_prompt(mut state: GemmaBpeState) -> (bool, GemmaBpeState) {
-    let Some((piece_idx, merged)) = best_merge_candidate(&state) else {
-        return (true, state);
+pub fn merge_bpe_tokenize_prompt(
+    mut state: GemmaBpeState,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<(bool, GemmaBpeState)> {
+    let Some((piece_idx, merged)) = best_merge_candidate(&state, tokenizer)? else {
+        return Ok((true, state));
     };
 
     state.pieces.splice(piece_idx..=piece_idx + 1, [merged]);
     state.iteration += 1;
-    (false, state)
+    Ok((false, state))
 }
 
 #[tile]
@@ -160,12 +167,11 @@ pub fn finalize_bpe_tokenize_prompt(state: GemmaBpeState) -> Result<GemmaBpeOutp
 #[tile]
 pub fn finalize_tokenize_prompt(
     output: GemmaBpeOutput,
-    tokenizer: &GemmaTokenizerSpec,
+    tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<Vec<u32>> {
     let mut token_ids = Vec::with_capacity(output.pieces.len());
     for piece in output.pieces {
-        let token_id = tokenizer
-            .token_id(&piece)
+        let token_id = auth_read!(tokenizer, GemmaTokenIdRequest { token: &piece })?
             .with_context(|| format!("Gemma tokenizer piece {piece:?} is missing from vocab"))?;
         token_ids.push(token_id);
     }
@@ -195,12 +201,22 @@ fn split_merged_with_previous(text: &str, pattern: &str) -> Vec<String> {
     segments
 }
 
-fn initial_bpe_pieces(segment: &str, tokenizer: &GemmaTokenizerSpec) -> Result<Vec<String>> {
+fn initial_bpe_pieces(
+    segment: &str,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+    metadata: &GemmaTokenizerMetadata,
+) -> Result<Vec<String>> {
     let mut pieces = Vec::new();
     let mut byte_idx = 0;
 
     while byte_idx < segment.len() {
-        if let Some(token) = tokenizer.longest_special_token_at(segment, byte_idx) {
+        if let Some(token) = auth_read!(
+            tokenizer,
+            GemmaSpecialTokenAtRequest {
+                input: segment,
+                byte_idx,
+            },
+        )? {
             pieces.push(token.content.clone());
             byte_idx += token.content.len();
             continue;
@@ -211,14 +227,14 @@ fn initial_bpe_pieces(segment: &str, tokenizer: &GemmaTokenizerSpec) -> Result<V
             .next()
             .expect("byte_idx should point at a char boundary");
         let piece = ch.to_string();
-        if tokenizer.token_id(&piece).is_some() {
+        if auth_read!(tokenizer, GemmaTokenIdRequest { token: &piece })?.is_some() {
             pieces.push(piece);
-        } else if tokenizer.byte_fallback {
+        } else if metadata.byte_fallback {
             for byte in piece.as_bytes() {
                 pieces.push(GemmaTokenizerSpec::byte_fallback_token(*byte));
             }
         } else {
-            pieces.push(tokenizer.unk_token.clone());
+            pieces.push(metadata.unk_token.clone());
         }
         byte_idx += ch.len_utf8();
     }
@@ -226,36 +242,43 @@ fn initial_bpe_pieces(segment: &str, tokenizer: &GemmaTokenizerSpec) -> Result<V
     Ok(pieces)
 }
 
-fn best_merge_candidate(state: &GemmaBpeState) -> Option<(usize, String)> {
-    let mut best = None::<(usize, usize, String)>;
+fn best_merge_candidate(
+    state: &GemmaBpeState,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<Option<(usize, String)>> {
+    let mut best = None::<(usize, usize, usize)>;
 
     for piece_idx in 0..state.pieces.len().saturating_sub(1) {
         let left = &state.pieces[piece_idx];
         let right = &state.pieces[piece_idx + 1];
-        for rule in &state.merge_rules {
-            if &rule.left == left && &rule.right == right {
-                match &best {
-                    Some((_, best_rank, _)) if *best_rank <= rule.rank => {}
-                    _ => best = Some((piece_idx, rule.rank, rule.merged.clone())),
-                }
+        if let Some(rule) = auth_read!(tokenizer, GemmaBpeMergeRequest { left, right },)? {
+            match &best {
+                Some((_, best_rank, _)) if *best_rank <= rule.rank => {}
+                _ => best = Some((piece_idx, rule.rank, rule.merge_index)),
             }
         }
     }
 
-    best.map(|(piece_idx, _, merged)| (piece_idx, merged))
+    let Some((piece_idx, _, merge_index)) = best else {
+        return Ok(None);
+    };
+    let merged = auth_read!(tokenizer, GemmaBpeMergedTokenRequest { merge_index })?
+        .with_context(|| format!("Gemma tokenizer BPE merge index {merge_index} is missing"))?;
+
+    Ok(Some((piece_idx, merged)))
 }
 
 #[sequence]
 pub fn tokenize_prompt(
     prompt: &str,
-    tokenizer: &GemmaTokenizerSpec,
+    tokenizer: &AuthenticatedGemmaTokenizer,
     add_special_tokens: bool,
 ) -> Result<Vec<u32>> {
     let input = call_tile!(init_tokenize_prompt, prompt, add_special_tokens)?;
     let normalized = call_tile!(normalize_tokenize_prompt, &input, tokenizer)?;
     let pre_tokenized = call_tile!(split_tokenize_prompt, normalized, tokenizer)?;
     let state = call_tile!(init_bpe_tokenize_prompt, pre_tokenized, tokenizer)?;
-    let state = call_recur_tile!(merge_bpe_tokenize_prompt, state);
+    let state = call_recur_tile_result!(merge_bpe_tokenize_prompt, state, tokenizer)?;
     let output = call_tile!(finalize_bpe_tokenize_prompt, state)?;
     call_tile!(finalize_tokenize_prompt, output, tokenizer)
 }
@@ -286,7 +309,7 @@ pub fn finalize_prompt_preparation(
 pub fn run(
     request: &InferenceRequest,
     model: &ModelSpec,
-    tokenizer: &GemmaTokenizerSpec,
+    tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<PromptPreparationState> {
     let prompt_text = call_tile!(
         decode_prompt_bytes,
@@ -322,7 +345,8 @@ mod tests {
         finalize_tokenize_prompt, init_tokenize_prompt, render_prompt, tokenize_prompt,
     };
     use crate::shared::gemma_tokenizer::{
-        GemmaAddedToken, GemmaBpeMerge, GemmaBpeOutput, GemmaTokenizerSpec, GemmaVocabEntry,
+        AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeOutput,
+        GemmaTokenizerSpec, GemmaVocabEntry,
     };
     use crate::shared::input::{MessageRole, ModelSpec, TextDecodingPolicy};
 
@@ -384,7 +408,7 @@ mod tests {
                 pieces: vec!["a".to_string(), "ab".to_string()],
                 add_special_tokens: false,
             },
-            &test_tokenizer_spec(),
+            &test_tokenizer_source(),
         )
         .expect("token ids should finalize");
 
@@ -394,7 +418,7 @@ mod tests {
     #[test]
     fn tokenize_prompt_applies_recursive_bpe_merges() {
         let token_ids =
-            tokenize_prompt("ab", &test_tokenizer_spec(), false).expect("prompt should tokenize");
+            tokenize_prompt("ab", &test_tokenizer_source(), false).expect("prompt should tokenize");
 
         assert_eq!(token_ids, vec![3]);
     }
@@ -402,7 +426,7 @@ mod tests {
     #[test]
     fn tokenize_prompt_uses_byte_fallback_for_unknown_chars() {
         let token_ids =
-            tokenize_prompt("é", &test_tokenizer_spec(), false).expect("prompt should tokenize");
+            tokenize_prompt("é", &test_tokenizer_source(), false).expect("prompt should tokenize");
 
         assert_eq!(token_ids, vec![10, 11]);
     }
@@ -415,6 +439,10 @@ mod tests {
             digest,
             "a615eeaee21de5179de080de8c3052c8da901138406ba71c38c032845f7d54f4"
         );
+    }
+
+    fn test_tokenizer_source() -> AuthenticatedGemmaTokenizer {
+        AuthenticatedGemmaTokenizer::new(test_tokenizer_spec())
     }
 
     fn test_tokenizer_spec() -> GemmaTokenizerSpec {

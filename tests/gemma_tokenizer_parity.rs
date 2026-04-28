@@ -1,6 +1,7 @@
 use raster_inference::io::parse_gemma_tokenizer_spec_bytes;
 use raster_inference::load_gemma_tokenizer_spec_from_path;
 use raster_inference::prompt_prepare::raster_tiles::tokenize_prompt;
+use raster_inference::AuthenticatedGemmaTokenizer;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -9,6 +10,7 @@ fn raster_gemma_tokenizer_matches_huggingface_for_supported_subset() {
     let tokenizer_json = minimal_gemma_tokenizer_json();
     let spec = parse_gemma_tokenizer_spec_bytes(tokenizer_json.as_bytes())
         .expect("Gemma tokenizer spec should parse");
+    let source = AuthenticatedGemmaTokenizer::new(spec);
     let tokenizer =
         Tokenizer::from_bytes(tokenizer_json.as_bytes()).expect("HF tokenizer should parse");
 
@@ -19,7 +21,7 @@ fn raster_gemma_tokenizer_matches_huggingface_for_supported_subset() {
             .get_ids()
             .to_vec();
         let raster_ids =
-            tokenize_prompt(prompt, &spec, false).expect("Raster tokenizer should encode");
+            tokenize_prompt(prompt, &source, false).expect("Raster tokenizer should encode");
 
         assert_eq!(raster_ids, hf_ids, "token ids should match for {prompt:?}");
     }

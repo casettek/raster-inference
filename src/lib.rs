@@ -40,7 +40,8 @@ pub use prefill_layer::tiles::{run_text_layers_prefill, run_text_layers_prefill_
 pub use prefill_prepare_aux::run as run_prefill_prepare_aux;
 pub use prompt_prepare::run as run_prompt_prepare;
 pub use shared::gemma_tokenizer::{
-    GemmaAddedToken, GemmaBpeMerge, GemmaBpeState, GemmaTokenizerSpec, GemmaVocabEntry,
+    AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeState, GemmaTokenizerSpec,
+    GemmaVocabEntry,
 };
 pub use shared::input::{
     Gemma4Prompt, InferenceExecutionMode, InferenceRequest, MessageRole, ModelSpec,
@@ -82,7 +83,7 @@ pub struct InferenceControls {
     pub commit_checkpoints: bool,
     pub terminal_checkpoint: Option<String>,
     pub raster_tiles: bool,
-    pub raster_tokenizer_spec: Option<GemmaTokenizerSpec>,
+    pub raster_tokenizer_source: Option<AuthenticatedGemmaTokenizer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -147,11 +148,11 @@ pub fn run_inference_with_controls(
         let result = (|| {
             trace::phase_started(PhaseId::InputEmbedding);
             let prompt_preparation = if controls.raster_tiles {
-                let tokenizer_spec = controls
-                    .raster_tokenizer_spec
+                let tokenizer_source = controls
+                    .raster_tokenizer_source
                     .as_ref()
-                    .context("raster tile inference requires a Gemma tokenizer spec")?;
-                prompt_prepare::run_raster(request, model, tokenizer_spec)?
+                    .context("raster tile inference requires an authenticated Gemma tokenizer")?;
+                prompt_prepare::run_raster(request, model, tokenizer_source)?
             } else {
                 run_prompt_prepare(request, model, tokenizer)?
             };
@@ -313,11 +314,11 @@ mod tests {
         embed_input_tokens, finalize_decode_transition, run_decode_select_token,
         run_decode_transition, run_inference, run_inference_with_controls, run_output_finalize,
         run_prefill_finalize, run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare,
-        DecodeState, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
-        Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel, GemmaBpeMerge,
-        GemmaTokenizerSpec, GemmaVocabEntry, InferenceControls, InferenceExecutionMode,
-        InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec, OutputDecodeStopReason,
-        SamplingConfig, TextDecodingPolicy,
+        AuthenticatedGemmaTokenizer, DecodeState, EmbeddingTable, Gemma4AttentionKind,
+        Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
+        GemmaBpeMerge, GemmaTokenizerSpec, GemmaVocabEntry, InferenceControls,
+        InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec,
+        OutputDecodeStopReason, SamplingConfig, TextDecodingPolicy,
     };
     use crate::shared::gemma_tokenizer::GemmaAddedToken;
 
@@ -441,7 +442,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prompt.prepare".to_string()),
                 raster_tiles: false,
-                raster_tokenizer_spec: None,
+                raster_tokenizer_source: None,
             },
         )
         .expect("inference should pause");
@@ -488,7 +489,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster_tiles: true,
-                raster_tokenizer_spec: Some(test_gemma_tokenizer_spec()),
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
             },
         )
         .expect("raster inference should pause after prompt prepare");
@@ -535,7 +536,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
                 raster_tiles: false,
-                raster_tokenizer_spec: None,
+                raster_tokenizer_source: None,
             },
         )
         .expect("inference should pause");
@@ -744,6 +745,10 @@ mod tests {
         let mut tokenizer = tokenizers::Tokenizer::new(model);
         tokenizer.with_pre_tokenizer(Some(Whitespace));
         tokenizer
+    }
+
+    fn test_gemma_tokenizer_source() -> AuthenticatedGemmaTokenizer {
+        AuthenticatedGemmaTokenizer::new(test_gemma_tokenizer_spec())
     }
 
     fn test_gemma_tokenizer_spec() -> GemmaTokenizerSpec {

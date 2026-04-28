@@ -4,8 +4,8 @@ use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
     load_transformer_state_model_from_det_num_wgt_path,
     load_transformer_state_model_from_gemma_model_path, run_inference_with_controls,
-    InferenceControls, InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, ModelSpec,
-    SamplingConfig, TextDecodingPolicy,
+    AuthenticatedGemmaTokenizer, InferenceControls, InferenceExecutionMode, InferenceRequest,
+    InferenceRunOutcome, ModelSpec, SamplingConfig, TextDecodingPolicy,
 };
 
 const CLI_MAX_NEW_TOKENS: usize = 3;
@@ -35,10 +35,10 @@ fn run() -> anyhow::Result<()> {
     }
     let chat_template = load_chat_template(&cli_args.template_path)?;
     let tokenizer = load_tokenizer_from_path(&cli_args.tokenizer_path)?;
-    let raster_tokenizer_spec = if cli_args.raster_tiles {
-        Some(load_gemma_tokenizer_spec_from_path(
-            &cli_args.tokenizer_path,
-        )?)
+    let raster_tokenizer_source = if cli_args.raster_tiles {
+        Some(AuthenticatedGemmaTokenizer::new(
+            load_gemma_tokenizer_spec_from_path(&cli_args.tokenizer_path)?,
+        ))
     } else {
         None
     };
@@ -82,7 +82,7 @@ fn run() -> anyhow::Result<()> {
             commit_checkpoints: cli_args.commit_checkpoints,
             terminal_checkpoint: cli_args.terminal_checkpoint,
             raster_tiles: cli_args.raster_tiles,
-            raster_tokenizer_spec,
+            raster_tokenizer_source,
         },
     )?;
     match inference_outcome {
