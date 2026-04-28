@@ -19,6 +19,7 @@ For every raster implementation:
 - Use recursive tiles or recursive sequences for dynamic repetition. Do not put unbounded routine-level loops in a sequence when the number of iterations depends on data.
 - Route external data access through `auth_read!`. Files, model weights, tokenizer tables, and other large or external sources must be represented as authenticated sources plus typed request objects.
 - Use deterministic arithmetic for any arithmetic that can diverge between native execution and zkVM execution. Raster tiles must not use native floating-point operations or floating-point library methods for replay-critical arithmetic.
+- Keep raster-specific shared code separate. If raster routines need shared helpers, sources, kernels, or state types, put them in dedicated `shared` files or modules such as `raster_transformer.rs`, `raster_transformer_kernels.rs`, or `shared/raster/...` rather than adding mode-conditionals to existing shared code.
 - Preserve deterministic state. Intermediate state that crosses tile boundaries should use owned, serializable, deterministic data structures rather than borrowed views into external libraries.
 - Fail closed when a feature is outside the supported replayable subset. It is better for a raster path to reject unsupported tokenizer/model behavior than to approximate it silently.
 
@@ -183,6 +184,13 @@ For prompt preparation, `TokenizePromptInput`, `GemmaNormalizedText`, `GemmaPreT
 - Keep narrowing, rounding, saturation, comparison, and argmax behavior routed through deterministic helpers rather than raw casts or ad hoc math.
 - Fail closed if a needed arithmetic operation does not yet have a deterministic counterpart.
 
+### Shared Raster Code
+
+- Put reusable raster implementation code under `src/shared/`, but keep it physically separate from existing native or deterministic shared modules.
+- Prefer names that make the raster boundary obvious, such as `raster_transformer.rs`, `raster_transformer_kernels.rs`, or a `shared/raster/` module tree.
+- Do not turn existing shared modules into large `match execution_mode` or `if raster_tiles` blocks to support raster behavior.
+- Only modify existing shared code when changing a truly shared contract. If the implementation differs because of raster authoring, authenticated reads, recursive state, or zkVM replay constraints, create raster-specific shared code instead.
+
 ---
 
 ## zkVM Isolation Principles
@@ -228,6 +236,7 @@ When a raster path intentionally supports only a deterministic subset, add tests
 - Using `f32`/`f64` arithmetic inside a raster tile where deterministic arithmetic is required for zkVM parity.
 - Keeping a data-dependent loop inside a sequence instead of moving it to a recursive tile.
 - Passing an entire model, tokenizer, or file blob through tile state when the tile only needs a narrow lookup.
+- Mixing raster-specific shared helpers into existing shared modules behind mode flags instead of creating dedicated raster shared files or modules.
 - Depending on `HashMap` iteration order, filesystem ordering, current time, random seeds, or thread scheduling.
 - Preserving native implementation structure when the native structure is not replayable. Preserve behavior, not incidental call shape.
 - Adding compatibility shims for unsupported in-progress behavior. If the raster path is new and not shipped, make the contract strict and clear.
