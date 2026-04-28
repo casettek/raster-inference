@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokenizers::Tokenizer;
@@ -23,7 +23,8 @@ pub use decode_transition::tiles::run_text_layers_decode_step;
 pub use decode_transition::{finalize as finalize_decode_transition, run as run_decode_transition};
 pub use io::{
     load_chat_template, load_embedding_table_from_gemma_model_path, load_embedding_table_from_path,
-    load_tokenizer_from_path, load_transformer_state_model_from_det_num_wgt_path,
+    load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
+    load_transformer_state_model_from_det_num_wgt_path,
     load_transformer_state_model_from_gemma_model_path,
 };
 pub use output_finalize::run as run_output_finalize;
@@ -38,6 +39,9 @@ pub use prefill_layer::run_with_mode as run_prefill_layer_with_mode;
 pub use prefill_layer::tiles::{run_text_layers_prefill, run_text_layers_prefill_with_cache};
 pub use prefill_prepare_aux::run as run_prefill_prepare_aux;
 pub use prompt_prepare::run as run_prompt_prepare;
+pub use shared::gemma_tokenizer::{
+    GemmaAddedToken, GemmaBpeMerge, GemmaBpeState, GemmaTokenizerSpec, GemmaVocabEntry,
+};
 pub use shared::input::{
     Gemma4Prompt, InferenceExecutionMode, InferenceRequest, MessageRole, ModelSpec,
     PromptPreparationState, SamplingConfig, TextDecodingPolicy, TextMessage,
@@ -78,6 +82,7 @@ pub struct InferenceControls {
     pub commit_checkpoints: bool,
     pub terminal_checkpoint: Option<String>,
     pub raster_tiles: bool,
+    pub raster_tokenizer_spec: Option<GemmaTokenizerSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -142,7 +147,11 @@ pub fn run_inference_with_controls(
         let result = (|| {
             trace::phase_started(PhaseId::InputEmbedding);
             let prompt_preparation = if controls.raster_tiles {
-                prompt_prepare::run_raster(request, model, tokenizer)?
+                let tokenizer_spec = controls
+                    .raster_tokenizer_spec
+                    .as_ref()
+                    .context("raster tile inference requires a Gemma tokenizer spec")?;
+                prompt_prepare::run_raster(request, model, tokenizer_spec)?
             } else {
                 run_prompt_prepare(request, model, tokenizer)?
             };
@@ -305,10 +314,12 @@ mod tests {
         run_decode_transition, run_inference, run_inference_with_controls, run_output_finalize,
         run_prefill_finalize, run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare,
         DecodeState, EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights,
-        Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel, InferenceControls,
-        InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec,
-        OutputDecodeStopReason, SamplingConfig, TextDecodingPolicy,
+        Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel, GemmaBpeMerge,
+        GemmaTokenizerSpec, GemmaVocabEntry, InferenceControls, InferenceExecutionMode,
+        InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec, OutputDecodeStopReason,
+        SamplingConfig, TextDecodingPolicy,
     };
+    use crate::shared::gemma_tokenizer::GemmaAddedToken;
 
     #[test]
     fn run_inference_generates_greedy_text_for_max_new_tokens() {
@@ -430,6 +441,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prompt.prepare".to_string()),
                 raster_tiles: false,
+                raster_tokenizer_spec: None,
             },
         )
         .expect("inference should pause");
@@ -476,6 +488,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster_tiles: true,
+                raster_tokenizer_spec: Some(test_gemma_tokenizer_spec()),
             },
         )
         .expect("raster inference should pause after prompt prepare");
@@ -522,6 +535,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
                 raster_tiles: false,
+                raster_tokenizer_spec: None,
             },
         )
         .expect("inference should pause");
@@ -730,6 +744,104 @@ mod tests {
         let mut tokenizer = tokenizers::Tokenizer::new(model);
         tokenizer.with_pre_tokenizer(Some(Whitespace));
         tokenizer
+    }
+
+    fn test_gemma_tokenizer_spec() -> GemmaTokenizerSpec {
+        GemmaTokenizerSpec::new(
+            "digest".to_string(),
+            vec![
+                GemmaVocabEntry {
+                    token: "hello".to_string(),
+                    id: 0,
+                },
+                GemmaVocabEntry {
+                    token: "prompt".to_string(),
+                    id: 1,
+                },
+                GemmaVocabEntry {
+                    token: "<unk>".to_string(),
+                    id: 2,
+                },
+                GemmaVocabEntry {
+                    token: "p".to_string(),
+                    id: 3,
+                },
+                GemmaVocabEntry {
+                    token: "r".to_string(),
+                    id: 4,
+                },
+                GemmaVocabEntry {
+                    token: "o".to_string(),
+                    id: 5,
+                },
+                GemmaVocabEntry {
+                    token: "m".to_string(),
+                    id: 6,
+                },
+                GemmaVocabEntry {
+                    token: "t".to_string(),
+                    id: 7,
+                },
+                GemmaVocabEntry {
+                    token: "pr".to_string(),
+                    id: 8,
+                },
+                GemmaVocabEntry {
+                    token: "pro".to_string(),
+                    id: 9,
+                },
+                GemmaVocabEntry {
+                    token: "prom".to_string(),
+                    id: 10,
+                },
+                GemmaVocabEntry {
+                    token: "promp".to_string(),
+                    id: 11,
+                },
+            ],
+            vec![
+                GemmaBpeMerge {
+                    left: "p".to_string(),
+                    right: "r".to_string(),
+                    merged: "pr".to_string(),
+                    rank: 0,
+                },
+                GemmaBpeMerge {
+                    left: "pr".to_string(),
+                    right: "o".to_string(),
+                    merged: "pro".to_string(),
+                    rank: 1,
+                },
+                GemmaBpeMerge {
+                    left: "pro".to_string(),
+                    right: "m".to_string(),
+                    merged: "prom".to_string(),
+                    rank: 2,
+                },
+                GemmaBpeMerge {
+                    left: "prom".to_string(),
+                    right: "p".to_string(),
+                    merged: "promp".to_string(),
+                    rank: 3,
+                },
+                GemmaBpeMerge {
+                    left: "promp".to_string(),
+                    right: "t".to_string(),
+                    merged: "prompt".to_string(),
+                    rank: 4,
+                },
+            ],
+            vec![GemmaAddedToken {
+                id: 2,
+                content: "<unk>".to_string(),
+                special: true,
+            }],
+            "<unk>".to_string(),
+            true,
+            "▁".to_string(),
+            " ".to_string(),
+        )
+        .expect("test Gemma tokenizer spec should build")
     }
 
     fn test_transformer_model() -> Gemma4TransformerModel {

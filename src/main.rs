@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, process};
 
 use raster_inference::{
-    load_chat_template, load_tokenizer_from_path,
+    load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
     load_transformer_state_model_from_det_num_wgt_path,
     load_transformer_state_model_from_gemma_model_path, run_inference_with_controls,
     InferenceControls, InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, ModelSpec,
@@ -35,6 +35,13 @@ fn run() -> anyhow::Result<()> {
     }
     let chat_template = load_chat_template(&cli_args.template_path)?;
     let tokenizer = load_tokenizer_from_path(&cli_args.tokenizer_path)?;
+    let raster_tokenizer_spec = if cli_args.raster_tiles {
+        Some(load_gemma_tokenizer_spec_from_path(
+            &cli_args.tokenizer_path,
+        )?)
+    } else {
+        None
+    };
     let transformer_model = match cli_args.execution_mode {
         InferenceExecutionMode::Fp32 => {
             load_transformer_state_model_from_gemma_model_path(&cli_args.model_path)?
@@ -75,6 +82,7 @@ fn run() -> anyhow::Result<()> {
             commit_checkpoints: cli_args.commit_checkpoints,
             terminal_checkpoint: cli_args.terminal_checkpoint,
             raster_tiles: cli_args.raster_tiles,
+            raster_tokenizer_spec,
         },
     )?;
     match inference_outcome {

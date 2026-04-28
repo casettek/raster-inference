@@ -16,6 +16,9 @@ use crate::shared::det_num::{
     f32_to_acc, f32_to_act, scale_act, Act, Wgt, DET_NUM_SPEC_VERSION,
     DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
+use crate::shared::gemma_tokenizer::{
+    GemmaAddedToken, GemmaBpeMerge, GemmaTokenizerSpec, GemmaVocabEntry,
+};
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
     ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
@@ -857,6 +860,175 @@ pub fn load_tokenizer_from_path<P: AsRef<Path>>(path: P) -> Result<Tokenizer> {
         .with_context(|| format!("failed to read tokenizer from {}", path.as_ref().display()))?;
 
     Tokenizer::from_bytes(raw.as_slice()).map_err(anyhow::Error::msg)
+}
+
+#[derive(serde::Deserialize)]
+struct GemmaTokenizerJson {
+    #[serde(default)]
+    added_tokens: Vec<GemmaTokenizerAddedTokenJson>,
+    normalizer: GemmaTokenizerNormalizerJson,
+    pre_tokenizer: GemmaTokenizerPreTokenizerJson,
+    post_processor: GemmaTokenizerPostProcessorJson,
+    model: GemmaTokenizerModelJson,
+}
+
+#[derive(serde::Deserialize)]
+struct GemmaTokenizerAddedTokenJson {
+    id: u32,
+    content: String,
+    #[serde(default)]
+    special: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct GemmaTokenizerStringPatternJson {
+    #[serde(rename = "String")]
+    string: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GemmaTokenizerNormalizerJson {
+    #[serde(rename = "type")]
+    kind: String,
+    pattern: GemmaTokenizerStringPatternJson,
+    content: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GemmaTokenizerPreTokenizerJson {
+    #[serde(rename = "type")]
+    kind: String,
+    pattern: GemmaTokenizerStringPatternJson,
+    behavior: String,
+    #[serde(default)]
+    invert: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct GemmaTokenizerPostProcessorJson {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    special_tokens: HashMap<String, serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct GemmaTokenizerModelJson {
+    #[serde(rename = "type")]
+    kind: String,
+    unk_token: String,
+    #[serde(default)]
+    byte_fallback: bool,
+    #[serde(default)]
+    ignore_merges: bool,
+    vocab: HashMap<String, u32>,
+    #[serde(default)]
+    merges: Vec<[String; 2]>,
+}
+
+pub fn load_gemma_tokenizer_spec_from_path<P: AsRef<Path>>(path: P) -> Result<GemmaTokenizerSpec> {
+    let raw = fs::read(path.as_ref()).with_context(|| {
+        format!(
+            "failed to read Gemma tokenizer spec from {}",
+            path.as_ref().display()
+        )
+    })?;
+
+    parse_gemma_tokenizer_spec_bytes(&raw)
+}
+
+pub fn parse_gemma_tokenizer_spec_bytes(raw: &[u8]) -> Result<GemmaTokenizerSpec> {
+    let tokenizer: GemmaTokenizerJson = serde_json::from_slice(raw)
+        .context("failed to parse Gemma tokenizer JSON into supported spec")?;
+
+    validate_gemma_tokenizer_json(&tokenizer)?;
+
+    let tokenizer_sha256 = format!("{:x}", sha2::Sha256::digest(raw));
+    let vocab = tokenizer
+        .model
+        .vocab
+        .into_iter()
+        .map(|(token, id)| GemmaVocabEntry { token, id })
+        .collect::<Vec<_>>();
+    let merges = tokenizer
+        .model
+        .merges
+        .into_iter()
+        .enumerate()
+        .map(|(rank, [left, right])| GemmaBpeMerge {
+            merged: format!("{left}{right}"),
+            left,
+            right,
+            rank,
+        })
+        .collect::<Vec<_>>();
+    let added_tokens = tokenizer
+        .added_tokens
+        .into_iter()
+        .map(|token| GemmaAddedToken {
+            id: token.id,
+            content: token.content,
+            special: token.special,
+        })
+        .collect::<Vec<_>>();
+
+    GemmaTokenizerSpec::new(
+        tokenizer_sha256,
+        vocab,
+        merges,
+        added_tokens,
+        tokenizer.model.unk_token,
+        tokenizer.model.byte_fallback,
+        tokenizer.normalizer.content,
+        tokenizer.pre_tokenizer.pattern.string,
+    )
+}
+
+fn validate_gemma_tokenizer_json(tokenizer: &GemmaTokenizerJson) -> Result<()> {
+    if tokenizer.normalizer.kind != "Replace" {
+        bail!(
+            "unsupported Gemma tokenizer normalizer {}",
+            tokenizer.normalizer.kind
+        );
+    }
+    if tokenizer.normalizer.pattern.string != " " || tokenizer.normalizer.content != "▁" {
+        bail!("unsupported Gemma tokenizer normalizer replacement");
+    }
+    if tokenizer.pre_tokenizer.kind != "Split" {
+        bail!(
+            "unsupported Gemma tokenizer pre-tokenizer {}",
+            tokenizer.pre_tokenizer.kind
+        );
+    }
+    if tokenizer.pre_tokenizer.pattern.string != " "
+        || tokenizer.pre_tokenizer.behavior != "MergedWithPrevious"
+        || tokenizer.pre_tokenizer.invert
+    {
+        bail!("unsupported Gemma tokenizer pre-tokenizer split behavior");
+    }
+    if tokenizer.post_processor.kind != "TemplateProcessing" {
+        bail!(
+            "unsupported Gemma tokenizer post-processor {}",
+            tokenizer.post_processor.kind
+        );
+    }
+    if !tokenizer.post_processor.special_tokens.is_empty() {
+        bail!("unsupported Gemma tokenizer post-processor special tokens");
+    }
+    if tokenizer.model.kind != "BPE" {
+        bail!("unsupported Gemma tokenizer model {}", tokenizer.model.kind);
+    }
+    if !tokenizer.model.byte_fallback {
+        bail!("Gemma tokenizer spec requires byte_fallback = true");
+    }
+    if tokenizer.model.ignore_merges {
+        bail!("Gemma tokenizer spec does not support ignore_merges = true");
+    }
+    if tokenizer.model.vocab.is_empty() {
+        bail!("Gemma tokenizer spec requires a non-empty vocab");
+    }
+
+    Ok(())
 }
 
 pub fn load_embedding_table_from_path<P: AsRef<Path>>(path: P) -> Result<EmbeddingTable> {
@@ -2584,7 +2756,8 @@ mod tests {
         decode_matrix_row_from_source, decode_matrix_slice, decode_matrix_slice_from_source,
         decode_single_scalar, decode_vector, load_ple_model_projection,
         load_ple_token_embedding_row_internal, load_transformer_state_model_from_det_num_wgt_path,
-        load_transformer_state_model_from_gemma_model_path, parse_safetensors_metadata,
+        load_transformer_state_model_from_gemma_model_path, parse_gemma_tokenizer_spec_bytes,
+        parse_safetensors_metadata,
     };
     use crate::shared::det_num::{
         f32_to_act, f32_to_wgt, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
@@ -2607,6 +2780,31 @@ mod tests {
         name: String,
         shape: Vec<usize>,
         bytes: Vec<u8>,
+    }
+
+    #[test]
+    fn parse_gemma_tokenizer_spec_accepts_supported_subset() {
+        let spec = parse_gemma_tokenizer_spec_bytes(minimal_gemma_tokenizer_json().as_bytes())
+            .expect("supported tokenizer should parse");
+
+        assert_eq!(spec.token_id("<unk>"), Some(0));
+        assert_eq!(spec.token_id("ab"), Some(3));
+        assert_eq!(spec.merges.len(), 1);
+        assert_eq!(spec.merges[0].left, "a");
+        assert_eq!(spec.merges[0].right, "b");
+        assert!(spec.byte_fallback);
+    }
+
+    #[test]
+    fn parse_gemma_tokenizer_spec_rejects_unsupported_model_type() {
+        let json =
+            minimal_gemma_tokenizer_json().replace("\"type\":\"BPE\"", "\"type\":\"WordLevel\"");
+        let error = parse_gemma_tokenizer_spec_bytes(json.as_bytes())
+            .expect_err("unsupported tokenizer model should fail");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported Gemma tokenizer model"));
     }
 
     #[test]
@@ -3782,5 +3980,62 @@ mod tests {
             .iter()
             .flat_map(|value| wgt_to_le_bytes(f32_to_wgt(*value)))
             .collect()
+    }
+
+    fn minimal_gemma_tokenizer_json() -> String {
+        serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [
+                {
+                    "id": 4,
+                    "content": "<bos>",
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true
+                }
+            ],
+            "normalizer": {
+                "type": "Replace",
+                "pattern": { "String": " " },
+                "content": "▁"
+            },
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": { "String": " " },
+                "behavior": "MergedWithPrevious",
+                "invert": false
+            },
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [],
+                "pair": [],
+                "special_tokens": {}
+            },
+            "decoder": {
+                "type": "Sequence",
+                "decoders": []
+            },
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": "<unk>",
+                "fuse_unk": true,
+                "byte_fallback": true,
+                "ignore_merges": false,
+                "vocab": {
+                    "<unk>": 0,
+                    "a": 1,
+                    "b": 2,
+                    "ab": 3,
+                    "<bos>": 4
+                },
+                "merges": [
+                    ["a", "b"]
+                ]
+            }
+        })
+        .to_string()
     }
 }
