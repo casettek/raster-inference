@@ -1,6 +1,8 @@
 use raster_inference::io::parse_gemma_tokenizer_spec_bytes;
 use raster_inference::load_gemma_tokenizer_spec_from_path;
+use raster_inference::output_finalize::raster_tiles::detokenize_output_tokens;
 use raster_inference::prompt_prepare::raster_tiles::tokenize_prompt;
+use raster_inference::shared::gemma_tokenizer::GemmaDecoderMetadataRequest;
 use raster_inference::AuthenticatedGemmaTokenizer;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -28,6 +30,38 @@ fn raster_gemma_tokenizer_matches_huggingface_for_supported_subset() {
 }
 
 #[test]
+fn raster_gemma_detokenizer_matches_huggingface_for_supported_subset() {
+    let tokenizer_json = minimal_gemma_tokenizer_json();
+    let spec = parse_gemma_tokenizer_spec_bytes(tokenizer_json.as_bytes())
+        .expect("Gemma tokenizer spec should parse");
+    let source = AuthenticatedGemmaTokenizer::new(spec);
+    let tokenizer =
+        Tokenizer::from_bytes(tokenizer_json.as_bytes()).expect("HF tokenizer should parse");
+
+    for token_ids in [
+        vec![],
+        vec![4, 3],
+        vec![5, 4, 3],
+        vec![6],
+        vec![6, 4, 3],
+        vec![6, 7],
+        vec![6, 7, 4, 3],
+        vec![4, 3, 6, 7],
+    ] {
+        let hf_text = tokenizer
+            .decode(&token_ids, true)
+            .expect("HF tokenizer should decode");
+        let raster_text =
+            detokenize_output_tokens(&token_ids, &source).expect("Raster tokenizer should decode");
+
+        assert_eq!(
+            raster_text, hf_text,
+            "decoded text should match for {token_ids:?}"
+        );
+    }
+}
+
+#[test]
 fn real_gemma_tokenizer_asset_converts_to_spec() {
     let mut tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     tokenizer_path.push("assets/gemma-4-E4B-it/tokenizer.json");
@@ -38,6 +72,82 @@ fn real_gemma_tokenizer_asset_converts_to_spec() {
     assert_eq!(spec.token_id("<unk>"), Some(spec.unk_token_id));
     assert!(spec.byte_fallback);
     assert!(!spec.merges.is_empty());
+}
+
+#[test]
+fn unsupported_gemma_tokenizer_decoder_is_rejected() {
+    let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>, &str)> = vec![
+        (
+            "decoder type",
+            Box::new(|json| json["decoder"]["type"] = serde_json::json!("Replace")),
+            "unsupported Gemma tokenizer decoder",
+        ),
+        (
+            "decoder length",
+            Box::new(|json| {
+                json["decoder"]["decoders"]
+                    .as_array_mut()
+                    .expect("decoder list")
+                    .pop();
+            }),
+            "unsupported Gemma tokenizer decoder sequence length",
+        ),
+        (
+            "replacement step",
+            Box::new(|json| {
+                json["decoder"]["decoders"][0]["pattern"]["String"] = serde_json::json!("_")
+            }),
+            "unsupported Gemma tokenizer decoder replacement",
+        ),
+        (
+            "byte fallback step",
+            Box::new(|json| {
+                json["decoder"]["decoders"][1]["type"] = serde_json::json!("Metaspace")
+            }),
+            "unsupported Gemma tokenizer decoder byte fallback",
+        ),
+        (
+            "fuse step",
+            Box::new(|json| json["decoder"]["decoders"][2]["type"] = serde_json::json!("Strip")),
+            "unsupported Gemma tokenizer decoder fuse",
+        ),
+    ];
+
+    for (name, mutate, expected_error) in cases {
+        let mut tokenizer_json: serde_json::Value =
+            serde_json::from_str(&minimal_gemma_tokenizer_json()).expect("fixture should parse");
+        mutate(&mut tokenizer_json);
+
+        let error = parse_gemma_tokenizer_spec_bytes(tokenizer_json.to_string().as_bytes())
+            .expect_err(&format!("{name} should fail with a supported error"));
+
+        assert!(
+            error.to_string().contains(expected_error),
+            "{name} should contain {expected_error:?}, got {error}"
+        );
+    }
+}
+
+#[test]
+fn gemma_tokenizer_without_decoder_still_loads_for_encode_only_use() {
+    let mut tokenizer_json: serde_json::Value =
+        serde_json::from_str(&minimal_gemma_tokenizer_json()).expect("fixture should parse");
+    tokenizer_json
+        .as_object_mut()
+        .expect("fixture should be an object")
+        .remove("decoder");
+
+    let spec = parse_gemma_tokenizer_spec_bytes(tokenizer_json.to_string().as_bytes())
+        .expect("encode-only tokenizer spec should parse without decoder metadata");
+    let source = AuthenticatedGemmaTokenizer::new(spec);
+
+    let encoded = tokenize_prompt("ab", &source, false).expect("encode path should still work");
+    assert_eq!(encoded, vec![3]);
+    let error = raster_inference::auth_read!(&source, GemmaDecoderMetadataRequest)
+        .expect_err("decoder metadata should be required for raster output decode");
+    assert!(error
+        .to_string()
+        .contains("missing supported decoder metadata"));
 }
 
 fn minimal_gemma_tokenizer_json() -> String {

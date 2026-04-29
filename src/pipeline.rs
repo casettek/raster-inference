@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
+use crate::shared::gemma_tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::input::{InferenceExecutionMode, PromptPreparationState, SamplingConfig};
 use crate::shared::output::OutputDecodeState;
 use crate::shared::transformer::{
@@ -286,6 +287,7 @@ pub fn run_output_decode_with_mode(
         execution_mode,
         false,
         false,
+        None,
     )
 }
 
@@ -307,6 +309,7 @@ pub(crate) fn run_output_decode_with_mode_and_raster_select(
         execution_mode,
         true,
         false,
+        None,
     )
 }
 
@@ -315,6 +318,7 @@ pub(crate) fn run_output_decode_with_mode_and_raster_tiles(
     initial_transformer_state: &TransformerPrefillResult,
     sampling: &SamplingConfig,
     tokenizer: &Tokenizer,
+    raster_tokenizer: &AuthenticatedGemmaTokenizer,
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
 ) -> Result<OutputDecodeState> {
@@ -327,6 +331,7 @@ pub(crate) fn run_output_decode_with_mode_and_raster_tiles(
         execution_mode,
         true,
         true,
+        Some(raster_tokenizer),
     )
 }
 
@@ -339,6 +344,7 @@ fn run_output_decode_with_mode_internal(
     execution_mode: InferenceExecutionMode,
     raster_select_token: bool,
     raster_decode_transition: bool,
+    raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
 ) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
@@ -373,7 +379,11 @@ fn run_output_decode_with_mode_internal(
         };
         if stop_condition.is_some() {
             trace_event("output.detokenize");
-            let mut output_decode_state = crate::output_finalize::run(decode_state, tokenizer)?;
+            let mut output_decode_state = if let Some(raster_tokenizer) = raster_tokenizer {
+                crate::output_finalize::run_raster(decode_state, raster_tokenizer)?
+            } else {
+                crate::output_finalize::run(decode_state, tokenizer)?
+            };
             output_decode_state.decode_transition_states = decode_transition_states;
             return Ok(output_decode_state);
         }

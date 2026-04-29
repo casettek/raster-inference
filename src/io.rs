@@ -17,7 +17,7 @@ use crate::shared::det_num::{
     DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
 use crate::shared::gemma_tokenizer::{
-    GemmaAddedToken, GemmaBpeMerge, GemmaTokenizerSpec, GemmaVocabEntry,
+    GemmaAddedToken, GemmaBpeMerge, GemmaDecoderMetadata, GemmaTokenizerSpec, GemmaVocabEntry,
 };
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::transformer::{
@@ -869,6 +869,7 @@ struct GemmaTokenizerJson {
     normalizer: GemmaTokenizerNormalizerJson,
     pre_tokenizer: GemmaTokenizerPreTokenizerJson,
     post_processor: GemmaTokenizerPostProcessorJson,
+    decoder: Option<GemmaTokenizerDecoderJson>,
     model: GemmaTokenizerModelJson,
 }
 
@@ -913,6 +914,22 @@ struct GemmaTokenizerPostProcessorJson {
 }
 
 #[derive(serde::Deserialize)]
+struct GemmaTokenizerDecoderJson {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    decoders: Vec<GemmaTokenizerDecoderStepJson>,
+}
+
+#[derive(serde::Deserialize)]
+struct GemmaTokenizerDecoderStepJson {
+    #[serde(rename = "type")]
+    kind: String,
+    pattern: Option<GemmaTokenizerStringPatternJson>,
+    content: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct GemmaTokenizerModelJson {
     #[serde(rename = "type")]
     kind: String,
@@ -940,10 +957,10 @@ pub fn load_gemma_tokenizer_spec_from_path<P: AsRef<Path>>(path: P) -> Result<Ge
 pub fn parse_gemma_tokenizer_spec_bytes(raw: &[u8]) -> Result<GemmaTokenizerSpec> {
     let tokenizer: GemmaTokenizerJson = serde_json::from_slice(raw)
         .context("failed to parse Gemma tokenizer JSON into supported spec")?;
-
-    validate_gemma_tokenizer_json(&tokenizer)?;
-
     let tokenizer_sha256 = format!("{:x}", sha2::Sha256::digest(raw));
+
+    let decoder_metadata = validate_gemma_tokenizer_json(&tokenizer, &tokenizer_sha256)?;
+
     let vocab = tokenizer
         .model
         .vocab
@@ -972,7 +989,7 @@ pub fn parse_gemma_tokenizer_spec_bytes(raw: &[u8]) -> Result<GemmaTokenizerSpec
         })
         .collect::<Vec<_>>();
 
-    GemmaTokenizerSpec::new(
+    GemmaTokenizerSpec::new_with_decoder_metadata(
         tokenizer_sha256,
         vocab,
         merges,
@@ -981,10 +998,14 @@ pub fn parse_gemma_tokenizer_spec_bytes(raw: &[u8]) -> Result<GemmaTokenizerSpec
         tokenizer.model.byte_fallback,
         tokenizer.normalizer.content,
         tokenizer.pre_tokenizer.pattern.string,
+        decoder_metadata,
     )
 }
 
-fn validate_gemma_tokenizer_json(tokenizer: &GemmaTokenizerJson) -> Result<()> {
+fn validate_gemma_tokenizer_json(
+    tokenizer: &GemmaTokenizerJson,
+    tokenizer_sha256: &str,
+) -> Result<Option<GemmaDecoderMetadata>> {
     if tokenizer.normalizer.kind != "Replace" {
         bail!(
             "unsupported Gemma tokenizer normalizer {}",
@@ -1015,6 +1036,7 @@ fn validate_gemma_tokenizer_json(tokenizer: &GemmaTokenizerJson) -> Result<()> {
     if !tokenizer.post_processor.special_tokens.is_empty() {
         bail!("unsupported Gemma tokenizer post-processor special tokens");
     }
+    let decoder_metadata = validate_gemma_tokenizer_decoder_json(tokenizer, tokenizer_sha256)?;
     if tokenizer.model.kind != "BPE" {
         bail!("unsupported Gemma tokenizer model {}", tokenizer.model.kind);
     }
@@ -1028,7 +1050,53 @@ fn validate_gemma_tokenizer_json(tokenizer: &GemmaTokenizerJson) -> Result<()> {
         bail!("Gemma tokenizer spec requires a non-empty vocab");
     }
 
-    Ok(())
+    Ok(decoder_metadata)
+}
+
+fn validate_gemma_tokenizer_decoder_json(
+    tokenizer: &GemmaTokenizerJson,
+    tokenizer_sha256: &str,
+) -> Result<Option<GemmaDecoderMetadata>> {
+    let Some(decoder) = tokenizer.decoder.as_ref() else {
+        return Ok(None);
+    };
+
+    if decoder.kind != "Sequence" {
+        bail!("unsupported Gemma tokenizer decoder {}", decoder.kind);
+    }
+    if decoder.decoders.len() != 3 {
+        bail!("unsupported Gemma tokenizer decoder sequence length");
+    }
+
+    let replace = &decoder.decoders[0];
+    if replace.kind != "Replace"
+        || replace
+            .pattern
+            .as_ref()
+            .map(|pattern| pattern.string.as_str())
+            != Some("▁")
+        || replace.content.as_deref() != Some(" ")
+    {
+        bail!("unsupported Gemma tokenizer decoder replacement");
+    }
+
+    let byte_fallback = &decoder.decoders[1];
+    if byte_fallback.kind != "ByteFallback" {
+        bail!("unsupported Gemma tokenizer decoder byte fallback");
+    }
+
+    let fuse = &decoder.decoders[2];
+    if fuse.kind != "Fuse" {
+        bail!("unsupported Gemma tokenizer decoder fuse");
+    }
+
+    Ok(Some(GemmaDecoderMetadata {
+        tokenizer_sha256: tokenizer_sha256.to_string(),
+        replacement_pattern: "▁".to_string(),
+        replacement_content: " ".to_string(),
+        byte_fallback: true,
+        fuse: true,
+    }))
 }
 
 pub fn load_embedding_table_from_path<P: AsRef<Path>>(path: P) -> Result<EmbeddingTable> {
@@ -4015,7 +4083,19 @@ mod tests {
             },
             "decoder": {
                 "type": "Sequence",
-                "decoders": []
+                "decoders": [
+                    {
+                        "type": "Replace",
+                        "pattern": { "String": "▁" },
+                        "content": " "
+                    },
+                    {
+                        "type": "ByteFallback"
+                    },
+                    {
+                        "type": "Fuse"
+                    }
+                ]
             },
             "model": {
                 "type": "BPE",

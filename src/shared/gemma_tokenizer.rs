@@ -37,8 +37,11 @@ pub struct GemmaTokenizerSpec {
     pub space_replacement: String,
     pub split_pattern: String,
     vocab_by_token: HashMap<String, u32>,
+    token_by_id: HashMap<u32, String>,
+    special_token_ids: HashSet<u32>,
     merge_by_pair: HashMap<String, HashMap<String, usize>>,
     special_tokens_by_length: Vec<GemmaAddedToken>,
+    decoder_metadata: Option<GemmaDecoderMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +61,22 @@ pub struct GemmaTokenizerMetadata {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GemmaDecoderMetadata {
+    pub tokenizer_sha256: String,
+    pub replacement_pattern: String,
+    pub replacement_content: String,
+    pub byte_fallback: bool,
+    pub fuse: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GemmaDecodedToken {
+    pub id: u32,
+    pub content: String,
+    pub special: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeMergeCandidate {
     pub merge_index: usize,
     pub rank: usize,
@@ -67,8 +86,16 @@ pub struct GemmaBpeMergeCandidate {
 pub struct GemmaTokenizerMetadataRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemmaDecoderMetadataRequest;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmaTokenIdRequest<'a> {
     pub token: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemmaTokenByIdRequest {
+    pub token_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +143,36 @@ pub struct GemmaBpeOutput {
 impl GemmaTokenizerSpec {
     pub fn new(
         tokenizer_sha256: String,
+        vocab: Vec<GemmaVocabEntry>,
+        merges: Vec<GemmaBpeMerge>,
+        added_tokens: Vec<GemmaAddedToken>,
+        unk_token: String,
+        byte_fallback: bool,
+        space_replacement: String,
+        split_pattern: String,
+    ) -> Result<Self> {
+        let decoder_metadata = Some(GemmaDecoderMetadata {
+            tokenizer_sha256: tokenizer_sha256.clone(),
+            replacement_pattern: space_replacement.clone(),
+            replacement_content: " ".to_string(),
+            byte_fallback,
+            fuse: true,
+        });
+        Self::new_with_decoder_metadata(
+            tokenizer_sha256,
+            vocab,
+            merges,
+            added_tokens,
+            unk_token,
+            byte_fallback,
+            space_replacement,
+            split_pattern,
+            decoder_metadata,
+        )
+    }
+
+    pub(crate) fn new_with_decoder_metadata(
+        tokenizer_sha256: String,
         mut vocab: Vec<GemmaVocabEntry>,
         merges: Vec<GemmaBpeMerge>,
         added_tokens: Vec<GemmaAddedToken>,
@@ -123,6 +180,7 @@ impl GemmaTokenizerSpec {
         byte_fallback: bool,
         space_replacement: String,
         split_pattern: String,
+        decoder_metadata: Option<GemmaDecoderMetadata>,
     ) -> Result<Self> {
         if vocab.is_empty() {
             bail!("Gemma tokenizer spec requires a non-empty vocab");
@@ -133,6 +191,7 @@ impl GemmaTokenizerSpec {
         let mut seen_tokens = HashSet::new();
         let mut seen_ids = HashSet::new();
         let mut vocab_by_token = HashMap::with_capacity(vocab.len());
+        let mut token_by_id = HashMap::with_capacity(vocab.len() + added_tokens.len());
         for entry in &vocab {
             if !seen_tokens.insert(entry.token.clone()) {
                 bail!(
@@ -144,11 +203,33 @@ impl GemmaTokenizerSpec {
                 bail!("Gemma tokenizer spec has duplicate vocab id {}", entry.id);
             }
             vocab_by_token.insert(entry.token.clone(), entry.id);
+            token_by_id.insert(entry.id, entry.token.clone());
         }
 
         let Some(unk_token_id) = vocab_by_token.get(&unk_token).copied() else {
             bail!("Gemma tokenizer spec unk token {unk_token} is missing from vocab");
         };
+
+        let mut special_token_ids = HashSet::new();
+        for token in &added_tokens {
+            if token.special {
+                special_token_ids.insert(token.id);
+            }
+            match token_by_id.get(&token.id) {
+                Some(existing) if existing != &token.content => {
+                    bail!(
+                        "Gemma tokenizer added token id {} content {} conflicts with vocab token {}",
+                        token.id,
+                        token.content,
+                        existing
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    token_by_id.insert(token.id, token.content.clone());
+                }
+            }
+        }
 
         let mut seen_merges = HashSet::new();
         let mut merge_by_pair = HashMap::<String, HashMap<String, usize>>::new();
@@ -193,13 +274,26 @@ impl GemmaTokenizerSpec {
             space_replacement,
             split_pattern,
             vocab_by_token,
+            token_by_id,
+            special_token_ids,
             merge_by_pair,
             special_tokens_by_length,
+            decoder_metadata,
         })
     }
 
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.vocab_by_token.get(token).copied()
+    }
+
+    pub fn token_by_id(&self, token_id: u32) -> Option<GemmaDecodedToken> {
+        self.token_by_id
+            .get(&token_id)
+            .map(|content| GemmaDecodedToken {
+                id: token_id,
+                content: content.clone(),
+                special: self.special_token_ids.contains(&token_id),
+            })
     }
 
     pub fn longest_special_token_at(
@@ -267,11 +361,30 @@ impl AuthRead<GemmaTokenizerMetadataRequest> for AuthenticatedGemmaTokenizer {
     }
 }
 
+impl AuthRead<GemmaDecoderMetadataRequest> for AuthenticatedGemmaTokenizer {
+    type Output = GemmaDecoderMetadata;
+
+    fn auth_read(&self, _request: GemmaDecoderMetadataRequest) -> Result<Self::Output> {
+        let Some(metadata) = self.spec.decoder_metadata.clone() else {
+            bail!("Gemma tokenizer spec is missing supported decoder metadata");
+        };
+        Ok(metadata)
+    }
+}
+
 impl<'a> AuthRead<GemmaTokenIdRequest<'a>> for AuthenticatedGemmaTokenizer {
     type Output = Option<u32>;
 
     fn auth_read(&self, request: GemmaTokenIdRequest<'a>) -> Result<Self::Output> {
         Ok(self.spec.token_id(request.token))
+    }
+}
+
+impl AuthRead<GemmaTokenByIdRequest> for AuthenticatedGemmaTokenizer {
+    type Output = Option<GemmaDecodedToken>;
+
+    fn auth_read(&self, request: GemmaTokenByIdRequest) -> Result<Self::Output> {
+        Ok(self.spec.token_by_id(request.token_id))
     }
 }
 
@@ -339,8 +452,9 @@ impl GemmaBpeState {
 mod tests {
     use super::{
         AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeMergeRequest,
-        GemmaBpeMergedTokenRequest, GemmaSpecialTokenAtRequest, GemmaTokenIdRequest,
-        GemmaTokenizerMetadataRequest, GemmaTokenizerSpec, GemmaVocabEntry,
+        GemmaBpeMergedTokenRequest, GemmaDecoderMetadataRequest, GemmaSpecialTokenAtRequest,
+        GemmaTokenByIdRequest, GemmaTokenIdRequest, GemmaTokenizerMetadataRequest,
+        GemmaTokenizerSpec, GemmaVocabEntry,
     };
 
     #[test]
@@ -444,6 +558,36 @@ mod tests {
     }
 
     #[test]
+    fn spec_rejects_added_token_id_that_conflicts_with_vocab_content() {
+        let error = GemmaTokenizerSpec::new(
+            "digest".to_string(),
+            vec![
+                GemmaVocabEntry {
+                    token: "<unk>".to_string(),
+                    id: 0,
+                },
+                GemmaVocabEntry {
+                    token: "a".to_string(),
+                    id: 1,
+                },
+            ],
+            Vec::new(),
+            vec![GemmaAddedToken {
+                id: 1,
+                content: "<bos>".to_string(),
+                special: true,
+            }],
+            "<unk>".to_string(),
+            true,
+            "▁".to_string(),
+            " ".to_string(),
+        )
+        .expect_err("conflicting added token id should fail");
+
+        assert!(error.to_string().contains("conflicts with vocab token"));
+    }
+
+    #[test]
     fn authenticated_tokenizer_reads_metadata() {
         let source = AuthenticatedGemmaTokenizer::new(test_spec());
         let metadata = crate::auth_read!(&source, GemmaTokenizerMetadataRequest)
@@ -470,6 +614,42 @@ mod tests {
         assert_eq!(
             crate::auth_read!(&source, GemmaTokenIdRequest { token: "missing" })
                 .expect("token id should read"),
+            None
+        );
+    }
+
+    #[test]
+    fn authenticated_tokenizer_reads_decoder_metadata() {
+        let source = AuthenticatedGemmaTokenizer::new(test_spec());
+        let metadata = crate::auth_read!(&source, GemmaDecoderMetadataRequest)
+            .expect("decoder metadata should read");
+
+        assert_eq!(metadata.tokenizer_sha256, "digest");
+        assert_eq!(metadata.replacement_pattern, "▁");
+        assert_eq!(metadata.replacement_content, " ");
+        assert!(metadata.byte_fallback);
+        assert!(metadata.fuse);
+    }
+
+    #[test]
+    fn authenticated_tokenizer_reads_tokens_by_id() {
+        let source = AuthenticatedGemmaTokenizer::new(test_spec());
+
+        let token = crate::auth_read!(&source, GemmaTokenByIdRequest { token_id: 3 })
+            .expect("token by id should read")
+            .expect("token should exist");
+        assert_eq!(token.content, "ab");
+        assert!(!token.special);
+
+        let special = crate::auth_read!(&source, GemmaTokenByIdRequest { token_id: 4 })
+            .expect("special token by id should read")
+            .expect("special token should exist");
+        assert_eq!(special.content, "<bos>");
+        assert!(special.special);
+
+        assert_eq!(
+            crate::auth_read!(&source, GemmaTokenByIdRequest { token_id: 99 })
+                .expect("missing token read should succeed"),
             None
         );
     }
