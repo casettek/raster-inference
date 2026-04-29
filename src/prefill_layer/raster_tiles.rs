@@ -12,7 +12,7 @@ use crate::shared::raster_prefill_layer::{
     GemmaPrefillLayerSourceMetadataRequest,
 };
 use crate::shared::raster_transformer_kernels::{
-    add_sequences, apply_rope_to_heads, build_raster_kv_cache, causal_attention_heads,
+    add_sequences, apply_rope_to_heads, build_raster_kv_cache, causal_attention_heads_with_cache,
     combine_attention_heads, gelu_sequence, mul_sequences, project_sequence_with_prefill_source,
     reshape_sequence_heads, rms_norm_sequence, scale_sequence, value_rms_norm_heads,
     RasterActivationSequence, RasterKvCache,
@@ -79,15 +79,6 @@ pub fn compute_next_prefill_layer(
 
     let layer_idx = state.next_layer_idx;
     let layer = auth_read!(layer_source, GemmaPrefillLayerMetadataRequest { layer_idx })?;
-    if layer.attention_kind != GemmaPrefillAttentionKind::Full {
-        bail!("raster prefill layer phase 3 supports full attention only");
-    }
-    if layer.num_heads != 1 || layer.num_kv_heads != 1 {
-        bail!("raster prefill layer phase 3 supports one query head and one KV head");
-    }
-    if layer.kv_shared_layer_index.is_some() {
-        bail!("raster prefill layer phase 3 does not support donor KV sharing");
-    }
     if layer.has_ple {
         bail!("raster prefill layer phase 3 does not support PLE layers");
     }
@@ -100,8 +91,13 @@ pub fn compute_next_prefill_layer(
         bail!("transformer layer received PLE inputs without PLE weights");
     }
 
-    let (layer_output, layer_cache) =
-        run_basic_prefill_layer(&state.current_activations, layer_source, &layer)?;
+    let donor_cache = resolve_prefill_donor_cache(&state.layer_caches, layer_idx, &layer)?;
+    let (layer_output, layer_cache) = run_basic_prefill_layer(
+        &state.current_activations,
+        layer_source,
+        &layer,
+        donor_cache,
+    )?;
     state.current_activations = layer_output;
     state.layer_caches.push(layer_cache);
     state.completed_layer_output_sha256s.push(
@@ -169,6 +165,7 @@ fn run_basic_prefill_layer(
     input: &RasterActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer: &crate::shared::raster_prefill_layer::GemmaPrefillLayerMetadata,
+    donor_cache: Option<&RasterKvCache>,
 ) -> Result<(RasterActivationSequence, RasterKvCache)> {
     let scalars = auth_read!(
         layer_source,
@@ -263,12 +260,26 @@ fn run_basic_prefill_layer(
         0,
     )?;
 
-    let layer_cache = build_raster_kv_cache(&k_heads, &v_heads, layer.cache_sliding_window)?;
+    let layer_cache = if donor_cache.is_some() {
+        RasterKvCache::empty(layer.num_kv_heads)
+    } else {
+        build_raster_kv_cache(&k_heads, &v_heads, layer.cache_sliding_window)?
+    };
     let attention_window = match layer.attention_kind {
         GemmaPrefillAttentionKind::Full => None,
-        GemmaPrefillAttentionKind::Sliding => layer.sliding_window,
+        GemmaPrefillAttentionKind::Sliding => Some(
+            layer
+                .sliding_window
+                .ok_or_else(|| anyhow!("sliding attention layer is missing a sliding window"))?,
+        ),
     };
-    let attention_heads = causal_attention_heads(&q_heads, &k_heads, &v_heads, attention_window)?;
+    let attention_heads = causal_attention_heads_with_cache(
+        &q_heads,
+        &k_heads,
+        &v_heads,
+        donor_cache,
+        attention_window,
+    )?;
     let attention_sequence = combine_attention_heads(&attention_heads)?;
     let attention_output = project_sequence_with_prefill_source(
         &attention_sequence,
@@ -344,6 +355,26 @@ fn run_basic_prefill_layer(
     Ok((xs, layer_cache))
 }
 
+fn resolve_prefill_donor_cache<'a>(
+    layer_caches: &'a [RasterKvCache],
+    layer_idx: usize,
+    layer: &crate::shared::raster_prefill_layer::GemmaPrefillLayerMetadata,
+) -> Result<Option<&'a RasterKvCache>> {
+    layer
+        .kv_shared_layer_index
+        .map(|donor_idx| {
+            if donor_idx >= layer_idx {
+                bail!(
+                    "transformer prefill layer {layer_idx} cannot share KV with non-prior donor {donor_idx}"
+                );
+            }
+            layer_caches.get(donor_idx).ok_or_else(|| {
+                anyhow!("transformer prefill donor cache {donor_idx} missing for layer {layer_idx}")
+            })
+        })
+        .transpose()
+}
+
 fn raster_activation_sequence_from_activation(
     input_activations: &ActivationSequence,
 ) -> Result<RasterActivationSequence> {
@@ -366,6 +397,10 @@ fn raster_sequence_acts(
 }
 
 fn layer_cache_from_raster(cache: RasterKvCache) -> LayerKvCache {
+    if cache.current_len() == 0 {
+        return LayerKvCache::new(cache.head_count());
+    }
+
     LayerKvCache::from_det_heads(
         cache
             .keys()
@@ -397,12 +432,111 @@ mod tests {
     #[test]
     fn single_layer_no_ple_matches_deterministic_prefill_layer() {
         let (_path, model) = no_ple_model();
+
+        assert_raster_matches_deterministic(
+            &model,
+            vec![vec![Act::from_num(1.0), Act::from_num(-0.5)]],
+        );
+    }
+
+    #[test]
+    fn sliding_attention_matches_deterministic_prefill_layer() {
+        let (_path, mut model) = no_ple_model();
+        model.layers[0].attention_kind = Gemma4AttentionKind::Sliding;
+        model.layers[0].sliding_window = Some(1);
+        model.layers[0].cache_sliding_window = Some(1);
+
+        let raster = assert_raster_matches_deterministic(
+            &model,
+            vec![
+                vec![Act::from_num(1.0), Act::from_num(0.0)],
+                vec![Act::from_num(0.5), Act::from_num(-0.5)],
+                vec![Act::from_num(-1.0), Act::from_num(1.0)],
+            ],
+        );
+        assert_eq!(raster.1[0].current_len(), 1);
+    }
+
+    #[test]
+    fn attention_k_equals_v_matches_deterministic_prefill_layer() {
+        let (_path, mut model) = no_ple_model();
+        model.layers[0].v_proj = None;
+        model.layers[0].attention_k_eq_v = true;
+
+        assert_raster_matches_deterministic(
+            &model,
+            vec![
+                vec![Act::from_num(1.0), Act::from_num(0.0)],
+                vec![Act::from_num(0.0), Act::from_num(1.0)],
+            ],
+        );
+    }
+
+    #[test]
+    fn donor_kv_sharing_matches_deterministic_prefill_layer() {
+        let (_path, mut model) = no_ple_model();
+        let mut donor_layer = model.layers[0].clone();
+        donor_layer.kv_shared_layer_index = Some(0);
+        model.layers.push(donor_layer);
+
+        let raster = assert_raster_matches_deterministic(
+            &model,
+            vec![
+                vec![Act::from_num(1.0), Act::from_num(0.0)],
+                vec![Act::from_num(0.0), Act::from_num(1.0)],
+            ],
+        );
+        assert_eq!(raster.1.len(), 2);
+        assert_eq!(raster.1[1].current_len(), 0);
+    }
+
+    #[test]
+    fn non_prior_donor_cache_fails_closed() {
+        let (_path, mut model) = no_ple_model();
+        model.layers[0].kv_shared_layer_index = Some(0);
         let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
             .expect("source should build");
-        let input_internal = InternalActivationSequence::from_det_values(vec![vec![
-            Act::from_num(1.0),
-            Act::from_num(-0.5),
-        ]]);
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+
+        let error = run(&input, &source, None).expect_err("self donor should fail");
+
+        assert!(error
+            .to_string()
+            .contains("cannot share KV with non-prior donor"));
+    }
+
+    fn assert_raster_matches_deterministic(
+        model: &Gemma4TransformerModel,
+        rows: Vec<Vec<Act>>,
+    ) -> (
+        ActivationSequence,
+        Vec<crate::shared::transformer::LayerKvCache>,
+    ) {
+        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", model)
+            .expect("source should build");
+        let input_internal = InternalActivationSequence::from_det_values(rows);
+        let input = activation_sequence_from_internal(input_internal.clone());
+
+        let raster = run(&input, &source, None).expect("raster prefill layer should run");
+        let deterministic = deterministic_tiles::run_internal(input_internal, model, None)
+            .expect("deterministic prefill layer should run");
+
+        assert_eq!(raster.0.activations, deterministic.0.activations);
+        assert_eq!(
+            raster.0.det_activations_sha256,
+            deterministic.0.det_activations_sha256
+        );
+        assert_eq!(raster.1, deterministic.1);
+        raster
+    }
+
+    fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {
+        activation_sequence_from_internal(InternalActivationSequence::from_det_values(rows))
+    }
+
+    fn activation_sequence_from_internal(
+        input_internal: InternalActivationSequence,
+    ) -> ActivationSequence {
         let mut input = ActivationSequence::from_internal(
             input_internal.clone(),
             crate::shared::transformer_kernels::build_activation_commitment(
@@ -414,17 +548,7 @@ mod tests {
                 input_internal.det_values().expect("det input"),
             ),
         );
-
-        let raster = run(&input, &source, None).expect("raster prefill layer should run");
-        let deterministic = deterministic_tiles::run_internal(input_internal, &model, None)
-            .expect("deterministic prefill layer should run");
-
-        assert_eq!(raster.0.activations, deterministic.0.activations);
-        assert_eq!(
-            raster.0.det_activations_sha256,
-            deterministic.0.det_activations_sha256
-        );
-        assert_eq!(raster.1, deterministic.1);
+        input
     }
 
     fn no_ple_model() -> (PathBuf, Gemma4TransformerModel) {

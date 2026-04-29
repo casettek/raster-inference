@@ -154,6 +154,13 @@ impl RasterAttentionHeadSequence {
 }
 
 impl RasterKvCache {
+    pub fn empty(num_kv_heads: usize) -> Self {
+        Self {
+            keys: vec![Vec::new(); num_kv_heads],
+            values: vec![Vec::new(); num_kv_heads],
+        }
+    }
+
     pub fn from_heads(
         keys: Vec<Vec<RasterActivationRow>>,
         values: Vec<Vec<RasterActivationRow>>,
@@ -184,6 +191,40 @@ impl RasterKvCache {
 
     pub fn current_len(&self) -> usize {
         self.keys.first().map(Vec::len).unwrap_or(0)
+    }
+
+    pub fn key_rows_window(
+        &self,
+        head_idx: usize,
+        start: usize,
+        len: usize,
+    ) -> Result<Vec<RasterActivationRow>> {
+        self.keys
+            .get(head_idx)
+            .ok_or_else(|| {
+                anyhow!(
+                    "KV cache key head {head_idx} is out of range for {} heads",
+                    self.keys.len()
+                )
+            })
+            .map(|head| head.iter().skip(start).take(len).cloned().collect())
+    }
+
+    pub fn value_rows_window(
+        &self,
+        head_idx: usize,
+        start: usize,
+        len: usize,
+    ) -> Result<Vec<RasterActivationRow>> {
+        self.values
+            .get(head_idx)
+            .ok_or_else(|| {
+                anyhow!(
+                    "KV cache value head {head_idx} is out of range for {} heads",
+                    self.values.len()
+                )
+            })
+            .map(|head| head.iter().skip(start).take(len).cloned().collect())
     }
 }
 
@@ -545,6 +586,96 @@ pub fn causal_attention_heads(
     Ok(RasterAttentionHeadSequence::from_heads(heads))
 }
 
+pub fn causal_attention_heads_with_cache(
+    queries: &RasterAttentionHeadSequence,
+    keys: &RasterAttentionHeadSequence,
+    values: &RasterAttentionHeadSequence,
+    donor_cache: Option<&RasterKvCache>,
+    attention_window: Option<usize>,
+) -> Result<RasterAttentionHeadSequence> {
+    let sequence_len = attention_sequence_len(queries)?;
+    let query_width = attention_head_width(queries)?;
+    let key_width = attention_head_width(keys)?;
+    let value_width = attention_head_width(values)?;
+    if query_width != key_width || query_width != value_width {
+        bail!(
+            "attention head width mismatch: query {query_width}, key {key_width}, value {value_width}"
+        );
+    }
+    let kv_head_count = keys.head_count();
+    if kv_head_count == 0 {
+        bail!("attention requires at least one KV head");
+    }
+    if values.head_count() != kv_head_count {
+        bail!(
+            "attention key/value head count mismatch: {} vs {}",
+            kv_head_count,
+            values.head_count()
+        );
+    }
+    if queries.head_count() % kv_head_count != 0 {
+        bail!(
+            "attention query head count {} must be divisible by KV head count {}",
+            queries.head_count(),
+            kv_head_count
+        );
+    }
+    let key_sequence_len = attention_sequence_len(keys)?;
+    let value_sequence_len = attention_sequence_len(values)?;
+    if key_sequence_len != sequence_len || value_sequence_len != sequence_len {
+        bail!(
+            "attention sequence length mismatch: query {sequence_len}, key {key_sequence_len}, value {value_sequence_len}"
+        );
+    }
+    if let Some(cache) = donor_cache {
+        if cache.head_count() != kv_head_count {
+            bail!(
+                "attention donor cache head count mismatch: {} vs {}",
+                cache.head_count(),
+                kv_head_count
+            );
+        }
+    }
+
+    let kv_groups = queries.head_count() / kv_head_count;
+    let heads = queries
+        .heads()
+        .iter()
+        .enumerate()
+        .map(|(query_head_idx, query_head)| {
+            let kv_head_idx = query_head_idx / kv_groups;
+            let key_head = &keys.heads()[kv_head_idx];
+            let value_head = &values.heads()[kv_head_idx];
+            let mut output_rows = Vec::with_capacity(sequence_len);
+            for query_idx in 0..sequence_len {
+                let start = attention_window
+                    .map(|window| query_idx.saturating_add(1).saturating_sub(window))
+                    .unwrap_or(0);
+                let row_count = query_idx + 1 - start;
+                let (key_rows, value_rows) = if let Some(cache) = donor_cache {
+                    (
+                        cache.key_rows_window(kv_head_idx, start, row_count)?,
+                        cache.value_rows_window(kv_head_idx, start, row_count)?,
+                    )
+                } else {
+                    (
+                        key_head[start..=query_idx].to_vec(),
+                        value_head[start..=query_idx].to_vec(),
+                    )
+                };
+                output_rows.push(attention_output_row(
+                    &query_head[query_idx],
+                    &key_rows,
+                    &value_rows,
+                )?);
+            }
+            Ok(output_rows)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(RasterAttentionHeadSequence::from_heads(heads))
+}
+
 pub fn build_raster_kv_cache(
     keys: &RasterAttentionHeadSequence,
     values: &RasterAttentionHeadSequence,
@@ -786,10 +917,11 @@ fn validate_projection_rows(projection_rows: &[Vec<Wgt>]) -> Result<()> {
 mod tests {
     use super::{
         add_sequences, apply_rope_to_heads, attention_output_row, build_raster_kv_cache,
-        causal_attention_heads, combine_attention_heads, gelu_sequence, mul_sequences,
-        project_sequence, project_sequence_with_prefill_source, project_sequence_with_source,
-        reshape_sequence_heads, rms_norm_sequence, scale_sequence, value_rms_norm_heads,
-        RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence,
+        causal_attention_heads, causal_attention_heads_with_cache, combine_attention_heads,
+        gelu_sequence, mul_sequences, project_sequence, project_sequence_with_prefill_source,
+        project_sequence_with_source, reshape_sequence_heads, rms_norm_sequence, scale_sequence,
+        value_rms_norm_heads, RasterActivationRow, RasterActivationSequence,
+        RasterAttentionHeadSequence, RasterKvCache,
     };
     use crate::raster_authoring::AuthRead;
     use crate::shared::det_num::{
@@ -1125,6 +1257,90 @@ mod tests {
             attention_output_row(&query_head[2], &key_head[1..=2], &value_head[1..=2])
                 .expect("last attention output");
         assert_eq!(output.heads()[0][2], expected_last);
+    }
+
+    #[test]
+    fn grouped_causal_attention_maps_query_heads_to_kv_heads() {
+        let queries = RasterAttentionHeadSequence::from_acts(vec![
+            vec![vec![Act::from_num(1.0)]],
+            vec![vec![Act::from_num(2.0)]],
+            vec![vec![Act::from_num(3.0)]],
+            vec![vec![Act::from_num(4.0)]],
+        ]);
+        let keys = RasterAttentionHeadSequence::from_acts(vec![
+            vec![vec![Act::from_num(1.0)]],
+            vec![vec![Act::from_num(2.0)]],
+        ]);
+        let values = RasterAttentionHeadSequence::from_acts(vec![
+            vec![vec![Act::from_num(5.0)]],
+            vec![vec![Act::from_num(7.0)]],
+        ]);
+
+        let output = causal_attention_heads_with_cache(&queries, &keys, &values, None, None)
+            .expect("grouped attention should work");
+
+        assert_eq!(output.head_count(), 4);
+        assert_eq!(
+            output.heads()[0][0].act_bits(),
+            &[Act::from_num(5.0).to_bits()]
+        );
+        assert_eq!(
+            output.heads()[1][0].act_bits(),
+            &[Act::from_num(5.0).to_bits()]
+        );
+        assert_eq!(
+            output.heads()[2][0].act_bits(),
+            &[Act::from_num(7.0).to_bits()]
+        );
+        assert_eq!(
+            output.heads()[3][0].act_bits(),
+            &[Act::from_num(7.0).to_bits()]
+        );
+    }
+
+    #[test]
+    fn donor_cache_attention_reads_prior_cache_rows() {
+        let queries = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(1.0)],
+            vec![Act::from_num(1.0)],
+        ]]);
+        let current_keys = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(9.0)],
+            vec![Act::from_num(9.0)],
+        ]]);
+        let current_values = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(9.0)],
+            vec![Act::from_num(9.0)],
+        ]]);
+        let donor_cache = RasterKvCache::from_heads(
+            vec![vec![
+                RasterActivationRow::from_acts(vec![Act::from_num(1.0)]),
+                RasterActivationRow::from_acts(vec![Act::from_num(2.0)]),
+            ]],
+            vec![vec![
+                RasterActivationRow::from_acts(vec![Act::from_num(3.0)]),
+                RasterActivationRow::from_acts(vec![Act::from_num(4.0)]),
+            ]],
+        )
+        .expect("cache should build");
+
+        let output = causal_attention_heads_with_cache(
+            &queries,
+            &current_keys,
+            &current_values,
+            Some(&donor_cache),
+            Some(1),
+        )
+        .expect("donor attention should work");
+
+        assert_eq!(
+            output.heads()[0][0].act_bits(),
+            &[Act::from_num(3.0).to_bits()]
+        );
+        assert_eq!(
+            output.heads()[0][1].act_bits(),
+            &[Act::from_num(4.0).to_bits()]
+        );
     }
 
     #[test]
