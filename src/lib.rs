@@ -131,6 +131,10 @@ pub fn run_inference_with_controls(
     controls: &InferenceControls,
 ) -> Result<InferenceRunOutcome> {
     trace::with_checkpointing_enabled(controls.commit_checkpoints, || {
+        if controls.raster_tiles && request.execution_mode != InferenceExecutionMode::Deterministic
+        {
+            anyhow::bail!("raster tile inference requires deterministic execution");
+        }
         transformer_model.validate_execution_mode(request.execution_mode)?;
         trace::start_inference_trace(&json!({
             "model_id": model.model_id,
@@ -193,7 +197,7 @@ pub fn run_inference_with_controls(
                     "sampling": request.sampling.clone(),
                 }),
             );
-            if controls.raster_tiles || should_stop_at_checkpoint(controls, "prompt.prepare") {
+            if should_stop_at_checkpoint(controls, "prompt.prepare") {
                 return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
                     terminal_checkpoint_id: "prompt.prepare".to_string(),
                     input_embedding,
@@ -204,13 +208,26 @@ pub fn run_inference_with_controls(
             trace::phase_finished(PhaseId::InputEmbedding);
 
             trace::phase_started(PhaseId::TransformerStateTransition);
-            let ple_inputs = run_prefill_prepare_aux(
-                &prompt_preparation.prompt_token_ids,
-                transformer_model,
-                &token_embeddings,
-                request.execution_mode,
-            )?;
-            if should_stop_at_checkpoint(controls, "prefill.prepare_aux") {
+            let ple_inputs = if controls.raster_tiles {
+                let ple_source =
+                    crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource::from_model(
+                        model.model_id.clone(),
+                        transformer_model,
+                    )?;
+                prefill_prepare_aux::run_raster(
+                    &prompt_preparation.prompt_token_ids,
+                    &ple_source,
+                    &token_embeddings,
+                )?
+            } else {
+                run_prefill_prepare_aux(
+                    &prompt_preparation.prompt_token_ids,
+                    transformer_model,
+                    &token_embeddings,
+                    request.execution_mode,
+                )?
+            };
+            if controls.raster_tiles || should_stop_at_checkpoint(controls, "prefill.prepare_aux") {
                 trace::phase_paused(PhaseId::TransformerStateTransition);
                 return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
                     terminal_checkpoint_id: "prefill.prepare_aux".to_string(),
@@ -320,7 +337,12 @@ mod tests {
         InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec,
         OutputDecodeStopReason, SamplingConfig, TextDecodingPolicy,
     };
+    use crate::shared::det_num::{f32_to_acc, Act};
     use crate::shared::gemma_tokenizer::GemmaAddedToken;
+    use crate::shared::transformer::{
+        DetNumMatrix, DetNumTensorSliceSource, GemmaEmbeddingTensorSource,
+    };
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn run_inference_generates_greedy_text_for_max_new_tokens() {
@@ -462,16 +484,16 @@ mod tests {
     }
 
     #[test]
-    fn run_inference_with_controls_raster_tiles_stop_after_prompt_prepare() {
+    fn run_inference_with_controls_raster_tiles_stop_after_prefill_prepare_aux() {
         let tokenizer = test_tokenizer();
         let model = test_model_spec();
-        let transformer_model = test_transformer_model();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
         let request = InferenceRequest {
             prompt_bytes: b"prompt".to_vec(),
             text_decoding_policy: TextDecodingPolicy::Utf8,
             add_generation_prompt: false,
             add_special_tokens: false,
-            execution_mode: InferenceExecutionMode::Fp32,
+            execution_mode: InferenceExecutionMode::Deterministic,
             sampling: SamplingConfig {
                 max_new_tokens: Some(2),
                 temperature: Some(1.0),
@@ -484,7 +506,7 @@ mod tests {
             &request,
             &model,
             &tokenizer,
-            &transformer_model,
+            &transformer_fixture.model,
             &InferenceControls {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
@@ -492,11 +514,11 @@ mod tests {
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
             },
         )
-        .expect("raster inference should pause after prompt prepare");
+        .expect("raster inference should pause after prefill prepare aux");
 
         match paused {
             InferenceRunOutcome::Paused(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
+                assert_eq!(state.terminal_checkpoint_id, "prefill.prepare_aux");
                 assert_eq!(
                     state.input_embedding.prompt_preparation.prompt_token_ids,
                     vec![1]
@@ -506,6 +528,80 @@ mod tests {
             }
             InferenceRunOutcome::Completed(_) => panic!("expected paused raster inference"),
         }
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_rejects_non_deterministic_request() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_model = test_transformer_model();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            },
+        )
+        .expect_err("raster inference should reject fp32 requests");
+
+        assert!(error
+            .to_string()
+            .contains("requires deterministic execution"));
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_rejects_non_deterministic_model() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_model = test_transformer_model();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            },
+        )
+        .expect_err("raster inference should reject fp32 models");
+
+        assert!(error.to_string().contains(".detwgt artifact"));
     }
 
     #[test]
@@ -847,6 +943,74 @@ mod tests {
             " ".to_string(),
         )
         .expect("test Gemma tokenizer spec should build")
+    }
+
+    struct DeterministicModelFixture {
+        model: Gemma4TransformerModel,
+        weights_file: std::path::PathBuf,
+    }
+
+    impl Drop for DeterministicModelFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.weights_file);
+        }
+    }
+
+    fn deterministic_no_ple_model_fixture() -> DeterministicModelFixture {
+        let embedding_rows = vec![
+            vec![Act::from_num(0.0); 4],
+            vec![Act::from_num(0.0); 4],
+            vec![Act::from_num(0.0); 4],
+        ];
+        let (weights_file, source) = write_det_embedding_weights(embedding_rows);
+        let mut model = test_transformer_model();
+        model.provenance = Gemma4ModelProvenance::DetNumWgt;
+        model.embedding_table = None;
+        model.embedding_source = Some(GemmaEmbeddingTensorSource::Deterministic {
+            source,
+            scale: 1.0,
+            det_cache: Arc::new(Mutex::new(None::<Arc<DetNumMatrix>>)),
+        });
+        model.rms_norm_eps_det = Some(f32_to_acc(model.rms_norm_eps));
+        DeterministicModelFixture {
+            model,
+            weights_file,
+        }
+    }
+
+    fn write_det_embedding_weights(
+        rows: Vec<Vec<Act>>,
+    ) -> (std::path::PathBuf, DetNumTensorSliceSource) {
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "raster-lib-det-embedding-{}-{unique_suffix}.detwgt",
+            std::process::id()
+        ));
+        let mut bytes = Vec::new();
+        for row in &rows {
+            for value in row {
+                bytes.extend(value.to_bits().to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).expect("det embedding fixture should write");
+        let row_count = rows.len();
+        let col_count = rows.first().map(Vec::len).unwrap_or(0);
+        (
+            path.clone(),
+            DetNumTensorSliceSource {
+                weights_path: path,
+                total_rows: row_count,
+                total_cols: col_count,
+                data_offset: 0,
+                row_offset: 0,
+                row_count,
+                col_offset: 0,
+                col_count,
+            },
+        )
     }
 
     fn test_transformer_model() -> Gemma4TransformerModel {

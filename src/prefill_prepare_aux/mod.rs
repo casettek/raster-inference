@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::shared::input::InferenceExecutionMode;
+use crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel,
 };
@@ -29,6 +30,25 @@ pub fn run(
             )
         })
         .transpose()?;
+    trace_prefill_prepare_aux_checkpoint(prompt_token_ids, token_embeddings, ple_inputs.as_ref());
+    Ok(ple_inputs)
+}
+
+pub fn run_raster(
+    prompt_token_ids: &[u32],
+    ple_source: &AuthenticatedGemmaPleSource,
+    token_embeddings: &ActivationSequence,
+) -> Result<Option<Gemma4PrefillPleInputs>> {
+    let ple_inputs = raster_tiles::run(prompt_token_ids, token_embeddings, ple_source)?;
+    trace_prefill_prepare_aux_checkpoint(prompt_token_ids, token_embeddings, ple_inputs.as_ref());
+    Ok(ple_inputs)
+}
+
+fn trace_prefill_prepare_aux_checkpoint(
+    prompt_token_ids: &[u32],
+    token_embeddings: &ActivationSequence,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+) {
     crate::trace::trace_checkpoint(
         "prefill.prepare_aux",
         &json!({
@@ -37,8 +57,8 @@ pub fn run(
             "embedded_prompt_activations": token_embeddings.activations.clone(),
             "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
             "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
-            "per_layer_prefill_inputs": ple_inputs.as_ref().map(|inputs| inputs.per_layer_inputs.clone()),
-            "per_layer_prefill_input_sha256s": ple_inputs.as_ref().map(|inputs| {
+            "per_layer_prefill_inputs": ple_inputs.map(|inputs| inputs.per_layer_inputs.clone()),
+            "per_layer_prefill_input_sha256s": ple_inputs.map(|inputs| {
                 inputs
                     .per_layer_inputs
                     .iter()
@@ -47,5 +67,4 @@ pub fn run(
             }),
         }),
     );
-    Ok(ple_inputs)
 }

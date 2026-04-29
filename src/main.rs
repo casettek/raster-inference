@@ -16,7 +16,7 @@ fn print_usage() {
         "Usage: raster-inference [--deterministic] [--raster] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize. Pass --raster to use raster-authored tiles and stop after prompt.prepare while that path is being built out."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize. Pass --raster to use raster-authored tiles and stop after prefill.prepare_aux while that path is being built out."
     );
 }
 
