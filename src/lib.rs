@@ -260,13 +260,27 @@ pub fn run_inference_with_controls(
                     output_decode: None,
                 }));
             }
-            let prefill = run_prefill_finalize(
-                &prompt_preparation.prompt_token_ids,
-                transformer_model,
-                final_hidden_states,
-                layer_caches,
-                request.execution_mode,
-            )?;
+            let prefill = if controls.raster_tiles {
+                let finalize_source =
+                    crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource::from_model(
+                        model.model_id.clone(),
+                        transformer_model,
+                    )?;
+                prefill_finalize::run_raster(
+                    &prompt_preparation.prompt_token_ids,
+                    &finalize_source,
+                    final_hidden_states,
+                    layer_caches,
+                )?
+            } else {
+                run_prefill_finalize(
+                    &prompt_preparation.prompt_token_ids,
+                    transformer_model,
+                    final_hidden_states,
+                    layer_caches,
+                    request.execution_mode,
+                )?
+            };
             let mut transformer_state_transition = prefill.transformer_state.clone();
             if should_stop_at_checkpoint(controls, "prefill.finalize") {
                 trace::phase_paused(PhaseId::TransformerStateTransition);
@@ -583,6 +597,56 @@ mod tests {
                     vec![1]
                 );
                 assert!(state.transformer_state_transition.is_none());
+                assert!(state.output_decode.is_none());
+            }
+            InferenceRunOutcome::Completed(_) => panic!("expected paused raster inference"),
+        }
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_can_pause_after_prefill_finalize() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: Some("prefill.finalize".to_string()),
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            },
+        )
+        .expect("raster inference should pause after prefill finalize");
+
+        match paused {
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prefill.finalize");
+                let transformer_state = state
+                    .transformer_state_transition
+                    .expect("transformer phase should be present");
+                assert_eq!(transformer_state.activation_states.len(), 1);
+                assert!(transformer_state
+                    .prefill_logits
+                    .det_final_logits_sha256
+                    .is_some());
                 assert!(state.output_decode.is_none());
             }
             InferenceRunOutcome::Completed(_) => panic!("expected paused raster inference"),
@@ -1042,6 +1106,14 @@ mod tests {
             scale: 1.0,
             det_cache: Arc::new(Mutex::new(None::<Arc<DetNumMatrix>>)),
         });
+        model.logits_projection = Gemma4LogitsProjection::UntiedLmHead {
+            weight: zero_matrix(3, 4),
+            det_weight: Some(Arc::new(DetNumMatrix {
+                rows: 3,
+                cols: 4,
+                values: vec![Wgt::from_num(0.0).to_bits(); 12],
+            })),
+        };
         model.rms_norm_eps_det = Some(f32_to_acc(model.rms_norm_eps));
         model.final_norm_weight_det = Some(vec![Wgt::from_num(1.0); 4]);
         let layer = &mut model.layers[0];

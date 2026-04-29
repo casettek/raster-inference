@@ -1,10 +1,8 @@
-use std::fs::File;
-
-use anyhow::{anyhow, bail, Context, Result};
-use memmap2::Mmap;
+use anyhow::{anyhow, bail, Result};
 
 use crate::raster_authoring::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
+use crate::shared::raster_transformer_kernels::det_num_tensor_slice_row_wgts;
 use crate::shared::transformer::{
     DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights,
     Gemma4ModelProvenance, Gemma4TransformerModel,
@@ -557,50 +555,7 @@ fn det_num_matrix_row_wgts(
     row_idx: usize,
     label: &str,
 ) -> Result<Vec<Wgt>> {
-    if row_idx >= source.row_count {
-        bail!(
-            "Gemma prefill {label} row {row_idx} is out of range for {} rows",
-            source.row_count
-        );
-    }
-
-    let file = File::open(&source.weights_path).with_context(|| {
-        format!(
-            "failed to open deterministic artifact {}",
-            source.weights_path.display()
-        )
-    })?;
-    let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
-        format!(
-            "failed to mmap deterministic artifact {}",
-            source.weights_path.display()
-        )
-    })?;
-    let row_bytes = source
-        .total_cols
-        .checked_mul(4)
-        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
-    let global_row_idx = source.row_offset + row_idx;
-    let start = source
-        .data_offset
-        .checked_add(global_row_idx * row_bytes)
-        .and_then(|offset| offset.checked_add(source.col_offset * 4))
-        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
-    let end = start
-        .checked_add(source.col_count * 4)
-        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
-    let encoded_row = mmap
-        .get(start..end)
-        .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
-    let mut row = Vec::with_capacity(source.col_count);
-    for encoded_value in encoded_row.chunks_exact(4) {
-        row.push(Wgt::from_bits(i32::from_le_bytes(
-            encoded_value
-                .try_into()
-                .expect("i32 byte width should match"),
-        )));
-    }
-    Ok(row)
+    det_num_tensor_slice_row_wgts(source, row_idx, label)
 }
 
 #[cfg(test)]

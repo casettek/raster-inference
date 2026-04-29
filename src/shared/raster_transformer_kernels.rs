@@ -1,4 +1,6 @@
-use anyhow::{anyhow, bail, Result};
+use std::fs::File;
+
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::auth_read;
 use crate::raster_authoring::AuthRead;
@@ -13,6 +15,7 @@ use crate::shared::raster_prefill_layer::{
     GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMatrixRowRequest,
 };
 use crate::shared::raster_prefill_ple::GemmaPleModelProjectionRowRequest;
+use crate::shared::transformer::DetNumTensorSliceSource;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterActivationRow {
@@ -321,6 +324,57 @@ where
         )?);
     }
     project_sequence(input, &rows)
+}
+
+pub(crate) fn det_num_tensor_slice_row_wgts(
+    source: &DetNumTensorSliceSource,
+    row_idx: usize,
+    label: &str,
+) -> Result<Vec<Wgt>> {
+    if row_idx >= source.row_count {
+        bail!(
+            "Gemma prefill {label} row {row_idx} is out of range for {} rows",
+            source.row_count
+        );
+    }
+
+    let file = File::open(&source.weights_path).with_context(|| {
+        format!(
+            "failed to open deterministic artifact {}",
+            source.weights_path.display()
+        )
+    })?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.with_context(|| {
+        format!(
+            "failed to mmap deterministic artifact {}",
+            source.weights_path.display()
+        )
+    })?;
+    let row_bytes = source
+        .total_cols
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
+    let global_row_idx = source.row_offset + row_idx;
+    let start = source
+        .data_offset
+        .checked_add(global_row_idx * row_bytes)
+        .and_then(|offset| offset.checked_add(source.col_offset * 4))
+        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+    let end = start
+        .checked_add(source.col_count * 4)
+        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+    let encoded_row = mmap
+        .get(start..end)
+        .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
+    let mut row = Vec::with_capacity(source.col_count);
+    for encoded_value in encoded_row.chunks_exact(4) {
+        row.push(Wgt::from_bits(i32::from_le_bytes(
+            encoded_value
+                .try_into()
+                .expect("i32 byte width should match"),
+        )));
+    }
+    Ok(row)
 }
 
 pub fn project_sequence_with_prefill_source<S>(
@@ -733,25 +787,40 @@ fn project_row(
     input: &RasterActivationRow,
     projection_rows: &[Vec<Wgt>],
 ) -> Result<RasterActivationRow> {
-    let input_acts = input.acts();
     let width = projection_rows[0].len();
-    if input_acts.len() != width {
+    if input.width() != width {
         bail!(
             "deterministic linear input width mismatch: {} vs {}",
-            input_acts.len(),
+            input.width(),
             width
         );
     }
 
     let mut output = Vec::with_capacity(projection_rows.len());
     for row in projection_rows {
-        let mut acc_bits = 0_i64;
-        for (act, weight) in input_acts.iter().zip(row) {
-            acc_bits = mac_bits(acc_bits, act.to_bits(), weight.to_bits());
-        }
-        output.push(requantize(Acc::from_bits(acc_bits)));
+        output.push(project_row_with_weights(input, row)?);
     }
     Ok(RasterActivationRow::from_acts(output))
+}
+
+pub(crate) fn project_row_with_weights(
+    input: &RasterActivationRow,
+    projection_row: &[Wgt],
+) -> Result<Act> {
+    if input.width() != projection_row.len() {
+        bail!(
+            "deterministic linear input width mismatch: {} vs {}",
+            input.width(),
+            projection_row.len()
+        );
+    }
+
+    let input_acts = input.acts();
+    let mut acc_bits = 0_i64;
+    for (act, weight) in input_acts.iter().zip(projection_row) {
+        acc_bits = mac_bits(acc_bits, act.to_bits(), weight.to_bits());
+    }
+    Ok(requantize(Acc::from_bits(acc_bits)))
 }
 
 fn validate_non_empty_sequence(input: &RasterActivationSequence, label: &str) -> Result<()> {
