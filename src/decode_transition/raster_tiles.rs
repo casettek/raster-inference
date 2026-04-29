@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Result};
+use serde_json::json;
 
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_tile_result, call_tile, sequence, tile,
@@ -116,6 +117,14 @@ pub fn compute_next_decode_layer(
 
     let layer_idx = state.next_layer_idx;
     let layer = auth_read!(source, GemmaDecodeLayerMetadataRequest { layer_idx })?;
+    let _trace = crate::trace::trace_scope(format!(
+        "decode.layer.det layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
+        state.next_token,
+        state.position,
+        layer.attention_kind,
+        layer.has_ple,
+        layer.kv_shared_layer_index
+    ));
     let cache = state
         .original_layer_caches
         .get(layer_idx)
@@ -144,6 +153,54 @@ pub fn compute_next_decode_layer(
     state.completed_layer_output_det_sha256s.push(Some(
         crate::shared::transformer_kernels::build_det_vector_commitment(&current_activation_acts),
     ));
+    let mut checkpoint_layer_caches = state
+        .updated_layer_caches
+        .iter()
+        .cloned()
+        .map(layer_cache_from_raster)
+        .collect::<Vec<_>>();
+    checkpoint_layer_caches.extend(
+        state
+            .original_layer_caches
+            .iter()
+            .skip(layer_idx + 1)
+            .cloned()
+            .map(layer_cache_from_raster),
+    );
+    let decode_input_values = state.decode_input.to_f32_values();
+    let decode_input_acts = state.decode_input.acts();
+    let current_activation_sha256 = state
+        .completed_layer_output_sha256s
+        .last()
+        .cloned()
+        .expect("current layer output commitment should exist");
+    let det_current_activation_sha256 = state
+        .completed_layer_output_det_sha256s
+        .last()
+        .cloned()
+        .unwrap_or(None);
+    crate::trace::trace_checkpoint(
+        &format!(
+            "decode.layer_token.layer_{layer_idx}.position_{}",
+            state.position
+        ),
+        &json!({
+            "execution_mode": "deterministic",
+            "token_id": state.next_token,
+            "position": state.position,
+            "next_layer_idx": layer_idx + 1,
+            "decode_input_activation": decode_input_values.clone(),
+            "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&decode_input_values),
+            "det_decode_input_activation_sha256": Some(crate::shared::transformer_kernels::build_det_vector_commitment(&decode_input_acts)),
+            "current_activation": current_activation_values,
+            "current_activation_sha256": current_activation_sha256,
+            "det_current_activation_sha256": det_current_activation_sha256,
+            "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
+            "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
+            "completed_layer_output_sha256s": state.completed_layer_output_sha256s.clone(),
+            "completed_layer_output_det_sha256s": state.completed_layer_output_det_sha256s.clone(),
+        }),
+    );
 
     state.next_layer_idx += 1;
     Ok((false, state))
