@@ -1,12 +1,14 @@
 use anyhow::Result;
 
 use crate::shared::input::InferenceExecutionMode;
+use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence,
     LayerKvCache,
 };
 
 pub mod deterministic_tiles;
+pub mod raster_tiles;
 pub mod tiles;
 
 pub fn run(
@@ -34,6 +36,14 @@ pub fn run_with_mode(
         ple_inputs,
         execution_mode,
     )
+}
+
+pub fn run_raster(
+    input_activations: &ActivationSequence,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    raster_tiles::run(input_activations, layer_source, ple_inputs)
 }
 
 pub(crate) fn run_with_mode_internal(
