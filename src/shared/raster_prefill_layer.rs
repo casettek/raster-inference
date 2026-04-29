@@ -139,7 +139,7 @@ pub struct GemmaPrefillLayerNormWeightsRequest {
     pub norm: GemmaPrefillLayerNormKind,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum GemmaPrefillLayerMatrixKind {
     Query,
     Key,
@@ -152,7 +152,7 @@ pub enum GemmaPrefillLayerMatrixKind {
     PleLayerProjection,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum GemmaPrefillLayerNormKind {
     Query,
     Key,
