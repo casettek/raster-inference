@@ -128,7 +128,7 @@ pub fn compute_next_prefill_layer(
     crate::trace::trace_checkpoint(
         "prefill.layer",
         &json!({
-            "execution_mode": "raster",
+            "execution_mode": "deterministic",
             "next_layer_idx": layer_idx + 1,
             "current_activations": current_activations.clone(),
             "current_activations_sha256": crate::shared::transformer_kernels::build_activation_commitment(&current_activations),
@@ -146,7 +146,7 @@ pub fn compute_next_prefill_layer(
         crate::trace::trace_checkpoint(
             &format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}"),
             &json!({
-                "execution_mode": "raster",
+                "execution_mode": "deterministic",
                 "layer_idx": layer_idx,
                 "token_idx": token_idx,
                 "token_count": current_activations.len(),
