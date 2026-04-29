@@ -133,7 +133,7 @@ cargo run -- \
   "Hello from Raster"
 ```
 
-For now, `--raster` implies the deterministic model/runtime path, routes prompt preparation through duplicated raster-authored tiles, and then stops after the `prompt.prepare` checkpoint. The CLI prints the same paused-state JSON shape used by `--terminal-checkpoint prompt.prepare`.
+For now, `--raster` implies the deterministic model/runtime path and routes the implemented raster-authored routines through separate raster tile modules. Prompt preparation, prefill preparation/finalization work, prefill layers, and decode token selection use raster-authored tiles where available. Decode transition still uses the native deterministic path until it is separately converted.
 
 When `--deterministic` is set, the model path must point to either:
 

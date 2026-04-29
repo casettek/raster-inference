@@ -294,14 +294,25 @@ pub fn run_inference_with_controls(
             trace::phase_finished(PhaseId::TransformerStateTransition);
 
             trace::phase_started(PhaseId::OutputDecode);
-            let output_decode = run_output_decode_with_mode(
-                &prompt_preparation.prompt_token_ids,
-                &prefill,
-                &request.sampling,
-                tokenizer,
-                transformer_model,
-                request.execution_mode,
-            )?;
+            let output_decode = if controls.raster_tiles {
+                pipeline::run_output_decode_with_mode_and_raster_select(
+                    &prompt_preparation.prompt_token_ids,
+                    &prefill,
+                    &request.sampling,
+                    tokenizer,
+                    transformer_model,
+                    request.execution_mode,
+                )?
+            } else {
+                run_output_decode_with_mode(
+                    &prompt_preparation.prompt_token_ids,
+                    &prefill,
+                    &request.sampling,
+                    tokenizer,
+                    transformer_model,
+                    request.execution_mode,
+                )?
+            };
             transformer_state_transition
                 .activation_states
                 .extend(output_decode.decode_transition_states.iter().cloned());
@@ -650,6 +661,49 @@ mod tests {
                 assert!(state.output_decode.is_none());
             }
             InferenceRunOutcome::Completed(_) => panic!("expected paused raster inference"),
+        }
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_runs_decode_select_token() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let outcome = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            },
+        )
+        .expect("raster inference should complete");
+
+        match outcome {
+            InferenceRunOutcome::Completed(state) => {
+                assert_eq!(state.output_decode.generated_token_ids, vec![0, 0]);
+                assert_eq!(state.output_decode.generated_token_count, 2);
+                assert_eq!(state.output_decode.decode_transition_states.len(), 2);
+            }
+            InferenceRunOutcome::Paused(_) => panic!("expected completed raster inference"),
         }
     }
 

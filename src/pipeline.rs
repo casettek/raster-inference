@@ -277,6 +277,45 @@ pub fn run_output_decode_with_mode(
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
 ) -> Result<OutputDecodeState> {
+    run_output_decode_with_mode_internal(
+        prompt_token_ids,
+        initial_transformer_state,
+        sampling,
+        tokenizer,
+        transformer_model,
+        execution_mode,
+        false,
+    )
+}
+
+pub(crate) fn run_output_decode_with_mode_and_raster_select(
+    prompt_token_ids: &[u32],
+    initial_transformer_state: &TransformerPrefillResult,
+    sampling: &SamplingConfig,
+    tokenizer: &Tokenizer,
+    transformer_model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
+) -> Result<OutputDecodeState> {
+    run_output_decode_with_mode_internal(
+        prompt_token_ids,
+        initial_transformer_state,
+        sampling,
+        tokenizer,
+        transformer_model,
+        execution_mode,
+        true,
+    )
+}
+
+fn run_output_decode_with_mode_internal(
+    prompt_token_ids: &[u32],
+    initial_transformer_state: &TransformerPrefillResult,
+    sampling: &SamplingConfig,
+    tokenizer: &Tokenizer,
+    transformer_model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
+    raster_select_token: bool,
+) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
     let mut decode_transition_states = Vec::new();
@@ -297,12 +336,18 @@ pub fn run_output_decode_with_mode(
     );
 
     loop {
-        if crate::decode_select_token::tiles::check_stop_condition(
-            decode_state.generated_token_ids.len(),
-            max_new_tokens,
-        )
-        .is_some()
-        {
+        let stop_condition = if raster_select_token {
+            crate::decode_select_token::raster_tiles::check_stop_condition(
+                decode_state.generated_token_ids.len(),
+                max_new_tokens,
+            )
+        } else {
+            crate::decode_select_token::tiles::check_stop_condition(
+                decode_state.generated_token_ids.len(),
+                max_new_tokens,
+            )
+        };
+        if stop_condition.is_some() {
             trace_event("output.detokenize");
             let mut output_decode_state = crate::output_finalize::run(decode_state, tokenizer)?;
             output_decode_state.decode_transition_states = decode_transition_states;
@@ -310,9 +355,12 @@ pub fn run_output_decode_with_mode(
         }
 
         trace_event("decode.select_token");
-        let next_token =
+        let next_token = if raster_select_token {
+            crate::decode_select_token::run_raster(&mut decode_state, max_new_tokens)?
+        } else {
             crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
-                .expect("stop condition should have returned earlier");
+        }
+        .expect("stop condition should have returned earlier");
 
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
@@ -336,7 +384,8 @@ mod tests {
     use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
     use super::{
-        decode_step, decode_step_with_mode, run_output_decode, run_prefill_pass,
+        decode_step, decode_step_with_mode, run_output_decode,
+        run_output_decode_with_mode_and_raster_select, run_prefill_pass,
         run_prefill_pass_with_mode, run_transformer_state_transition,
         run_transformer_state_transition_for_token_ids, validate_sampling_config,
     };
@@ -384,6 +433,74 @@ mod tests {
         assert!(output_decode_state.generated_token_ids.is_empty());
         assert_eq!(output_decode_state.generated_text, "");
         assert!(output_decode_state.decode_transition_states.is_empty());
+    }
+
+    #[test]
+    fn run_output_decode_with_raster_select_preserves_zero_token_short_circuit() {
+        let tokenizer = test_tokenizer();
+        let model = test_decode_model();
+        let prompt_token_ids = vec![1];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-output_decode".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let prefill =
+            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
+
+        let output_decode_state = run_output_decode_with_mode_and_raster_select(
+            &prompt_token_ids,
+            &prefill,
+            &SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+            &tokenizer,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("zero-token raster select should not require canonical logits");
+
+        assert!(output_decode_state.generated_token_ids.is_empty());
+        assert_eq!(output_decode_state.generated_text, "");
+        assert!(output_decode_state.decode_transition_states.is_empty());
+    }
+
+    #[test]
+    fn run_output_decode_with_raster_select_requires_canonical_logits_when_selecting() {
+        let tokenizer = test_tokenizer();
+        let model = test_decode_model();
+        let prompt_token_ids = vec![1];
+        let prompt_preparation_state = PromptPreparationState {
+            prompt_text: "prompt".to_string(),
+            prompt_token_ids: prompt_token_ids.clone(),
+            prompt_token_ids_sha256: "unused-for-output_decode".to_string(),
+        };
+        let token_embeddings =
+            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
+        let prefill =
+            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
+
+        let error = run_output_decode_with_mode_and_raster_select(
+            &prompt_token_ids,
+            &prefill,
+            &SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+            &tokenizer,
+            &model,
+            InferenceExecutionMode::Fp32,
+        )
+        .expect_err("raster select should reject f32-only prefill logits");
+
+        assert!(error.to_string().contains("canonical deterministic logits"));
     }
 
     #[test]
