@@ -225,7 +225,8 @@ mod tests {
     };
     use crate::shared::transformer::{
         ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-        Gemma4LayerWeights, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+        Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
+        Gemma4PleLayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
         InternalActivationSequence, MatrixF32,
     };
     use crate::shared::{det_num::act_to_f32, input::InferenceExecutionMode};
@@ -250,7 +251,33 @@ mod tests {
     }
 
     #[test]
-    fn one_layer_fixture_matches_native_prefill_ple_computation() {
+    fn no_ple_globals_match_native_none_output() {
+        let source = AuthenticatedGemmaPleSource::no_ple(
+            "no-ple",
+            vec![GemmaPleLayerConfig {
+                has_ple: false,
+                hidden_width: 2,
+            }],
+        )
+        .expect("source should build");
+        let input = ActivationSequence::from_values(vec![vec![1.0, 2.0]], "digest".to_string());
+        let native_model = no_ple_model(2);
+
+        let raster = run(&[0], &input, &source).expect("raster PLE should run");
+        let native = crate::prefill_prepare_aux::run(
+            &[0],
+            &native_model,
+            &input,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("native PLE should run");
+
+        assert_eq!(raster, native);
+        assert!(raster.is_none());
+    }
+
+    #[test]
+    fn single_token_single_ple_layer_matches_native_prefill_ple_computation() {
         let fixture = PleFixture::new(
             vec![true],
             vec![vec![
@@ -263,24 +290,10 @@ mod tests {
             ]],
         )
         .expect("fixture should build");
-        let input = activation_sequence(vec![
-            vec![Act::from_num(1.0), Act::from_num(0.5)],
-            vec![Act::from_num(-1.0), Act::from_num(2.0)],
-        ]);
+        let token_ids = [0];
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
 
-        let raster = run(&[0, 1], &input, &fixture.source)
-            .expect("raster PLE should run")
-            .expect("PLE inputs");
-        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
-            &[0, 1],
-            input.clone_internal(),
-            &fixture.layers,
-            &fixture.native_ple_global,
-            0.0,
-            Some(f32_to_acc(0.0)),
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("native PLE should run");
+        let (raster, native) = compare_raster_and_native(&fixture, &token_ids, &input);
 
         assert_eq!(raster.per_layer_inputs, native.per_layer_inputs);
         assert_eq!(
@@ -296,7 +309,42 @@ mod tests {
     }
 
     #[test]
-    fn mixed_ple_and_non_ple_layers_preserve_native_layout() {
+    fn multiple_prompt_tokens_single_ple_layer_matches_native_prefill_ple_computation() {
+        let fixture = PleFixture::new(
+            vec![true],
+            vec![vec![
+                vec![Act::from_num(0.25), Act::from_num(-0.5)],
+                vec![Act::from_num(1.0), Act::from_num(0.5)],
+            ]],
+            vec![vec![
+                vec![Wgt::from_num(0.5), Wgt::from_num(1.0)],
+                vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)],
+            ]],
+        )
+        .expect("fixture should build");
+        let token_ids = [0, 1];
+        let input = activation_sequence(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.5)],
+            vec![Act::from_num(-1.0), Act::from_num(2.0)],
+        ]);
+
+        let (raster, native) = compare_raster_and_native(&fixture, &token_ids, &input);
+
+        assert_eq!(raster.per_layer_inputs, native.per_layer_inputs);
+        assert_eq!(
+            raster
+                .clone_layer_internal(0)
+                .expect("raster layer")
+                .det_values(),
+            native
+                .clone_layer_internal(0)
+                .expect("native layer")
+                .det_values()
+        );
+    }
+
+    #[test]
+    fn mixed_ple_and_non_ple_layers_match_native_layout() {
         let fixture = PleFixture::new(
             vec![true, false],
             vec![
@@ -321,21 +369,22 @@ mod tests {
             ],
         )
         .expect("fixture should build");
+        let token_ids = [0];
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
 
-        let output = run(&[0], &input, &fixture.source)
-            .expect("raster PLE should run")
-            .expect("PLE inputs");
+        let (raster, native) = compare_raster_and_native(&fixture, &token_ids, &input);
 
-        assert_eq!(output.per_layer_inputs.len(), 2);
-        assert!(output.per_layer_inputs[0].is_some());
-        assert!(output.per_layer_inputs[1].is_none());
-        assert!(output
+        assert_eq!(raster.per_layer_inputs, native.per_layer_inputs);
+        assert_eq!(raster.per_layer_inputs.len(), 2);
+        assert!(raster.per_layer_inputs[0].is_some());
+        assert!(raster.per_layer_inputs[1].is_none());
+        assert!(raster
             .clone_layer_internal(0)
             .expect("layer 0")
             .det_values()
             .is_some());
-        assert!(output.clone_layer_internal(1).is_none());
+        assert!(raster.clone_layer_internal(1).is_none());
+        assert!(native.clone_layer_internal(1).is_none());
     }
 
     #[test]
@@ -415,6 +464,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("model projection slice count mismatch"));
+    }
+
+    #[test]
+    fn unsupported_fp32_only_ple_source_fails_closed() {
+        let ple_global = Gemma4PleGlobalWeights::from_materialized(
+            vec![MatrixF32 {
+                rows: 2,
+                cols: 2,
+                values: vec![1.0, 0.0, 0.0, 1.0],
+            }],
+            vec![MatrixF32 {
+                rows: 2,
+                cols: 2,
+                values: vec![1.0, 0.0, 0.0, 1.0],
+            }],
+            vec![1.0, 1.0],
+            1.0,
+            1.0,
+            1.0,
+        );
+
+        let error = AuthenticatedGemmaPleSource::from_ple_global(
+            "fp32-ple",
+            Gemma4ModelProvenance::DetNumWgt,
+            vec![GemmaPleLayerConfig {
+                has_ple: true,
+                hidden_width: 2,
+            }],
+            Some(ple_global),
+            Some(f32_to_acc(0.0)),
+        )
+        .expect_err("fp32-only PLE source should fail");
+
+        assert!(error.to_string().contains(".detwgt token embedding source"));
     }
 
     struct PleFixture {
@@ -502,6 +585,27 @@ mod tests {
                 _weights_file: weights_file,
             })
         }
+    }
+
+    fn compare_raster_and_native(
+        fixture: &PleFixture,
+        token_ids: &[u32],
+        input: &ActivationSequence,
+    ) -> (Gemma4PrefillPleInputs, Gemma4PrefillPleInputs) {
+        let raster = run(token_ids, input, &fixture.source)
+            .expect("raster PLE should run")
+            .expect("raster PLE inputs");
+        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
+            token_ids,
+            input.clone_internal(),
+            &fixture.layers,
+            &fixture.native_ple_global,
+            0.0,
+            Some(f32_to_acc(0.0)),
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("native PLE should run");
+        (raster, native)
     }
 
     fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {
@@ -650,6 +754,30 @@ mod tests {
             }),
             layer_scalar: None,
             layer_scalar_det: None,
+        }
+    }
+
+    fn no_ple_model(hidden_width: usize) -> Gemma4TransformerModel {
+        Gemma4TransformerModel {
+            provenance: Gemma4ModelProvenance::DetNumWgt,
+            embedding_table: None,
+            embedding_source: None,
+            layers: vec![test_layer(hidden_width, false)],
+            ple_global: None,
+            final_norm_weight: vec![1.0; hidden_width],
+            final_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                weight: MatrixF32 {
+                    rows: 1,
+                    cols: hidden_width,
+                    values: vec![0.0; hidden_width],
+                },
+                det_weight: None,
+            },
+            final_logit_softcapping: None,
+            final_logit_softcapping_det: None,
+            rms_norm_eps: 0.0,
+            rms_norm_eps_det: Some(f32_to_acc(0.0)),
         }
     }
 
