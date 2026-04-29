@@ -3,6 +3,7 @@ pub mod gemma_tokenizer;
 pub mod input;
 pub mod output;
 pub mod raster_decode_select_token;
+pub mod raster_decode_transition;
 pub mod raster_prefill_finalize;
 pub mod raster_prefill_layer;
 pub mod raster_prefill_ple;

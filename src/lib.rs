@@ -295,7 +295,7 @@ pub fn run_inference_with_controls(
 
             trace::phase_started(PhaseId::OutputDecode);
             let output_decode = if controls.raster_tiles {
-                pipeline::run_output_decode_with_mode_and_raster_select(
+                pipeline::run_output_decode_with_mode_and_raster_tiles(
                     &prompt_preparation.prompt_token_ids,
                     &prefill,
                     &request.sampling,

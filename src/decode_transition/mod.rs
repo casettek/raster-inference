@@ -3,11 +3,13 @@ use serde_json::json;
 
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::output::DecodeState;
+use crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource;
 use crate::shared::transformer::{
     Gemma4TransformerModel, TransformerDecodeState, TransformerDecodeStepResult,
 };
 
 pub mod deterministic_tiles;
+pub mod raster_tiles;
 pub mod tiles;
 
 pub fn run(
@@ -104,6 +106,14 @@ pub fn run_with_mode(
         activation_state: final_hidden_state.activation_state,
         prefill_logits,
     })
+}
+
+pub fn run_raster(
+    transformer_decode_state: TransformerDecodeState,
+    next_token: u32,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<TransformerDecodeStepResult> {
+    raster_tiles::run(transformer_decode_state, next_token, source)
 }
 
 pub fn finalize(decode_state: &DecodeState) -> Result<()> {

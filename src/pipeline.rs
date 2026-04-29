@@ -285,9 +285,11 @@ pub fn run_output_decode_with_mode(
         transformer_model,
         execution_mode,
         false,
+        false,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn run_output_decode_with_mode_and_raster_select(
     prompt_token_ids: &[u32],
     initial_transformer_state: &TransformerPrefillResult,
@@ -304,6 +306,27 @@ pub(crate) fn run_output_decode_with_mode_and_raster_select(
         transformer_model,
         execution_mode,
         true,
+        false,
+    )
+}
+
+pub(crate) fn run_output_decode_with_mode_and_raster_tiles(
+    prompt_token_ids: &[u32],
+    initial_transformer_state: &TransformerPrefillResult,
+    sampling: &SamplingConfig,
+    tokenizer: &Tokenizer,
+    transformer_model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
+) -> Result<OutputDecodeState> {
+    run_output_decode_with_mode_internal(
+        prompt_token_ids,
+        initial_transformer_state,
+        sampling,
+        tokenizer,
+        transformer_model,
+        execution_mode,
+        true,
+        true,
     )
 }
 
@@ -315,6 +338,7 @@ fn run_output_decode_with_mode_internal(
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
     raster_select_token: bool,
+    raster_decode_transition: bool,
 ) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
@@ -364,12 +388,21 @@ fn run_output_decode_with_mode_internal(
 
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
-        let decode_transition = crate::decode_transition::run_with_mode(
-            transformer_decode_state,
-            next_token,
-            transformer_model,
-            execution_mode,
-        )?;
+        let decode_transition = if raster_decode_transition {
+            let source =
+                crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource::from_model(
+                    format!("decode.transition.position_{}", transformer_decode_state.position),
+                    transformer_model,
+                )?;
+            crate::decode_transition::run_raster(transformer_decode_state, next_token, &source)?
+        } else {
+            crate::decode_transition::run_with_mode(
+                transformer_decode_state,
+                next_token,
+                transformer_model,
+                execution_mode,
+            )?
+        };
         decode_transition_states.push(decode_transition.activation_state.clone());
         decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
