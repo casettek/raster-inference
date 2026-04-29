@@ -227,7 +227,7 @@ pub fn run_inference_with_controls(
                     request.execution_mode,
                 )?
             };
-            if controls.raster_tiles || should_stop_at_checkpoint(controls, "prefill.prepare_aux") {
+            if should_stop_at_checkpoint(controls, "prefill.prepare_aux") {
                 trace::phase_paused(PhaseId::TransformerStateTransition);
                 return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
                     terminal_checkpoint_id: "prefill.prepare_aux".to_string(),
@@ -236,12 +236,21 @@ pub fn run_inference_with_controls(
                     output_decode: None,
                 }));
             }
-            let (final_hidden_states, layer_caches) = prefill_layer::run_with_mode_internal(
-                token_embeddings.clone_internal(),
-                transformer_model,
-                ple_inputs.as_ref(),
-                request.execution_mode,
-            )?;
+            let (final_hidden_states, layer_caches) = if controls.raster_tiles {
+                let layer_source =
+                    crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
+                        model.model_id.clone(),
+                        transformer_model,
+                    )?;
+                prefill_layer::run_raster(&token_embeddings, &layer_source, ple_inputs.as_ref())?
+            } else {
+                prefill_layer::run_with_mode_internal(
+                    token_embeddings.clone_internal(),
+                    transformer_model,
+                    ple_inputs.as_ref(),
+                    request.execution_mode,
+                )?
+            };
             if should_stop_at_checkpoint(controls, "prefill.layer") {
                 trace::phase_paused(PhaseId::TransformerStateTransition);
                 return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
@@ -337,12 +346,15 @@ mod tests {
         InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec,
         OutputDecodeStopReason, SamplingConfig, TextDecodingPolicy,
     };
-    use crate::shared::det_num::{f32_to_acc, Act};
+    use crate::shared::det_num::{f32_to_acc, Act, Wgt};
     use crate::shared::gemma_tokenizer::GemmaAddedToken;
     use crate::shared::transformer::{
-        DetNumMatrix, DetNumTensorSliceSource, GemmaEmbeddingTensorSource,
+        DetNumMatrix, DetNumTensorSliceSource, Gemma4LayerMatrixSource, GemmaEmbeddingTensorSource,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    };
 
     #[test]
     fn run_inference_generates_greedy_text_for_max_new_tokens() {
@@ -484,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn run_inference_with_controls_raster_tiles_stop_after_prefill_prepare_aux() {
+    fn run_inference_with_controls_raster_tiles_can_pause_after_prefill_prepare_aux() {
         let tokenizer = test_tokenizer();
         let model = test_model_spec();
         let transformer_fixture = deterministic_no_ple_model_fixture();
@@ -509,7 +521,7 @@ mod tests {
             &transformer_fixture.model,
             &InferenceControls {
                 commit_checkpoints: false,
-                terminal_checkpoint: None,
+                terminal_checkpoint: Some("prefill.prepare_aux".to_string()),
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
             },
@@ -519,6 +531,53 @@ mod tests {
         match paused {
             InferenceRunOutcome::Paused(state) => {
                 assert_eq!(state.terminal_checkpoint_id, "prefill.prepare_aux");
+                assert_eq!(
+                    state.input_embedding.prompt_preparation.prompt_token_ids,
+                    vec![1]
+                );
+                assert!(state.transformer_state_transition.is_none());
+                assert!(state.output_decode.is_none());
+            }
+            InferenceRunOutcome::Completed(_) => panic!("expected paused raster inference"),
+        }
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_can_pause_after_prefill_layer() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: Some("prefill.layer".to_string()),
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            },
+        )
+        .expect("raster inference should pause after prefill layer");
+
+        match paused {
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prefill.layer");
                 assert_eq!(
                     state.input_embedding.prompt_preparation.prompt_token_ids,
                     vec![1]
@@ -947,12 +1006,14 @@ mod tests {
 
     struct DeterministicModelFixture {
         model: Gemma4TransformerModel,
-        weights_file: std::path::PathBuf,
+        weights_files: Vec<std::path::PathBuf>,
     }
 
     impl Drop for DeterministicModelFixture {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.weights_file);
+            for weights_file in &self.weights_files {
+                let _ = std::fs::remove_file(weights_file);
+            }
         }
     }
 
@@ -964,6 +1025,16 @@ mod tests {
         ];
         let (weights_file, source) = write_det_embedding_weights(embedding_rows);
         let mut model = test_transformer_model();
+        let (layer_weights_file, layer_sources) = write_det_layer_weights(vec![
+            det_zero_matrix(4, 4),
+            det_zero_matrix(2, 4),
+            det_zero_matrix(2, 4),
+            det_zero_matrix(4, 4),
+            det_zero_matrix(8, 4),
+            det_zero_matrix(8, 4),
+            det_zero_matrix(4, 8),
+        ]);
+        let mut layer_sources = layer_sources.into_iter();
         model.provenance = Gemma4ModelProvenance::DetNumWgt;
         model.embedding_table = None;
         model.embedding_source = Some(GemmaEmbeddingTensorSource::Deterministic {
@@ -972,9 +1043,36 @@ mod tests {
             det_cache: Arc::new(Mutex::new(None::<Arc<DetNumMatrix>>)),
         });
         model.rms_norm_eps_det = Some(f32_to_acc(model.rms_norm_eps));
+        model.final_norm_weight_det = Some(vec![Wgt::from_num(1.0); 4]);
+        let layer = &mut model.layers[0];
+        layer.q_proj =
+            Gemma4LayerMatrixSource::from_det_num_source(layer_sources.next().expect("q source"));
+        layer.k_proj =
+            Gemma4LayerMatrixSource::from_det_num_source(layer_sources.next().expect("k source"));
+        layer.v_proj = Some(Gemma4LayerMatrixSource::from_det_num_source(
+            layer_sources.next().expect("v source"),
+        ));
+        layer.o_proj =
+            Gemma4LayerMatrixSource::from_det_num_source(layer_sources.next().expect("o source"));
+        layer.gate_proj = Gemma4LayerMatrixSource::from_det_num_source(
+            layer_sources.next().expect("gate source"),
+        );
+        layer.up_proj =
+            Gemma4LayerMatrixSource::from_det_num_source(layer_sources.next().expect("up source"));
+        layer.down_proj = Gemma4LayerMatrixSource::from_det_num_source(
+            layer_sources.next().expect("down source"),
+        );
+        layer.rms_norm_eps_det = Some(f32_to_acc(layer.rms_norm_eps));
+        layer.rope_base_det = Some(f32_to_acc(layer.rope_base));
+        layer.q_norm_weight_det = Some(vec![Wgt::from_num(1.0); 2]);
+        layer.k_norm_weight_det = Some(vec![Wgt::from_num(1.0); 2]);
+        layer.input_layernorm_weight_det = Some(vec![Wgt::from_num(1.0); 4]);
+        layer.post_attention_layernorm_weight_det = Some(vec![Wgt::from_num(1.0); 4]);
+        layer.pre_feedforward_layernorm_weight_det = Some(vec![Wgt::from_num(1.0); 4]);
+        layer.post_feedforward_layernorm_weight_det = Some(vec![Wgt::from_num(1.0); 4]);
         DeterministicModelFixture {
             model,
-            weights_file,
+            weights_files: vec![weights_file, layer_weights_file],
         }
     }
 
@@ -985,9 +1083,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
+        let unique_counter = next_fixture_counter();
         let path = std::env::temp_dir().join(format!(
-            "raster-lib-det-embedding-{}-{unique_suffix}.detwgt",
-            std::process::id()
+            "raster-lib-det-embedding-{}-{unique_suffix}-{unique_counter}.detwgt",
+            std::process::id(),
         ));
         let mut bytes = Vec::new();
         for row in &rows {
@@ -1011,6 +1110,51 @@ mod tests {
                 col_count,
             },
         )
+    }
+
+    fn write_det_layer_weights(
+        matrices: Vec<Vec<Vec<Wgt>>>,
+    ) -> (std::path::PathBuf, Vec<DetNumTensorSliceSource>) {
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let unique_counter = next_fixture_counter();
+        let path = std::env::temp_dir().join(format!(
+            "raster-lib-det-layer-{}-{unique_suffix}-{unique_counter}.detwgt",
+            std::process::id(),
+        ));
+        let mut bytes = Vec::new();
+        let mut sources = Vec::new();
+        for matrix in matrices {
+            let data_offset = bytes.len();
+            for row in &matrix {
+                for value in row {
+                    bytes.extend(value.to_bits().to_le_bytes());
+                }
+            }
+            sources.push(DetNumTensorSliceSource {
+                weights_path: path.clone(),
+                total_rows: matrix.len(),
+                total_cols: matrix.first().map(Vec::len).unwrap_or(0),
+                data_offset,
+                row_offset: 0,
+                row_count: matrix.len(),
+                col_offset: 0,
+                col_count: matrix.first().map(Vec::len).unwrap_or(0),
+            });
+        }
+        std::fs::write(&path, bytes).expect("det layer fixture should write");
+        (path, sources)
+    }
+
+    fn det_zero_matrix(rows: usize, cols: usize) -> Vec<Vec<Wgt>> {
+        vec![vec![Wgt::from_num(0.0); cols]; rows]
+    }
+
+    fn next_fixture_counter() -> u64 {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     }
 
     fn test_transformer_model() -> Gemma4TransformerModel {

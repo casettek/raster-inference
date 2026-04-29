@@ -620,6 +620,7 @@ mod tests {
     };
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn canonical_model_reads_source_and_layer_metadata() {
@@ -964,10 +965,12 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
+        let unique_counter = next_fixture_counter();
         let path = std::env::temp_dir().join(format!(
-            "raster-prefill-layer-{}-{}-{}.detwgt",
+            "raster-prefill-layer-{}-{}-{}-{}.detwgt",
             std::process::id(),
             unique_suffix,
+            unique_counter,
             crate::trace::sha256_hex(&format!("{:?}", matrices))
         ));
         let mut bytes = Vec::new();
@@ -1004,5 +1007,10 @@ mod tests {
             col_offset: 0,
             col_count: cols,
         }
+    }
+
+    fn next_fixture_counter() -> u64 {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     }
 }

@@ -478,6 +478,38 @@ pub fn value_rms_norm_heads(
     ))
 }
 
+pub fn rms_norm_heads(
+    heads: &RasterAttentionHeadSequence,
+    norm_weights: Option<&[Wgt]>,
+    eps: Option<Acc>,
+) -> Result<RasterAttentionHeadSequence> {
+    let norm_weights = norm_weights
+        .ok_or_else(|| anyhow!("deterministic head RMSNorm requires canonical norm weights"))?;
+    let eps =
+        eps.ok_or_else(|| anyhow!("deterministic head RMSNorm requires canonical Acc epsilon"))?;
+    let head_width = attention_head_width(heads)?;
+    if norm_weights.len() != head_width {
+        bail!(
+            "deterministic head RMSNorm weight width mismatch: {} vs {}",
+            norm_weights.len(),
+            head_width
+        );
+    }
+    Ok(RasterAttentionHeadSequence::from_heads(
+        heads
+            .heads()
+            .iter()
+            .map(|head| {
+                head.iter()
+                    .map(|row| {
+                        RasterActivationRow::from_acts(det_rms_norm(&row.acts(), norm_weights, eps))
+                    })
+                    .collect()
+            })
+            .collect(),
+    ))
+}
+
 pub fn apply_rope_to_heads(
     heads: &RasterAttentionHeadSequence,
     rotary_dim: usize,
@@ -919,8 +951,8 @@ mod tests {
         add_sequences, apply_rope_to_heads, attention_output_row, build_raster_kv_cache,
         causal_attention_heads, causal_attention_heads_with_cache, combine_attention_heads,
         gelu_sequence, mul_sequences, project_sequence, project_sequence_with_prefill_source,
-        project_sequence_with_source, reshape_sequence_heads, rms_norm_sequence, scale_sequence,
-        value_rms_norm_heads, RasterActivationRow, RasterActivationSequence,
+        project_sequence_with_source, reshape_sequence_heads, rms_norm_heads, rms_norm_sequence,
+        scale_sequence, value_rms_norm_heads, RasterActivationRow, RasterActivationSequence,
         RasterAttentionHeadSequence, RasterKvCache,
     };
     use crate::raster_authoring::AuthRead;
@@ -1156,6 +1188,30 @@ mod tests {
             head_bits(&normalized),
             vec![vec![value_rms_norm(
                 &[Act::from_bits(65_536), Act::from_bits(0)],
+                Acc::from_bits(0),
+            )
+            .into_iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()]]
+        );
+    }
+
+    #[test]
+    fn rms_norm_heads_matches_det_num_fixture() {
+        let heads = RasterAttentionHeadSequence::from_acts(vec![vec![vec![
+            Act::from_bits(65_536),
+            Act::from_bits(0),
+        ]]]);
+        let weights = vec![Wgt::from_bits(32_768), Wgt::from_bits(65_536)];
+
+        let normalized =
+            rms_norm_heads(&heads, Some(&weights), Some(Acc::from_bits(0))).expect("norm");
+
+        assert_eq!(
+            head_bits(&normalized),
+            vec![vec![rms_norm(
+                &[Act::from_bits(65_536), Act::from_bits(0)],
+                &weights,
                 Acc::from_bits(0),
             )
             .into_iter()
