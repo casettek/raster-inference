@@ -79,24 +79,27 @@ pub fn compute_next_prefill_layer(
 
     let layer_idx = state.next_layer_idx;
     let layer = auth_read!(layer_source, GemmaPrefillLayerMetadataRequest { layer_idx })?;
-    if layer.has_ple {
-        bail!("raster prefill layer phase 3 does not support PLE layers");
-    }
-    if state
-        .per_layer_inputs
-        .get(layer_idx)
-        .and_then(Option::as_ref)
-        .is_some()
+    if !layer.has_ple
+        && state
+            .per_layer_inputs
+            .get(layer_idx)
+            .and_then(Option::as_ref)
+            .is_some()
     {
         bail!("transformer layer received PLE inputs without PLE weights");
     }
 
     let donor_cache = resolve_prefill_donor_cache(&state.layer_caches, layer_idx, &layer)?;
+    let per_layer_input = state
+        .per_layer_inputs
+        .get(layer_idx)
+        .and_then(Option::as_ref);
     let (layer_output, layer_cache) = run_basic_prefill_layer(
         &state.current_activations,
         layer_source,
         &layer,
         donor_cache,
+        per_layer_input,
     )?;
     state.current_activations = layer_output;
     state.layer_caches.push(layer_cache);
@@ -166,6 +169,7 @@ fn run_basic_prefill_layer(
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer: &crate::shared::raster_prefill_layer::GemmaPrefillLayerMetadata,
     donor_cache: Option<&RasterKvCache>,
+    per_layer_input: Option<&RasterActivationSequence>,
 ) -> Result<(RasterActivationSequence, RasterKvCache)> {
     let scalars = auth_read!(
         layer_source,
@@ -348,6 +352,49 @@ fn run_basic_prefill_layer(
         Some(scalars.rms_norm_eps),
     )?;
     let mut xs = add_sequences(&residual, &ff_out)?;
+
+    if let Some(per_layer_input) = per_layer_input {
+        let residual = xs.clone();
+        let gated = project_sequence_with_prefill_source(
+            &xs,
+            layer_source,
+            layer.layer_idx,
+            GemmaPrefillLayerMatrixKind::PleInputGate,
+            layer
+                .ple_input_gate_shape
+                .ok_or_else(|| {
+                    anyhow!("Gemma prefill layer metadata is missing PLE input gate shape")
+                })?
+                .rows,
+        )?;
+        let gated = gelu_sequence(&gated)?;
+        let gated = mul_sequences(&gated, per_layer_input)?;
+        let projected = project_sequence_with_prefill_source(
+            &gated,
+            layer_source,
+            layer.layer_idx,
+            GemmaPrefillLayerMatrixKind::PleLayerProjection,
+            layer
+                .ple_layer_projection_shape
+                .ok_or_else(|| {
+                    anyhow!("Gemma prefill layer metadata is missing PLE layer projection shape")
+                })?
+                .rows,
+        )?;
+        let projected = rms_norm_sequence(
+            &projected,
+            Some(&auth_read!(
+                layer_source,
+                GemmaPrefillLayerNormWeightsRequest {
+                    layer_idx: layer.layer_idx,
+                    norm: GemmaPrefillLayerNormKind::PlePostInput,
+                },
+            )?),
+            Some(scalars.rms_norm_eps),
+        )?;
+        xs = add_sequences(&residual, &projected)?;
+    }
+
     if scalars.layer_scalar.is_some() {
         xs = scale_sequence(&xs, scalars.layer_scalar)?;
     }
@@ -423,8 +470,8 @@ mod tests {
     use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
     use crate::shared::transformer::{
         ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-        Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
-        InternalActivationSequence, MatrixF32,
+        Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleLayerWeights,
+        Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence, MatrixF32,
     };
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
@@ -505,9 +552,85 @@ mod tests {
             .contains("cannot share KV with non-prior donor"));
     }
 
+    #[test]
+    fn nonzero_mlp_and_layer_scalar_match_deterministic_prefill_layer() {
+        let (_path, model) = nonzero_model(false, true);
+
+        assert_raster_matches_deterministic(
+            &model,
+            vec![
+                vec![Act::from_num(1.0), Act::from_num(-0.5)],
+                vec![Act::from_num(0.25), Act::from_num(0.75)],
+            ],
+        );
+    }
+
+    #[test]
+    fn ple_layer_with_matching_input_matches_deterministic_prefill_layer() {
+        let (_path, model) = nonzero_model(true, false);
+        let ple_inputs = ple_inputs(vec![
+            vec![Act::from_num(0.5), Act::from_num(-0.25)],
+            vec![Act::from_num(1.0), Act::from_num(0.25)],
+        ]);
+
+        assert_raster_matches_deterministic_with_ple(
+            &model,
+            vec![
+                vec![Act::from_num(1.0), Act::from_num(-0.5)],
+                vec![Act::from_num(0.25), Act::from_num(0.75)],
+            ],
+            Some(&ple_inputs),
+        );
+    }
+
+    #[test]
+    fn ple_input_on_non_ple_layer_fails_closed() {
+        let (_path, model) = no_ple_model();
+        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+            .expect("source should build");
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        let ple_inputs = ple_inputs(vec![vec![Act::from_num(0.5), Act::from_num(0.25)]]);
+
+        let error = run(&input, &source, Some(&ple_inputs)).expect_err("PLE input should fail");
+
+        assert!(error
+            .to_string()
+            .contains("received PLE inputs without PLE weights"));
+    }
+
+    #[test]
+    fn ple_input_shape_mismatch_fails_closed() {
+        let (_path, model) = nonzero_model(true, false);
+        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+            .expect("source should build");
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        let ple_inputs = ple_inputs(vec![vec![
+            Act::from_num(0.5),
+            Act::from_num(0.25),
+            Act::from_num(0.125),
+        ]]);
+
+        let error = run(&input, &source, Some(&ple_inputs)).expect_err("PLE width should fail");
+
+        assert!(error
+            .to_string()
+            .contains("right sequence row 0 has width 3"));
+    }
+
     fn assert_raster_matches_deterministic(
         model: &Gemma4TransformerModel,
         rows: Vec<Vec<Act>>,
+    ) -> (
+        ActivationSequence,
+        Vec<crate::shared::transformer::LayerKvCache>,
+    ) {
+        assert_raster_matches_deterministic_with_ple(model, rows, None)
+    }
+
+    fn assert_raster_matches_deterministic_with_ple(
+        model: &Gemma4TransformerModel,
+        rows: Vec<Vec<Act>>,
+        ple_inputs: Option<&Gemma4PrefillPleInputs>,
     ) -> (
         ActivationSequence,
         Vec<crate::shared::transformer::LayerKvCache>,
@@ -517,8 +640,8 @@ mod tests {
         let input_internal = InternalActivationSequence::from_det_values(rows);
         let input = activation_sequence_from_internal(input_internal.clone());
 
-        let raster = run(&input, &source, None).expect("raster prefill layer should run");
-        let deterministic = deterministic_tiles::run_internal(input_internal, model, None)
+        let raster = run(&input, &source, ple_inputs).expect("raster prefill layer should run");
+        let deterministic = deterministic_tiles::run_internal(input_internal, model, ple_inputs)
             .expect("deterministic prefill layer should run");
 
         assert_eq!(raster.0.activations, deterministic.0.activations);
@@ -549,6 +672,12 @@ mod tests {
             ),
         );
         input
+    }
+
+    fn ple_inputs(rows: Vec<Vec<Act>>) -> Gemma4PrefillPleInputs {
+        Gemma4PrefillPleInputs::from_internal(vec![Some(
+            InternalActivationSequence::from_det_values(rows),
+        )])
     }
 
     fn no_ple_model() -> (PathBuf, Gemma4TransformerModel) {
@@ -628,6 +757,109 @@ mod tests {
                 rms_norm_eps_det: Some(Acc::from_num(0.0)),
             },
         )
+    }
+
+    fn nonzero_model(has_ple: bool, has_layer_scalar: bool) -> (PathBuf, Gemma4TransformerModel) {
+        let hidden_width = 2;
+        let matrices = vec![
+            zero_matrix(hidden_width),
+            zero_matrix(hidden_width),
+            zero_matrix(hidden_width),
+            zero_matrix(hidden_width),
+            identity_matrix(),
+            identity_matrix(),
+            identity_matrix(),
+            identity_matrix(),
+            identity_matrix(),
+        ];
+        let (path, sources) = write_det_matrices(matrices).expect("fixture weights should write");
+        let mut sources = sources.into_iter();
+        let q_proj = det_matrix(sources.next().expect("q source"));
+        let k_proj = det_matrix(sources.next().expect("k source"));
+        let v_proj = det_matrix(sources.next().expect("v source"));
+        let o_proj = det_matrix(sources.next().expect("o source"));
+        let gate_proj = det_matrix(sources.next().expect("gate source"));
+        let up_proj = det_matrix(sources.next().expect("up source"));
+        let down_proj = det_matrix(sources.next().expect("down source"));
+        let ple_input_gate = det_matrix(sources.next().expect("PLE input gate source"));
+        let ple_layer_projection = det_matrix(sources.next().expect("PLE projection source"));
+
+        let layer = Gemma4LayerWeights {
+            attention_kind: Gemma4AttentionKind::Full,
+            hidden_size: hidden_width,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: hidden_width,
+            sliding_window: None,
+            cache_sliding_window: None,
+            rms_norm_eps: 0.001,
+            rms_norm_eps_det: Some(Acc::from_num(0.001)),
+            rope_base: 10_000.0,
+            rope_base_det: None,
+            partial_rotary_dim: 0,
+            rope_freq_base_dim: 2,
+            kv_shared_layer_index: None,
+            attention_k_eq_v: false,
+            q_proj,
+            k_proj,
+            v_proj: Some(v_proj),
+            o_proj,
+            q_norm_weight: vec![1.0; hidden_width],
+            q_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            k_norm_weight: vec![1.0; hidden_width],
+            k_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            input_layernorm_weight: vec![1.0; hidden_width],
+            input_layernorm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            post_attention_layernorm_weight: vec![1.0; hidden_width],
+            post_attention_layernorm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            pre_feedforward_layernorm_weight: vec![1.0; hidden_width],
+            pre_feedforward_layernorm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            post_feedforward_layernorm_weight: vec![1.0; hidden_width],
+            post_feedforward_layernorm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            gate_proj,
+            up_proj,
+            down_proj,
+            ple: has_ple.then(|| Gemma4PleLayerWeights {
+                input_gate: ple_input_gate,
+                layer_projection: ple_layer_projection,
+                post_input_norm_weight: vec![1.0; hidden_width],
+                post_input_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+            }),
+            layer_scalar: has_layer_scalar.then_some(0.5),
+            layer_scalar_det: has_layer_scalar.then_some(Act::from_num(0.5)),
+        };
+
+        (
+            path,
+            Gemma4TransformerModel {
+                provenance: Gemma4ModelProvenance::DetNumWgt,
+                embedding_table: None,
+                embedding_source: None,
+                layers: vec![layer],
+                ple_global: None,
+                final_norm_weight: vec![1.0; hidden_width],
+                final_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+                logits_projection: Gemma4LogitsProjection::UntiedLmHead {
+                    weight: MatrixF32 {
+                        rows: 1,
+                        cols: hidden_width,
+                        values: vec![0.0; hidden_width],
+                    },
+                    det_weight: None,
+                },
+                final_logit_softcapping: None,
+                final_logit_softcapping_det: None,
+                rms_norm_eps: 0.001,
+                rms_norm_eps_det: Some(Acc::from_num(0.001)),
+            },
+        )
+    }
+
+    fn identity_matrix() -> Vec<Vec<Wgt>> {
+        vec![
+            vec![Wgt::from_num(1.0), Wgt::from_num(0.0)],
+            vec![Wgt::from_num(0.0), Wgt::from_num(1.0)],
+        ]
     }
 
     fn zero_matrix(width: usize) -> Vec<Vec<Wgt>> {
