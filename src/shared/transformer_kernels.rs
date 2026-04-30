@@ -923,7 +923,7 @@ pub fn run_text_layers_prefill_with_cache(
         xs = layer_output.activations;
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
-        crate::trace::trace_checkpoint(
+        if crate::trace::trace_checkpoint(
             "prefill.layer",
             &json!({
                 "next_layer_idx": layer_idx + 1,
@@ -932,9 +932,12 @@ pub fn run_text_layers_prefill_with_cache(
                 "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
                 "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
             }),
-        );
+        ) {
+            break;
+        }
+        let mut reached_terminal_checkpoint = false;
         for (token_idx, token_activation) in xs.iter().enumerate() {
-            crate::trace::trace_checkpoint(
+            if crate::trace::trace_checkpoint(
                 &format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}"),
                 &json!({
                     "layer_idx": layer_idx,
@@ -942,7 +945,13 @@ pub fn run_text_layers_prefill_with_cache(
                     "token_count": xs.len(),
                     "token_activation": token_activation,
                 }),
-            );
+            ) {
+                reached_terminal_checkpoint = true;
+                break;
+            }
+        }
+        if reached_terminal_checkpoint {
+            break;
         }
     }
 

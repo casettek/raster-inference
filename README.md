@@ -119,7 +119,7 @@ cargo run -- \
   "Hello from Raster"
 ```
 
-To stop after a specific checkpoint, pass `--terminal-checkpoint <checkpoint-id>`. For example, `--terminal-checkpoint prefill.finalize` stops after the prefill finalize checkpoint has been emitted.
+To stop after a specific checkpoint, pass `--terminal-checkpoint <checkpoint-id>`. For example, `--terminal-checkpoint prefill.finalize` stops after the prefill finalize checkpoint has been emitted. Add `:N` to stop after a later occurrence of a repeated checkpoint, such as `--terminal-checkpoint prefill.layer:2` for the second prefill layer checkpoint.
 
 The raster-authored path is opt-in while routines are ported one at a time:
 
@@ -157,7 +157,7 @@ The CLI prints the resulting `InferenceState` as formatted JSON with:
 
 If you stop at a terminal checkpoint before the normal end of inference, the CLI prints a `PausedInferenceState` instead, with `terminal_checkpoint_id` plus the completed outputs gathered so far.
 
-Pass `--commit-checkpoints` to emit the checkpoint trace file at the end of the run. Leave it off to skip checkpoint commitment work entirely. Checkpoint hits and phase start/end logs still go to stderr even when checkpoint output is disabled.
+Pass `--commit-checkpoints` to emit the checkpoint trace file at the end of the run. Leave it off to skip checkpoint commitment work entirely. Checkpoint hits and phase start/end logs still go to stderr even when checkpoint output is disabled. Per-token prefill checkpoints (`prefill.layer_token.*`) are logged live but omitted from the final checkpoint commitment bundle.
 
 ```bash
 cargo run -- \

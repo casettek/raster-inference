@@ -99,6 +99,13 @@ impl InferenceControls {
             None => Ok(Self::DEFAULT_RASTER_PROJECTION_ROWS_PER_TILE),
         }
     }
+
+    fn terminal_checkpoint_spec(&self) -> Result<Option<trace::TerminalCheckpointSpec>> {
+        self.terminal_checkpoint
+            .as_deref()
+            .map(trace::TerminalCheckpointSpec::parse)
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -147,47 +154,51 @@ pub fn run_inference_with_controls(
     transformer_model: &Gemma4TransformerModel,
     controls: &InferenceControls,
 ) -> Result<InferenceRunOutcome> {
-    trace::with_checkpointing_enabled(controls.commit_checkpoints, || {
-        if controls.raster_tiles && request.execution_mode != InferenceExecutionMode::Deterministic
-        {
-            anyhow::bail!("raster tile inference requires deterministic execution");
-        }
-        let raster_projection_rows_per_tile = if controls.raster_tiles {
-            Some(controls.raster_projection_rows_per_tile()?)
-        } else {
-            None
-        };
-        transformer_model.validate_execution_mode(request.execution_mode)?;
-        trace::start_inference_trace(&json!({
-            "model_id": model.model_id,
-            "execution_mode": request.execution_mode,
-            "det_num_spec_version": crate::shared::det_num::DET_NUM_SPEC_VERSION,
-            "model_provenance": format!("{:?}", transformer_model.provenance),
-            "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
-            "max_new_tokens": request.sampling.max_new_tokens,
-            "transformer_layer_count": transformer_model.layers.len(),
-            "terminal_checkpoint": controls.terminal_checkpoint,
-            "commit_checkpoints": controls.commit_checkpoints,
-            "tile_authoring_mode": if controls.raster_tiles { "raster" } else { "native" },
-            "raster_projection_rows_per_tile": raster_projection_rows_per_tile,
-        }));
-        if controls.raster_tiles {
-            crate::raster_authoring::start_tile_invocation_counting();
-        }
-
-        let result = (|| {
-            trace::phase_started(PhaseId::InputEmbedding);
-            let prompt_preparation = if controls.raster_tiles {
-                let tokenizer_source = controls
-                    .raster_tokenizer_source
-                    .as_ref()
-                    .context("raster tile inference requires an authenticated Gemma tokenizer")?;
-                prompt_prepare::run_raster(request, model, tokenizer_source)?
+    let terminal_checkpoint = controls.terminal_checkpoint_spec()?;
+    trace::with_terminal_checkpoint(terminal_checkpoint.clone(), || {
+        trace::with_checkpointing_enabled(controls.commit_checkpoints, || {
+            if controls.raster_tiles
+                && request.execution_mode != InferenceExecutionMode::Deterministic
+            {
+                anyhow::bail!("raster tile inference requires deterministic execution");
+            }
+            let raster_projection_rows_per_tile = if controls.raster_tiles {
+                Some(controls.raster_projection_rows_per_tile()?)
             } else {
-                run_prompt_prepare(request, model, tokenizer)?
+                None
             };
-            let token_embeddings =
-                if let Some(embedding_table) = transformer_model.embedding_table.as_ref() {
+            transformer_model.validate_execution_mode(request.execution_mode)?;
+            trace::start_inference_trace(&json!({
+                "model_id": model.model_id,
+                "execution_mode": request.execution_mode,
+                "det_num_spec_version": crate::shared::det_num::DET_NUM_SPEC_VERSION,
+                "model_provenance": format!("{:?}", transformer_model.provenance),
+                "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
+                "max_new_tokens": request.sampling.max_new_tokens,
+                "transformer_layer_count": transformer_model.layers.len(),
+                "terminal_checkpoint": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.checkpoint_id()),
+                "terminal_checkpoint_occurrence": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.occurrence()),
+                "commit_checkpoints": controls.commit_checkpoints,
+                "tile_authoring_mode": if controls.raster_tiles { "raster" } else { "native" },
+                "raster_projection_rows_per_tile": raster_projection_rows_per_tile,
+            }));
+            if controls.raster_tiles {
+                crate::raster_authoring::start_tile_invocation_counting();
+            }
+
+            let result = (|| {
+                trace::phase_started(PhaseId::InputEmbedding);
+                let prompt_preparation = if controls.raster_tiles {
+                    let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
+                        "raster tile inference requires an authenticated Gemma tokenizer",
+                    )?;
+                    prompt_prepare::run_raster(request, model, tokenizer_source)?
+                } else {
+                    run_prompt_prepare(request, model, tokenizer)?
+                };
+                let token_embeddings = if let Some(embedding_table) =
+                    transformer_model.embedding_table.as_ref()
+                {
                     embed_input_tokens_with_mode(
                         &prompt_preparation.prompt_token_ids,
                         embedding_table,
@@ -204,226 +215,229 @@ pub fn run_inference_with_controls(
                     "transformer state model is missing both embedding_table and embedding_source"
                 )
                 };
-            let input_embedding = InputEmbeddingState {
-                prompt_preparation: prompt_preparation.clone(),
-                embedded_prompt_activations_sha256: token_embeddings.activations_sha256.clone(),
-                det_embedded_prompt_activations_sha256: token_embeddings
-                    .det_activations_sha256
-                    .clone(),
-            };
-            trace::trace_checkpoint(
-                "prompt.prepare",
-                &json!({
-                    "prompt_text": prompt_preparation.prompt_text.clone(),
-                    "prompt_token_ids": prompt_preparation.prompt_token_ids.clone(),
-                    "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
-                    "embedded_prompt_activations": token_embeddings.activations.clone(),
-                    "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
-                    "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
-                    "sampling": request.sampling.clone(),
-                }),
-            );
-            if should_stop_at_checkpoint(controls, "prompt.prepare") {
-                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                    terminal_checkpoint_id: "prompt.prepare".to_string(),
-                    input_embedding,
-                    transformer_state_transition: None,
-                    output_decode: None,
-                    raster_tile_invocations: None,
-                }));
-            }
-            trace::phase_finished(PhaseId::InputEmbedding);
+                let input_embedding = InputEmbeddingState {
+                    prompt_preparation: prompt_preparation.clone(),
+                    embedded_prompt_activations_sha256: token_embeddings.activations_sha256.clone(),
+                    det_embedded_prompt_activations_sha256: token_embeddings
+                        .det_activations_sha256
+                        .clone(),
+                };
+                trace::trace_checkpoint(
+                    "prompt.prepare",
+                    &json!({
+                        "prompt_text": prompt_preparation.prompt_text.clone(),
+                        "prompt_token_ids": prompt_preparation.prompt_token_ids.clone(),
+                        "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
+                        "embedded_prompt_activations": token_embeddings.activations.clone(),
+                        "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
+                        "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
+                        "sampling": request.sampling.clone(),
+                    }),
+                );
+                if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                    return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                        terminal_checkpoint_id,
+                        input_embedding,
+                        transformer_state_transition: None,
+                        output_decode: None,
+                        raster_tile_invocations: None,
+                    }));
+                }
+                trace::phase_finished(PhaseId::InputEmbedding);
 
-            trace::phase_started(PhaseId::TransformerStateTransition);
-            let ple_inputs = if controls.raster_tiles {
-                let ple_source =
-                    crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource::from_model(
-                        model.model_id.clone(),
+                trace::phase_started(PhaseId::TransformerStateTransition);
+                let ple_inputs = if controls.raster_tiles {
+                    let ple_source =
+                        crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource::from_model(
+                            model.model_id.clone(),
+                            transformer_model,
+                        )?;
+                    prefill_prepare_aux::run_raster(
+                        &prompt_preparation.prompt_token_ids,
+                        &ple_source,
+                        &token_embeddings,
+                        raster_projection_rows_per_tile
+                            .expect("raster projection rows per tile should be validated"),
+                    )?
+                } else {
+                    run_prefill_prepare_aux(
+                        &prompt_preparation.prompt_token_ids,
                         transformer_model,
-                    )?;
-                prefill_prepare_aux::run_raster(
-                    &prompt_preparation.prompt_token_ids,
-                    &ple_source,
-                    &token_embeddings,
-                    raster_projection_rows_per_tile
-                        .expect("raster projection rows per tile should be validated"),
-                )?
-            } else {
-                run_prefill_prepare_aux(
-                    &prompt_preparation.prompt_token_ids,
-                    transformer_model,
-                    &token_embeddings,
-                    request.execution_mode,
-                )?
-            };
-            if should_stop_at_checkpoint(controls, "prefill.prepare_aux") {
-                trace::phase_paused(PhaseId::TransformerStateTransition);
-                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                    terminal_checkpoint_id: "prefill.prepare_aux".to_string(),
-                    input_embedding,
-                    transformer_state_transition: None,
-                    output_decode: None,
-                    raster_tile_invocations: None,
-                }));
-            }
-            let (final_hidden_states, layer_caches) = if controls.raster_tiles {
-                let layer_source =
+                        &token_embeddings,
+                        request.execution_mode,
+                    )?
+                };
+                if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                    trace::phase_paused(PhaseId::TransformerStateTransition);
+                    return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                        terminal_checkpoint_id,
+                        input_embedding,
+                        transformer_state_transition: None,
+                        output_decode: None,
+                        raster_tile_invocations: None,
+                    }));
+                }
+                let (final_hidden_states, layer_caches) = if controls.raster_tiles {
+                    let layer_source =
                     crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                prefill_layer::run_raster(
-                    &token_embeddings,
-                    &layer_source,
-                    ple_inputs.as_ref(),
-                    raster_projection_rows_per_tile
-                        .expect("raster projection rows per tile should be validated"),
-                )?
-            } else {
-                prefill_layer::run_with_mode_internal(
-                    token_embeddings.clone_internal(),
-                    transformer_model,
-                    ple_inputs.as_ref(),
-                    request.execution_mode,
-                )?
-            };
-            if should_stop_at_checkpoint(controls, "prefill.layer") {
-                trace::phase_paused(PhaseId::TransformerStateTransition);
-                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                    terminal_checkpoint_id: "prefill.layer".to_string(),
-                    input_embedding,
-                    transformer_state_transition: None,
-                    output_decode: None,
-                    raster_tile_invocations: None,
-                }));
-            }
-            let prefill = if controls.raster_tiles {
-                let finalize_source =
+                    prefill_layer::run_raster(
+                        &token_embeddings,
+                        &layer_source,
+                        ple_inputs.as_ref(),
+                        raster_projection_rows_per_tile
+                            .expect("raster projection rows per tile should be validated"),
+                    )?
+                } else {
+                    prefill_layer::run_with_mode_internal(
+                        token_embeddings.clone_internal(),
+                        transformer_model,
+                        ple_inputs.as_ref(),
+                        request.execution_mode,
+                    )?
+                };
+                if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                    trace::phase_paused(PhaseId::TransformerStateTransition);
+                    return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                        terminal_checkpoint_id,
+                        input_embedding,
+                        transformer_state_transition: None,
+                        output_decode: None,
+                        raster_tile_invocations: None,
+                    }));
+                }
+                let prefill = if controls.raster_tiles {
+                    let finalize_source =
                     crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource::from_model(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                prefill_finalize::run_raster(
-                    &prompt_preparation.prompt_token_ids,
-                    &finalize_source,
-                    final_hidden_states,
-                    layer_caches,
-                    raster_projection_rows_per_tile
-                        .expect("raster projection rows per tile should be validated"),
-                )?
-            } else {
-                run_prefill_finalize(
-                    &prompt_preparation.prompt_token_ids,
-                    transformer_model,
-                    final_hidden_states,
-                    layer_caches,
-                    request.execution_mode,
-                )?
-            };
-            let mut transformer_state_transition = prefill.transformer_state.clone();
-            if should_stop_at_checkpoint(controls, "prefill.finalize") {
-                trace::phase_paused(PhaseId::TransformerStateTransition);
-                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                    terminal_checkpoint_id: "prefill.finalize".to_string(),
+                    prefill_finalize::run_raster(
+                        &prompt_preparation.prompt_token_ids,
+                        &finalize_source,
+                        final_hidden_states,
+                        layer_caches,
+                        raster_projection_rows_per_tile
+                            .expect("raster projection rows per tile should be validated"),
+                    )?
+                } else {
+                    run_prefill_finalize(
+                        &prompt_preparation.prompt_token_ids,
+                        transformer_model,
+                        final_hidden_states,
+                        layer_caches,
+                        request.execution_mode,
+                    )?
+                };
+                let mut transformer_state_transition = prefill.transformer_state.clone();
+                if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                    trace::phase_paused(PhaseId::TransformerStateTransition);
+                    return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                        terminal_checkpoint_id,
+                        input_embedding,
+                        transformer_state_transition: Some(transformer_state_transition),
+                        output_decode: None,
+                        raster_tile_invocations: None,
+                    }));
+                }
+                trace::phase_finished(PhaseId::TransformerStateTransition);
+
+                trace::phase_started(PhaseId::OutputDecode);
+                let output_decode = if controls.raster_tiles {
+                    let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
+                        "raster tile inference requires an authenticated Gemma tokenizer",
+                    )?;
+                    pipeline::run_output_decode_with_mode_and_raster_tiles(
+                        &prompt_preparation.prompt_token_ids,
+                        &prefill,
+                        &request.sampling,
+                        tokenizer,
+                        tokenizer_source,
+                        transformer_model,
+                        request.execution_mode,
+                    )?
+                } else {
+                    run_output_decode_with_mode(
+                        &prompt_preparation.prompt_token_ids,
+                        &prefill,
+                        &request.sampling,
+                        tokenizer,
+                        transformer_model,
+                        request.execution_mode,
+                    )?
+                };
+                transformer_state_transition
+                    .activation_states
+                    .extend(output_decode.decode_transition_states.iter().cloned());
+                if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                    trace::phase_paused(PhaseId::OutputDecode);
+                    return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                        terminal_checkpoint_id,
+                        input_embedding,
+                        transformer_state_transition: Some(transformer_state_transition),
+                        output_decode: Some(output_decode),
+                        raster_tile_invocations: None,
+                    }));
+                }
+                trace::phase_finished(PhaseId::OutputDecode);
+
+                Ok(InferenceRunOutcome::Completed(InferenceState {
                     input_embedding,
-                    transformer_state_transition: Some(transformer_state_transition),
-                    output_decode: None,
+                    transformer_state_transition,
+                    output_decode,
                     raster_tile_invocations: None,
-                }));
+                }))
+            })();
+
+            let raster_tile_invocations = controls
+                .raster_tiles
+                .then(crate::raster_authoring::stop_tile_invocation_counting)
+                .flatten();
+            if let Some(total) = raster_tile_invocations {
+                trace::raster_tile_invocations_finished(total);
             }
-            trace::phase_finished(PhaseId::TransformerStateTransition);
 
-            trace::phase_started(PhaseId::OutputDecode);
-            let output_decode = if controls.raster_tiles {
-                let tokenizer_source = controls
-                    .raster_tokenizer_source
-                    .as_ref()
-                    .context("raster tile inference requires an authenticated Gemma tokenizer")?;
-                pipeline::run_output_decode_with_mode_and_raster_tiles(
-                    &prompt_preparation.prompt_token_ids,
-                    &prefill,
-                    &request.sampling,
-                    tokenizer,
-                    tokenizer_source,
-                    transformer_model,
-                    request.execution_mode,
-                )?
-            } else {
-                run_output_decode_with_mode(
-                    &prompt_preparation.prompt_token_ids,
-                    &prefill,
-                    &request.sampling,
-                    tokenizer,
-                    transformer_model,
-                    request.execution_mode,
-                )?
-            };
-            transformer_state_transition
-                .activation_states
-                .extend(output_decode.decode_transition_states.iter().cloned());
-            if should_stop_at_checkpoint(controls, "output.finalize") {
-                trace::phase_paused(PhaseId::OutputDecode);
-                return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                    terminal_checkpoint_id: "output.finalize".to_string(),
-                    input_embedding,
-                    transformer_state_transition: Some(transformer_state_transition),
-                    output_decode: Some(output_decode),
-                    raster_tile_invocations: None,
-                }));
+            let mut result = result;
+            if let Some(total) = raster_tile_invocations {
+                match &mut result {
+                    Ok(InferenceRunOutcome::Completed(state)) => {
+                        state.raster_tile_invocations = Some(total);
+                    }
+                    Ok(InferenceRunOutcome::Paused(state)) => {
+                        state.raster_tile_invocations = Some(total);
+                    }
+                    Err(_) => {}
+                }
             }
-            trace::phase_finished(PhaseId::OutputDecode);
 
-            Ok(InferenceRunOutcome::Completed(InferenceState {
-                input_embedding,
-                transformer_state_transition,
-                output_decode,
-                raster_tile_invocations: None,
-            }))
-        })();
-
-        let raster_tile_invocations = controls
-            .raster_tiles
-            .then(crate::raster_authoring::stop_tile_invocation_counting)
-            .flatten();
-        if let Some(total) = raster_tile_invocations {
-            trace::raster_tile_invocations_finished(total);
-        }
-
-        let mut result = result;
-        if let Some(total) = raster_tile_invocations {
-            match &mut result {
+            match &result {
                 Ok(InferenceRunOutcome::Completed(state)) => {
-                    state.raster_tile_invocations = Some(total);
+                    trace::finish_inference_trace(&json!({
+                        "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
+                        "output_decode_generated_token_ids_sha256": state.output_decode.generated_token_ids_sha256,
+                        "output_decode_generated_text_sha256": trace::sha256_hex(&state.output_decode.generated_text),
+                        "generated_token_count": state.output_decode.generated_token_count,
+                        "raster_tile_invocations": state.raster_tile_invocations,
+                    }))
                 }
-                Ok(InferenceRunOutcome::Paused(state)) => {
-                    state.raster_tile_invocations = Some(total);
-                }
-                Err(_) => {}
+                Ok(InferenceRunOutcome::Paused(state)) => trace::finish_inference_trace(&json!({
+                    "terminal_checkpoint_id": state.terminal_checkpoint_id,
+                    "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
+                    "raster_tile_invocations": state.raster_tile_invocations,
+                })),
+                Err(error) => trace::abort_inference_trace(error),
             }
-        }
 
-        match &result {
-            Ok(InferenceRunOutcome::Completed(state)) => trace::finish_inference_trace(&json!({
-                "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
-                "output_decode_generated_token_ids_sha256": state.output_decode.generated_token_ids_sha256,
-                "output_decode_generated_text_sha256": trace::sha256_hex(&state.output_decode.generated_text),
-                "generated_token_count": state.output_decode.generated_token_count,
-                "raster_tile_invocations": state.raster_tile_invocations,
-            })),
-            Ok(InferenceRunOutcome::Paused(state)) => trace::finish_inference_trace(&json!({
-                "terminal_checkpoint_id": state.terminal_checkpoint_id,
-                "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
-                "raster_tile_invocations": state.raster_tile_invocations,
-            })),
-            Err(error) => trace::abort_inference_trace(error),
-        }
-
-        result
+            result
+        })
     })
 }
 
-fn should_stop_at_checkpoint(controls: &InferenceControls, checkpoint_id: &str) -> bool {
-    controls.terminal_checkpoint.as_deref() == Some(checkpoint_id)
+fn reached_terminal_checkpoint_id(controls: &InferenceControls) -> Option<String> {
+    controls.terminal_checkpoint.as_ref()?;
+    trace::reached_terminal_checkpoint_id()
 }
 
 #[cfg(test)]
@@ -684,6 +698,53 @@ mod tests {
                 assert!(state.output_decode.is_none());
             }
             InferenceRunOutcome::Completed(_) => panic!("expected paused raster inference"),
+        }
+    }
+
+    #[test]
+    fn run_inference_with_controls_pauses_after_second_prefill_layer_checkpoint() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let mut transformer_model = test_transformer_model();
+        transformer_model
+            .layers
+            .push(transformer_model.layers[0].clone());
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: Some("prefill.layer:2".to_string()),
+                raster_tiles: false,
+                raster_tokenizer_source: None,
+                raster_projection_rows_per_tile: None,
+            },
+        )
+        .expect("inference should pause after the second prefill layer checkpoint");
+
+        match paused {
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prefill.layer");
+                assert!(state.transformer_state_transition.is_none());
+                assert!(state.output_decode.is_none());
+            }
+            InferenceRunOutcome::Completed(_) => panic!("expected paused inference"),
         }
     }
 

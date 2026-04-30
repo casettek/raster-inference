@@ -131,7 +131,7 @@ pub fn compute_next_prefill_layer(
     let current_activations = state.current_activations.to_f32_values();
     let current_det_activations = raster_sequence_acts(&state.current_activations);
     let layer_caches = layer_caches_from_raster(&state.layer_caches);
-    crate::trace::trace_checkpoint(
+    if crate::trace::trace_checkpoint(
         "prefill.layer",
         &json!({
             "execution_mode": "deterministic",
@@ -144,12 +144,16 @@ pub fn compute_next_prefill_layer(
             "completed_layer_output_sha256s": state.completed_layer_output_sha256s.clone(),
             "completed_layer_output_det_sha256s": state.completed_layer_output_det_sha256s.clone(),
         }),
-    );
+    ) {
+        state.next_layer_idx += 1;
+        state.layer_count = state.next_layer_idx;
+        return Ok((true, state));
+    }
     for (token_idx, token_activation) in current_activations.iter().enumerate() {
         let det_token_activation_sha256 = current_det_activations
             .get(token_idx)
             .map(|row| crate::shared::transformer_kernels::build_det_vector_commitment(row));
-        crate::trace::trace_checkpoint(
+        if crate::trace::trace_checkpoint(
             &format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}"),
             &json!({
                 "execution_mode": "deterministic",
@@ -159,7 +163,11 @@ pub fn compute_next_prefill_layer(
                 "token_activation": token_activation,
                 "det_token_activation_sha256": det_token_activation_sha256,
             }),
-        );
+        ) {
+            state.next_layer_idx += 1;
+            state.layer_count = state.next_layer_idx;
+            return Ok((true, state));
+        }
     }
     state.next_layer_idx += 1;
     Ok((false, state))

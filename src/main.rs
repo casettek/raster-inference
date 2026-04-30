@@ -13,10 +13,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] [--raster] [--raster-projection-rows-per-tile <rows>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--raster] [--raster-projection-rows-per-tile <rows>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize. Pass --raster to use raster-authored tiles where implemented. Pass --raster-projection-rows-per-tile to bound raster projection row chunks."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use raster-authored tiles where implemented. Pass --raster-projection-rows-per-tile to bound raster projection row chunks."
     );
 }
 
@@ -238,6 +238,22 @@ mod tests {
 
         assert_eq!(args.terminal_checkpoint.as_deref(), Some("output.finalize"));
         assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
+    }
+
+    #[test]
+    fn parse_terminal_checkpoint_occurrence_suffix() {
+        let args = CliArgs::parse([
+            "--terminal-checkpoint".to_string(),
+            "prefill.layer:2".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(args.terminal_checkpoint.as_deref(), Some("prefill.layer:2"));
     }
 
     #[test]

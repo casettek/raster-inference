@@ -112,10 +112,16 @@ macro_rules! call_tile {
 #[macro_export]
 macro_rules! call_seq {
     ($sequence:ident $(,)?) => {
-        $sequence()
+        {
+            $crate::raster_authoring::record_tile_invocation();
+            $sequence()
+        }
     };
     ($sequence:ident, $($args:expr),+ $(,)?) => {
-        $sequence($($args),+)
+        {
+            $crate::raster_authoring::record_tile_invocation();
+            $sequence($($args),+)
+        }
     };
 }
 
@@ -264,6 +270,7 @@ macro_rules! __raster_authoring_run_recur_sequence {
     ($sequence:ident, $state:expr $(,)?) => {{
         let mut state = $state;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state) = $sequence(state);
             if done {
                 break next_state;
@@ -275,6 +282,7 @@ macro_rules! __raster_authoring_run_recur_sequence {
         let mut state_a = $state_a;
         let mut state_b = $state_b;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state_a, next_state_b) = $sequence(state_a, state_b);
             if done {
                 break (next_state_a, next_state_b);
@@ -288,6 +296,7 @@ macro_rules! __raster_authoring_run_recur_sequence {
         let mut state_b = $state_b;
         let mut state_c = $state_c;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state_a, next_state_b, next_state_c) =
                 $sequence(state_a, state_b, state_c);
             if done {
@@ -304,6 +313,7 @@ macro_rules! __raster_authoring_run_recur_sequence {
         let mut state_c = $state_c;
         let mut state_d = $state_d;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state_a, next_state_b, next_state_c, next_state_d) =
                 $sequence(state_a, state_b, state_c, state_d);
             if done {
@@ -495,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn tile_invocation_counter_counts_tiles_only_while_enabled() {
+    fn tile_invocation_counter_counts_tiles_and_sequences_only_while_enabled() {
         assert_eq!(call_tile!(add_one, 1), 2);
         assert_eq!(super::stop_tile_invocation_counting(), None);
 
@@ -503,8 +513,9 @@ mod tests {
         assert_eq!(call_tile!(add_one, 1), 2);
         assert_eq!(call_seq!(add_sequence, 1), 2);
         assert_eq!(call_recur_tile!(double_until_at_least_ten, 2), 16);
+        assert_eq!(call_recur_seq!(add_sequence_until_goal, 0, 3), (3, 3));
 
-        assert_eq!(super::stop_tile_invocation_counting(), Some(6));
+        assert_eq!(super::stop_tile_invocation_counting(), Some(11));
         assert_eq!(super::stop_tile_invocation_counting(), None);
     }
 

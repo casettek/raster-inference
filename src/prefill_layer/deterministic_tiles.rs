@@ -68,7 +68,7 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
         completed_layer_output_det_sha256s.push(layer_output.det_activations_sha256.clone());
-        crate::trace::trace_checkpoint(
+        if crate::trace::trace_checkpoint(
             "prefill.layer",
             &json!({
                 "execution_mode": "deterministic",
@@ -81,13 +81,16 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
                 "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
                 "completed_layer_output_det_sha256s": completed_layer_output_det_sha256s.clone(),
             }),
-        );
+        ) {
+            break;
+        }
+        let mut reached_terminal_checkpoint = false;
         for (token_idx, token_activation) in xs_values.iter().enumerate() {
             let det_token_activation_sha256 = xs.det_values().and_then(|rows| {
                 rows.get(token_idx)
                     .map(|row| crate::shared::transformer_kernels::build_det_vector_commitment(row))
             });
-            crate::trace::trace_checkpoint(
+            if crate::trace::trace_checkpoint(
                 &format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}"),
                 &json!({
                     "execution_mode": "deterministic",
@@ -97,7 +100,13 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
                     "token_activation": token_activation,
                     "det_token_activation_sha256": det_token_activation_sha256,
                 }),
-            );
+            ) {
+                reached_terminal_checkpoint = true;
+                break;
+            }
+        }
+        if reached_terminal_checkpoint {
+            break;
         }
     }
 

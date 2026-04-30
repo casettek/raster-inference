@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    cell::RefCell,
     env, fs,
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -84,6 +85,83 @@ pub fn with_checkpointing_enabled<T>(enabled: bool, f: impl FnOnce() -> T) -> T 
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalCheckpointSpec {
+    checkpoint_id: String,
+    occurrence: usize,
+}
+
+impl TerminalCheckpointSpec {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        let (checkpoint_id, occurrence) = match value.rsplit_once(':') {
+            Some((checkpoint_id, occurrence)) => {
+                if checkpoint_id.is_empty() {
+                    anyhow::bail!("terminal checkpoint id must not be empty");
+                }
+                let occurrence = occurrence.parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!("terminal checkpoint occurrence must be a positive integer")
+                })?;
+                (checkpoint_id.to_string(), occurrence)
+            }
+            None => (value.to_string(), 1),
+        };
+
+        if checkpoint_id.is_empty() {
+            anyhow::bail!("terminal checkpoint id must not be empty");
+        }
+        if occurrence == 0 {
+            anyhow::bail!("terminal checkpoint occurrence must be greater than zero");
+        }
+
+        Ok(Self {
+            checkpoint_id,
+            occurrence,
+        })
+    }
+
+    pub fn checkpoint_id(&self) -> &str {
+        &self.checkpoint_id
+    }
+
+    pub fn occurrence(&self) -> usize {
+        self.occurrence
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TerminalCheckpointState {
+    spec: TerminalCheckpointSpec,
+    seen: usize,
+    reached: bool,
+}
+
+pub fn with_terminal_checkpoint<T>(
+    spec: Option<TerminalCheckpointSpec>,
+    f: impl FnOnce() -> T,
+) -> T {
+    TERMINAL_CHECKPOINT.with(|terminal_checkpoint| {
+        let previous = terminal_checkpoint.replace(spec.map(|spec| TerminalCheckpointState {
+            spec,
+            seen: 0,
+            reached: false,
+        }));
+        let reset = ResetTerminalCheckpoint(previous);
+        let result = f();
+        drop(reset);
+        result
+    })
+}
+
+pub fn reached_terminal_checkpoint_id() -> Option<String> {
+    TERMINAL_CHECKPOINT.with(|terminal_checkpoint| {
+        terminal_checkpoint
+            .borrow()
+            .as_ref()
+            .filter(|state| state.reached)
+            .map(|state| state.spec.checkpoint_id.clone())
+    })
+}
+
 #[derive(Default)]
 struct TraceCollector {
     checkpoints: Vec<Value>,
@@ -109,10 +187,11 @@ pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
     collector.completed_trace_path = None;
 }
 
-pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) {
+pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) -> bool {
     emit_checkpoint(checkpoint_name);
-    if !trace_checkpointing_enabled() {
-        return;
+    let reached_terminal_checkpoint = mark_terminal_checkpoint(checkpoint_name);
+    if !trace_checkpointing_enabled() || !should_commit_checkpoint(checkpoint_name) {
+        return reached_terminal_checkpoint;
     }
 
     let mut collector = trace_collector()
@@ -121,6 +200,7 @@ pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) {
     collector.checkpoints.push(json!({
         checkpoint_name: sha256_hex(state),
     }));
+    reached_terminal_checkpoint
 }
 
 pub fn finish_inference_trace<T: Serialize>(summary: &T) {
@@ -194,6 +274,28 @@ fn trace_logging_enabled() -> bool {
 
 fn trace_checkpointing_enabled() -> bool {
     CHECKPOINTING_ENABLED.with(Cell::get)
+}
+
+fn should_commit_checkpoint(checkpoint_name: &str) -> bool {
+    !checkpoint_name.starts_with("prefill.layer_token.")
+}
+
+fn mark_terminal_checkpoint(checkpoint_name: &str) -> bool {
+    TERMINAL_CHECKPOINT.with(|terminal_checkpoint| {
+        let mut terminal_checkpoint = terminal_checkpoint.borrow_mut();
+        let Some(state) = terminal_checkpoint.as_mut() else {
+            return false;
+        };
+        if state.reached || state.spec.checkpoint_id != checkpoint_name {
+            return state.reached;
+        }
+
+        state.seen += 1;
+        if state.seen == state.spec.occurrence {
+            state.reached = true;
+        }
+        state.reached
+    })
 }
 
 fn emit(kind: &str, label: &str, duration: Option<Duration>) {
@@ -291,6 +393,82 @@ impl Drop for ResetCheckpointingFlag {
     }
 }
 
+struct ResetTerminalCheckpoint(Option<TerminalCheckpointState>);
+
+impl Drop for ResetTerminalCheckpoint {
+    fn drop(&mut self) {
+        TERMINAL_CHECKPOINT.with(|terminal_checkpoint| {
+            terminal_checkpoint.replace(self.0.take());
+        });
+    }
+}
+
 thread_local! {
     static CHECKPOINTING_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static TERMINAL_CHECKPOINT: RefCell<Option<TerminalCheckpointState>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{should_commit_checkpoint, TerminalCheckpointSpec};
+
+    #[test]
+    fn checkpoint_commitments_skip_prefill_layer_token_entries() {
+        assert!(!should_commit_checkpoint(
+            "prefill.layer_token.layer_0.token_0"
+        ));
+        assert!(should_commit_checkpoint("prefill.layer"));
+        assert!(should_commit_checkpoint(
+            "decode.layer_token.layer_0.position_0"
+        ));
+    }
+
+    #[test]
+    fn terminal_checkpoint_spec_defaults_to_first_occurrence() {
+        let spec =
+            TerminalCheckpointSpec::parse("prefill.finalize").expect("checkpoint should parse");
+
+        assert_eq!(spec.checkpoint_id(), "prefill.finalize");
+        assert_eq!(spec.occurrence(), 1);
+    }
+
+    #[test]
+    fn terminal_checkpoint_spec_accepts_occurrence_suffix() {
+        let spec =
+            TerminalCheckpointSpec::parse("prefill.layer:2").expect("checkpoint should parse");
+
+        assert_eq!(spec.checkpoint_id(), "prefill.layer");
+        assert_eq!(spec.occurrence(), 2);
+    }
+
+    #[test]
+    fn terminal_checkpoint_spec_rejects_zero_occurrence() {
+        let error = TerminalCheckpointSpec::parse("prefill.layer:0").expect_err("zero should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn terminal_checkpoint_tracking_reaches_requested_occurrence() {
+        let spec =
+            TerminalCheckpointSpec::parse("prefill.layer:2").expect("checkpoint should parse");
+
+        super::with_terminal_checkpoint(Some(spec), || {
+            assert!(!super::trace_checkpoint(
+                "prefill.layer",
+                &json!({ "index": 0 })
+            ));
+            assert_eq!(super::reached_terminal_checkpoint_id(), None);
+            assert!(super::trace_checkpoint(
+                "prefill.layer",
+                &json!({ "index": 1 })
+            ));
+            assert_eq!(
+                super::reached_terminal_checkpoint_id().as_deref(),
+                Some("prefill.layer")
+            );
+        });
+    }
 }
