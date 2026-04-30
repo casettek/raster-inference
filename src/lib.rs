@@ -76,6 +76,8 @@ pub struct InferenceState {
     pub input_embedding: InputEmbeddingState,
     pub transformer_state_transition: TransformerStateTransitionState,
     pub output_decode: OutputDecodeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster_tile_invocations: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -84,6 +86,19 @@ pub struct InferenceControls {
     pub terminal_checkpoint: Option<String>,
     pub raster_tiles: bool,
     pub raster_tokenizer_source: Option<AuthenticatedGemmaTokenizer>,
+    pub raster_projection_rows_per_tile: Option<usize>,
+}
+
+impl InferenceControls {
+    pub const DEFAULT_RASTER_PROJECTION_ROWS_PER_TILE: usize = 1;
+
+    pub fn raster_projection_rows_per_tile(&self) -> Result<usize> {
+        match self.raster_projection_rows_per_tile {
+            Some(0) => anyhow::bail!("raster projection rows per tile must be greater than zero"),
+            Some(rows) => Ok(rows),
+            None => Ok(Self::DEFAULT_RASTER_PROJECTION_ROWS_PER_TILE),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,6 +109,8 @@ pub struct PausedInferenceState {
     pub transformer_state_transition: Option<TransformerStateTransitionState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_decode: Option<OutputDecodeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster_tile_invocations: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +152,11 @@ pub fn run_inference_with_controls(
         {
             anyhow::bail!("raster tile inference requires deterministic execution");
         }
+        let raster_projection_rows_per_tile = if controls.raster_tiles {
+            Some(controls.raster_projection_rows_per_tile()?)
+        } else {
+            None
+        };
         transformer_model.validate_execution_mode(request.execution_mode)?;
         trace::start_inference_trace(&json!({
             "model_id": model.model_id,
@@ -147,7 +169,11 @@ pub fn run_inference_with_controls(
             "terminal_checkpoint": controls.terminal_checkpoint,
             "commit_checkpoints": controls.commit_checkpoints,
             "tile_authoring_mode": if controls.raster_tiles { "raster" } else { "native" },
+            "raster_projection_rows_per_tile": raster_projection_rows_per_tile,
         }));
+        if controls.raster_tiles {
+            crate::raster_authoring::start_tile_invocation_counting();
+        }
 
         let result = (|| {
             trace::phase_started(PhaseId::InputEmbedding);
@@ -203,6 +229,7 @@ pub fn run_inference_with_controls(
                     input_embedding,
                     transformer_state_transition: None,
                     output_decode: None,
+                    raster_tile_invocations: None,
                 }));
             }
             trace::phase_finished(PhaseId::InputEmbedding);
@@ -218,6 +245,8 @@ pub fn run_inference_with_controls(
                     &prompt_preparation.prompt_token_ids,
                     &ple_source,
                     &token_embeddings,
+                    raster_projection_rows_per_tile
+                        .expect("raster projection rows per tile should be validated"),
                 )?
             } else {
                 run_prefill_prepare_aux(
@@ -234,6 +263,7 @@ pub fn run_inference_with_controls(
                     input_embedding,
                     transformer_state_transition: None,
                     output_decode: None,
+                    raster_tile_invocations: None,
                 }));
             }
             let (final_hidden_states, layer_caches) = if controls.raster_tiles {
@@ -242,7 +272,13 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                prefill_layer::run_raster(&token_embeddings, &layer_source, ple_inputs.as_ref())?
+                prefill_layer::run_raster(
+                    &token_embeddings,
+                    &layer_source,
+                    ple_inputs.as_ref(),
+                    raster_projection_rows_per_tile
+                        .expect("raster projection rows per tile should be validated"),
+                )?
             } else {
                 prefill_layer::run_with_mode_internal(
                     token_embeddings.clone_internal(),
@@ -258,6 +294,7 @@ pub fn run_inference_with_controls(
                     input_embedding,
                     transformer_state_transition: None,
                     output_decode: None,
+                    raster_tile_invocations: None,
                 }));
             }
             let prefill = if controls.raster_tiles {
@@ -271,6 +308,8 @@ pub fn run_inference_with_controls(
                     &finalize_source,
                     final_hidden_states,
                     layer_caches,
+                    raster_projection_rows_per_tile
+                        .expect("raster projection rows per tile should be validated"),
                 )?
             } else {
                 run_prefill_finalize(
@@ -289,6 +328,7 @@ pub fn run_inference_with_controls(
                     input_embedding,
                     transformer_state_transition: Some(transformer_state_transition),
                     output_decode: None,
+                    raster_tile_invocations: None,
                 }));
             }
             trace::phase_finished(PhaseId::TransformerStateTransition);
@@ -328,6 +368,7 @@ pub fn run_inference_with_controls(
                     input_embedding,
                     transformer_state_transition: Some(transformer_state_transition),
                     output_decode: Some(output_decode),
+                    raster_tile_invocations: None,
                 }));
             }
             trace::phase_finished(PhaseId::OutputDecode);
@@ -336,8 +377,30 @@ pub fn run_inference_with_controls(
                 input_embedding,
                 transformer_state_transition,
                 output_decode,
+                raster_tile_invocations: None,
             }))
         })();
+
+        let raster_tile_invocations = controls
+            .raster_tiles
+            .then(crate::raster_authoring::stop_tile_invocation_counting)
+            .flatten();
+        if let Some(total) = raster_tile_invocations {
+            trace::raster_tile_invocations_finished(total);
+        }
+
+        let mut result = result;
+        if let Some(total) = raster_tile_invocations {
+            match &mut result {
+                Ok(InferenceRunOutcome::Completed(state)) => {
+                    state.raster_tile_invocations = Some(total);
+                }
+                Ok(InferenceRunOutcome::Paused(state)) => {
+                    state.raster_tile_invocations = Some(total);
+                }
+                Err(_) => {}
+            }
+        }
 
         match &result {
             Ok(InferenceRunOutcome::Completed(state)) => trace::finish_inference_trace(&json!({
@@ -345,10 +408,12 @@ pub fn run_inference_with_controls(
                 "output_decode_generated_token_ids_sha256": state.output_decode.generated_token_ids_sha256,
                 "output_decode_generated_text_sha256": trace::sha256_hex(&state.output_decode.generated_text),
                 "generated_token_count": state.output_decode.generated_token_count,
+                "raster_tile_invocations": state.raster_tile_invocations,
             })),
             Ok(InferenceRunOutcome::Paused(state)) => trace::finish_inference_trace(&json!({
                 "terminal_checkpoint_id": state.terminal_checkpoint_id,
                 "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
+                "raster_tile_invocations": state.raster_tile_invocations,
             })),
             Err(error) => trace::abort_inference_trace(error),
         }
@@ -507,6 +572,7 @@ mod tests {
                 terminal_checkpoint: Some("prompt.prepare".to_string()),
                 raster_tiles: false,
                 raster_tokenizer_source: None,
+                raster_projection_rows_per_tile: None,
             },
         )
         .expect("inference should pause");
@@ -554,6 +620,7 @@ mod tests {
                 terminal_checkpoint: Some("prefill.prepare_aux".to_string()),
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: None,
             },
         )
         .expect("raster inference should pause after prefill prepare aux");
@@ -601,6 +668,7 @@ mod tests {
                 terminal_checkpoint: Some("prefill.layer".to_string()),
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: Some(2),
             },
         )
         .expect("raster inference should pause after prefill layer");
@@ -648,6 +716,7 @@ mod tests {
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: Some(2),
             },
         )
         .expect("raster inference should pause after prefill finalize");
@@ -655,6 +724,10 @@ mod tests {
         match paused {
             InferenceRunOutcome::Paused(state) => {
                 assert_eq!(state.terminal_checkpoint_id, "prefill.finalize");
+                assert!(
+                    state.raster_tile_invocations.unwrap_or(0) > 0,
+                    "paused raster inference should include tile invocation count"
+                );
                 let transformer_state = state
                     .transformer_state_transition
                     .expect("transformer phase should be present");
@@ -698,6 +771,7 @@ mod tests {
                 terminal_checkpoint: None,
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: Some(2),
             },
         )
         .expect("raster inference should complete");
@@ -745,6 +819,7 @@ mod tests {
                 terminal_checkpoint: Some("output.finalize".to_string()),
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: Some(2),
             },
         )
         .expect("raster inference should pause after output finalize");
@@ -792,6 +867,7 @@ mod tests {
                 terminal_checkpoint: None,
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: None,
             },
         )
         .expect_err("raster inference should reject fp32 requests");
@@ -830,11 +906,49 @@ mod tests {
                 terminal_checkpoint: None,
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: None,
             },
         )
         .expect_err("raster inference should reject fp32 models");
 
         assert!(error.to_string().contains(".detwgt artifact"));
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_rejects_zero_projection_rows_per_tile() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: Some(0),
+            },
+        )
+        .expect_err("zero raster projection rows per tile should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]
@@ -866,6 +980,7 @@ mod tests {
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
                 raster_tiles: false,
                 raster_tokenizer_source: None,
+                raster_projection_rows_per_tile: Some(0),
             },
         )
         .expect("inference should pause");
@@ -873,6 +988,7 @@ mod tests {
         match paused {
             InferenceRunOutcome::Paused(state) => {
                 assert_eq!(state.terminal_checkpoint_id, "prefill.finalize");
+                assert_eq!(state.raster_tile_invocations, None);
                 assert_eq!(
                     state
                         .transformer_state_transition

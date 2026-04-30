@@ -2,9 +2,9 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::raster_authoring::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
+use crate::shared::raster_transformer_kernels::det_num_tensor_slice_row_wgts;
 use crate::shared::transformer::{
-    DetNumMatrix, Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleMatrixSource,
-    Gemma4TransformerModel,
+    Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
 };
 
 #[derive(Debug, Clone)]
@@ -327,14 +327,19 @@ impl AuthRead<GemmaPleModelProjectionRowRequest> for AuthenticatedGemmaPleSource
                     )
                 }),
             GemmaPleBacking::Model(ple_global) => {
-                let matrix = crate::io::materialize_det_num_ple_model_projection(
-                    ple_global,
-                    request.layer_idx,
-                )?
-                .ok_or_else(|| {
-                    anyhow!("deterministic raster PLE model projection requires canonical Wgt rows")
-                })?;
-                matrix_row_wgts(&matrix, request.row_idx)
+                let source = ple_global
+                    .model_projections
+                    .get(request.layer_idx)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Gemma PLE model projection layer {} is out of range",
+                            request.layer_idx
+                        )
+                    })?;
+                let Gemma4PleMatrixSource::DetNumLazy(source) = source else {
+                    bail!("deterministic raster PLE model projection row requires .detwgt backing");
+                };
+                det_num_tensor_slice_row_wgts(source, request.row_idx, "PLE model projection")
             }
         }
     }
@@ -581,22 +586,6 @@ fn rectangular_width<T>(matrix: &[Vec<T>], label: &str, layer_idx: usize) -> Res
     Ok(width)
 }
 
-fn matrix_row_wgts(matrix: &DetNumMatrix, row_idx: usize) -> Result<Vec<Wgt>> {
-    if row_idx >= matrix.rows {
-        bail!(
-            "Gemma PLE model projection row {row_idx} is out of range for {} rows",
-            matrix.rows
-        );
-    }
-    let start = row_idx * matrix.cols;
-    let end = start + matrix.cols;
-    Ok(matrix.values[start..end]
-        .iter()
-        .copied()
-        .map(Wgt::from_bits)
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -606,7 +595,10 @@ mod tests {
         GemmaPleTokenEmbeddingRowRequest,
     };
     use crate::shared::det_num::{Acc, Act, Wgt};
-    use crate::shared::transformer::{Gemma4ModelProvenance, Gemma4PleGlobalWeights, MatrixF32};
+    use crate::shared::transformer::{
+        DetNumTensorSliceSource, Gemma4ModelProvenance, Gemma4PleGlobalWeights, MatrixF32,
+    };
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn canonical_source_reads_metadata_and_layer_shape() {
@@ -669,6 +661,66 @@ mod tests {
                 Wgt::from_num(-0.25)
             ]
         );
+    }
+
+    #[test]
+    fn model_backing_reads_projection_row_from_det_source() {
+        let (path, token_source, projection_source) = write_det_sources(
+            vec![
+                vec![Act::from_num(1.0), Act::from_num(0.0)],
+                vec![Act::from_num(0.0), Act::from_num(1.0)],
+            ],
+            vec![
+                vec![Wgt::from_num(1.0), Wgt::from_num(0.0), Wgt::from_num(-1.0)],
+                vec![
+                    Wgt::from_num(0.5),
+                    Wgt::from_num(0.25),
+                    Wgt::from_num(-0.25),
+                ],
+            ],
+        );
+        let ple_global = Gemma4PleGlobalWeights::from_det_num_sources_with_canonical(
+            vec![token_source],
+            vec![projection_source],
+            vec![1.0, 1.0],
+            vec![Wgt::from_num(1.0), Wgt::from_num(1.0)],
+            1.0,
+            Act::from_num(1.0),
+            1.0,
+            Act::from_num(1.0),
+            1.0,
+            Act::from_num(1.0),
+        );
+        let source = AuthenticatedGemmaPleSource::from_ple_global(
+            "det-source-ple",
+            Gemma4ModelProvenance::DetNumWgt,
+            vec![GemmaPleLayerConfig {
+                has_ple: true,
+                hidden_width: 3,
+            }],
+            Some(ple_global),
+            Some(Acc::from_num(0.001)),
+        )
+        .expect("det source should build");
+
+        let row = crate::auth_read!(
+            &source,
+            GemmaPleModelProjectionRowRequest {
+                layer_idx: 0,
+                row_idx: 1,
+            }
+        )
+        .expect("projection row should read");
+
+        assert_eq!(
+            row,
+            vec![
+                Wgt::from_num(0.5),
+                Wgt::from_num(0.25),
+                Wgt::from_num(-0.25)
+            ]
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -869,6 +921,68 @@ mod tests {
             projection_scalar: Act::from_num(0.5),
             input_scale: Act::from_num(0.25),
             rms_norm_eps: Acc::from_num(0.001),
+        }
+    }
+
+    fn write_det_sources(
+        token_embeddings: Vec<Vec<Act>>,
+        model_projection: Vec<Vec<Wgt>>,
+    ) -> (PathBuf, DetNumTensorSliceSource, DetNumTensorSliceSource) {
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "raster-prefill-ple-source-{}-{unique_suffix}.detwgt",
+            std::process::id()
+        ));
+        let mut bytes = Vec::new();
+        let token_offset = bytes.len();
+        for row in &token_embeddings {
+            for value in row {
+                bytes.extend(value.to_bits().to_le_bytes());
+            }
+        }
+        let projection_offset = bytes.len();
+        for row in &model_projection {
+            for value in row {
+                bytes.extend(value.to_bits().to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).expect("fixture weights should write");
+
+        (
+            path.clone(),
+            det_source(
+                &path,
+                token_embeddings.len(),
+                token_embeddings[0].len(),
+                token_offset,
+            ),
+            det_source(
+                &path,
+                model_projection.len(),
+                model_projection[0].len(),
+                projection_offset,
+            ),
+        )
+    }
+
+    fn det_source(
+        path: &Path,
+        rows: usize,
+        cols: usize,
+        data_offset: usize,
+    ) -> DetNumTensorSliceSource {
+        DetNumTensorSliceSource {
+            weights_path: path.to_path_buf(),
+            total_rows: rows,
+            total_cols: cols,
+            data_offset,
+            row_offset: 0,
+            row_count: rows,
+            col_offset: 0,
+            col_count: cols,
         }
     }
 }

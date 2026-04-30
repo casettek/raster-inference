@@ -10,7 +10,8 @@ use crate::shared::raster_prefill_finalize::{
     GemmaPrefillFinalizeScalarsRequest,
 };
 use crate::shared::raster_transformer_kernels::{
-    project_row_with_weights, rms_norm_sequence, RasterActivationRow, RasterActivationSequence,
+    project_row_with_weights, rms_norm_sequence, validate_projection_rows_per_tile,
+    RasterActivationRow, RasterActivationSequence,
 };
 use crate::shared::transformer::{
     ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerPrefillResult,
@@ -23,6 +24,7 @@ pub struct PrefillFinalizeRasterState {
     logit_count: usize,
     logit_bits: Vec<i32>,
     softcap_bits: Option<i32>,
+    projection_rows_per_tile: usize,
 }
 
 #[tile]
@@ -62,7 +64,9 @@ pub fn normalize_final_position(
 pub fn init_prefill_finalize_projection(
     normalized_final_position: RasterActivationRow,
     finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
+    projection_rows_per_tile: usize,
 ) -> Result<PrefillFinalizeRasterState> {
+    validate_projection_rows_per_tile(projection_rows_per_tile)?;
     let metadata = auth_read!(finalize_source, GemmaPrefillFinalizeMetadataRequest)?;
     if metadata.projection_rows == 0 {
         bail!("deterministic logits projection requires at least one projection row");
@@ -89,6 +93,7 @@ pub fn init_prefill_finalize_projection(
         logit_count: metadata.projection_rows,
         logit_bits: Vec::with_capacity(metadata.projection_rows),
         softcap_bits: scalars.final_logit_softcapping.map(Act::to_bits),
+        projection_rows_per_tile,
     })
 }
 
@@ -108,18 +113,25 @@ pub fn project_next_prefill_logit(
         );
     }
 
-    let projection_row = auth_read!(
-        finalize_source,
-        GemmaPrefillFinalizeProjectionRowRequest {
-            row_idx: state.next_logit_idx,
-        },
-    )?;
-    let mut logit = project_row_with_weights(&state.normalized_final_position, &projection_row)?;
-    if let Some(softcap_bits) = state.softcap_bits {
-        logit = softcap_act(logit, Act::from_bits(softcap_bits));
+    let end = state
+        .next_logit_idx
+        .saturating_add(state.projection_rows_per_tile)
+        .min(state.logit_count);
+    while state.next_logit_idx < end {
+        let projection_row = auth_read!(
+            finalize_source,
+            GemmaPrefillFinalizeProjectionRowRequest {
+                row_idx: state.next_logit_idx,
+            },
+        )?;
+        let mut logit =
+            project_row_with_weights(&state.normalized_final_position, &projection_row)?;
+        if let Some(softcap_bits) = state.softcap_bits {
+            logit = softcap_act(logit, Act::from_bits(softcap_bits));
+        }
+        state.logit_bits.push(logit.to_bits());
+        state.next_logit_idx += 1;
     }
-    state.logit_bits.push(logit.to_bits());
-    state.next_logit_idx += 1;
     Ok((false, state))
 }
 
@@ -171,6 +183,7 @@ pub fn run(
     final_hidden_states: ActivationSequence,
     layer_caches: Vec<LayerKvCache>,
     finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
+    projection_rows_per_tile: usize,
 ) -> Result<TransformerPrefillResult> {
     crate::trace::trace_event("prefill.select_final_position");
     let final_position = call_tile!(select_final_position, &final_hidden_states)?;
@@ -179,7 +192,8 @@ pub fn run(
     let state = call_tile!(
         init_prefill_finalize_projection,
         normalized,
-        finalize_source
+        finalize_source,
+        projection_rows_per_tile
     )?;
     let state = call_recur_tile_result!(project_next_prefill_logit, state, finalize_source)?;
     call_tile!(
@@ -217,7 +231,7 @@ mod tests {
             vec![Act::from_num(1.0), Act::from_num(-0.5)],
         ]);
 
-        let raster = run(&[3, 4], final_hidden_states.clone(), vec![], &source)
+        let raster = run(&[3, 4], final_hidden_states.clone(), vec![], &source, 1)
             .expect("raster finalize should run");
         let native = crate::prefill_finalize::run(
             &[3, 4],
@@ -254,7 +268,7 @@ mod tests {
         let final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(0.5), Act::from_num(-0.25)]]);
 
-        let raster = run(&[9], final_hidden_states.clone(), vec![], &source)
+        let raster = run(&[9], final_hidden_states.clone(), vec![], &source, 1)
             .expect("raster finalize should run");
         let native = crate::prefill_finalize::run(
             &[9],
@@ -281,7 +295,7 @@ mod tests {
         let final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
 
-        let raster = run(&[1], final_hidden_states.clone(), vec![], &source)
+        let raster = run(&[1], final_hidden_states.clone(), vec![], &source, 2)
             .expect("raster finalize should run");
         let native = crate::prefill_finalize::run(
             &[1],
@@ -306,12 +320,26 @@ mod tests {
         let final_hidden_states =
             ActivationSequence::from_values(vec![vec![1.0, 0.0]], "f32-only".to_string());
 
-        let error = run(&[1], final_hidden_states, vec![], &source)
+        let error = run(&[1], final_hidden_states, vec![], &source, 1)
             .expect_err("f32-only input should fail");
 
         assert!(error
             .to_string()
             .contains("canonical final hidden activations"));
+    }
+
+    #[test]
+    fn raster_finalize_rejects_zero_projection_rows_per_tile() {
+        let model = untied_model(false);
+        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+            .expect("source should build");
+        let final_hidden_states =
+            activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+
+        let error = run(&[1], final_hidden_states, vec![], &source, 0)
+            .expect_err("zero rows per tile should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]
@@ -323,7 +351,7 @@ mod tests {
             activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         final_hidden_states.activations = vec![vec![0.0, 1.0]];
 
-        let raster = run(&[1], final_hidden_states.clone(), vec![], &source)
+        let raster = run(&[1], final_hidden_states.clone(), vec![], &source, 1)
             .expect("raster finalize should run");
         let native = crate::prefill_finalize::run(
             &[1],
@@ -357,6 +385,7 @@ mod tests {
             final_hidden_states,
             vec![layer_cache.clone()],
             &source,
+            2,
         )
         .expect("raster finalize should run");
 

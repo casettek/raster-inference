@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::raster_authoring::prelude::{
-    auth_read, call_recur_tile_result, call_tile, sequence, tile,
+    auth_read, call_recur_tile_result, call_seq, call_tile, sequence, tile,
 };
 use crate::shared::raster_prefill_layer::{
     AuthenticatedGemmaPrefillLayerSource, GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind,
@@ -13,10 +13,11 @@ use crate::shared::raster_prefill_layer::{
     GemmaPrefillLayerSourceMetadataRequest,
 };
 use crate::shared::raster_transformer_kernels::{
-    add_sequences, apply_rope_to_heads, build_raster_kv_cache, causal_attention_heads_with_cache,
-    combine_attention_heads, gelu_sequence, mul_sequences, project_sequence_with_prefill_source,
-    reshape_sequence_heads, rms_norm_heads, rms_norm_sequence, scale_sequence,
-    value_rms_norm_heads, RasterActivationSequence, RasterKvCache,
+    add_sequences, append_projection_row_to_state, apply_rope_to_heads, build_raster_kv_cache,
+    causal_attention_heads_with_cache, combine_attention_heads, finalize_sequence_projection_state,
+    gelu_sequence, init_sequence_projection_state, mul_sequences, reshape_sequence_heads,
+    rms_norm_heads, rms_norm_sequence, scale_sequence, validate_projection_rows_per_tile,
+    value_rms_norm_heads, RasterActivationSequence, RasterKvCache, RasterSequenceProjectionState,
 };
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, InternalActivationSequence, LayerKvCache,
@@ -32,6 +33,7 @@ pub struct PrefillLayerRasterState {
     per_layer_inputs: Vec<Option<RasterActivationSequence>>,
     completed_layer_output_sha256s: Vec<String>,
     completed_layer_output_det_sha256s: Vec<Option<String>>,
+    projection_rows_per_tile: usize,
 }
 
 #[tile]
@@ -39,7 +41,9 @@ pub fn init_prefill_layer_state(
     input_activations: &ActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    projection_rows_per_tile: usize,
 ) -> Result<PrefillLayerRasterState> {
+    validate_projection_rows_per_tile(projection_rows_per_tile)?;
     let metadata = auth_read!(layer_source, GemmaPrefillLayerSourceMetadataRequest)?;
     if metadata.layer_count == 0 {
         bail!("transformer prefill requires at least one layer");
@@ -67,6 +71,7 @@ pub fn init_prefill_layer_state(
         per_layer_inputs,
         completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
         completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+        projection_rows_per_tile,
     })
 }
 
@@ -109,6 +114,7 @@ pub fn compute_next_prefill_layer(
         &layer,
         donor_cache,
         per_layer_input,
+        state.projection_rows_per_tile,
     )?;
     state.current_activations = layer_output;
     state.layer_caches.push(layer_cache);
@@ -195,15 +201,87 @@ pub fn run(
     input_activations: &ActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    projection_rows_per_tile: usize,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     let state = call_tile!(
         init_prefill_layer_state,
         input_activations,
         layer_source,
-        ple_inputs
+        ple_inputs,
+        projection_rows_per_tile
     )?;
     let state = call_recur_tile_result!(compute_next_prefill_layer, state, layer_source)?;
     call_tile!(finalize_prefill_layer_state, state)
+}
+
+#[tile]
+pub fn init_prefill_sequence_projection(
+    input: &RasterActivationSequence,
+    projection_rows: usize,
+    projection_rows_per_tile: usize,
+) -> Result<RasterSequenceProjectionState> {
+    init_sequence_projection_state(input, projection_rows, projection_rows_per_tile)
+}
+
+#[tile(kind = recursive)]
+pub fn project_next_prefill_sequence_rows(
+    mut state: RasterSequenceProjectionState,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_idx: usize,
+    matrix: GemmaPrefillLayerMatrixKind,
+) -> Result<(bool, RasterSequenceProjectionState)> {
+    if state.is_complete() {
+        return Ok((true, state));
+    }
+
+    let end = state
+        .next_row_idx()
+        .saturating_add(state.rows_per_tile())
+        .min(state.projection_rows());
+    while state.next_row_idx() < end {
+        let row = auth_read!(
+            layer_source,
+            crate::shared::raster_prefill_layer::GemmaPrefillLayerMatrixRowRequest {
+                layer_idx,
+                matrix,
+                row_idx: state.next_row_idx(),
+            },
+        )?;
+        append_projection_row_to_state(&mut state, &row)?;
+    }
+    Ok((false, state))
+}
+
+#[tile]
+pub fn finalize_prefill_sequence_projection(
+    state: RasterSequenceProjectionState,
+) -> Result<RasterActivationSequence> {
+    finalize_sequence_projection_state(state)
+}
+
+#[sequence]
+pub fn project_sequence_with_prefill_source(
+    input: &RasterActivationSequence,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_idx: usize,
+    matrix: GemmaPrefillLayerMatrixKind,
+    projection_rows: usize,
+    projection_rows_per_tile: usize,
+) -> Result<RasterActivationSequence> {
+    let state = call_tile!(
+        init_prefill_sequence_projection,
+        input,
+        projection_rows,
+        projection_rows_per_tile
+    )?;
+    let state = call_recur_tile_result!(
+        project_next_prefill_sequence_rows,
+        state,
+        layer_source,
+        layer_idx,
+        matrix
+    )?;
+    call_tile!(finalize_prefill_sequence_projection, state)
 }
 
 fn run_basic_prefill_layer(
@@ -212,6 +290,7 @@ fn run_basic_prefill_layer(
     layer: &crate::shared::raster_prefill_layer::GemmaPrefillLayerMetadata,
     donor_cache: Option<&RasterKvCache>,
     per_layer_input: Option<&RasterActivationSequence>,
+    projection_rows_per_tile: usize,
 ) -> Result<(RasterActivationSequence, RasterKvCache)> {
     let scalars = auth_read!(
         layer_source,
@@ -233,22 +312,27 @@ fn run_basic_prefill_layer(
         Some(scalars.rms_norm_eps),
     )?;
 
-    let q_projected = project_sequence_with_prefill_source(
+    let q_projected = call_seq!(
+        project_sequence_with_prefill_source,
         &normed,
         layer_source,
         layer.layer_idx,
         GemmaPrefillLayerMatrixKind::Query,
         layer.q_proj_shape.rows,
+        projection_rows_per_tile,
     )?;
-    let k_projected = project_sequence_with_prefill_source(
+    let k_projected = call_seq!(
+        project_sequence_with_prefill_source,
         &normed,
         layer_source,
         layer.layer_idx,
         GemmaPrefillLayerMatrixKind::Key,
         layer.k_proj_shape.rows,
+        projection_rows_per_tile,
     )?;
     let v_projected = if layer.has_v_proj {
-        project_sequence_with_prefill_source(
+        call_seq!(
+            project_sequence_with_prefill_source,
             &normed,
             layer_source,
             layer.layer_idx,
@@ -257,6 +341,7 @@ fn run_basic_prefill_layer(
                 .v_proj_shape
                 .ok_or_else(|| anyhow!("Gemma prefill layer metadata is missing v_proj shape"))?
                 .rows,
+            projection_rows_per_tile,
         )?
     } else if layer.attention_k_eq_v {
         k_projected.clone()
@@ -326,12 +411,14 @@ fn run_basic_prefill_layer(
         attention_window,
     )?;
     let attention_sequence = combine_attention_heads(&attention_heads)?;
-    let attention_output = project_sequence_with_prefill_source(
+    let attention_output = call_seq!(
+        project_sequence_with_prefill_source,
         &attention_sequence,
         layer_source,
         layer.layer_idx,
         GemmaPrefillLayerMatrixKind::Output,
         layer.o_proj_shape.rows,
+        projection_rows_per_tile,
     )?;
     let attention_output = rms_norm_sequence(
         &attention_output,
@@ -358,28 +445,34 @@ fn run_basic_prefill_layer(
         )?),
         Some(scalars.rms_norm_eps),
     )?;
-    let gate = project_sequence_with_prefill_source(
+    let gate = call_seq!(
+        project_sequence_with_prefill_source,
         &normed,
         layer_source,
         layer.layer_idx,
         GemmaPrefillLayerMatrixKind::Gate,
         layer.gate_proj_shape.rows,
+        projection_rows_per_tile,
     )?;
     let gate = gelu_sequence(&gate)?;
-    let up = project_sequence_with_prefill_source(
+    let up = call_seq!(
+        project_sequence_with_prefill_source,
         &normed,
         layer_source,
         layer.layer_idx,
         GemmaPrefillLayerMatrixKind::Up,
         layer.up_proj_shape.rows,
+        projection_rows_per_tile,
     )?;
     let ff_hidden = mul_sequences(&gate, &up)?;
-    let ff_out = project_sequence_with_prefill_source(
+    let ff_out = call_seq!(
+        project_sequence_with_prefill_source,
         &ff_hidden,
         layer_source,
         layer.layer_idx,
         GemmaPrefillLayerMatrixKind::Down,
         layer.down_proj_shape.rows,
+        projection_rows_per_tile,
     )?;
     let ff_out = rms_norm_sequence(
         &ff_out,
@@ -396,7 +489,8 @@ fn run_basic_prefill_layer(
 
     if let Some(per_layer_input) = per_layer_input {
         let residual = xs.clone();
-        let gated = project_sequence_with_prefill_source(
+        let gated = call_seq!(
+            project_sequence_with_prefill_source,
             &xs,
             layer_source,
             layer.layer_idx,
@@ -407,10 +501,12 @@ fn run_basic_prefill_layer(
                     anyhow!("Gemma prefill layer metadata is missing PLE input gate shape")
                 })?
                 .rows,
+            projection_rows_per_tile,
         )?;
         let gated = gelu_sequence(&gated)?;
         let gated = mul_sequences(&gated, per_layer_input)?;
-        let projected = project_sequence_with_prefill_source(
+        let projected = call_seq!(
+            project_sequence_with_prefill_source,
             &gated,
             layer_source,
             layer.layer_idx,
@@ -421,6 +517,7 @@ fn run_basic_prefill_layer(
                     anyhow!("Gemma prefill layer metadata is missing PLE layer projection shape")
                 })?
                 .rows,
+            projection_rows_per_tile,
         )?;
         let projected = rms_norm_sequence(
             &projected,
@@ -624,7 +721,7 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
-        let error = run(&input, &source, None).expect_err("self donor should fail");
+        let error = run(&input, &source, None, 1).expect_err("self donor should fail");
 
         assert!(error
             .to_string()
@@ -642,6 +739,30 @@ mod tests {
                 vec![Act::from_num(0.25), Act::from_num(0.75)],
             ],
         );
+    }
+
+    #[test]
+    fn chunked_projection_matches_deterministic_prefill_layer() {
+        let (_path, model) = nonzero_model(false, true);
+        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+            .expect("source should build");
+        let rows = vec![
+            vec![Act::from_num(1.0), Act::from_num(-0.5)],
+            vec![Act::from_num(0.25), Act::from_num(0.75)],
+        ];
+        let input_internal = InternalActivationSequence::from_det_values(rows);
+        let input = activation_sequence_from_internal(input_internal.clone());
+
+        let raster = run(&input, &source, None, 2).expect("raster prefill layer should run");
+        let deterministic = deterministic_tiles::run_internal(input_internal, &model, None)
+            .expect("deterministic prefill layer should run");
+
+        assert_eq!(raster.0.activations, deterministic.0.activations);
+        assert_eq!(
+            raster.0.det_activations_sha256,
+            deterministic.0.det_activations_sha256
+        );
+        assert_eq!(raster.1, deterministic.1);
     }
 
     #[test]
@@ -670,7 +791,7 @@ mod tests {
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let ple_inputs = ple_inputs(vec![vec![Act::from_num(0.5), Act::from_num(0.25)]]);
 
-        let error = run(&input, &source, Some(&ple_inputs)).expect_err("PLE input should fail");
+        let error = run(&input, &source, Some(&ple_inputs), 1).expect_err("PLE input should fail");
 
         assert!(error
             .to_string()
@@ -689,7 +810,7 @@ mod tests {
             Act::from_num(0.125),
         ]]);
 
-        let error = run(&input, &source, Some(&ple_inputs)).expect_err("PLE width should fail");
+        let error = run(&input, &source, Some(&ple_inputs), 1).expect_err("PLE width should fail");
 
         assert!(error
             .to_string()
@@ -723,7 +844,7 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
-        let error = run(&input, &source, None).expect_err("zero layers should fail");
+        let error = run(&input, &source, None, 1).expect_err("zero layers should fail");
 
         assert!(error
             .to_string()
@@ -737,7 +858,7 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(Vec::new());
 
-        let error = run(&input, &source, None).expect_err("empty input should fail");
+        let error = run(&input, &source, None, 1).expect_err("empty input should fail");
 
         assert!(error
             .to_string()
@@ -754,7 +875,7 @@ mod tests {
             crate::shared::transformer_kernels::build_activation_commitment(&[vec![1.0, 0.0]]),
         );
 
-        let error = run(&input, &source, None).expect_err("f32-only input should fail");
+        let error = run(&input, &source, None, 1).expect_err("f32-only input should fail");
 
         assert!(error.to_string().contains("requires canonical activations"));
     }
@@ -782,7 +903,7 @@ mod tests {
         let input_internal = InternalActivationSequence::from_det_values(rows);
         let input = activation_sequence_from_internal(input_internal.clone());
 
-        let raster = run(&input, &source, ple_inputs).expect("raster prefill layer should run");
+        let raster = run(&input, &source, ple_inputs, 1).expect("raster prefill layer should run");
         let deterministic = deterministic_tiles::run_internal(input_internal, model, ple_inputs)
             .expect("deterministic prefill layer should run");
 

@@ -42,8 +42,14 @@ pub fn run_raster(
     input_activations: &ActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    projection_rows_per_tile: usize,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    raster_tiles::run(input_activations, layer_source, ple_inputs)
+    raster_tiles::run(
+        input_activations,
+        layer_source,
+        ple_inputs,
+        projection_rows_per_tile,
+    )
 }
 
 pub(crate) fn run_with_mode_internal(

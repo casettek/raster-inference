@@ -1,15 +1,18 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::raster_authoring::prelude::{
-    auth_read, call_recur_tile_result, call_tile, sequence, tile,
+    auth_read, call_recur_tile_result, call_seq, call_tile, sequence, tile,
 };
 use crate::shared::raster_prefill_ple::{
     AuthenticatedGemmaPleSource, GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest,
-    GemmaPleProjectionNormWeightsRequest, GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
+    GemmaPleModelProjectionRowRequest, GemmaPleProjectionNormWeightsRequest,
+    GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
 };
 use crate::shared::raster_transformer_kernels::{
-    add_sequences, project_sequence_with_source, rms_norm_sequence, scale_sequence,
-    RasterActivationRow, RasterActivationSequence,
+    add_sequences, append_projection_row_to_state, finalize_sequence_projection_state,
+    init_sequence_projection_state, rms_norm_sequence, scale_sequence,
+    validate_projection_rows_per_tile, RasterActivationRow, RasterActivationSequence,
+    RasterSequenceProjectionState,
 };
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, InternalActivationSequence,
@@ -23,6 +26,7 @@ pub struct PrefillPleRasterState {
     layer_count: usize,
     per_layer_inputs: Vec<Option<RasterActivationSequence>>,
     has_ple_global: bool,
+    projection_rows_per_tile: usize,
 }
 
 #[tile]
@@ -30,7 +34,9 @@ pub fn init_prefill_ple_state(
     token_ids: &[u32],
     input_activations: &ActivationSequence,
     ple_source: &AuthenticatedGemmaPleSource,
+    projection_rows_per_tile: usize,
 ) -> Result<PrefillPleRasterState> {
+    validate_projection_rows_per_tile(projection_rows_per_tile)?;
     let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
     if !metadata.has_ple_global {
         return Ok(PrefillPleRasterState {
@@ -40,6 +46,7 @@ pub fn init_prefill_ple_state(
             layer_count: metadata.layer_count,
             per_layer_inputs: Vec::with_capacity(metadata.layer_count),
             has_ple_global: false,
+            projection_rows_per_tile,
         });
     }
 
@@ -88,6 +95,7 @@ pub fn init_prefill_ple_state(
         layer_count: metadata.layer_count,
         per_layer_inputs: Vec::with_capacity(metadata.layer_count),
         has_ple_global: true,
+        projection_rows_per_tile,
     })
 }
 
@@ -121,8 +129,14 @@ pub fn compute_next_prefill_ple_layer(
     let embedded = gather_token_embedding_sequence(&state.token_ids, layer_idx, ple_source)?;
     let embedded = scale_sequence(&embedded, Some(scalars.embedding_scale))?;
 
-    let projected =
-        project_sequence_with_source(input_activations, ple_source, layer_idx, projection_rows)?;
+    let projected = call_seq!(
+        project_sequence_with_source,
+        input_activations,
+        ple_source,
+        layer_idx,
+        projection_rows,
+        state.projection_rows_per_tile
+    )?;
     let projected = scale_sequence(&projected, Some(scalars.projection_scalar))?;
     let projected = rms_norm_sequence(&projected, Some(&norm_weights), Some(scalars.rms_norm_eps))?;
 
@@ -158,17 +172,81 @@ pub fn finalize_prefill_ple_inputs(
     )))
 }
 
+#[tile]
+pub fn init_ple_sequence_projection(
+    input: &RasterActivationSequence,
+    projection_rows: usize,
+    projection_rows_per_tile: usize,
+) -> Result<RasterSequenceProjectionState> {
+    init_sequence_projection_state(input, projection_rows, projection_rows_per_tile)
+}
+
+#[tile(kind = recursive)]
+pub fn project_next_ple_sequence_rows(
+    mut state: RasterSequenceProjectionState,
+    ple_source: &AuthenticatedGemmaPleSource,
+    layer_idx: usize,
+) -> Result<(bool, RasterSequenceProjectionState)> {
+    if state.is_complete() {
+        return Ok((true, state));
+    }
+
+    let end = state
+        .next_row_idx()
+        .saturating_add(state.rows_per_tile())
+        .min(state.projection_rows());
+    while state.next_row_idx() < end {
+        let row = auth_read!(
+            ple_source,
+            GemmaPleModelProjectionRowRequest {
+                layer_idx,
+                row_idx: state.next_row_idx(),
+            },
+        )?;
+        append_projection_row_to_state(&mut state, &row)?;
+    }
+    Ok((false, state))
+}
+
+#[tile]
+pub fn finalize_ple_sequence_projection(
+    state: RasterSequenceProjectionState,
+) -> Result<RasterActivationSequence> {
+    finalize_sequence_projection_state(state)
+}
+
+#[sequence]
+pub fn project_sequence_with_source(
+    input: &RasterActivationSequence,
+    ple_source: &AuthenticatedGemmaPleSource,
+    layer_idx: usize,
+    projection_rows: usize,
+    projection_rows_per_tile: usize,
+) -> Result<RasterActivationSequence> {
+    let state = call_tile!(
+        init_ple_sequence_projection,
+        input,
+        projection_rows,
+        projection_rows_per_tile
+    )?;
+    let state =
+        call_recur_tile_result!(project_next_ple_sequence_rows, state, ple_source, layer_idx)?;
+    call_tile!(finalize_ple_sequence_projection, state)
+}
+
 #[sequence]
 pub fn run(
     token_ids: &[u32],
     input_activations: &ActivationSequence,
     ple_source: &AuthenticatedGemmaPleSource,
+    projection_rows_per_tile: usize,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let state = call_tile!(
         init_prefill_ple_state,
         token_ids,
         input_activations,
-        ple_source
+        ple_source,
+        projection_rows_per_tile
     )?;
     let state = call_recur_tile_result!(compute_next_prefill_ple_layer, state, ple_source)?;
     call_tile!(finalize_prefill_ple_inputs, state)
@@ -245,7 +323,7 @@ mod tests {
         .expect("source should build");
         let input = ActivationSequence::from_values(vec![vec![1.0, 2.0]], "digest".to_string());
 
-        let output = run(&[0], &input, &source).expect("raster PLE should run");
+        let output = run(&[0], &input, &source, 1).expect("raster PLE should run");
 
         assert!(output.is_none());
     }
@@ -263,7 +341,7 @@ mod tests {
         let input = ActivationSequence::from_values(vec![vec![1.0, 2.0]], "digest".to_string());
         let native_model = no_ple_model(2);
 
-        let raster = run(&[0], &input, &source).expect("raster PLE should run");
+        let raster = run(&[0], &input, &source, 1).expect("raster PLE should run");
         let native = crate::prefill_prepare_aux::run(
             &[0],
             &native_model,
@@ -344,6 +422,43 @@ mod tests {
     }
 
     #[test]
+    fn chunked_prefill_ple_projection_matches_native_prefill_ple_computation() {
+        let fixture = PleFixture::new(
+            vec![true],
+            vec![vec![
+                vec![Act::from_num(0.25), Act::from_num(-0.5)],
+                vec![Act::from_num(1.0), Act::from_num(0.5)],
+            ]],
+            vec![vec![
+                vec![Wgt::from_num(0.5), Wgt::from_num(1.0)],
+                vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)],
+            ]],
+        )
+        .expect("fixture should build");
+        let token_ids = [0, 1];
+        let input = activation_sequence(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.5)],
+            vec![Act::from_num(-1.0), Act::from_num(2.0)],
+        ]);
+
+        let raster = run(&token_ids, &input, &fixture.source, 2)
+            .expect("raster PLE should run")
+            .expect("raster PLE inputs");
+        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
+            &token_ids,
+            input.clone_internal(),
+            &fixture.layers,
+            &fixture.native_ple_global,
+            0.0,
+            Some(f32_to_acc(0.0)),
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("native PLE should run");
+
+        assert_eq!(raster.per_layer_inputs, native.per_layer_inputs);
+    }
+
+    #[test]
     fn mixed_ple_and_non_ple_layers_match_native_layout() {
         let fixture = PleFixture::new(
             vec![true, false],
@@ -392,7 +507,8 @@ mod tests {
         let fixture = PleFixture::single_layer().expect("fixture should build");
         let input = activation_sequence(Vec::new());
 
-        let error = run(&[], &input, &fixture.source).expect_err("empty activations should fail");
+        let error =
+            run(&[], &input, &fixture.source, 1).expect_err("empty activations should fail");
 
         assert!(error
             .to_string()
@@ -404,7 +520,7 @@ mod tests {
         let fixture = PleFixture::single_layer().expect("fixture should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
 
-        let error = run(&[0, 1], &input, &fixture.source).expect_err("mismatch should fail");
+        let error = run(&[0, 1], &input, &fixture.source, 1).expect_err("mismatch should fail");
 
         assert!(error
             .to_string()
@@ -592,7 +708,7 @@ mod tests {
         token_ids: &[u32],
         input: &ActivationSequence,
     ) -> (Gemma4PrefillPleInputs, Gemma4PrefillPleInputs) {
-        let raster = run(token_ids, input, &fixture.source)
+        let raster = run(token_ids, input, &fixture.source, 1)
             .expect("raster PLE should run")
             .expect("raster PLE inputs");
         let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(

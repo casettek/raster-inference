@@ -126,6 +126,7 @@ The raster-authored path is opt-in while routines are ported one at a time:
 ```bash
 cargo run -- \
   --raster \
+  --raster-projection-rows-per-tile 1 \
   google/gemma-4-test \
   /path/to/tokenizer.json \
   /path/to/chat_template.jinja \
@@ -133,7 +134,7 @@ cargo run -- \
   "Hello from Raster"
 ```
 
-For now, `--raster` implies the deterministic model/runtime path and routes the implemented raster-authored routines through separate raster tile modules. Prompt preparation, prefill preparation/finalization work, prefill layers, and decode token selection use raster-authored tiles where available. Decode transition still uses the native deterministic path until it is separately converted.
+For now, `--raster` implies the deterministic model/runtime path and routes the implemented raster-authored routines through separate raster tile modules. Prompt preparation, prefill preparation/finalization work, prefill layers, and decode token selection use raster-authored tiles where available. Decode transition still uses the native deterministic path until it is separately converted. Use `--raster-projection-rows-per-tile` to bound how many projection rows a raster projection tile reads at once; lower values reduce zkVM memory pressure, and the default is `1`.
 
 When `--deterministic` is set, the model path must point to either:
 

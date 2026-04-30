@@ -38,8 +38,14 @@ pub fn run_raster(
     prompt_token_ids: &[u32],
     ple_source: &AuthenticatedGemmaPleSource,
     token_embeddings: &ActivationSequence,
+    projection_rows_per_tile: usize,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
-    let ple_inputs = raster_tiles::run(prompt_token_ids, token_embeddings, ple_source)?;
+    let ple_inputs = raster_tiles::run(
+        prompt_token_ids,
+        token_embeddings,
+        ple_source,
+        projection_rows_per_tile,
+    )?;
     trace_prefill_prepare_aux_checkpoint(prompt_token_ids, token_embeddings, ple_inputs.as_ref());
     Ok(ple_inputs)
 }

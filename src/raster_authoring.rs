@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{cell::Cell, marker::PhantomData};
 
 pub use raster_authoring_macros::{sequence, tile};
 
@@ -60,6 +60,31 @@ where
     source.auth_read(request)
 }
 
+thread_local! {
+    static TILE_INVOCATION_COUNT: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+pub fn start_tile_invocation_counting() {
+    TILE_INVOCATION_COUNT.with(|count| count.set(Some(0)));
+}
+
+pub fn stop_tile_invocation_counting() -> Option<u64> {
+    TILE_INVOCATION_COUNT.with(|count| {
+        let total = count.get();
+        count.set(None);
+        total
+    })
+}
+
+#[inline(always)]
+pub fn record_tile_invocation() {
+    TILE_INVOCATION_COUNT.with(|count| {
+        if let Some(total) = count.get() {
+            count.set(Some(total.saturating_add(1)));
+        }
+    });
+}
+
 pub mod prelude {
     pub use crate::{
         auth_read, call_recur_seq, call_recur_tile, call_recur_tile_result, call_seq, call_tile,
@@ -71,10 +96,16 @@ pub mod prelude {
 #[macro_export]
 macro_rules! call_tile {
     ($tile:ident $(,)?) => {
-        $tile()
+        {
+            $crate::raster_authoring::record_tile_invocation();
+            $tile()
+        }
     };
     ($tile:ident, $($args:expr),+ $(,)?) => {
-        $tile($($args),+)
+        {
+            $crate::raster_authoring::record_tile_invocation();
+            $tile($($args),+)
+        }
     };
 }
 
@@ -140,6 +171,7 @@ macro_rules! __raster_authoring_run_recur_tile {
     ($tile:ident, $state:expr $(,)?) => {{
         let mut state = $state;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state) = $tile(state);
             if done {
                 break next_state;
@@ -151,6 +183,7 @@ macro_rules! __raster_authoring_run_recur_tile {
         let mut state_a = $state_a;
         let mut state_b = $state_b;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state_a, next_state_b) = $tile(state_a, state_b);
             if done {
                 break (next_state_a, next_state_b);
@@ -164,6 +197,7 @@ macro_rules! __raster_authoring_run_recur_tile {
         let mut state_b = $state_b;
         let mut state_c = $state_c;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state_a, next_state_b, next_state_c) = $tile(state_a, state_b, state_c);
             if done {
                 break (next_state_a, next_state_b, next_state_c);
@@ -179,6 +213,7 @@ macro_rules! __raster_authoring_run_recur_tile {
         let mut state_c = $state_c;
         let mut state_d = $state_d;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state_a, next_state_b, next_state_c, next_state_d) =
                 $tile(state_a, state_b, state_c, state_d);
             if done {
@@ -197,6 +232,7 @@ macro_rules! __raster_authoring_run_recur_tile_result {
     ($tile:ident, $state:expr $(,)?) => {{
         let mut state = $state;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state) = match $tile(state) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -210,6 +246,7 @@ macro_rules! __raster_authoring_run_recur_tile_result {
     ($tile:ident, $state:expr, $($context:expr),+ $(,)?) => {{
         let mut state = $state;
         loop {
+            $crate::raster_authoring::record_tile_invocation();
             let (done, next_state) = match $tile(state, $($context),+) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -455,5 +492,30 @@ mod tests {
             .expect_err("recursive tile should fail");
 
         assert!(error.to_string().contains("step failed"));
+    }
+
+    #[test]
+    fn tile_invocation_counter_counts_tiles_only_while_enabled() {
+        assert_eq!(call_tile!(add_one, 1), 2);
+        assert_eq!(super::stop_tile_invocation_counting(), None);
+
+        super::start_tile_invocation_counting();
+        assert_eq!(call_tile!(add_one, 1), 2);
+        assert_eq!(call_seq!(add_sequence, 1), 2);
+        assert_eq!(call_recur_tile!(double_until_at_least_ten, 2), 16);
+
+        assert_eq!(super::stop_tile_invocation_counting(), Some(6));
+        assert_eq!(super::stop_tile_invocation_counting(), None);
+    }
+
+    #[test]
+    fn tile_invocation_counter_counts_fallible_failed_step() {
+        super::start_tile_invocation_counting();
+
+        let error = call_recur_tile_result!(fallible_step_that_fails, 0)
+            .expect_err("recursive tile should fail");
+
+        assert!(error.to_string().contains("step failed"));
+        assert_eq!(super::stop_tile_invocation_counting(), Some(3));
     }
 }

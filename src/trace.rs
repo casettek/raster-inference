@@ -69,6 +69,11 @@ pub fn phase_paused(phase_id: PhaseId) {
     emit_phase("pause", phase_id);
 }
 
+pub fn raster_tile_invocations_finished(total: u64) {
+    let elapsed = process_start().elapsed().as_secs_f64();
+    eprintln!("[raster-tiles +{elapsed:>8.3}s] total {total}");
+}
+
 pub fn with_checkpointing_enabled<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
     CHECKPOINTING_ENABLED.with(|checkpointing_enabled| {
         let previous = checkpointing_enabled.replace(enabled);

@@ -303,6 +303,114 @@ pub fn project_sequence(
     ))
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterSequenceProjectionState {
+    input: RasterActivationSequence,
+    next_row_idx: usize,
+    projection_rows: usize,
+    rows_per_tile: usize,
+    output_act_bits: Vec<Vec<i32>>,
+}
+
+impl RasterSequenceProjectionState {
+    pub fn next_row_idx(&self) -> usize {
+        self.next_row_idx
+    }
+
+    pub fn projection_rows(&self) -> usize {
+        self.projection_rows
+    }
+
+    pub fn rows_per_tile(&self) -> usize {
+        self.rows_per_tile
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.next_row_idx >= self.projection_rows
+    }
+}
+
+pub fn validate_projection_rows_per_tile(rows_per_tile: usize) -> Result<()> {
+    if rows_per_tile == 0 {
+        bail!("raster projection rows per tile must be greater than zero");
+    }
+    Ok(())
+}
+
+pub fn init_sequence_projection_state(
+    input: &RasterActivationSequence,
+    projection_rows: usize,
+    rows_per_tile: usize,
+) -> Result<RasterSequenceProjectionState> {
+    if projection_rows == 0 {
+        bail!("deterministic linear projection requires at least one projection row");
+    }
+    validate_projection_rows_per_tile(rows_per_tile)?;
+    sequence_width(input)?;
+
+    Ok(RasterSequenceProjectionState {
+        input: input.clone(),
+        next_row_idx: 0,
+        projection_rows,
+        rows_per_tile,
+        output_act_bits: vec![Vec::with_capacity(projection_rows); input.len()],
+    })
+}
+
+pub fn append_projection_row_to_state(
+    state: &mut RasterSequenceProjectionState,
+    projection_row: &[Wgt],
+) -> Result<()> {
+    if state.is_complete() {
+        bail!(
+            "raster projection already completed {} rows",
+            state.projection_rows
+        );
+    }
+    if state.output_act_bits.len() != state.input.len() {
+        bail!(
+            "raster projection state has {} output rows for {} input rows",
+            state.output_act_bits.len(),
+            state.input.len()
+        );
+    }
+
+    for (token_idx, input_row) in state.input.rows().iter().enumerate() {
+        let projected = project_row_with_weights(input_row, projection_row)?;
+        state.output_act_bits[token_idx].push(projected.to_bits());
+    }
+    state.next_row_idx += 1;
+    Ok(())
+}
+
+pub fn finalize_sequence_projection_state(
+    state: RasterSequenceProjectionState,
+) -> Result<RasterActivationSequence> {
+    if state.next_row_idx != state.projection_rows {
+        bail!(
+            "raster projection completed {} rows, expected {}",
+            state.next_row_idx,
+            state.projection_rows
+        );
+    }
+    if let Some((row_idx, row)) = state
+        .output_act_bits
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.len() != state.projection_rows)
+    {
+        bail!(
+            "raster projection output row {row_idx} has width {}, expected {}",
+            row.len(),
+            state.projection_rows
+        );
+    }
+
+    Ok(RasterActivationSequence::from_act_bits(
+        state.output_act_bits,
+    ))
+}
+
 pub fn project_sequence_with_source<S>(
     input: &RasterActivationSequence,
     source: &S,
@@ -312,18 +420,37 @@ pub fn project_sequence_with_source<S>(
 where
     S: AuthRead<GemmaPleModelProjectionRowRequest, Output = Vec<Wgt>>,
 {
-    if projection_rows == 0 {
-        bail!("deterministic linear projection requires at least one projection row");
-    }
+    project_sequence_with_source_chunked(input, source, layer_idx, projection_rows, projection_rows)
+}
 
-    let mut rows = Vec::with_capacity(projection_rows);
-    for row_idx in 0..projection_rows {
-        rows.push(auth_read!(
-            source,
-            GemmaPleModelProjectionRowRequest { layer_idx, row_idx }
-        )?);
+pub fn project_sequence_with_source_chunked<S>(
+    input: &RasterActivationSequence,
+    source: &S,
+    layer_idx: usize,
+    projection_rows: usize,
+    rows_per_tile: usize,
+) -> Result<RasterActivationSequence>
+where
+    S: AuthRead<GemmaPleModelProjectionRowRequest, Output = Vec<Wgt>>,
+{
+    let mut state = init_sequence_projection_state(input, projection_rows, rows_per_tile)?;
+    while !state.is_complete() {
+        let end = state
+            .next_row_idx()
+            .saturating_add(state.rows_per_tile())
+            .min(state.projection_rows());
+        while state.next_row_idx() < end {
+            let row = auth_read!(
+                source,
+                GemmaPleModelProjectionRowRequest {
+                    layer_idx,
+                    row_idx: state.next_row_idx(),
+                }
+            )?;
+            append_projection_row_to_state(&mut state, &row)?;
+        }
     }
-    project_sequence(input, &rows)
+    finalize_sequence_projection_state(state)
 }
 
 pub(crate) fn det_num_tensor_slice_row_wgts(
@@ -387,22 +514,46 @@ pub fn project_sequence_with_prefill_source<S>(
 where
     S: AuthRead<GemmaPrefillLayerMatrixRowRequest, Output = Vec<Wgt>>,
 {
-    if projection_rows == 0 {
-        bail!("deterministic linear projection requires at least one projection row");
-    }
+    project_sequence_with_prefill_source_chunked(
+        input,
+        source,
+        layer_idx,
+        matrix,
+        projection_rows,
+        projection_rows,
+    )
+}
 
-    let mut rows = Vec::with_capacity(projection_rows);
-    for row_idx in 0..projection_rows {
-        rows.push(auth_read!(
-            source,
-            GemmaPrefillLayerMatrixRowRequest {
-                layer_idx,
-                matrix,
-                row_idx,
-            }
-        )?);
+pub fn project_sequence_with_prefill_source_chunked<S>(
+    input: &RasterActivationSequence,
+    source: &S,
+    layer_idx: usize,
+    matrix: GemmaPrefillLayerMatrixKind,
+    projection_rows: usize,
+    rows_per_tile: usize,
+) -> Result<RasterActivationSequence>
+where
+    S: AuthRead<GemmaPrefillLayerMatrixRowRequest, Output = Vec<Wgt>>,
+{
+    let mut state = init_sequence_projection_state(input, projection_rows, rows_per_tile)?;
+    while !state.is_complete() {
+        let end = state
+            .next_row_idx()
+            .saturating_add(state.rows_per_tile())
+            .min(state.projection_rows());
+        while state.next_row_idx() < end {
+            let row = auth_read!(
+                source,
+                GemmaPrefillLayerMatrixRowRequest {
+                    layer_idx,
+                    matrix,
+                    row_idx: state.next_row_idx(),
+                }
+            )?;
+            append_projection_row_to_state(&mut state, &row)?;
+        }
     }
-    project_sequence(input, &rows)
+    finalize_sequence_projection_state(state)
 }
 
 pub fn rms_norm_sequence(
@@ -1020,9 +1171,10 @@ mod tests {
         add_sequences, apply_rope_to_heads, attention_output_row, build_raster_kv_cache,
         causal_attention_heads, causal_attention_heads_with_cache, combine_attention_heads,
         gelu_sequence, mul_sequences, project_sequence, project_sequence_with_prefill_source,
-        project_sequence_with_source, reshape_sequence_heads, rms_norm_heads, rms_norm_sequence,
-        scale_sequence, value_rms_norm_heads, RasterActivationRow, RasterActivationSequence,
-        RasterAttentionHeadSequence, RasterKvCache,
+        project_sequence_with_prefill_source_chunked, project_sequence_with_source,
+        project_sequence_with_source_chunked, reshape_sequence_heads, rms_norm_heads,
+        rms_norm_sequence, scale_sequence, value_rms_norm_heads, RasterActivationRow,
+        RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
     };
     use crate::raster_authoring::AuthRead;
     use crate::shared::det_num::{
@@ -1143,6 +1295,41 @@ mod tests {
     }
 
     #[test]
+    fn projection_chunk_size_does_not_change_output() {
+        let source = ProjectionSource::new(HashMap::from([
+            ((0, 0), vec![Wgt::from_num(0.5), Wgt::from_num(1.0)]),
+            ((0, 1), vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)]),
+            ((0, 2), vec![Wgt::from_num(2.0), Wgt::from_num(-2.0)]),
+        ]));
+        let input = RasterActivationSequence::from_acts(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.5)],
+            vec![Act::from_num(-1.0), Act::from_num(2.0)],
+        ]);
+
+        let one_row =
+            project_sequence_with_source_chunked(&input, &source, 0, 3, 1).expect("project");
+        let two_rows =
+            project_sequence_with_source_chunked(&input, &source, 0, 3, 2).expect("project");
+        let oversized =
+            project_sequence_with_source_chunked(&input, &source, 0, 3, 10).expect("project");
+
+        assert_eq!(scaled_bits(&one_row), scaled_bits(&two_rows));
+        assert_eq!(scaled_bits(&one_row), scaled_bits(&oversized));
+    }
+
+    #[test]
+    fn projection_rejects_zero_rows_per_tile() {
+        let source = ProjectionSource::new(HashMap::new());
+        let input =
+            RasterActivationSequence::from_acts(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+
+        let error = project_sequence_with_source_chunked(&input, &source, 0, 1, 0)
+            .expect_err("zero rows per tile should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
     fn prefill_projection_can_read_rows_from_authenticated_source() {
         let source = PrefillProjectionSource::new(HashMap::from([
             (
@@ -1173,6 +1360,49 @@ mod tests {
                 Act::from_num(-0.875).to_bits(),
             ]]
         );
+    }
+
+    #[test]
+    fn prefill_projection_chunk_size_does_not_change_output() {
+        let source = PrefillProjectionSource::new(HashMap::from([
+            (
+                (0, GemmaPrefillLayerMatrixKind::Query, 0),
+                vec![Wgt::from_num(0.5), Wgt::from_num(1.0)],
+            ),
+            (
+                (0, GemmaPrefillLayerMatrixKind::Query, 1),
+                vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)],
+            ),
+            (
+                (0, GemmaPrefillLayerMatrixKind::Query, 2),
+                vec![Wgt::from_num(2.0), Wgt::from_num(-2.0)],
+            ),
+        ]));
+        let input = RasterActivationSequence::from_acts(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.5)],
+            vec![Act::from_num(-1.0), Act::from_num(2.0)],
+        ]);
+
+        let one_row = project_sequence_with_prefill_source_chunked(
+            &input,
+            &source,
+            0,
+            GemmaPrefillLayerMatrixKind::Query,
+            3,
+            1,
+        )
+        .expect("project");
+        let two_rows = project_sequence_with_prefill_source_chunked(
+            &input,
+            &source,
+            0,
+            GemmaPrefillLayerMatrixKind::Query,
+            3,
+            2,
+        )
+        .expect("project");
+
+        assert_eq!(scaled_bits(&one_row), scaled_bits(&two_rows));
     }
 
     #[test]

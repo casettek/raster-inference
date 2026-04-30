@@ -48,12 +48,14 @@ pub fn run_raster(
     finalize_source: &crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource,
     final_hidden_states: ActivationSequence,
     layer_caches: Vec<LayerKvCache>,
+    projection_rows_per_tile: usize,
 ) -> Result<TransformerPrefillResult> {
     raster_tiles::run(
         prompt_token_ids,
         final_hidden_states,
         layer_caches,
         finalize_source,
+        projection_rows_per_tile,
     )
 }
 
