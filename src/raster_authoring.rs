@@ -87,9 +87,9 @@ pub fn record_tile_invocation() {
 
 pub mod prelude {
     pub use crate::{
-        auth_read, call_recur_seq, call_recur_tile, call_recur_tile_result, call_seq, call_tile,
-        external, raster_authoring::sequence, raster_authoring::tile, raster_authoring::AuthRead,
-        raster_authoring::External, raster_authoring::ExternalRef,
+        auth_read, call_recur_seq, call_recur_seq_result, call_recur_tile, call_recur_tile_result,
+        call_seq, call_tile, external, raster_authoring::sequence, raster_authoring::tile,
+        raster_authoring::AuthRead, raster_authoring::External, raster_authoring::ExternalRef,
     };
 }
 
@@ -152,6 +152,16 @@ macro_rules! call_recur_seq {
     };
     ($sequence:ident, $($args:expr),+ $(,)?) => {
         $crate::__raster_authoring_run_recur_sequence!($sequence, $($args),+)
+    };
+}
+
+#[macro_export]
+macro_rules! call_recur_seq_result {
+    ($sequence:ident, $state:expr $(,)?) => {
+        $crate::__raster_authoring_run_recur_sequence_result!($sequence, $state)
+    };
+    ($sequence:ident, $state:expr, $($context:expr),+ $(,)?) => {
+        $crate::__raster_authoring_run_recur_sequence_result!($sequence, $state, $($context),+)
     };
 }
 
@@ -327,6 +337,38 @@ macro_rules! __raster_authoring_run_recur_sequence {
     }};
 }
 
+#[macro_export]
+macro_rules! __raster_authoring_run_recur_sequence_result {
+    ($sequence:ident, $state:expr $(,)?) => {{
+        let mut state = $state;
+        loop {
+            $crate::raster_authoring::record_tile_invocation();
+            let (done, next_state) = match $sequence(state) {
+                Ok(next) => next,
+                Err(error) => break Err(error),
+            };
+            if done {
+                break Ok(next_state);
+            }
+            state = next_state;
+        }
+    }};
+    ($sequence:ident, $state:expr, $($context:expr),+ $(,)?) => {{
+        let mut state = $state;
+        loop {
+            $crate::raster_authoring::record_tile_invocation();
+            let (done, next_state) = match $sequence(state, $($context),+) {
+                Ok(next) => next,
+                Err(error) => break Err(error),
+            };
+            if done {
+                break Ok(next_state);
+            }
+            state = next_state;
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use crate::raster_authoring::prelude::*;
@@ -424,6 +466,35 @@ mod tests {
         }
     }
 
+    #[sequence(kind = recur)]
+    fn fallible_add_sequence_until_at_least_ten(value: u32) -> anyhow::Result<(bool, u32)> {
+        let value = call_tile!(add_one, value);
+
+        if value >= 10 {
+            Ok((true, value))
+        } else {
+            Ok((false, value))
+        }
+    }
+
+    #[sequence(kind = recur)]
+    fn fallible_add_sequence_until_goal(current: u64, goal: u64) -> anyhow::Result<(bool, u64)> {
+        if current >= goal {
+            Ok((true, current))
+        } else {
+            Ok((false, current + 1))
+        }
+    }
+
+    #[sequence(kind = recur)]
+    fn fallible_sequence_step_that_fails(value: u32) -> anyhow::Result<(bool, u32)> {
+        if value >= 2 {
+            anyhow::bail!("sequence step failed");
+        }
+
+        Ok((false, call_tile!(add_one, value)))
+    }
+
     #[test]
     fn call_tile_invokes_tile_function() {
         assert_eq!(call_tile!(add_one, 41), 42);
@@ -505,6 +576,30 @@ mod tests {
     }
 
     #[test]
+    fn fallible_recursive_sequence_macro_runs_until_done() {
+        let value = call_recur_seq_result!(fallible_add_sequence_until_at_least_ten, 7)
+            .expect("recursive sequence");
+
+        assert_eq!(value, 10);
+    }
+
+    #[test]
+    fn fallible_recursive_sequence_macro_accepts_context() {
+        let value = call_recur_seq_result!(fallible_add_sequence_until_goal, 0, 3)
+            .expect("recursive sequence");
+
+        assert_eq!(value, 3);
+    }
+
+    #[test]
+    fn fallible_recursive_sequence_macro_propagates_errors() {
+        let error = call_recur_seq_result!(fallible_sequence_step_that_fails, 0)
+            .expect_err("recursive sequence should fail");
+
+        assert!(error.to_string().contains("sequence step failed"));
+    }
+
+    #[test]
     fn tile_invocation_counter_counts_tiles_and_sequences_only_while_enabled() {
         assert_eq!(call_tile!(add_one, 1), 2);
         assert_eq!(super::stop_tile_invocation_counting(), None);
@@ -528,5 +623,16 @@ mod tests {
 
         assert!(error.to_string().contains("step failed"));
         assert_eq!(super::stop_tile_invocation_counting(), Some(3));
+    }
+
+    #[test]
+    fn tile_invocation_counter_counts_fallible_failed_sequence_step() {
+        super::start_tile_invocation_counting();
+
+        let error = call_recur_seq_result!(fallible_sequence_step_that_fails, 0)
+            .expect_err("recursive sequence should fail");
+
+        assert!(error.to_string().contains("sequence step failed"));
+        assert_eq!(super::stop_tile_invocation_counting(), Some(5));
     }
 }
