@@ -4,10 +4,10 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::raster_authoring::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
-use crate::shared::raster_transformer_kernels::det_num_tensor_slice_row_wgts;
+use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
 use crate::shared::transformer::{
-    DetNumMatrix, DetNumTensorSliceSource, Gemma4LogitsProjection, Gemma4ModelProvenance,
-    Gemma4TransformerModel, GemmaEmbeddingTensorSource,
+    DetNumMatrix, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
+    GemmaEmbeddingTensorSource,
 };
 
 #[derive(Debug, Clone)]
@@ -22,7 +22,6 @@ pub struct AuthenticatedGemmaPrefillFinalizeSource {
 #[derive(Debug, Clone)]
 enum GemmaPrefillFinalizeProjectionBacking {
     Matrix(Arc<DetNumMatrix>),
-    TensorSlice(DetNumTensorSliceSource),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -154,9 +153,6 @@ impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest>
             GemmaPrefillFinalizeProjectionBacking::Matrix(matrix) => {
                 matrix_row_wgts(matrix, request.row_idx, "lm_head")
             }
-            GemmaPrefillFinalizeProjectionBacking::TensorSlice(source) => {
-                det_num_tensor_slice_row_wgts(source, request.row_idx, "finalize tied embedding")
-            }
         }
     }
 }
@@ -203,20 +199,30 @@ fn canonical_projection_backing(
             det_weight: None, ..
         } => bail!("deterministic raster prefill finalize requires canonical lm_head det_weight"),
         Gemma4LogitsProjection::TiedEmbedding(_) => {
-            let source = match model.embedding_source.as_ref() {
-                Some(GemmaEmbeddingTensorSource::Deterministic { source, .. }) => source,
+            let matrix = match model.embedding_source.as_ref() {
+                Some(GemmaEmbeddingTensorSource::Deterministic { .. }) => {
+                    crate::io::materialize_det_num_embedding_matrix(
+                        model
+                            .embedding_source
+                            .as_ref()
+                            .expect("embedding source should exist"),
+                    )?
+                    .ok_or_else(|| {
+                        anyhow!("deterministic raster tied embedding logits require canonical embedding matrix")
+                    })?
+                }
                 Some(_) | None => {
                     bail!(
                         "deterministic raster tied embedding logits require a .detwgt embedding source"
                     )
                 }
             };
-            validate_det_source_shape(source, "tied embedding")?;
+            validate_det_matrix_shape(&matrix, "tied embedding")?;
             Ok((
                 GemmaPrefillFinalizeProjectionKind::TiedEmbedding,
-                source.row_count,
-                source.col_count,
-                GemmaPrefillFinalizeProjectionBacking::TensorSlice(source.clone()),
+                matrix.rows,
+                matrix.cols,
+                GemmaPrefillFinalizeProjectionBacking::Matrix(matrix),
             ))
         }
     }
@@ -239,31 +245,8 @@ fn validate_det_matrix_shape(matrix: &DetNumMatrix, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_det_source_shape(source: &DetNumTensorSliceSource, label: &str) -> Result<()> {
-    if source.row_count == 0 || source.col_count == 0 {
-        bail!("Gemma prefill finalize {label} matrix must have non-zero shape");
-    }
-    Ok(())
-}
-
 fn matrix_row_wgts(matrix: &DetNumMatrix, row_idx: usize, label: &str) -> Result<Vec<Wgt>> {
-    if row_idx >= matrix.rows {
-        bail!(
-            "Gemma prefill finalize {label} row {row_idx} is out of range for {} rows",
-            matrix.rows
-        );
-    }
-    let start = row_idx
-        .checked_mul(matrix.cols)
-        .ok_or_else(|| anyhow!("Gemma prefill finalize {label} row offset overflowed"))?;
-    let end = start
-        .checked_add(matrix.cols)
-        .ok_or_else(|| anyhow!("Gemma prefill finalize {label} row range overflowed"))?;
-    Ok(matrix.values[start..end]
-        .iter()
-        .copied()
-        .map(Wgt::from_bits)
-        .collect())
+    det_num_matrix_row_wgts(matrix, row_idx, label)
 }
 
 #[cfg(test)]

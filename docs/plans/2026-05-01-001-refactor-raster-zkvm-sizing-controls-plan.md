@@ -100,7 +100,7 @@ This plan turns those observations into a sequence of implementation-ready work 
 | Control | Primary bound | Applies to | Initial default |
 |---|---:|---|---:|
 | `--raster-projection-rows-per-tile` | projection weight rows | sequence projections and logits projection | existing default `1` |
-| `--raster-attention-kv-rows-per-tile` | visible key/value rows per query-row step | attention score/softmax/weighted-sum work | start with full visible window until implemented, then conservative value such as `32` or `64` |
+| `--raster-attention-kv-rows-per-tile` | visible key/value or score/weight rows per attention step | attention score collection, softmax passes, and weighted-sum work | conservative default `32` |
 | `--raster-sequence-rows-per-tile` | activation sequence rows | RMSNorm, GELU, scale, add, mul | optional; default `1` |
 | `--raster-head-rows-per-tile` | head/token rows | head RMSNorm, value norm, RoPE, reshape, combine, KV build | optional; default `1` |
 | `--raster-materialize-rows-per-tile` | rows materialized per tile | finalization/checkpoint materialization if needed | optional; no behavior until materialization is chunked |
@@ -192,16 +192,16 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 **Units:** U4 plus the public/control pieces of U1 needed for `--raster-attention-kv-rows-per-tile`.
 
-**Goal:** Add the attention equivalent of projection chunking: a knob that bounds visible key/value rows consumed per tile invocation.
+**Goal:** Add the attention equivalent of projection chunking: a knob that bounds visible key/value rows and per-query softmax score/weight rows consumed per tile invocation.
 
 **Implementation guidance:**
 - Preserve attention arithmetic exactly. Treat softmax/reduction ordering as the main correctness risk.
-- If streaming accumulation is risky, split the operation into explicit score collection and weighted-sum phases with committed intermediate refs rather than forcing a clever one-pass algorithm.
+- Split softmax into explicit bounded phases over committed score/weight refs rather than forcing a clever one-pass algorithm.
 - Add the CLI flag only when attention actually honors it.
 
 **Exit criteria:**
 - Attention outputs match current behavior for chunk size `1`, small values, and oversized values.
-- For a given query tile, key/value row reads are bounded by `raster_attention_kv_rows_per_tile`.
+- For a given query tile, key/value row reads and softmax score/weight row reads are bounded by `raster_attention_kv_rows_per_tile`.
 - Existing prefill-layer parity tests pass.
 
 ### Phase 5: Thread refs through full prefill orchestration
@@ -386,10 +386,10 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 **Approach:**
 - Extend attention state with a cursor over the visible KV window for the current `(query_head_idx, query_token_idx)`.
-- Accumulate enough deterministic intermediate state to combine chunked attention scores and values without changing arithmetic semantics.
+- Accumulate enough deterministic intermediate state to combine chunked attention scores, softmax weights, and values without changing arithmetic semantics.
 - Preserve grouped KV mapping and donor-cache behavior.
 - Start conservative: one query row remains the outer unit; KV-window chunks become the inner unit.
-- If exact streaming softmax is too risky for this pass, split into explicit score-collection and weighted-sum phases with committed intermediate refs.
+- Split exact softmax into bounded max, exponent-sum, raw-weight, residual-correction, and weighted-sum phases over committed intermediate refs.
 
 **Patterns to follow:**
 - `compute_next_attention_row` in `src/shared/raster_transformer_kernels.rs`.
@@ -400,11 +400,12 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 - Happy path: sliding-window attention respects the smaller of window size and chunk size.
 - Happy path: donor-cache attention reads from cache refs and matches current donor-cache output.
 - Edge case: first token with a one-row visible window works with any positive chunk size.
+- Edge case: equal max logits across chunk boundaries preserve first-max residual correction.
 - Error path: zero `kv_rows_per_tile` fails closed.
 - Error path: malformed refs or mismatched query/key/value shapes fail closed.
 
 **Verification:**
-- For a given query tile invocation, the number of key/value rows read is bounded by `raster_attention_kv_rows_per_tile`.
+- For a given query tile invocation, key/value reads and softmax score/weight row passes are bounded by `raster_attention_kv_rows_per_tile`.
 
 ---
 

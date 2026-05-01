@@ -2,6 +2,8 @@ use anyhow::Result;
 
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
+use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
+use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence,
     LayerKvCache,
@@ -45,7 +47,30 @@ pub fn run_raster(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    raster_tiles::run(input_activations, layer_source, ple_inputs, raster_sizing)
+    // Compatibility entry point for callers that still hold materialized PLE
+    // inputs. The proof-shaped raster path should use `run_raster_with_store`.
+    raster_tiles::run_materialized_compat(
+        input_activations,
+        layer_source,
+        ple_inputs,
+        raster_sizing,
+    )
+}
+
+pub fn run_raster_with_store(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_activations: &ActivationSequence,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    raster_sizing: RasterSizingControls,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    raster_tiles::run_with_store(
+        store,
+        input_activations,
+        layer_source,
+        ple_input_refs,
+        raster_sizing,
+    )
 }
 
 pub(crate) fn run_with_mode_internal(

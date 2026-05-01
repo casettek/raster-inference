@@ -2,7 +2,8 @@ use std::{mem::size_of, panic};
 
 use super::{
     acc_add_sat, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first,
-    attention_score, attention_softmax, attention_weighted_sum, clip_act, div_acc_by_u32, div_act,
+    attention_score, attention_softmax, attention_softmax_exp_term, attention_softmax_raw_weight,
+    attention_softmax_residual, attention_weighted_sum, clip_act, div_acc_by_u32, div_act,
     f32_to_acc, f32_to_act, f32_to_wgt, gelu_pytorch_tanh_act, mac, mac_bits, mul_sat, mul_wide,
     requantize, rms_norm, rms_norm_scale, rope_rotate_pairs, rshift_round_ties_even, scale_act,
     softcap_act, sub_sat, tanh_act, types::ACC_FRACTIONAL_BITS, types::ACT_FRACTIONAL_BITS,
@@ -522,6 +523,45 @@ fn attention_softmax_matches_contract_vectors() {
             .collect::<Vec<_>>(),
         vec![21_846, 21_845, 21_845]
     );
+}
+
+#[test]
+fn attention_softmax_helpers_reconstruct_contract_vectors() {
+    for logits in [
+        vec![Act::from_num(0.0), Act::from_num(0.0)],
+        vec![Act::from_num(0.0), Act::from_bits(-45_426)],
+        vec![Act::from_num(0.0), Act::from_num(0.0), Act::from_num(0.0)],
+        vec![Act::from_num(-1.0), Act::from_num(2.0), Act::from_num(2.0)],
+    ] {
+        let max_index = argmax_first(&logits);
+        let max_logit = logits[max_index];
+        let exp_terms = logits
+            .iter()
+            .map(|logit| attention_softmax_exp_term(*logit, max_logit))
+            .collect::<Vec<_>>();
+        let sum_exp = exp_terms
+            .iter()
+            .copied()
+            .fold(Acc::from_bits(0), acc_add_sat);
+        let mut weights = exp_terms
+            .iter()
+            .map(|term| attention_softmax_raw_weight(*term, sum_exp))
+            .collect::<Vec<_>>();
+        let summed_weights = weights.iter().copied().fold(Act::from_bits(0), add_sat);
+        let residual = attention_softmax_residual(summed_weights);
+        weights[max_index] = add_sat(weights[max_index], residual);
+
+        assert_eq!(
+            weights
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            attention_softmax(&logits)
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]

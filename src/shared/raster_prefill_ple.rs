@@ -2,7 +2,8 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::raster_authoring::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
-use crate::shared::raster_transformer_kernels::det_num_tensor_slice_row_wgts;
+use crate::shared::raster_row_store::RasterActivationSequenceRef;
+use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
 use crate::shared::transformer::{
     Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
 };
@@ -40,6 +41,71 @@ pub struct GemmaPleMetadata {
     pub token_embedding_layer_count: usize,
     pub model_projection_layer_count: usize,
     pub projection_norm_width: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterPrefillPleInputRefs {
+    source_id: String,
+    layer_count: usize,
+    token_count: usize,
+    per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
+}
+
+impl RasterPrefillPleInputRefs {
+    pub fn new(
+        source_id: impl Into<String>,
+        layer_count: usize,
+        token_count: usize,
+        per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
+    ) -> Result<Self> {
+        let source_id = validate_identifier(source_id.into())?;
+        if layer_count == 0 {
+            bail!("raster PLE input refs require at least one layer");
+        }
+        if token_count == 0 {
+            bail!("raster PLE input refs require at least one token");
+        }
+        if per_layer_inputs.len() != layer_count {
+            bail!(
+                "raster PLE input refs received {} layers, expected {layer_count}",
+                per_layer_inputs.len()
+            );
+        }
+        Ok(Self {
+            source_id,
+            layer_count,
+            token_count,
+            per_layer_inputs,
+        })
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    pub fn per_layer_inputs(&self) -> &[Option<RasterActivationSequenceRef>] {
+        &self.per_layer_inputs
+    }
+
+    pub fn clone_layer_ref(&self, layer_idx: usize) -> Result<Option<RasterActivationSequenceRef>> {
+        self.per_layer_inputs
+            .get(layer_idx)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "raster PLE input ref layer {layer_idx} is out of range for {} layers",
+                    self.layer_count
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -327,19 +393,17 @@ impl AuthRead<GemmaPleModelProjectionRowRequest> for AuthenticatedGemmaPleSource
                     )
                 }),
             GemmaPleBacking::Model(ple_global) => {
-                let source = ple_global
-                    .model_projections
-                    .get(request.layer_idx)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Gemma PLE model projection layer {} is out of range",
-                            request.layer_idx
-                        )
-                    })?;
-                let Gemma4PleMatrixSource::DetNumLazy(source) = source else {
-                    bail!("deterministic raster PLE model projection row requires .detwgt backing");
-                };
-                det_num_tensor_slice_row_wgts(source, request.row_idx, "PLE model projection")
+                let matrix = crate::io::materialize_det_num_ple_model_projection(
+                    ple_global,
+                    request.layer_idx,
+                )?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "deterministic raster PLE model projection layer {} requires canonical matrix",
+                        request.layer_idx
+                    )
+                })?;
+                det_num_matrix_row_wgts(&matrix, request.row_idx, "PLE model projection")
             }
         }
     }

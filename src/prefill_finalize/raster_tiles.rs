@@ -9,6 +9,9 @@ use crate::shared::raster_prefill_finalize::{
     GemmaPrefillFinalizeNormWeightsRequest, GemmaPrefillFinalizeProjectionRowRequest,
     GemmaPrefillFinalizeScalarsRequest,
 };
+use crate::shared::raster_row_store::{
+    AuthenticatedRasterTensorStore, RasterProjectionOutputBuilderRef, RasterTensorId,
+};
 use crate::shared::raster_transformer_kernels::{
     project_row_with_weights, rms_norm_sequence, validate_projection_rows_per_tile,
     RasterActivationRow, RasterActivationSequence,
@@ -22,15 +25,23 @@ pub struct PrefillFinalizeRasterState {
     normalized_final_position: RasterActivationRow,
     next_logit_idx: usize,
     logit_count: usize,
-    logit_bits: Vec<i32>,
+    output_builder_ref: RasterProjectionOutputBuilderRef,
     softcap_bits: Option<i32>,
     projection_rows_per_tile: usize,
+}
+
+#[tile]
+pub fn init_prefill_finalize_store() -> AuthenticatedRasterTensorStore {
+    AuthenticatedRasterTensorStore::new()
 }
 
 #[tile]
 pub fn select_final_position(
     final_hidden_states: &ActivationSequence,
 ) -> Result<RasterActivationRow> {
+    // Public compatibility boundary: prefill.layer has already produced the
+    // materialized final hidden state returned by the native API. zkVM-target
+    // layer substeps should consume refs before this point.
     let internal = final_hidden_states.clone_internal();
     let det_rows = internal.det_values().ok_or_else(|| {
         anyhow!("deterministic raster prefill finalize requires canonical final hidden activations")
@@ -62,6 +73,7 @@ pub fn normalize_final_position(
 
 #[tile]
 pub fn init_prefill_finalize_projection(
+    store: &mut AuthenticatedRasterTensorStore,
     normalized_final_position: RasterActivationRow,
     finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
     projection_rows_per_tile: usize,
@@ -87,11 +99,16 @@ pub fn init_prefill_finalize_projection(
     }
 
     let scalars = auth_read!(finalize_source, GemmaPrefillFinalizeScalarsRequest)?;
+    let output_builder_ref = store.start_projection_output_builder(
+        RasterTensorId::new("prefill.finalize.logits")?,
+        1,
+        metadata.projection_rows,
+    )?;
     Ok(PrefillFinalizeRasterState {
         normalized_final_position,
         next_logit_idx: 0,
         logit_count: metadata.projection_rows,
-        logit_bits: Vec::with_capacity(metadata.projection_rows),
+        output_builder_ref,
         softcap_bits: scalars.final_logit_softcapping.map(Act::to_bits),
         projection_rows_per_tile,
     })
@@ -101,22 +118,18 @@ pub fn init_prefill_finalize_projection(
 pub fn project_next_prefill_logit(
     mut state: PrefillFinalizeRasterState,
     finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, PrefillFinalizeRasterState)> {
     if state.next_logit_idx >= state.logit_count {
         return Ok((true, state));
-    }
-    if state.logit_bits.len() != state.next_logit_idx {
-        bail!(
-            "raster prefill finalize projection state has {} logits before row {}",
-            state.logit_bits.len(),
-            state.next_logit_idx
-        );
     }
 
     let end = state
         .next_logit_idx
         .saturating_add(state.projection_rows_per_tile)
         .min(state.logit_count);
+    let start_logit_idx = state.next_logit_idx;
+    let mut logit_bits = Vec::with_capacity(end - start_logit_idx);
     while state.next_logit_idx < end {
         let projection_row = auth_read!(
             finalize_source,
@@ -129,19 +142,29 @@ pub fn project_next_prefill_logit(
         if let Some(softcap_bits) = state.softcap_bits {
             logit = softcap_act(logit, Act::from_bits(softcap_bits));
         }
-        state.logit_bits.push(logit.to_bits());
+        logit_bits.push(logit.to_bits());
         state.next_logit_idx += 1;
     }
+    store.append_projection_output_chunk(
+        &mut state.output_builder_ref,
+        0,
+        start_logit_idx,
+        &logit_bits,
+    )?;
     Ok((false, state))
 }
 
 #[tile]
 pub fn finalize_prefill_result(
+    store: &mut AuthenticatedRasterTensorStore,
     state: PrefillFinalizeRasterState,
     prompt_token_count: usize,
     final_hidden_states: ActivationSequence,
     layer_caches: Vec<LayerKvCache>,
 ) -> Result<TransformerPrefillResult> {
+    // Public compatibility boundary. The logits and layer caches are shaped
+    // like the existing native `TransformerPrefillResult`; replay-critical
+    // projection state above carries only the output builder ref/cursors.
     if state.next_logit_idx != state.logit_count {
         bail!(
             "raster prefill finalize completed {} logits, expected {}",
@@ -149,19 +172,14 @@ pub fn finalize_prefill_result(
             state.logit_count
         );
     }
-    if state.logit_bits.len() != state.logit_count {
-        bail!(
-            "raster prefill finalize stored {} logits, expected {}",
-            state.logit_bits.len(),
-            state.logit_count
-        );
-    }
-
-    let det_logits = state
-        .logit_bits
+    let logits_ref = store.finalize_projection_output_builder(state.output_builder_ref)?;
+    let logits_sequence = store.materialize_sequence(&logits_ref)?;
+    let det_logits = logits_sequence
+        .into_rows()
         .into_iter()
-        .map(Act::from_bits)
-        .collect::<Vec<_>>();
+        .next()
+        .ok_or_else(|| anyhow!("raster prefill finalize produced no logits row"))?
+        .acts();
     let internal_logits = InternalLogits::from_det_values(det_logits.clone());
     let final_logits_sha256 =
         crate::shared::transformer_kernels::build_vector_commitment(internal_logits.as_f32_slice());
@@ -189,15 +207,23 @@ pub fn run(
     let final_position = call_tile!(select_final_position, &final_hidden_states)?;
     crate::trace::trace_event("prefill.project_to_logits");
     let normalized = call_tile!(normalize_final_position, final_position, finalize_source)?;
+    let mut store = call_tile!(init_prefill_finalize_store);
     let state = call_tile!(
         init_prefill_finalize_projection,
+        &mut store,
         normalized,
         finalize_source,
         projection_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(project_next_prefill_logit, state, finalize_source)?;
+    let state = call_recur_tile_result!(
+        project_next_prefill_logit,
+        state,
+        finalize_source,
+        &mut store
+    )?;
     call_tile!(
         finalize_prefill_result,
+        &mut store,
         state,
         prompt_token_ids.len(),
         final_hidden_states,
@@ -207,10 +233,11 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{init_prefill_finalize_projection, init_prefill_finalize_store, run};
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::input::InferenceExecutionMode;
     use crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource;
+    use crate::shared::raster_transformer_kernels::RasterActivationRow;
     use crate::shared::transformer::{
         ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, Gemma4LogitsProjection,
         Gemma4ModelProvenance, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
@@ -258,6 +285,23 @@ mod tests {
         );
         assert_eq!(raster.transformer_decode_state.position, 2);
         assert_eq!(raster.transformer_decode_state.token_count, 2);
+    }
+
+    #[test]
+    fn finalize_projection_state_serializes_builder_not_logits() {
+        let model = untied_model(false);
+        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+            .expect("source should build");
+        let final_position =
+            RasterActivationRow::from_acts(vec![Act::from_num(1.0), Act::from_num(0.0)]);
+        let mut store = init_prefill_finalize_store();
+
+        let state = init_prefill_finalize_projection(&mut store, final_position, &source, 1)
+            .expect("init finalize projection");
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("logit_bits"));
     }
 
     #[test]

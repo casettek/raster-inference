@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};
@@ -454,11 +456,23 @@ struct BuilderState {
 pub struct AuthenticatedRasterTensorStore {
     tensors: HashMap<RasterTensorId, StoredTensor>,
     builders: HashMap<RasterTensorId, BuilderState>,
+    #[cfg(test)]
+    materialize_sequence_count: Cell<usize>,
+    #[cfg(test)]
+    materialize_kv_cache_count: Cell<usize>,
 }
 
 impl AuthenticatedRasterTensorStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    pub fn materialization_counts(&self) -> (usize, usize) {
+        (
+            self.materialize_sequence_count.get(),
+            self.materialize_kv_cache_count.get(),
+        )
     }
 
     pub fn insert_activation_sequence(
@@ -874,6 +888,9 @@ impl AuthenticatedRasterTensorStore {
         &self,
         tensor_ref: &RasterActivationSequenceRef,
     ) -> Result<RasterActivationSequence> {
+        #[cfg(test)]
+        self.materialize_sequence_count
+            .set(self.materialize_sequence_count.get() + 1);
         let sequence = match self.tensor(tensor_ref.tensor_ref())? {
             StoredTensor::Sequence(sequence) => sequence.clone(),
             _ => bail!("raster activation sequence ref points to non-sequence tensor"),
@@ -903,6 +920,9 @@ impl AuthenticatedRasterTensorStore {
     }
 
     pub fn materialize_kv_cache(&self, cache_ref: &RasterKvCacheRef) -> Result<RasterKvCache> {
+        #[cfg(test)]
+        self.materialize_kv_cache_count
+            .set(self.materialize_kv_cache_count.get() + 1);
         let keys = match self.tensor(cache_ref.keys())? {
             StoredTensor::KvKeys(keys) => keys.clone(),
             _ => bail!("raster KV cache keys ref points to non-key tensor"),

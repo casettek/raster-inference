@@ -193,7 +193,7 @@ run_prefill_layer_sequence
 
 Replace full attention over all heads/tokens inside a single call with bounded recursive attention tiles.
 
-The current high-risk helper is `causal_attention_heads_with_cache` in `src/shared/raster_transformer_kernels.rs`. It loops over query heads and query tokens, and each `attention_output_row` scans the visible key/value rows.
+The original high-risk helper was `causal_attention_heads_with_cache` in `src/shared/raster_transformer_kernels.rs`. It loops over query heads and query tokens, and each `attention_output_row` scans the visible key/value rows. The raster path should keep that behavior decomposed into explicit recursive phases: score collection, softmax max scan, exponent sum, raw-weight build, residual correction, and value application.
 
 ### Key Design Decision
 
@@ -213,7 +213,7 @@ State should include:
 - output heads built so far
 - derived KV grouping metadata
 
-Each recursive tile should compute at most one `(query_head_idx, query_token_idx)` output row, or a small configured token chunk.
+Each recursive tile should process at most one bounded chunk for the current `(query_head_idx, query_token_idx)`: key rows during score collection, score rows during softmax, weight rows during residual correction, or value rows during weighted-sum application.
 
 ### Implementation Shape
 
@@ -228,7 +228,9 @@ run_prefill_attention_rows
 
 - map query head to KV head
 - select the allowed key/value range
-- compute one `attention_output_row`
+- collect score rows through bounded authenticated reads
+- compute exact softmax through bounded recursive passes over committed score/weight refs
+- apply corrected weights to value rows through bounded authenticated reads
 - append output row to state
 - advance token/head indices
 
@@ -243,13 +245,15 @@ run_prefill_attention_rows
 - Sliding-window attention matches existing behavior.
 - Donor-cache attention matches existing behavior.
 - Multi-head query with grouped KV heads maps query heads to KV heads correctly.
+- Equal max logits split across chunks preserve first-index softmax residual correction.
+- Recursive attention state serializes refs, builders, cursors, and scalar bits rather than materialized score or weight rows.
 - Empty or malformed head/cache shapes fail closed with existing-style errors.
 - Raster prefill layer parity tests still pass.
 
 ### Done Criteria
 
 - `run_basic_prefill_layer` or its replacement no longer calls full `causal_attention_heads_with_cache` as one large operation.
-- The largest attention tile is bounded to one query row or an intentionally configured small chunk.
+- The largest attention tile is bounded to one configured row chunk for score collection, softmax, residual correction, or value application.
 - Existing checkpoint commitments remain stable unless a plan explicitly accepts trace changes.
 
 ## Plan C: Chunk Remaining Sequence And Head Operations

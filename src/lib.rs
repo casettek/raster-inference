@@ -295,13 +295,15 @@ pub fn run_inference_with_controls(
                 trace::phase_finished(PhaseId::InputEmbedding);
 
                 trace::phase_started(PhaseId::TransformerStateTransition);
-                let ple_inputs = if controls.raster_tiles {
+                let (final_hidden_states, layer_caches) = if controls.raster_tiles {
+                    let mut raster_prefill_store =
+                        crate::shared::raster_row_store::AuthenticatedRasterTensorStore::new();
                     let ple_source =
                         crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource::from_model(
                             model.model_id.clone(),
                             transformer_model,
                         )?;
-                    prefill_prepare_aux::run_raster(
+                    let ple_input_refs = prefill_prepare_aux::run_raster_refs_with_store(
                         &prompt_preparation.prompt_token_ids,
                         &ple_source,
                         &token_embeddings,
@@ -309,38 +311,47 @@ pub fn run_inference_with_controls(
                             .as_ref()
                             .map(|controls| controls.projection_rows_per_tile)
                             .expect("raster projection rows per tile should be validated"),
-                    )?
-                } else {
-                    run_prefill_prepare_aux(
-                        &prompt_preparation.prompt_token_ids,
-                        transformer_model,
-                        &token_embeddings,
-                        request.execution_mode,
-                    )?
-                };
-                if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
-                    trace::phase_paused(PhaseId::TransformerStateTransition);
-                    return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                        terminal_checkpoint_id,
-                        input_embedding,
-                        transformer_state_transition: None,
-                        output_decode: None,
-                        raster_tile_invocations: None,
-                    }));
-                }
-                let (final_hidden_states, layer_caches) = if controls.raster_tiles {
+                        &mut raster_prefill_store,
+                    )?;
+                    if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                        trace::phase_paused(PhaseId::TransformerStateTransition);
+                        return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                            terminal_checkpoint_id,
+                            input_embedding,
+                            transformer_state_transition: None,
+                            output_decode: None,
+                            raster_tile_invocations: None,
+                        }));
+                    }
                     let layer_source =
                     crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    prefill_layer::run_raster(
+                    prefill_layer::run_raster_with_store(
+                        &mut raster_prefill_store,
                         &token_embeddings,
                         &layer_source,
-                        ple_inputs.as_ref(),
+                        ple_input_refs.as_ref(),
                         raster_sizing_controls.expect("raster sizing controls should be validated"),
                     )?
                 } else {
+                    let ple_inputs = run_prefill_prepare_aux(
+                        &prompt_preparation.prompt_token_ids,
+                        transformer_model,
+                        &token_embeddings,
+                        request.execution_mode,
+                    )?;
+                    if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                        trace::phase_paused(PhaseId::TransformerStateTransition);
+                        return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                            terminal_checkpoint_id,
+                            input_embedding,
+                            transformer_state_transition: None,
+                            output_decode: None,
+                            raster_tile_invocations: None,
+                        }));
+                    }
                     prefill_layer::run_with_mode_internal(
                         token_embeddings.clone_internal(),
                         transformer_model,
@@ -502,10 +513,11 @@ mod tests {
         run_decode_transition, run_inference, run_inference_with_controls, run_output_finalize,
         run_prefill_finalize, run_prefill_layer, run_prefill_prepare_aux, run_prompt_prepare,
         AuthenticatedGemmaTokenizer, DecodeState, EmbeddingTable, Gemma4AttentionKind,
-        Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
-        GemmaBpeMerge, GemmaTokenizerSpec, GemmaVocabEntry, InferenceControls,
-        InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, MatrixF32, ModelSpec,
-        OutputDecodeStopReason, SamplingConfig, TextDecodingPolicy,
+        Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
+        Gemma4PleLayerWeights, Gemma4TransformerModel, GemmaBpeMerge, GemmaTokenizerSpec,
+        GemmaVocabEntry, InferenceControls, InferenceExecutionMode, InferenceRequest,
+        InferenceRunOutcome, MatrixF32, ModelSpec, OutputDecodeStopReason, SamplingConfig,
+        TextDecodingPolicy,
     };
     use crate::shared::det_num::{f32_to_acc, Act, Wgt};
     use crate::shared::gemma_tokenizer::GemmaAddedToken;
@@ -919,6 +931,68 @@ mod tests {
             }
             InferenceRunOutcome::Paused(_) => panic!("expected completed raster inference"),
         }
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_uses_ple_ref_bridge() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls::default(),
+        )
+        .expect("native deterministic inference should complete");
+        let raster = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: Some(2),
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
+            },
+        )
+        .expect("raster inference should complete");
+
+        let InferenceRunOutcome::Completed(native) = native else {
+            panic!("expected native inference to complete");
+        };
+        let InferenceRunOutcome::Completed(raster) = raster else {
+            panic!("expected raster inference to complete");
+        };
+        assert_eq!(
+            raster.output_decode.generated_token_ids,
+            native.output_decode.generated_token_ids
+        );
+        assert_eq!(
+            raster.output_decode.generated_token_count,
+            native.output_decode.generated_token_count
+        );
+        assert!(raster.raster_tile_invocations.expect("tile count") > 0);
     }
 
     #[test]
@@ -1638,6 +1712,47 @@ mod tests {
             model,
             weights_files: vec![weights_file, layer_weights_file],
         }
+    }
+
+    fn deterministic_ple_model_fixture() -> DeterministicModelFixture {
+        let mut fixture = deterministic_no_ple_model_fixture();
+        let (ple_layer_weights_file, ple_layer_sources) =
+            write_det_layer_weights(vec![det_zero_matrix(2, 4), det_zero_matrix(4, 2)]);
+        let mut ple_layer_sources = ple_layer_sources.into_iter();
+        fixture.model.layers[0].ple = Some(Gemma4PleLayerWeights {
+            input_gate: Gemma4LayerMatrixSource::from_det_num_source(
+                ple_layer_sources
+                    .next()
+                    .expect("PLE input gate layer source"),
+            ),
+            layer_projection: Gemma4LayerMatrixSource::from_det_num_source(
+                ple_layer_sources
+                    .next()
+                    .expect("PLE layer projection source"),
+            ),
+            post_input_norm_weight: vec![1.0; 4],
+            post_input_norm_weight_det: Some(vec![Wgt::from_num(1.0); 4]),
+        });
+
+        let (ple_global_weights_file, ple_global_sources) =
+            write_det_layer_weights(vec![det_zero_matrix(3, 2), det_zero_matrix(2, 4)]);
+        let mut ple_global_sources = ple_global_sources.into_iter();
+        fixture.model.ple_global =
+            Some(Gemma4PleGlobalWeights::from_det_num_sources_with_canonical(
+                vec![ple_global_sources.next().expect("PLE token embeddings")],
+                vec![ple_global_sources.next().expect("PLE model projection")],
+                vec![1.0; 2],
+                vec![Wgt::from_num(1.0); 2],
+                1.0,
+                Act::from_num(1.0),
+                1.0,
+                Act::from_num(1.0),
+                1.0,
+                Act::from_num(1.0),
+            ));
+        fixture.weights_files.push(ple_layer_weights_file);
+        fixture.weights_files.push(ple_global_weights_file);
+        fixture
     }
 
     fn write_det_embedding_weights(

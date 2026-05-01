@@ -58,6 +58,16 @@ pub fn trace_event(label: impl AsRef<str>) {
     }
 }
 
+pub fn with_trace_logging_enabled<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TRACE_LOGGING_OVERRIDE.with(|trace_logging_override| {
+        let previous = trace_logging_override.replace(Some(enabled));
+        let reset = ResetTraceLoggingOverride(previous);
+        let result = f();
+        drop(reset);
+        result
+    })
+}
+
 pub fn phase_started(phase_id: PhaseId) {
     emit_phase("start", phase_id);
 }
@@ -188,6 +198,13 @@ pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
 }
 
 pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) -> bool {
+    trace_checkpoint_lazy(checkpoint_name, || state)
+}
+
+pub fn trace_checkpoint_lazy<T: Serialize>(
+    checkpoint_name: &str,
+    build_state: impl FnOnce() -> T,
+) -> bool {
     let should_commit = should_commit_checkpoint(checkpoint_name);
     let observed_by_terminal_checkpoint = terminal_checkpoint_observes(checkpoint_name);
     let reached_terminal_checkpoint = mark_terminal_checkpoint(checkpoint_name);
@@ -201,10 +218,35 @@ pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) -> bool 
     let mut collector = trace_collector()
         .lock()
         .expect("trace collector mutex should not be poisoned");
+    let state = build_state();
     collector.checkpoints.push(json!({
-        checkpoint_name: sha256_hex(state),
+        checkpoint_name: sha256_hex(&state),
     }));
     reached_terminal_checkpoint
+}
+
+pub fn trace_checkpoint_lazy_result<T: Serialize>(
+    checkpoint_name: &str,
+    build_state: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<bool> {
+    let should_commit = should_commit_checkpoint(checkpoint_name);
+    let observed_by_terminal_checkpoint = terminal_checkpoint_observes(checkpoint_name);
+    let reached_terminal_checkpoint = mark_terminal_checkpoint(checkpoint_name);
+    if should_commit || trace_logging_enabled() || observed_by_terminal_checkpoint {
+        emit_checkpoint(checkpoint_name);
+    }
+    if !trace_checkpointing_enabled() || !should_commit {
+        return Ok(reached_terminal_checkpoint);
+    }
+
+    let state = build_state()?;
+    let mut collector = trace_collector()
+        .lock()
+        .expect("trace collector mutex should not be poisoned");
+    collector.checkpoints.push(json!({
+        checkpoint_name: sha256_hex(&state),
+    }));
+    Ok(reached_terminal_checkpoint)
 }
 
 pub fn finish_inference_trace<T: Serialize>(summary: &T) {
@@ -266,6 +308,13 @@ pub fn sha256_hex<T: Serialize>(value: &T) -> String {
 }
 
 fn trace_mode() -> TraceMode {
+    if let Some(enabled) = TRACE_LOGGING_OVERRIDE.with(Cell::get) {
+        return if enabled {
+            TraceMode::Verbose
+        } else {
+            TraceMode::Off
+        };
+    }
     match env::var("RASTER_TRACE_TILES").as_deref() {
         Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => TraceMode::Verbose,
         _ => TraceMode::Off,
@@ -406,6 +455,16 @@ impl Drop for ResetCheckpointingFlag {
     }
 }
 
+struct ResetTraceLoggingOverride(Option<bool>);
+
+impl Drop for ResetTraceLoggingOverride {
+    fn drop(&mut self) {
+        TRACE_LOGGING_OVERRIDE.with(|trace_logging_override| {
+            trace_logging_override.set(self.0.take());
+        });
+    }
+}
+
 struct ResetTerminalCheckpoint(Option<TerminalCheckpointState>);
 
 impl Drop for ResetTerminalCheckpoint {
@@ -418,6 +477,7 @@ impl Drop for ResetTerminalCheckpoint {
 
 thread_local! {
     static CHECKPOINTING_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static TRACE_LOGGING_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     static TERMINAL_CHECKPOINT: RefCell<Option<TerminalCheckpointState>> = const { RefCell::new(None) };
 }
 
@@ -436,6 +496,40 @@ mod tests {
         assert!(should_commit_checkpoint(
             "decode.layer_token.layer_0.position_0"
         ));
+    }
+
+    #[test]
+    fn lazy_checkpoint_does_not_build_state_when_checkpointing_disabled() {
+        let mut built = false;
+
+        super::with_checkpointing_enabled(false, || {
+            let reached = super::trace_checkpoint_lazy_result("prefill.prepare_aux", || {
+                built = true;
+                Ok(json!({ "materialized": true }))
+            })
+            .expect("lazy checkpoint should succeed");
+
+            assert!(!reached);
+        });
+
+        assert!(!built);
+    }
+
+    #[test]
+    fn lazy_checkpoint_builds_state_when_checkpointing_enabled() {
+        let mut built = false;
+
+        super::with_checkpointing_enabled(true, || {
+            let reached = super::trace_checkpoint_lazy_result("prefill.prepare_aux", || {
+                built = true;
+                Ok(json!({ "materialized": true }))
+            })
+            .expect("lazy checkpoint should succeed");
+
+            assert!(!reached);
+        });
+
+        assert!(built);
     }
 
     #[test]

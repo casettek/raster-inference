@@ -5,8 +5,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::auth_read;
 use crate::raster_authoring::AuthRead;
 use crate::shared::det_num::{
-    act_to_f32, add_sat, attention_score as det_attention_score,
-    attention_softmax as det_attention_softmax,
+    acc_add_sat, act_to_f32, add_sat, attention_score as det_attention_score,
+    attention_softmax as det_attention_softmax, attention_softmax_exp_term,
+    attention_softmax_raw_weight, attention_softmax_residual,
     attention_weighted_sum as det_attention_weighted_sum, gelu_pytorch_tanh_act, mac_bits, mul_sat,
     requantize, rms_norm as det_rms_norm, rope_rotate_pairs, scale_act,
     value_rms_norm as det_value_rms_norm, Acc, Act, Wgt,
@@ -21,7 +22,7 @@ use crate::shared::raster_row_store::{
     RasterProjectionOutputBuilderRef, RasterSequenceRowRequest, RasterTensorBuilderRef,
     RasterTensorId,
 };
-use crate::shared::transformer::DetNumTensorSliceSource;
+use crate::shared::transformer::{DetNumMatrix, DetNumTensorSliceSource};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterActivationRow {
@@ -132,6 +133,7 @@ pub struct RasterAttentionRowState {
     output_builder_ref: RasterTensorBuilderRef,
     attention_window: Option<usize>,
     phase: RasterAttentionRowPhase,
+    attention_id_prefix: String,
     next_query_head_idx: usize,
     next_query_token_idx: usize,
     sequence_len: usize,
@@ -146,6 +148,35 @@ enum RasterAttentionRowPhase {
     CollectScores {
         score_builder_ref: RasterTensorBuilderRef,
         next_kv_token_idx: usize,
+    },
+    FindSoftmaxMax {
+        score_ref: RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: Option<usize>,
+        max_logit_bits: i32,
+    },
+    SumSoftmaxExp {
+        score_ref: RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+    },
+    BuildRawSoftmaxWeights {
+        score_ref: RasterActivationSequenceRef,
+        raw_weight_builder_ref: RasterTensorBuilderRef,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+        summed_weight_bits: i32,
+    },
+    CorrectSoftmaxResidual {
+        raw_weight_ref: RasterActivationSequenceRef,
+        final_weight_builder_ref: RasterTensorBuilderRef,
+        next_weight_row_idx: usize,
+        max_index: usize,
+        residual_bits: i32,
     },
     ApplyValues {
         weight_ref: RasterActivationSequenceRef,
@@ -597,6 +628,33 @@ pub fn init_sequence_projection_state(
     })
 }
 
+pub fn init_sequence_projection_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    projection_rows: usize,
+    rows_per_tile: usize,
+) -> Result<RasterSequenceProjectionState> {
+    if projection_rows == 0 {
+        bail!("deterministic linear projection requires at least one projection row");
+    }
+    validate_projection_rows_per_tile(rows_per_tile)?;
+    let (token_count, input_width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    let output_builder_ref =
+        store.start_projection_output_builder(output_id, token_count, projection_rows)?;
+
+    Ok(RasterSequenceProjectionState {
+        input_ref,
+        output_builder_ref,
+        next_token_idx: 0,
+        next_projection_row_idx: 0,
+        token_count,
+        input_width,
+        projection_rows,
+        rows_per_tile,
+    })
+}
+
 pub fn append_projection_chunk_to_state(
     state: &mut RasterSequenceProjectionState,
     store: &mut AuthenticatedRasterTensorStore,
@@ -679,6 +737,22 @@ pub fn finalize_sequence_projection_state(
 
     let output_ref = store.finalize_projection_output_builder(state.output_builder_ref)?;
     store.materialize_sequence(&output_ref)
+}
+
+pub fn finalize_sequence_projection_state_ref(
+    state: RasterSequenceProjectionState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterActivationSequenceRef> {
+    if state.next_token_idx != state.token_count || state.next_projection_row_idx != 0 {
+        bail!(
+            "raster projection completed token {}, projection row {}, expected {} complete token rows",
+            state.next_token_idx,
+            state.next_projection_row_idx,
+            state.token_count
+        );
+    }
+
+    store.finalize_projection_output_builder(state.output_builder_ref)
 }
 
 pub fn project_sequence_with_source<S>(
@@ -772,6 +846,30 @@ pub(crate) fn det_num_tensor_slice_row_wgts(
         )));
     }
     Ok(row)
+}
+
+pub(crate) fn det_num_matrix_row_wgts(
+    matrix: &DetNumMatrix,
+    row_idx: usize,
+    label: &str,
+) -> Result<Vec<Wgt>> {
+    if row_idx >= matrix.rows {
+        bail!(
+            "Gemma prefill {label} row {row_idx} is out of range for {} rows",
+            matrix.rows
+        );
+    }
+    let start = row_idx
+        .checked_mul(matrix.cols)
+        .ok_or_else(|| anyhow!("matrix row range overflowed"))?;
+    let end = start
+        .checked_add(matrix.cols)
+        .ok_or_else(|| anyhow!("matrix row range overflowed"))?;
+    let encoded_row = matrix
+        .values
+        .get(start..end)
+        .ok_or_else(|| anyhow!("matrix row range is out of bounds"))?;
+    Ok(encoded_row.iter().copied().map(Wgt::from_bits).collect())
 }
 
 pub fn project_sequence_with_prefill_source<S>(
@@ -925,6 +1023,41 @@ pub fn init_sequence_rms_norm_row_state(
     })
 }
 
+pub fn init_sequence_rms_norm_row_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    norm_weights: Option<&[Wgt]>,
+    eps: Option<Acc>,
+    rows_per_tile: usize,
+) -> Result<RasterSequenceUnaryState> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let norm_weights = norm_weights
+        .ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical norm weights"))?;
+    let eps = eps.ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical Acc epsilon"))?;
+    let (row_count, width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    if norm_weights.len() != width {
+        bail!(
+            "deterministic RMSNorm input width mismatch: row width {}, norm width {}",
+            width,
+            norm_weights.len()
+        );
+    }
+    let output_builder_ref = store.start_sequence_builder(output_id, row_count, width)?;
+    Ok(RasterSequenceUnaryState {
+        input_ref,
+        output_builder_ref,
+        op: RasterSequenceUnaryOp::RmsNorm {
+            norm_weight_bits: norm_weights.iter().map(|weight| weight.to_bits()).collect(),
+            eps_bits: eps.to_bits(),
+        },
+        next_row_idx: 0,
+        row_count,
+        width,
+        rows_per_tile,
+    })
+}
+
 pub fn init_sequence_gelu_row_state(
     store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
@@ -947,6 +1080,26 @@ pub fn init_sequence_gelu_row_state(
         next_row_idx: 0,
         row_count: input.len(),
         width: input.width()?,
+        rows_per_tile,
+    })
+}
+
+pub fn init_sequence_gelu_row_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    rows_per_tile: usize,
+) -> Result<RasterSequenceUnaryState> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let (row_count, width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    let output_builder_ref = store.start_sequence_builder(output_id, row_count, width)?;
+    Ok(RasterSequenceUnaryState {
+        input_ref,
+        output_builder_ref,
+        op: RasterSequenceUnaryOp::Gelu,
+        next_row_idx: 0,
+        row_count,
+        width,
         rows_per_tile,
     })
 }
@@ -978,6 +1131,31 @@ pub fn init_sequence_scale_row_state(
         next_row_idx: 0,
         row_count: input.len(),
         width: input.width()?,
+        rows_per_tile,
+    })
+}
+
+pub fn init_sequence_scale_row_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    scalar: Option<Act>,
+    rows_per_tile: usize,
+) -> Result<RasterSequenceUnaryState> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let scalar = scalar
+        .ok_or_else(|| anyhow!("deterministic sequence scaling requires canonical Act scalar"))?;
+    let (row_count, width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    let output_builder_ref = store.start_sequence_builder(output_id, row_count, width)?;
+    Ok(RasterSequenceUnaryState {
+        input_ref,
+        output_builder_ref,
+        op: RasterSequenceUnaryOp::Scale {
+            scalar_bits: scalar.to_bits(),
+        },
+        next_row_idx: 0,
+        row_count,
+        width,
         rows_per_tile,
     })
 }
@@ -1054,6 +1232,21 @@ pub fn finalize_sequence_unary_row_state(
     store.materialize_sequence(&output_ref)
 }
 
+pub fn finalize_sequence_unary_row_state_ref(
+    state: RasterSequenceUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterActivationSequenceRef> {
+    if !state.is_complete() {
+        bail!(
+            "sequence unary state completed {} rows, expected {}",
+            state.next_row_idx,
+            state.row_count
+        );
+    }
+
+    store.finalize_sequence_builder(state.output_builder_ref)
+}
+
 pub fn init_sequence_add_row_state(
     store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
@@ -1070,6 +1263,40 @@ pub fn init_sequence_mul_row_state(
     rows_per_tile: usize,
 ) -> Result<RasterSequenceBinaryState> {
     init_sequence_binary_row_state(store, lhs, rhs, RasterSequenceBinaryOp::Mul, rows_per_tile)
+}
+
+pub fn init_sequence_add_row_state_from_refs(
+    store: &mut AuthenticatedRasterTensorStore,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    rows_per_tile: usize,
+) -> Result<RasterSequenceBinaryState> {
+    init_sequence_binary_row_state_from_refs(
+        store,
+        lhs_ref,
+        rhs_ref,
+        output_id,
+        RasterSequenceBinaryOp::Add,
+        rows_per_tile,
+    )
+}
+
+pub fn init_sequence_mul_row_state_from_refs(
+    store: &mut AuthenticatedRasterTensorStore,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    rows_per_tile: usize,
+) -> Result<RasterSequenceBinaryState> {
+    init_sequence_binary_row_state_from_refs(
+        store,
+        lhs_ref,
+        rhs_ref,
+        output_id,
+        RasterSequenceBinaryOp::Mul,
+        rows_per_tile,
+    )
 }
 
 fn init_sequence_binary_row_state(
@@ -1102,6 +1329,36 @@ fn init_sequence_binary_row_state(
         op,
         next_row_idx: 0,
         row_count: lhs.len(),
+        width,
+        rows_per_tile,
+    })
+}
+
+fn init_sequence_binary_row_state_from_refs(
+    store: &mut AuthenticatedRasterTensorStore,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    op: RasterSequenceBinaryOp,
+    rows_per_tile: usize,
+) -> Result<RasterSequenceBinaryState> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let (lhs_rows, width) = lhs_ref.tensor_ref().shape().sequence_metadata()?;
+    let (rhs_rows, rhs_width) = rhs_ref.tensor_ref().shape().sequence_metadata()?;
+    if width != rhs_width {
+        bail!("right sequence row 0 has width {rhs_width}, expected {width}");
+    }
+    if lhs_rows != rhs_rows {
+        bail!("sequence length mismatch: {} vs {}", lhs_rows, rhs_rows);
+    }
+    let output_builder_ref = store.start_sequence_builder(output_id, lhs_rows, width)?;
+    Ok(RasterSequenceBinaryState {
+        lhs_ref,
+        rhs_ref,
+        output_builder_ref,
+        op,
+        next_row_idx: 0,
+        row_count: lhs_rows,
         width,
         rows_per_tile,
     })
@@ -1176,6 +1433,21 @@ pub fn finalize_sequence_binary_row_state(
 
     let output_ref = store.finalize_sequence_builder(state.output_builder_ref)?;
     store.materialize_sequence(&output_ref)
+}
+
+pub fn finalize_sequence_binary_row_state_ref(
+    state: RasterSequenceBinaryState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterActivationSequenceRef> {
+    if !state.is_complete() {
+        bail!(
+            "sequence binary state completed {} rows, expected {}",
+            state.next_row_idx,
+            state.row_count
+        );
+    }
+
+    store.finalize_sequence_builder(state.output_builder_ref)
 }
 
 pub fn reshape_sequence_heads(
@@ -1395,6 +1667,92 @@ pub fn init_rope_row_state(
     )
 }
 
+pub fn init_head_rms_norm_row_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+    norm_weights: Option<&[Wgt]>,
+    eps: Option<Acc>,
+    rows_per_tile: usize,
+) -> Result<RasterHeadUnaryState> {
+    validate_head_rows_per_tile(rows_per_tile)?;
+    let norm_weights = norm_weights
+        .ok_or_else(|| anyhow!("deterministic head RMSNorm requires canonical norm weights"))?;
+    let eps =
+        eps.ok_or_else(|| anyhow!("deterministic head RMSNorm requires canonical Acc epsilon"))?;
+    let (_, _, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    if norm_weights.len() != head_dim {
+        bail!(
+            "deterministic head RMSNorm weight width mismatch: {} vs {}",
+            norm_weights.len(),
+            head_dim
+        );
+    }
+    init_head_unary_row_state_from_ref(
+        store,
+        heads_ref,
+        output_id,
+        RasterHeadUnaryOp::RmsNorm {
+            norm_weight_bits: norm_weights.iter().map(|weight| weight.to_bits()).collect(),
+            eps_bits: eps.to_bits(),
+        },
+        rows_per_tile,
+    )
+}
+
+pub fn init_value_rms_norm_row_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+    eps: Option<Acc>,
+    rows_per_tile: usize,
+) -> Result<RasterHeadUnaryState> {
+    validate_head_rows_per_tile(rows_per_tile)?;
+    let eps =
+        eps.ok_or_else(|| anyhow!("deterministic value RMSNorm requires canonical Acc epsilon"))?;
+    init_head_unary_row_state_from_ref(
+        store,
+        heads_ref,
+        output_id,
+        RasterHeadUnaryOp::ValueRmsNorm {
+            eps_bits: eps.to_bits(),
+        },
+        rows_per_tile,
+    )
+}
+
+pub fn init_rope_row_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+    rotary_dim: usize,
+    freq_base_dim: usize,
+    base: Option<Acc>,
+    position_offset: usize,
+    rows_per_tile: usize,
+) -> Result<RasterHeadUnaryState> {
+    validate_head_rows_per_tile(rows_per_tile)?;
+    let (_, _, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    if rotary_dim != 0 {
+        if rotary_dim > head_dim {
+            bail!("RoPE rotary_dim {rotary_dim} exceeds attention head width {head_dim}");
+        }
+        base.ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
+    }
+    init_head_unary_row_state_from_ref(
+        store,
+        heads_ref,
+        output_id,
+        RasterHeadUnaryOp::Rope {
+            rotary_dim,
+            freq_base_dim,
+            base_bits: base.map(Acc::to_bits),
+            position_offset,
+        },
+        rows_per_tile,
+    )
+}
+
 fn init_head_unary_row_state(
     store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
@@ -1412,6 +1770,29 @@ fn init_head_unary_row_state(
         sequence_len,
         head_dim,
     )?;
+    Ok(RasterHeadUnaryState {
+        heads_ref,
+        output_builder_ref,
+        op,
+        next_head_idx: 0,
+        next_token_idx: 0,
+        head_count,
+        sequence_len,
+        head_dim,
+        rows_per_tile,
+    })
+}
+
+fn init_head_unary_row_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+    op: RasterHeadUnaryOp,
+    rows_per_tile: usize,
+) -> Result<RasterHeadUnaryState> {
+    let (head_count, sequence_len, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    let output_builder_ref =
+        store.start_heads_builder(output_id, head_count, sequence_len, head_dim)?;
     Ok(RasterHeadUnaryState {
         heads_ref,
         output_builder_ref,
@@ -1518,6 +1899,21 @@ pub fn finalize_head_unary_row_state(
     }
     let output_ref = store.finalize_heads_builder(state.output_builder_ref)?;
     store.materialize_heads(&output_ref)
+}
+
+pub fn finalize_head_unary_row_state_ref(
+    state: RasterHeadUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterAttentionHeadsRef> {
+    if !state.is_complete() {
+        bail!(
+            "head unary state finalized at head {} token {}, expected {} heads",
+            state.next_head_idx,
+            state.next_token_idx,
+            state.head_count
+        );
+    }
+    store.finalize_heads_builder(state.output_builder_ref)
 }
 
 pub fn attention_output_row(
@@ -1758,8 +2154,14 @@ pub fn init_attention_row_state(
     )?;
     let (initial_visible_start, initial_visible_rows) =
         attention_visible_range(0, attention_window);
-    let phase =
-        init_attention_score_phase(store, 0, 0, initial_visible_start, initial_visible_rows)?;
+    let phase = init_attention_score_phase(
+        store,
+        "attention",
+        0,
+        0,
+        initial_visible_start,
+        initial_visible_rows,
+    )?;
 
     Ok(RasterAttentionRowState {
         query_ref,
@@ -1769,12 +2171,104 @@ pub fn init_attention_row_state(
         output_builder_ref,
         attention_window,
         phase,
+        attention_id_prefix: "attention".to_string(),
         next_query_head_idx: 0,
         next_query_token_idx: 0,
         sequence_len,
         query_head_count: queries.head_count(),
         kv_head_count,
         kv_groups: queries.head_count() / kv_head_count,
+        kv_rows_per_tile,
+    })
+}
+
+pub fn init_attention_row_state_from_refs(
+    store: &mut AuthenticatedRasterTensorStore,
+    query_ref: RasterAttentionHeadsRef,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    donor_cache_ref: Option<RasterKvCacheRef>,
+    output_id: RasterTensorId,
+    attention_window: Option<usize>,
+    kv_rows_per_tile: usize,
+) -> Result<RasterAttentionRowState> {
+    validate_attention_kv_rows_per_tile(kv_rows_per_tile)?;
+    let (query_head_count, sequence_len, query_width) =
+        query_ref.tensor_ref().shape().heads_metadata()?;
+    let (kv_head_count, key_sequence_len, key_width) =
+        key_ref.tensor_ref().shape().heads_metadata()?;
+    let (value_head_count, value_sequence_len, value_width) =
+        value_ref.tensor_ref().shape().heads_metadata()?;
+    if query_width != key_width || query_width != value_width {
+        bail!(
+            "attention head width mismatch: query {query_width}, key {key_width}, value {value_width}"
+        );
+    }
+    if value_head_count != kv_head_count {
+        bail!(
+            "attention key/value head count mismatch: {} vs {}",
+            kv_head_count,
+            value_head_count
+        );
+    }
+    if query_head_count % kv_head_count != 0 {
+        bail!(
+            "attention query head count {} must be divisible by KV head count {}",
+            query_head_count,
+            kv_head_count
+        );
+    }
+    if key_sequence_len != sequence_len || value_sequence_len != sequence_len {
+        bail!(
+            "attention sequence length mismatch: query {sequence_len}, key {key_sequence_len}, value {value_sequence_len}"
+        );
+    }
+    if let Some(cache_ref) = &donor_cache_ref {
+        let (cache_head_count, _, cache_head_dim) = cache_ref.shape().kv_cache_metadata()?;
+        if cache_head_count != kv_head_count {
+            bail!(
+                "attention donor cache head count mismatch: {} vs {}",
+                cache_head_count,
+                kv_head_count
+            );
+        }
+        if cache_head_dim != query_width {
+            bail!(
+                "attention donor cache head width mismatch: {} vs {}",
+                cache_head_dim,
+                query_width
+            );
+        }
+    }
+    let attention_id_prefix = output_id.source_name().to_string();
+    let output_builder_ref =
+        store.start_heads_builder(output_id, query_head_count, sequence_len, query_width)?;
+    let (initial_visible_start, initial_visible_rows) =
+        attention_visible_range(0, attention_window);
+    let phase = init_attention_score_phase(
+        store,
+        &attention_id_prefix,
+        0,
+        0,
+        initial_visible_start,
+        initial_visible_rows,
+    )?;
+
+    Ok(RasterAttentionRowState {
+        query_ref,
+        key_ref,
+        value_ref,
+        donor_cache_ref,
+        output_builder_ref,
+        attention_window,
+        phase,
+        attention_id_prefix,
+        next_query_head_idx: 0,
+        next_query_token_idx: 0,
+        sequence_len,
+        query_head_count,
+        kv_head_count,
+        kv_groups: query_head_count / kv_head_count,
         kv_rows_per_tile,
     })
 }
@@ -1788,6 +2282,7 @@ fn attention_visible_range(query_idx: usize, attention_window: Option<usize>) ->
 
 fn init_attention_score_phase(
     store: &mut AuthenticatedRasterTensorStore,
+    id_prefix: &str,
     query_head_idx: usize,
     query_idx: usize,
     visible_start: usize,
@@ -1795,7 +2290,7 @@ fn init_attention_score_phase(
 ) -> Result<RasterAttentionRowPhase> {
     let score_builder_ref = store.start_sequence_builder(
         RasterTensorId::new(format!(
-            "attention.scores.head_{query_head_idx}.token_{query_idx}"
+            "{id_prefix}.scores.head_{query_head_idx}.token_{query_idx}"
         ))?,
         visible_row_count,
         1,
@@ -1868,33 +2363,213 @@ pub fn compute_next_attention_row(
             }
 
             let score_ref = store.finalize_sequence_builder(score_builder_ref)?;
-            let score_rows = store.materialize_sequence(&score_ref)?;
-            let logits = score_rows
-                .rows()
-                .iter()
-                .map(|row| {
-                    if row.width() != 1 {
-                        bail!("attention score row has width {}, expected 1", row.width());
-                    }
-                    Ok(row.acts()[0])
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let weights = det_attention_softmax(&logits);
-            let mut weight_builder_ref = store.start_sequence_builder(
+            state.phase = RasterAttentionRowPhase::FindSoftmaxMax {
+                score_ref,
+                next_score_row_idx: 0,
+                max_index: None,
+                max_logit_bits: 0,
+            };
+            Ok((false, state))
+        }
+        RasterAttentionRowPhase::FindSoftmaxMax {
+            score_ref,
+            next_score_row_idx,
+            mut max_index,
+            mut max_logit_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(row_count);
+            for row_idx in next_score_row_idx..end {
+                let score = read_attention_scalar_row(store, &score_ref, row_idx, "score")?;
+                let score_bits = score.to_bits();
+                if max_index.is_none() || score_bits > max_logit_bits {
+                    max_index = Some(row_idx);
+                    max_logit_bits = score_bits;
+                }
+            }
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.softmax.max head={} token={} score_rows={}..{} of {}",
+                query_head_idx, query_idx, next_score_row_idx, end, row_count
+            ));
+            if end < row_count {
+                state.phase = RasterAttentionRowPhase::FindSoftmaxMax {
+                    score_ref,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                };
+                return Ok((false, state));
+            }
+
+            let max_index = max_index
+                .ok_or_else(|| anyhow!("attention softmax requires at least one score"))?;
+            state.phase = RasterAttentionRowPhase::SumSoftmaxExp {
+                score_ref,
+                next_score_row_idx: 0,
+                max_index,
+                max_logit_bits,
+                sum_exp_bits: 0,
+            };
+            Ok((false, state))
+        }
+        RasterAttentionRowPhase::SumSoftmaxExp {
+            score_ref,
+            next_score_row_idx,
+            max_index,
+            max_logit_bits,
+            mut sum_exp_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(row_count);
+            let max_logit = Act::from_bits(max_logit_bits);
+            let mut sum_exp = Acc::from_bits(sum_exp_bits);
+            for row_idx in next_score_row_idx..end {
+                let score = read_attention_scalar_row(store, &score_ref, row_idx, "score")?;
+                let exp_term = attention_softmax_exp_term(score, max_logit);
+                sum_exp = acc_add_sat(sum_exp, exp_term);
+            }
+            sum_exp_bits = sum_exp.to_bits();
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.softmax.exp_sum head={} token={} score_rows={}..{} of {}",
+                query_head_idx, query_idx, next_score_row_idx, end, row_count
+            ));
+            if end < row_count {
+                state.phase = RasterAttentionRowPhase::SumSoftmaxExp {
+                    score_ref,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                    sum_exp_bits,
+                };
+                return Ok((false, state));
+            }
+            if sum_exp_bits == 0 {
+                bail!("attention softmax exp sum is zero");
+            }
+
+            let raw_weight_builder_ref = store.start_sequence_builder(
                 RasterTensorId::new(format!(
-                    "attention.weights.head_{query_head_idx}.token_{query_idx}"
+                    "{}.raw_weights.head_{query_head_idx}.token_{query_idx}",
+                    state.attention_id_prefix
                 ))?,
                 row_count,
                 1,
             )?;
-            for (row_idx, weight) in weights.into_iter().enumerate() {
+            state.phase = RasterAttentionRowPhase::BuildRawSoftmaxWeights {
+                score_ref,
+                raw_weight_builder_ref,
+                next_score_row_idx: 0,
+                max_index,
+                max_logit_bits,
+                sum_exp_bits,
+                summed_weight_bits: 0,
+            };
+            Ok((false, state))
+        }
+        RasterAttentionRowPhase::BuildRawSoftmaxWeights {
+            score_ref,
+            mut raw_weight_builder_ref,
+            next_score_row_idx,
+            max_index,
+            max_logit_bits,
+            sum_exp_bits,
+            mut summed_weight_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(row_count);
+            let max_logit = Act::from_bits(max_logit_bits);
+            let sum_exp = Acc::from_bits(sum_exp_bits);
+            let mut summed_weight = Act::from_bits(summed_weight_bits);
+            for row_idx in next_score_row_idx..end {
+                let score = read_attention_scalar_row(store, &score_ref, row_idx, "score")?;
+                let exp_term = attention_softmax_exp_term(score, max_logit);
+                let weight = attention_softmax_raw_weight(exp_term, sum_exp);
                 store.append_sequence_row(
-                    &mut weight_builder_ref,
+                    &mut raw_weight_builder_ref,
+                    row_idx,
+                    RasterActivationRow::from_acts(vec![weight]),
+                )?;
+                summed_weight = add_sat(summed_weight, weight);
+            }
+            summed_weight_bits = summed_weight.to_bits();
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.softmax.raw_weights head={} token={} score_rows={}..{} of {}",
+                query_head_idx, query_idx, next_score_row_idx, end, row_count
+            ));
+            if end < row_count {
+                state.phase = RasterAttentionRowPhase::BuildRawSoftmaxWeights {
+                    score_ref,
+                    raw_weight_builder_ref,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                    sum_exp_bits,
+                    summed_weight_bits,
+                };
+                return Ok((false, state));
+            }
+
+            let raw_weight_ref = store.finalize_sequence_builder(raw_weight_builder_ref)?;
+            let final_weight_builder_ref = store.start_sequence_builder(
+                RasterTensorId::new(format!(
+                    "{}.weights.head_{query_head_idx}.token_{query_idx}",
+                    state.attention_id_prefix
+                ))?,
+                row_count,
+                1,
+            )?;
+            let residual = attention_softmax_residual(Act::from_bits(summed_weight_bits));
+            state.phase = RasterAttentionRowPhase::CorrectSoftmaxResidual {
+                raw_weight_ref,
+                final_weight_builder_ref,
+                next_weight_row_idx: 0,
+                max_index,
+                residual_bits: residual.to_bits(),
+            };
+            Ok((false, state))
+        }
+        RasterAttentionRowPhase::CorrectSoftmaxResidual {
+            raw_weight_ref,
+            mut final_weight_builder_ref,
+            next_weight_row_idx,
+            max_index,
+            residual_bits,
+        } => {
+            let end = next_weight_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(row_count);
+            let residual = Act::from_bits(residual_bits);
+            for row_idx in next_weight_row_idx..end {
+                let mut weight =
+                    read_attention_scalar_row(store, &raw_weight_ref, row_idx, "weight")?;
+                if row_idx == max_index {
+                    weight = add_sat(weight, residual);
+                }
+                store.append_sequence_row(
+                    &mut final_weight_builder_ref,
                     row_idx,
                     RasterActivationRow::from_acts(vec![weight]),
                 )?;
             }
-            let weight_ref = store.finalize_sequence_builder(weight_builder_ref)?;
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.softmax.correct head={} token={} weight_rows={}..{} of {}",
+                query_head_idx, query_idx, next_weight_row_idx, end, row_count
+            ));
+            if end < row_count {
+                state.phase = RasterAttentionRowPhase::CorrectSoftmaxResidual {
+                    raw_weight_ref,
+                    final_weight_builder_ref,
+                    next_weight_row_idx: end,
+                    max_index,
+                    residual_bits,
+                };
+                return Ok((false, state));
+            }
+
+            let weight_ref = store.finalize_sequence_builder(final_weight_builder_ref)?;
             state.phase = RasterAttentionRowPhase::ApplyValues {
                 weight_ref,
                 next_kv_token_idx: start,
@@ -1911,20 +2586,8 @@ pub fn compute_next_attention_row(
                 .saturating_add(state.kv_rows_per_tile)
                 .min(start + row_count);
             for token_idx in next_kv_token_idx..end {
-                let weight_row = auth_read!(
-                    store,
-                    RasterSequenceRowRequest {
-                        tensor_ref: weight_ref.clone(),
-                        row_idx: token_idx - start,
-                    }
-                )?;
-                if weight_row.width() != 1 {
-                    bail!(
-                        "attention weight row {} has width {}, expected 1",
-                        token_idx - start,
-                        weight_row.width()
-                    );
-                }
+                let weight =
+                    read_attention_scalar_row(store, &weight_ref, token_idx - start, "weight")?;
                 let value_row = read_attention_value_row(&state, store, kv_head_idx, token_idx)?;
                 if value_row.width() != weighted_sum_acc_bits.len() {
                     bail!(
@@ -1933,7 +2596,6 @@ pub fn compute_next_attention_row(
                         weighted_sum_acc_bits.len()
                     );
                 }
-                let weight = weight_row.acts()[0];
                 for (acc_bits, value) in weighted_sum_acc_bits.iter_mut().zip(value_row.acts()) {
                     *acc_bits = mac_bits(*acc_bits, value.to_bits(), weight.to_bits());
                 }
@@ -1979,6 +2641,7 @@ pub fn compute_next_attention_row(
                     attention_visible_range(state.next_query_token_idx, state.attention_window);
                 state.phase = init_attention_score_phase(
                     store,
+                    &state.attention_id_prefix,
                     state.next_query_head_idx,
                     state.next_query_token_idx,
                     next_start,
@@ -2046,6 +2709,28 @@ fn read_attention_value_row(
     }
 }
 
+fn read_attention_scalar_row(
+    store: &AuthenticatedRasterTensorStore,
+    tensor_ref: &RasterActivationSequenceRef,
+    row_idx: usize,
+    label: &str,
+) -> Result<Act> {
+    let row = auth_read!(
+        store,
+        RasterSequenceRowRequest {
+            tensor_ref: tensor_ref.clone(),
+            row_idx,
+        }
+    )?;
+    if row.width() != 1 {
+        bail!(
+            "attention {label} row {row_idx} has width {}, expected 1",
+            row.width()
+        );
+    }
+    Ok(row.acts()[0])
+}
+
 pub fn finalize_attention_row_state(
     state: RasterAttentionRowState,
     store: &mut AuthenticatedRasterTensorStore,
@@ -2061,6 +2746,22 @@ pub fn finalize_attention_row_state(
 
     let output_ref = store.finalize_heads_builder(state.output_builder_ref)?;
     store.materialize_heads(&output_ref)
+}
+
+pub fn finalize_attention_row_state_ref(
+    state: RasterAttentionRowState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterAttentionHeadsRef> {
+    if !state.is_complete() {
+        bail!(
+            "attention row state finalized at head {} token {}, expected {} heads",
+            state.next_query_head_idx,
+            state.next_query_token_idx,
+            state.query_head_count
+        );
+    }
+
+    store.finalize_heads_builder(state.output_builder_ref)
 }
 
 pub fn build_raster_kv_cache(
@@ -2119,6 +2820,40 @@ pub fn init_reshape_heads_state(
     })
 }
 
+pub fn init_reshape_heads_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<RasterReshapeHeadsState> {
+    if num_heads == 0 {
+        bail!("attention reshape requires at least one head");
+    }
+    if head_dim == 0 {
+        bail!("attention reshape requires non-zero head dimension");
+    }
+    let expected_width = num_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("attention reshape width overflowed"))?;
+    let (row_count, width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    if width != expected_width {
+        bail!(
+            "attention reshape input row width {width} does not match heads {num_heads} * head_dim {head_dim}"
+        );
+    }
+    let output_builder_ref =
+        store.start_heads_builder(output_id, num_heads, row_count, head_dim)?;
+    Ok(RasterReshapeHeadsState {
+        input_ref,
+        output_builder_ref,
+        num_heads,
+        head_dim,
+        next_row_idx: 0,
+        row_count,
+    })
+}
+
 pub fn compute_next_reshape_heads_row(
     mut state: RasterReshapeHeadsState,
     store: &mut AuthenticatedRasterTensorStore,
@@ -2163,6 +2898,20 @@ pub fn finalize_reshape_heads_state(
     store.materialize_heads(&output_ref)
 }
 
+pub fn finalize_reshape_heads_state_ref(
+    state: RasterReshapeHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterAttentionHeadsRef> {
+    if !state.is_complete() {
+        bail!(
+            "attention reshape completed {} rows, expected {}",
+            state.next_row_idx,
+            state.row_count
+        );
+    }
+    store.finalize_heads_builder(state.output_builder_ref)
+}
+
 pub fn init_combine_heads_state(
     store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
@@ -2176,6 +2925,29 @@ pub fn init_combine_heads_state(
         RasterTensorId::new("combine.output")?,
         sequence_len,
         head_count * head_dim,
+    )?;
+    Ok(RasterCombineHeadsState {
+        heads_ref,
+        output_builder_ref,
+        next_token_idx: 0,
+        head_count,
+        sequence_len,
+        head_dim,
+    })
+}
+
+pub fn init_combine_heads_state_from_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+) -> Result<RasterCombineHeadsState> {
+    let (head_count, sequence_len, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    let output_builder_ref = store.start_sequence_builder(
+        output_id,
+        sequence_len,
+        head_count
+            .checked_mul(head_dim)
+            .ok_or_else(|| anyhow!("attention combine width overflowed"))?,
     )?;
     Ok(RasterCombineHeadsState {
         heads_ref,
@@ -2231,6 +3003,20 @@ pub fn finalize_combine_heads_state(
     store.materialize_sequence(&output_ref)
 }
 
+pub fn finalize_combine_heads_state_ref(
+    state: RasterCombineHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterActivationSequenceRef> {
+    if !state.is_complete() {
+        bail!(
+            "attention combine completed {} rows, expected {}",
+            state.next_token_idx,
+            state.sequence_len
+        );
+    }
+    store.finalize_sequence_builder(state.output_builder_ref)
+}
+
 pub fn init_kv_cache_build_state(
     store: &mut AuthenticatedRasterTensorStore,
     keys: &RasterAttentionHeadSequence,
@@ -2249,6 +3035,44 @@ pub fn init_kv_cache_build_state(
     let output_builder_ref = store.start_kv_cache_builder(
         RasterTensorId::new("kv.build.output.keys")?,
         RasterTensorId::new("kv.build.output.values")?,
+        head_count,
+        sequence_len.saturating_sub(retained_start),
+        head_dim,
+    )?;
+    Ok(RasterKvCacheBuildState {
+        key_ref,
+        value_ref,
+        output_builder_ref,
+        retained_start,
+        next_head_idx: 0,
+        next_token_idx: retained_start,
+        head_count,
+        sequence_len,
+        head_dim,
+    })
+}
+
+pub fn init_kv_cache_build_state_from_refs(
+    store: &mut AuthenticatedRasterTensorStore,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    keys_id: RasterTensorId,
+    values_id: RasterTensorId,
+    sliding_window: Option<usize>,
+) -> Result<RasterKvCacheBuildState> {
+    let (head_count, sequence_len, head_dim) = key_ref.tensor_ref().shape().heads_metadata()?;
+    let (value_head_count, value_sequence_len, value_head_dim) =
+        value_ref.tensor_ref().shape().heads_metadata()?;
+    if head_count != value_head_count
+        || sequence_len != value_sequence_len
+        || head_dim != value_head_dim
+    {
+        bail!("key/value attention heads shape mismatch");
+    }
+    let retained_start = sliding_window.map_or(0, |window| sequence_len.saturating_sub(window));
+    let output_builder_ref = store.start_kv_cache_builder(
+        keys_id,
+        values_id,
         head_count,
         sequence_len.saturating_sub(retained_start),
         head_dim,
@@ -2329,6 +3153,21 @@ pub fn finalize_kv_cache_build_state(
     }
     let output_ref = store.finalize_kv_cache_builder(state.output_builder_ref)?;
     store.materialize_kv_cache(&output_ref)
+}
+
+pub fn finalize_kv_cache_build_state_ref(
+    state: RasterKvCacheBuildState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterKvCacheRef> {
+    if !state.is_complete() {
+        bail!(
+            "KV cache build finalized at head {} token {}, expected {} heads",
+            state.next_head_idx,
+            state.next_token_idx,
+            state.head_count
+        );
+    }
+    store.finalize_kv_cache_builder(state.output_builder_ref)
 }
 
 fn project_row(
@@ -2570,19 +3409,20 @@ mod tests {
         combine_attention_heads, compute_next_attention_row, compute_next_combine_heads_row,
         compute_next_head_unary_row, compute_next_kv_cache_row, compute_next_reshape_heads_row,
         compute_next_sequence_binary_row, compute_next_sequence_unary_row,
-        finalize_attention_row_state, finalize_combine_heads_state, finalize_head_unary_row_state,
-        finalize_kv_cache_build_state, finalize_reshape_heads_state,
-        finalize_sequence_binary_row_state, finalize_sequence_projection_state,
-        finalize_sequence_unary_row_state, gelu_sequence, init_attention_row_state,
-        init_combine_heads_state, init_head_rms_norm_row_state, init_kv_cache_build_state,
-        init_reshape_heads_state, init_rope_row_state, init_sequence_add_row_state,
-        init_sequence_gelu_row_state, init_sequence_mul_row_state, init_sequence_projection_state,
-        init_sequence_rms_norm_row_state, init_sequence_scale_row_state,
-        init_value_rms_norm_row_state, mul_sequences, project_sequence,
-        project_sequence_with_prefill_source, project_sequence_with_prefill_source_chunked,
-        project_sequence_with_source, project_sequence_with_source_chunked, reshape_sequence_heads,
-        rms_norm_heads, rms_norm_sequence, scale_sequence, value_rms_norm_heads,
-        RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
+        finalize_attention_row_state, finalize_attention_row_state_ref,
+        finalize_combine_heads_state, finalize_head_unary_row_state, finalize_kv_cache_build_state,
+        finalize_reshape_heads_state, finalize_sequence_binary_row_state,
+        finalize_sequence_projection_state, finalize_sequence_unary_row_state, gelu_sequence,
+        init_attention_row_state, init_combine_heads_state, init_head_rms_norm_row_state,
+        init_kv_cache_build_state, init_reshape_heads_state, init_rope_row_state,
+        init_sequence_add_row_state, init_sequence_gelu_row_state, init_sequence_mul_row_state,
+        init_sequence_projection_state, init_sequence_rms_norm_row_state,
+        init_sequence_scale_row_state, init_value_rms_norm_row_state, mul_sequences,
+        project_sequence, project_sequence_with_prefill_source,
+        project_sequence_with_prefill_source_chunked, project_sequence_with_source,
+        project_sequence_with_source_chunked, reshape_sequence_heads, rms_norm_heads,
+        rms_norm_sequence, scale_sequence, value_rms_norm_heads, RasterActivationRow,
+        RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
     };
     use crate::raster_authoring::AuthRead;
     use crate::shared::det_num::{
@@ -3590,6 +4430,66 @@ mod tests {
             .expect("row attention");
             assert_eq!(head_bits(&row_output), head_bits(&full_output));
         }
+    }
+
+    #[test]
+    fn attention_row_state_preserves_softmax_ties_across_chunks() {
+        let queries = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(1.0)],
+            vec![Act::from_num(1.0)],
+            vec![Act::from_num(1.0)],
+        ]]);
+        let keys = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(-1.0)],
+            vec![Act::from_num(2.0)],
+            vec![Act::from_num(2.0)],
+        ]]);
+        let values = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(1.0)],
+            vec![Act::from_num(2.0)],
+            vec![Act::from_num(4.0)],
+        ]]);
+        let full_output = causal_attention_heads_with_cache(&queries, &keys, &values, None, None)
+            .expect("full attention");
+
+        let row_output =
+            run_attention_row_state_with_kv_rows_per_tile(&queries, &keys, &values, None, None, 1)
+                .expect("row attention");
+
+        assert_eq!(head_bits(&row_output), head_bits(&full_output));
+    }
+
+    #[test]
+    fn attention_row_state_does_not_materialize_score_or_weight_sequences() {
+        let queries = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(1.0)],
+            vec![Act::from_num(1.0)],
+            vec![Act::from_num(1.0)],
+        ]]);
+        let keys = queries.clone();
+        let values = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(2.0)],
+            vec![Act::from_num(4.0)],
+            vec![Act::from_num(8.0)],
+        ]]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let mut state =
+            init_attention_row_state(&mut store, &queries, &keys, &values, None, None, 1)
+                .expect("attention state");
+
+        while !state.is_complete() {
+            let (_done, next_state) =
+                compute_next_attention_row(state, &mut store).expect("bounded attention step");
+            let encoded = serde_json::to_string(&next_state).expect("state should serialize");
+            assert!(encoded.contains("query_ref"));
+            assert!(!encoded.contains("act_bits"));
+            state = next_state;
+        }
+
+        assert_eq!(store.materialization_counts(), (0, 0));
+        let _output_ref =
+            finalize_attention_row_state_ref(state, &mut store).expect("finalize ref");
+        assert_eq!(store.materialization_counts(), (0, 0));
     }
 
     #[test]

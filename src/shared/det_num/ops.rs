@@ -188,7 +188,7 @@ pub fn attention_softmax(logits: &[Act]) -> Vec<Act> {
     let max_logit = logits[max_index];
     let exp_terms = logits
         .iter()
-        .map(|logit| softmax_exp_term(act_to_acc(sub_sat(*logit, max_logit))))
+        .map(|logit| attention_softmax_exp_term(*logit, max_logit))
         .collect::<Vec<_>>();
     let sum_exp = exp_terms
         .iter()
@@ -197,12 +197,27 @@ pub fn attention_softmax(logits: &[Act]) -> Vec<Act> {
 
     let mut weights = exp_terms
         .iter()
-        .map(|term| requantize(div_acc(*term, sum_exp)))
+        .map(|term| attention_softmax_raw_weight(*term, sum_exp))
         .collect::<Vec<_>>();
     let summed_weights = weights.iter().copied().fold(Act::from_bits(0), add_sat);
-    let residual = sub_sat(one_act(), summed_weights);
+    let residual = attention_softmax_residual(summed_weights);
     weights[max_index] = add_sat(weights[max_index], residual);
     weights
+}
+
+/// Computes the canonical exp term for one logit after shifting by the softmax max.
+pub fn attention_softmax_exp_term(logit: Act, max_logit: Act) -> Acc {
+    softmax_exp_term(act_to_acc(sub_sat(logit, max_logit)))
+}
+
+/// Computes an uncorrected attention softmax weight from an exp term and total exp sum.
+pub fn attention_softmax_raw_weight(exp_term: Acc, sum_exp: Acc) -> Act {
+    requantize(div_acc(exp_term, sum_exp))
+}
+
+/// Computes the final residual that canonical attention softmax assigns to the first max index.
+pub fn attention_softmax_residual(summed_weights: Act) -> Act {
+    sub_sat(one_act(), summed_weights)
 }
 
 /// Computes a deterministic weighted sum of value rows under canonical attention weights.

@@ -2,10 +2,10 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::raster_authoring::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
-use crate::shared::raster_transformer_kernels::det_num_tensor_slice_row_wgts;
+use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
 use crate::shared::transformer::{
-    DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights,
-    Gemma4ModelProvenance, Gemma4TransformerModel,
+    Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4ModelProvenance,
+    Gemma4TransformerModel,
 };
 
 #[derive(Debug, Clone)]
@@ -544,18 +544,13 @@ fn matrix_row_wgts(
     row_idx: usize,
     label: &str,
 ) -> Result<Vec<Wgt>> {
-    let Gemma4LayerMatrixSource::DetNumLazy { source, .. } = source else {
+    let Gemma4LayerMatrixSource::DetNumLazy { .. } = source else {
         bail!("deterministic raster prefill layer source requires .detwgt {label} source");
     };
-    det_num_matrix_row_wgts(source, row_idx, label)
-}
-
-fn det_num_matrix_row_wgts(
-    source: &DetNumTensorSliceSource,
-    row_idx: usize,
-    label: &str,
-) -> Result<Vec<Wgt>> {
-    det_num_tensor_slice_row_wgts(source, row_idx, label)
+    let matrix = crate::io::materialize_det_num_layer_matrix_source(source)?.ok_or_else(|| {
+        anyhow!("deterministic raster prefill layer source requires canonical {label} matrix")
+    })?;
+    det_num_matrix_row_wgts(&matrix, row_idx, label)
 }
 
 #[cfg(test)]

@@ -1645,7 +1645,7 @@ fn materialize_layer_matrix_source(
     }
 }
 
-fn materialize_det_num_layer_matrix_source(
+pub(crate) fn materialize_det_num_layer_matrix_source(
     source: &Gemma4LayerMatrixSource,
 ) -> Result<Option<std::sync::Arc<DetNumMatrix>>> {
     let Gemma4LayerMatrixSource::DetNumLazy {

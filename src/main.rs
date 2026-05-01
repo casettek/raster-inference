@@ -3,7 +3,7 @@ use std::{env, path::PathBuf, process};
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
     load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, run_inference_with_controls,
+    load_transformer_state_model_from_gemma_model_path, run_inference_with_controls, trace,
     AuthenticatedGemmaTokenizer, InferenceControls, InferenceExecutionMode, InferenceRequest,
     InferenceRunOutcome, ModelSpec, SamplingConfig, TextDecodingPolicy,
 };
@@ -13,10 +13,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] [--raster] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--raster] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use raster-authored tiles where implemented. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use raster-authored tiles where implemented. Pass --raster-trace-tiles to print verbose raster progress logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops."
     );
 }
 
@@ -73,22 +73,23 @@ fn run() -> anyhow::Result<()> {
         },
     };
 
-    let inference_outcome = run_inference_with_controls(
-        &request,
-        &model,
-        &tokenizer,
-        &transformer_model,
-        &InferenceControls {
-            commit_checkpoints: cli_args.commit_checkpoints,
-            terminal_checkpoint: cli_args.terminal_checkpoint,
-            raster_tiles: cli_args.raster_tiles,
-            raster_tokenizer_source,
-            raster_projection_rows_per_tile: cli_args.raster_projection_rows_per_tile,
-            raster_attention_kv_rows_per_tile: cli_args.raster_attention_kv_rows_per_tile,
-            raster_sequence_rows_per_tile: cli_args.raster_sequence_rows_per_tile,
-            raster_head_rows_per_tile: cli_args.raster_head_rows_per_tile,
-        },
-    )?;
+    let controls = InferenceControls {
+        commit_checkpoints: cli_args.commit_checkpoints,
+        terminal_checkpoint: cli_args.terminal_checkpoint,
+        raster_tiles: cli_args.raster_tiles,
+        raster_tokenizer_source,
+        raster_projection_rows_per_tile: cli_args.raster_projection_rows_per_tile,
+        raster_attention_kv_rows_per_tile: cli_args.raster_attention_kv_rows_per_tile,
+        raster_sequence_rows_per_tile: cli_args.raster_sequence_rows_per_tile,
+        raster_head_rows_per_tile: cli_args.raster_head_rows_per_tile,
+    };
+    let run_inference =
+        || run_inference_with_controls(&request, &model, &tokenizer, &transformer_model, &controls);
+    let inference_outcome = if cli_args.raster_trace_tiles {
+        trace::with_trace_logging_enabled(true, run_inference)
+    } else {
+        run_inference()
+    }?;
     match inference_outcome {
         InferenceRunOutcome::Completed(inference_state) => {
             println!("{}", serde_json::to_string_pretty(&inference_state)?);
@@ -106,6 +107,7 @@ struct CliArgs {
     commit_checkpoints: bool,
     execution_mode: InferenceExecutionMode,
     raster_tiles: bool,
+    raster_trace_tiles: bool,
     raster_projection_rows_per_tile: Option<usize>,
     raster_attention_kv_rows_per_tile: Option<usize>,
     raster_sequence_rows_per_tile: Option<usize>,
@@ -123,6 +125,7 @@ impl CliArgs {
         let mut commit_checkpoints = false;
         let mut execution_mode = InferenceExecutionMode::Fp32;
         let mut raster_tiles = false;
+        let mut raster_trace_tiles = false;
         let mut raster_projection_rows_per_tile = None;
         let mut raster_attention_kv_rows_per_tile = None;
         let mut raster_sequence_rows_per_tile = None;
@@ -135,6 +138,7 @@ impl CliArgs {
                 "--commit-checkpoints" => commit_checkpoints = true,
                 "--deterministic" => execution_mode = InferenceExecutionMode::Deterministic,
                 "--raster" => raster_tiles = true,
+                "--raster-trace-tiles" => raster_trace_tiles = true,
                 "--raster-projection-rows-per-tile" => {
                     let value = args
                         .next()
@@ -235,6 +239,7 @@ impl CliArgs {
             commit_checkpoints,
             execution_mode,
             raster_tiles,
+            raster_trace_tiles,
             raster_projection_rows_per_tile,
             raster_attention_kv_rows_per_tile,
             raster_sequence_rows_per_tile,
@@ -362,8 +367,25 @@ mod tests {
 
         assert!(args.raster_tiles);
         assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
+        assert!(!args.raster_trace_tiles);
         assert_eq!(args.raster_projection_rows_per_tile, None);
         assert_eq!(args.raster_attention_kv_rows_per_tile, None);
+    }
+
+    #[test]
+    fn parse_raster_trace_tiles_flag() {
+        let args = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-trace-tiles".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert!(args.raster_trace_tiles);
     }
 
     #[test]
