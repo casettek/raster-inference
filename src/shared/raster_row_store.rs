@@ -319,6 +319,18 @@ pub struct RasterKvRowRequest {
     pub token_idx: usize,
 }
 
+/// Authenticated row reads are the zkVM tile boundary for intermediate tensors.
+///
+/// Tile state should carry these compact row requests, typed refs, cursors, and
+/// control values. The value-backed store is a local execution detail for native
+/// runs and tests; a zkVM replay can replace it with an authenticated row source
+/// without serializing the full tensor map through recursive state.
+pub trait RasterRowSource {
+    fn read_sequence_row(&self, request: RasterSequenceRowRequest) -> Result<RasterActivationRow>;
+    fn read_head_row(&self, request: RasterHeadRowRequest) -> Result<RasterActivationRow>;
+    fn read_kv_row(&self, request: RasterKvRowRequest) -> Result<RasterActivationRow>;
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterTensorBuilderRef {
     id: RasterTensorId,
@@ -1074,28 +1086,29 @@ impl AuthenticatedRasterTensorStore {
     }
 }
 
-impl AuthRead<RasterSequenceRowRequest> for AuthenticatedRasterTensorStore {
-    type Output = RasterActivationRow;
-
-    fn auth_read(&self, request: RasterSequenceRowRequest) -> Result<Self::Output> {
-        let sequence = self.materialize_sequence(&request.tensor_ref)?;
-        let RasterTensorShape::Sequence { row_count, width } =
-            request.tensor_ref.tensor_ref().shape()
-        else {
-            bail!("sequence row request requires sequence shape");
-        };
-        if request.row_idx >= *row_count {
+impl RasterRowSource for AuthenticatedRasterTensorStore {
+    fn read_sequence_row(&self, request: RasterSequenceRowRequest) -> Result<RasterActivationRow> {
+        let (row_count, width) = request
+            .tensor_ref
+            .tensor_ref()
+            .shape()
+            .sequence_metadata()?;
+        if request.row_idx >= row_count {
             bail!(
                 "sequence row {} is out of range for {} rows",
                 request.row_idx,
                 row_count
             );
         }
+        let sequence = match self.tensor(request.tensor_ref.tensor_ref())? {
+            StoredTensor::Sequence(sequence) => sequence,
+            _ => bail!("raster activation sequence ref points to non-sequence tensor"),
+        };
         let row = sequence
             .rows()
             .get(request.row_idx)
             .ok_or_else(|| anyhow!("sequence row {} is missing", request.row_idx))?;
-        if row.width() != *width {
+        if row.width() != width {
             bail!(
                 "sequence row {} has width {}, expected {}",
                 request.row_idx,
@@ -1105,35 +1118,28 @@ impl AuthRead<RasterSequenceRowRequest> for AuthenticatedRasterTensorStore {
         }
         Ok(row.clone())
     }
-}
 
-impl AuthRead<RasterHeadRowRequest> for AuthenticatedRasterTensorStore {
-    type Output = RasterActivationRow;
-
-    fn auth_read(&self, request: RasterHeadRowRequest) -> Result<Self::Output> {
-        let heads = self.materialize_heads(&request.tensor_ref)?;
-        let RasterTensorShape::Heads {
-            head_count,
-            sequence_len,
-            head_dim,
-        } = request.tensor_ref.tensor_ref().shape()
-        else {
-            bail!("head row request requires heads shape");
-        };
-        if request.head_idx >= *head_count {
+    fn read_head_row(&self, request: RasterHeadRowRequest) -> Result<RasterActivationRow> {
+        let (head_count, sequence_len, head_dim) =
+            request.tensor_ref.tensor_ref().shape().heads_metadata()?;
+        if request.head_idx >= head_count {
             bail!(
                 "head row request head {} is out of range for {} heads",
                 request.head_idx,
                 head_count
             );
         }
-        if request.token_idx >= *sequence_len {
+        if request.token_idx >= sequence_len {
             bail!(
                 "head row request token {} is out of range for {} rows",
                 request.token_idx,
                 sequence_len
             );
         }
+        let heads = match self.tensor(request.tensor_ref.tensor_ref())? {
+            StoredTensor::Heads(heads) => heads,
+            _ => bail!("raster attention heads ref points to non-head tensor"),
+        };
         let row = heads
             .heads()
             .get(request.head_idx)
@@ -1145,7 +1151,7 @@ impl AuthRead<RasterHeadRowRequest> for AuthenticatedRasterTensorStore {
                     request.token_idx
                 )
             })?;
-        if row.width() != *head_dim {
+        if row.width() != head_dim {
             bail!(
                 "head row ({}, {}) has width {}, expected {}",
                 request.head_idx,
@@ -1156,38 +1162,39 @@ impl AuthRead<RasterHeadRowRequest> for AuthenticatedRasterTensorStore {
         }
         Ok(row.clone())
     }
-}
 
-impl AuthRead<RasterKvRowRequest> for AuthenticatedRasterTensorStore {
-    type Output = RasterActivationRow;
-
-    fn auth_read(&self, request: RasterKvRowRequest) -> Result<Self::Output> {
-        let cache = self.materialize_kv_cache(&request.cache_ref)?;
-        let RasterTensorShape::KvCache {
-            head_count,
-            current_len,
-            head_dim,
-        } = request.cache_ref.shape()
-        else {
-            bail!("KV row request requires KV cache shape");
-        };
-        if request.head_idx >= *head_count {
+    fn read_kv_row(&self, request: RasterKvRowRequest) -> Result<RasterActivationRow> {
+        let (head_count, current_len, head_dim) = request.cache_ref.shape().kv_cache_metadata()?;
+        if request.head_idx >= head_count {
             bail!(
                 "KV row request head {} is out of range for {} heads",
                 request.head_idx,
                 head_count
             );
         }
-        if request.token_idx >= *current_len {
+        if request.token_idx >= current_len {
             bail!(
                 "KV row request token {} is out of range for {} rows",
                 request.token_idx,
                 current_len
             );
         }
+        let key_rows = match self.tensor(request.cache_ref.keys())? {
+            StoredTensor::KvKeys(rows) => rows,
+            _ => bail!("raster KV cache keys ref points to non-key tensor"),
+        };
+        let value_rows = match self.tensor(request.cache_ref.values())? {
+            StoredTensor::KvValues(rows) => rows,
+            _ => bail!("raster KV cache values ref points to non-value tensor"),
+        };
+        ensure_commitment(
+            request.cache_ref.det_commitment(),
+            &build_intermediate_kv_cache_rows_commitment(key_rows, value_rows),
+            "KV cache",
+        )?;
         let rows = match request.row_kind {
-            RasterKvRowKind::Key => cache.keys(),
-            RasterKvRowKind::Value => cache.values(),
+            RasterKvRowKind::Key => key_rows,
+            RasterKvRowKind::Value => value_rows,
         };
         let row = rows
             .get(request.head_idx)
@@ -1200,7 +1207,7 @@ impl AuthRead<RasterKvRowRequest> for AuthenticatedRasterTensorStore {
                     request.token_idx
                 )
             })?;
-        if row.width() != *head_dim {
+        if row.width() != head_dim {
             bail!(
                 "KV row {:?} ({}, {}) has width {}, expected {}",
                 request.row_kind,
@@ -1214,6 +1221,30 @@ impl AuthRead<RasterKvRowRequest> for AuthenticatedRasterTensorStore {
     }
 }
 
+impl AuthRead<RasterSequenceRowRequest> for AuthenticatedRasterTensorStore {
+    type Output = RasterActivationRow;
+
+    fn auth_read(&self, request: RasterSequenceRowRequest) -> Result<Self::Output> {
+        self.read_sequence_row(request)
+    }
+}
+
+impl AuthRead<RasterHeadRowRequest> for AuthenticatedRasterTensorStore {
+    type Output = RasterActivationRow;
+
+    fn auth_read(&self, request: RasterHeadRowRequest) -> Result<Self::Output> {
+        self.read_head_row(request)
+    }
+}
+
+impl AuthRead<RasterKvRowRequest> for AuthenticatedRasterTensorStore {
+    type Output = RasterActivationRow;
+
+    fn auth_read(&self, request: RasterKvRowRequest) -> Result<Self::Output> {
+        self.read_kv_row(request)
+    }
+}
+
 pub fn build_intermediate_sequence_commitment(sequence: &RasterActivationSequence) -> String {
     build_rows_commitment(b"raster-intermediate-sequence-v1", sequence.rows())
 }
@@ -1223,10 +1254,17 @@ pub fn build_intermediate_heads_commitment(heads: &RasterAttentionHeadSequence) 
 }
 
 pub fn build_intermediate_kv_cache_commitment(cache: &RasterKvCache) -> String {
+    build_intermediate_kv_cache_rows_commitment(cache.keys(), cache.values())
+}
+
+fn build_intermediate_kv_cache_rows_commitment(
+    keys: &[Vec<RasterActivationRow>],
+    values: &[Vec<RasterActivationRow>],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"raster-intermediate-kv-cache-v1");
-    update_nested_rows(&mut hasher, cache.keys());
-    update_nested_rows(&mut hasher, cache.values());
+    update_nested_rows(&mut hasher, keys);
+    update_nested_rows(&mut hasher, values);
     hex_digest(hasher.finalize())
 }
 
@@ -1589,6 +1627,31 @@ mod tests {
     }
 
     #[test]
+    fn row_read_requests_serialize_compact_tile_boundary() {
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let seq_ref = store
+            .insert_activation_sequence(tensor_id("seq"), sequence_fixture())
+            .expect("insert seq");
+        let request = RasterSequenceRowRequest {
+            tensor_ref: seq_ref.clone(),
+            row_idx: 1,
+        };
+
+        let serialized = serde_json::to_string(&request).expect("serialize request");
+
+        assert_eq!(
+            serialized,
+            format!(
+                r#"{{"tensor_ref":{{"id":{{"source_name":"seq"}},"kind":"ActivationSequence","shape":{{"Sequence":{{"row_count":2,"width":2}}}},"det_commitment":"{}"}},"row_idx":1}}"#,
+                seq_ref.tensor_ref().det_commitment()
+            )
+        );
+        assert!(!serialized.contains("tensors"));
+        assert!(!serialized.contains("builders"));
+        assert!(!serialized.contains("rows"));
+    }
+
+    #[test]
     fn row_reads_return_expected_rows_and_fail_closed() {
         let mut store = AuthenticatedRasterTensorStore::new();
         let seq_ref = store
@@ -1657,6 +1720,100 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn row_source_contract_validates_ref_identity_shape_kind_and_commitment() {
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let seq_ref = store
+            .insert_activation_sequence(tensor_id("seq"), sequence_fixture())
+            .expect("insert seq");
+        let kv_ref = store
+            .insert_kv_cache(tensor_id("keys"), tensor_id("values"), kv_fixture())
+            .expect("insert kv");
+
+        let source: &dyn RasterRowSource = &store;
+        let row = source
+            .read_sequence_row(RasterSequenceRowRequest {
+                tensor_ref: seq_ref.clone(),
+                row_idx: 0,
+            })
+            .expect("valid row");
+        assert_eq!(
+            row.act_bits(),
+            &[Act::from_num(1.0).to_bits(), Act::from_num(-0.5).to_bits()]
+        );
+
+        let missing_ref = RasterActivationSequenceRef::new(
+            RasterTensorRef::new(
+                tensor_id("missing"),
+                RasterTensorKind::ActivationSequence,
+                seq_ref.tensor_ref().shape().clone(),
+                seq_ref.tensor_ref().det_commitment().to_owned(),
+            )
+            .expect("missing raw ref"),
+        )
+        .expect("missing typed ref");
+        assert!(store
+            .read_sequence_row(RasterSequenceRowRequest {
+                tensor_ref: missing_ref,
+                row_idx: 0,
+            })
+            .is_err());
+
+        let wrong_shape_ref = RasterActivationSequenceRef::new(
+            RasterTensorRef::new(
+                tensor_id("seq"),
+                RasterTensorKind::ActivationSequence,
+                RasterTensorShape::sequence(1, 2).expect("shape"),
+                seq_ref.tensor_ref().det_commitment().to_owned(),
+            )
+            .expect("wrong-shape raw ref"),
+        )
+        .expect("wrong-shape typed ref");
+        assert!(store
+            .read_sequence_row(RasterSequenceRowRequest {
+                tensor_ref: wrong_shape_ref,
+                row_idx: 0,
+            })
+            .is_err());
+
+        let wrong_commitment_ref = RasterActivationSequenceRef::new(
+            RasterTensorRef::new(
+                tensor_id("seq"),
+                RasterTensorKind::ActivationSequence,
+                seq_ref.tensor_ref().shape().clone(),
+                "not-the-sequence-commitment",
+            )
+            .expect("wrong-commitment raw ref"),
+        )
+        .expect("wrong-commitment typed ref");
+        assert!(store
+            .read_sequence_row(RasterSequenceRowRequest {
+                tensor_ref: wrong_commitment_ref,
+                row_idx: 0,
+            })
+            .is_err());
+
+        assert!(store
+            .read_kv_row(RasterKvRowRequest {
+                cache_ref: kv_ref,
+                row_kind: RasterKvRowKind::Key,
+                head_idx: 0,
+                token_idx: 2,
+            })
+            .is_err());
+
+        store
+            .tensors
+            .insert(tensor_id("seq"), StoredTensor::Heads(heads_fixture()));
+        let error = store
+            .read_sequence_row(RasterSequenceRowRequest {
+                tensor_ref: seq_ref,
+                row_idx: 0,
+            })
+            .expect_err("wrong stored kind should fail");
+        assert!(error.to_string().contains("stored tensor kind mismatch"));
     }
 
     #[test]

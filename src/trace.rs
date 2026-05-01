@@ -188,9 +188,13 @@ pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
 }
 
 pub fn trace_checkpoint<T: Serialize>(checkpoint_name: &str, state: &T) -> bool {
-    emit_checkpoint(checkpoint_name);
+    let should_commit = should_commit_checkpoint(checkpoint_name);
+    let observed_by_terminal_checkpoint = terminal_checkpoint_observes(checkpoint_name);
     let reached_terminal_checkpoint = mark_terminal_checkpoint(checkpoint_name);
-    if !trace_checkpointing_enabled() || !should_commit_checkpoint(checkpoint_name) {
+    if should_commit || trace_logging_enabled() || observed_by_terminal_checkpoint {
+        emit_checkpoint(checkpoint_name);
+    }
+    if !trace_checkpointing_enabled() || !should_commit {
         return reached_terminal_checkpoint;
     }
 
@@ -278,6 +282,15 @@ fn trace_checkpointing_enabled() -> bool {
 
 fn should_commit_checkpoint(checkpoint_name: &str) -> bool {
     !checkpoint_name.starts_with("prefill.layer_token.")
+}
+
+fn terminal_checkpoint_observes(checkpoint_name: &str) -> bool {
+    TERMINAL_CHECKPOINT.with(|terminal_checkpoint| {
+        terminal_checkpoint
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.spec.checkpoint_id == checkpoint_name)
+    })
 }
 
 fn mark_terminal_checkpoint(checkpoint_name: &str) -> bool {

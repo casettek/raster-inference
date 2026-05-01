@@ -87,10 +87,24 @@ pub struct InferenceControls {
     pub raster_tiles: bool,
     pub raster_tokenizer_source: Option<AuthenticatedGemmaTokenizer>,
     pub raster_projection_rows_per_tile: Option<usize>,
+    pub raster_attention_kv_rows_per_tile: Option<usize>,
+    pub raster_sequence_rows_per_tile: Option<usize>,
+    pub raster_head_rows_per_tile: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RasterSizingControls {
+    pub projection_rows_per_tile: usize,
+    pub attention_kv_rows_per_tile: usize,
+    pub sequence_rows_per_tile: usize,
+    pub head_rows_per_tile: usize,
 }
 
 impl InferenceControls {
     pub const DEFAULT_RASTER_PROJECTION_ROWS_PER_TILE: usize = 1;
+    pub const DEFAULT_RASTER_ATTENTION_KV_ROWS_PER_TILE: usize = 32;
+    pub const DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE: usize = 1;
+    pub const DEFAULT_RASTER_HEAD_ROWS_PER_TILE: usize = 1;
 
     pub fn raster_projection_rows_per_tile(&self) -> Result<usize> {
         match self.raster_projection_rows_per_tile {
@@ -98,6 +112,41 @@ impl InferenceControls {
             Some(rows) => Ok(rows),
             None => Ok(Self::DEFAULT_RASTER_PROJECTION_ROWS_PER_TILE),
         }
+    }
+
+    pub fn raster_attention_kv_rows_per_tile(&self) -> Result<usize> {
+        match self.raster_attention_kv_rows_per_tile {
+            Some(0) => {
+                anyhow::bail!("raster attention KV rows per tile must be greater than zero")
+            }
+            Some(rows) => Ok(rows),
+            None => Ok(Self::DEFAULT_RASTER_ATTENTION_KV_ROWS_PER_TILE),
+        }
+    }
+
+    pub fn raster_sequence_rows_per_tile(&self) -> Result<usize> {
+        match self.raster_sequence_rows_per_tile {
+            Some(0) => anyhow::bail!("raster sequence rows per tile must be greater than zero"),
+            Some(rows) => Ok(rows),
+            None => Ok(Self::DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE),
+        }
+    }
+
+    pub fn raster_head_rows_per_tile(&self) -> Result<usize> {
+        match self.raster_head_rows_per_tile {
+            Some(0) => anyhow::bail!("raster head rows per tile must be greater than zero"),
+            Some(rows) => Ok(rows),
+            None => Ok(Self::DEFAULT_RASTER_HEAD_ROWS_PER_TILE),
+        }
+    }
+
+    pub fn raster_sizing_controls(&self) -> Result<RasterSizingControls> {
+        Ok(RasterSizingControls {
+            projection_rows_per_tile: self.raster_projection_rows_per_tile()?,
+            attention_kv_rows_per_tile: self.raster_attention_kv_rows_per_tile()?,
+            sequence_rows_per_tile: self.raster_sequence_rows_per_tile()?,
+            head_rows_per_tile: self.raster_head_rows_per_tile()?,
+        })
     }
 
     fn terminal_checkpoint_spec(&self) -> Result<Option<trace::TerminalCheckpointSpec>> {
@@ -162,8 +211,8 @@ pub fn run_inference_with_controls(
             {
                 anyhow::bail!("raster tile inference requires deterministic execution");
             }
-            let raster_projection_rows_per_tile = if controls.raster_tiles {
-                Some(controls.raster_projection_rows_per_tile()?)
+            let raster_sizing_controls = if controls.raster_tiles {
+                Some(controls.raster_sizing_controls()?)
             } else {
                 None
             };
@@ -180,7 +229,7 @@ pub fn run_inference_with_controls(
                 "terminal_checkpoint_occurrence": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.occurrence()),
                 "commit_checkpoints": controls.commit_checkpoints,
                 "tile_authoring_mode": if controls.raster_tiles { "raster" } else { "native" },
-                "raster_projection_rows_per_tile": raster_projection_rows_per_tile,
+                "raster_sizing_controls": raster_sizing_controls,
             }));
             if controls.raster_tiles {
                 crate::raster_authoring::start_tile_invocation_counting();
@@ -256,7 +305,9 @@ pub fn run_inference_with_controls(
                         &prompt_preparation.prompt_token_ids,
                         &ple_source,
                         &token_embeddings,
-                        raster_projection_rows_per_tile
+                        raster_sizing_controls
+                            .as_ref()
+                            .map(|controls| controls.projection_rows_per_tile)
                             .expect("raster projection rows per tile should be validated"),
                     )?
                 } else {
@@ -287,8 +338,7 @@ pub fn run_inference_with_controls(
                         &token_embeddings,
                         &layer_source,
                         ple_inputs.as_ref(),
-                        raster_projection_rows_per_tile
-                            .expect("raster projection rows per tile should be validated"),
+                        raster_sizing_controls.expect("raster sizing controls should be validated"),
                     )?
                 } else {
                     prefill_layer::run_with_mode_internal(
@@ -319,7 +369,9 @@ pub fn run_inference_with_controls(
                         &finalize_source,
                         final_hidden_states,
                         layer_caches,
-                        raster_projection_rows_per_tile
+                        raster_sizing_controls
+                            .as_ref()
+                            .map(|controls| controls.projection_rows_per_tile)
                             .expect("raster projection rows per tile should be validated"),
                     )?
                 } else {
@@ -587,6 +639,9 @@ mod tests {
                 raster_tiles: false,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect("inference should pause");
@@ -635,6 +690,9 @@ mod tests {
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect("raster inference should pause after prefill prepare aux");
@@ -683,6 +741,9 @@ mod tests {
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect("raster inference should pause after prefill layer");
@@ -734,6 +795,9 @@ mod tests {
                 raster_tiles: false,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect("inference should pause after the second prefill layer checkpoint");
@@ -778,6 +842,9 @@ mod tests {
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect("raster inference should pause after prefill finalize");
@@ -833,6 +900,9 @@ mod tests {
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect("raster inference should complete");
@@ -881,6 +951,9 @@ mod tests {
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect("raster inference should pause after output finalize");
@@ -929,6 +1002,9 @@ mod tests {
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect_err("raster inference should reject fp32 requests");
@@ -968,6 +1044,9 @@ mod tests {
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect_err("raster inference should reject fp32 models");
@@ -1005,9 +1084,132 @@ mod tests {
                 raster_tiles: true,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(0),
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect_err("zero raster projection rows per tile should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_rejects_zero_attention_kv_rows_per_tile() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: Some(0),
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
+            },
+        )
+        .expect_err("zero raster attention KV rows per tile should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_rejects_zero_sequence_rows_per_tile() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: Some(0),
+                raster_head_rows_per_tile: None,
+            },
+        )
+        .expect_err("zero raster sequence rows per tile should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_rejects_zero_head_rows_per_tile() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: None,
+                raster_tiles: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: Some(0),
+            },
+        )
+        .expect_err("zero raster head rows per tile should fail");
 
         assert!(error.to_string().contains("greater than zero"));
     }
@@ -1042,6 +1244,9 @@ mod tests {
                 raster_tiles: false,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: Some(0),
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
             },
         )
         .expect("inference should pause");

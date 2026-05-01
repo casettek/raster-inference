@@ -6,6 +6,7 @@ use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence,
     LayerKvCache,
 };
+use crate::RasterSizingControls;
 
 pub mod deterministic_tiles;
 pub mod raster_tiles;
@@ -42,14 +43,9 @@ pub fn run_raster(
     input_activations: &ActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
-    projection_rows_per_tile: usize,
+    raster_sizing: RasterSizingControls,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    raster_tiles::run(
-        input_activations,
-        layer_source,
-        ple_inputs,
-        projection_rows_per_tile,
-    )
+    raster_tiles::run(input_activations, layer_source, ple_inputs, raster_sizing)
 }
 
 pub(crate) fn run_with_mode_internal(

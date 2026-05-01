@@ -294,7 +294,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 ---
 
-- [ ] U2. **Make the intermediate row store a zkVM-sized contract**
+- [x] U2. **Make the intermediate row store a zkVM-sized contract**
 
 **Goal:** Separate the logical authenticated row-source contract from the current in-memory store so refs actually bound tile arguments and state.
 
@@ -332,7 +332,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 ---
 
-- [ ] U3. **Refactor PLE prepare-aux state to refs**
+- [x] U3. **Refactor PLE prepare-aux state to refs**
 
 **Goal:** Remove materialized activation sequences and accumulated per-layer inputs from `PrefillPleRasterState` recursive state.
 
@@ -367,7 +367,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 ---
 
-- [ ] U4. **Add attention KV-window chunking**
+- [x] U4. **Add attention KV-window chunking**
 
 **Goal:** Add `--raster-attention-kv-rows-per-tile` behavior so attention work can be bounded independently from prompt length.
 
@@ -408,7 +408,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 ---
 
-- [ ] U5. **Thread refs through prefill layer orchestration**
+- [x] U5. **Thread refs through prefill layer orchestration**
 
 **Goal:** Stop materializing full tensors between prefill substeps unless crossing a public/checkpoint boundary.
 
@@ -444,7 +444,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 ---
 
-- [ ] U6. **Add optional sequence/head row batching controls**
+- [x] U6. **Add optional sequence/head row batching controls**
 
 **Goal:** Provide tuning knobs for tile count once state is bounded, without making simple row ops the limiting zkVM input size.
 
@@ -481,7 +481,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 ---
 
-- [ ] U7. **Plan bounded materialization and checkpoint behavior**
+- [x] U7. **Plan bounded materialization and checkpoint behavior**
 
 **Goal:** Decide where full materialization is still acceptable and where it needs chunked materialization or versioned checkpoint handling.
 
@@ -611,6 +611,25 @@ head_bytes_per_tile     ~= rows_per_tile * head_dim * 4
 ```
 
 These should remain conservative because they are performance knobs, not the main feasibility blocker.
+
+---
+
+## Phase 7 Materialization Boundary Inventory
+
+Phase 7 keeps the public checkpoint format unchanged and documents the remaining full materialization boundaries instead of adding `raster_materialize_rows_per_tile` without a versioned checkpoint change.
+
+| Boundary | Location | Classification | Decision |
+|---|---|---|---|
+| PLE public inputs | `src/prefill_prepare_aux/raster_tiles.rs` `finalize_prefill_ple_inputs` | Public compatibility output | Materialize from refs into `Gemma4PrefillPleInputs` at finalize only. Recursive PLE state remains ref-backed. |
+| Prefill layer current activations | `src/prefill_layer/raster_tiles.rs` `compute_next_prefill_layer_sequence` | Internal compatibility bridge | Materialized per layer while `run_prefill_layer_sequence` still consumes value tensors. The recursive orchestration state stores refs before and after each layer. |
+| Prefill layer PLE inputs | `src/prefill_layer/raster_tiles.rs` `compute_next_prefill_layer_sequence` | Internal compatibility bridge | Materialized only when entering the value-based layer sequence. Source state stores per-layer input refs. |
+| Donor/cache inputs | `src/prefill_layer/raster_tiles.rs` `materialize_prefill_layer_cache_from_store` | Internal compatibility bridge and checkpoint source | Empty caches stay compact; non-empty caches materialize when the current layer needs donor values or checkpoint serialization needs public cache shape. |
+| Prefill layer checkpoint payload | `src/prefill_layer/raster_tiles.rs` `finalize_prefill_layer_state` | Durable checkpoint compatibility | Keep existing f32/deterministic commitment payload shape. Do not serialize refs into checkpoint bundles without a versioned trace format. |
+| Terminal token checkpoints | `src/prefill_layer/raster_tiles.rs` `finalize_prefill_layer_state`; filter in `src/trace.rs` | Terminal checkpoint / verbose observability | Continue excluding `prefill.layer_token.*` from committed checkpoint bundles. Emit/check terminal hits only when verbose tracing or a matching terminal checkpoint observes them. |
+| Prefill finalize inputs and logits | `src/prefill_finalize/raster_tiles.rs` | Public compatibility output | Keep materializing final hidden state and logits projection output for the existing `prefill.finalize` payload and return type. Projection reads remain chunked by `raster_projection_rows_per_tile`. |
+| Row-store builder finalization | `src/shared/raster_row_store.rs` | Internal ref boundary | Builders reject incomplete/skipped/duplicate rows and materialize only when a public output or compatibility bridge requests it. No separate materialization chunk control is needed for Phase 7. |
+
+Deferred decision: implement `raster_materialize_rows_per_tile` only if a future versioned checkpoint plan changes durable checkpoint payloads to commit refs or chunked materialization products. The current compatibility checkpoints intentionally remain full materialization boundaries.
 
 ---
 

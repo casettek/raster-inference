@@ -35,7 +35,8 @@ use crate::shared::raster_transformer_kernels::{
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, InternalActivationSequence, LayerKvCache,
 };
-use crate::trace::trace_scope;
+use crate::trace::{trace_event, trace_scope};
+use crate::RasterSizingControls;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillLayerRasterState {
@@ -47,6 +48,9 @@ pub struct PrefillLayerRasterState {
     completed_layer_output_sha256s: Vec<String>,
     completed_layer_output_det_sha256s: Vec<Option<String>>,
     projection_rows_per_tile: usize,
+    attention_kv_rows_per_tile: usize,
+    sequence_rows_per_tile: usize,
+    head_rows_per_tile: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -69,9 +73,18 @@ pub fn init_prefill_layer_state(
     input_activations: &ActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
-    projection_rows_per_tile: usize,
+    raster_sizing: RasterSizingControls,
 ) -> Result<PrefillLayerRasterState> {
-    validate_projection_rows_per_tile(projection_rows_per_tile)?;
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    crate::shared::raster_transformer_kernels::validate_attention_kv_rows_per_tile(
+        raster_sizing.attention_kv_rows_per_tile,
+    )?;
+    crate::shared::raster_transformer_kernels::validate_sequence_rows_per_tile(
+        raster_sizing.sequence_rows_per_tile,
+    )?;
+    crate::shared::raster_transformer_kernels::validate_head_rows_per_tile(
+        raster_sizing.head_rows_per_tile,
+    )?;
     let metadata = auth_read!(layer_source, GemmaPrefillLayerSourceMetadataRequest)?;
     if metadata.layer_count == 0 {
         bail!("transformer prefill requires at least one layer");
@@ -111,7 +124,10 @@ pub fn init_prefill_layer_state(
         per_layer_inputs,
         completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
         completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
-        projection_rows_per_tile,
+        projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
+        attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
+        sequence_rows_per_tile: raster_sizing.sequence_rows_per_tile,
+        head_rows_per_tile: raster_sizing.head_rows_per_tile,
     })
 }
 
@@ -185,6 +201,15 @@ pub fn compute_next_prefill_layer_sequence(
         context.layer.has_ple,
         context.layer.kv_shared_layer_index
     ));
+    trace_event(format!(
+        "progress prefill.layer layer={}/{} tokens={} attention={:?} ple={} donor={:?}",
+        context.layer_idx + 1,
+        state.layer_count,
+        current_activations.len(),
+        context.layer.attention_kind,
+        context.layer.has_ple,
+        context.layer.kv_shared_layer_index
+    ));
     let donor_cache = context
         .donor_cache
         .as_ref()
@@ -203,6 +228,9 @@ pub fn compute_next_prefill_layer_sequence(
         donor_cache.as_ref(),
         per_layer_input.as_ref(),
         state.projection_rows_per_tile,
+        state.attention_kv_rows_per_tile,
+        state.sequence_rows_per_tile,
+        state.head_rows_per_tile,
     )?;
 
     call_tile!(
@@ -356,7 +384,7 @@ pub fn run(
     input_activations: &ActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
-    projection_rows_per_tile: usize,
+    raster_sizing: RasterSizingControls,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     let mut store = call_tile!(init_prefill_layer_store);
     let state = call_tile!(
@@ -365,7 +393,7 @@ pub fn run(
         input_activations,
         layer_source,
         ple_inputs,
-        projection_rows_per_tile
+        raster_sizing
     )?;
     let state = call_recur_seq_result!(
         compute_next_prefill_layer_sequence,
@@ -402,6 +430,8 @@ pub fn project_next_prefill_sequence_rows(
         .next_projection_row_idx()
         .saturating_add(state.rows_per_tile())
         .min(state.projection_rows());
+    let start_projection_row_idx = state.next_projection_row_idx();
+    let start_token_idx = state.next_token_idx();
     let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
     for row_idx in state.next_projection_row_idx()..end {
         rows.push(auth_read!(
@@ -414,6 +444,17 @@ pub fn project_next_prefill_sequence_rows(
         )?);
     }
     append_projection_chunk_to_state(&mut state, store, &rows)?;
+    trace_event(format!(
+        "progress prefill.layer.projection layer={} matrix={:?} token={}/{} projection_rows={}..{} of {} input_width={}",
+        layer_idx,
+        matrix,
+        start_token_idx + 1,
+        state.token_count(),
+        start_projection_row_idx,
+        end,
+        state.projection_rows(),
+        state.input_width()
+    ));
     Ok((false, state))
 }
 
@@ -521,8 +562,17 @@ pub fn init_prefill_attention_state(
     values: &RasterAttentionHeadSequence,
     donor_cache: Option<&RasterKvCache>,
     attention_window: Option<usize>,
+    kv_rows_per_tile: usize,
 ) -> Result<RasterAttentionRowState> {
-    init_attention_row_state(store, queries, keys, values, donor_cache, attention_window)
+    init_attention_row_state(
+        store,
+        queries,
+        keys,
+        values,
+        donor_cache,
+        attention_window,
+        kv_rows_per_tile,
+    )
 }
 
 #[tile(kind = recursive)]
@@ -548,6 +598,7 @@ pub fn run_prefill_attention_rows(
     values: &RasterAttentionHeadSequence,
     donor_cache: Option<&RasterKvCache>,
     attention_window: Option<usize>,
+    kv_rows_per_tile: usize,
 ) -> Result<RasterAttentionHeadSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
     let state = call_tile!(
@@ -557,7 +608,8 @@ pub fn run_prefill_attention_rows(
         keys,
         values,
         donor_cache,
-        attention_window
+        attention_window,
+        kv_rows_per_tile
     )?;
     let state = call_recur_tile_result!(project_next_prefill_attention_row, state, &mut store)?;
     call_tile!(finalize_prefill_attention_state, &mut store, state)
@@ -569,16 +621,18 @@ pub fn init_prefill_sequence_rms_norm_state(
     input: &RasterActivationSequence,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
+    rows_per_tile: usize,
 ) -> Result<RasterSequenceUnaryState> {
-    init_sequence_rms_norm_row_state(store, input, norm_weights, eps)
+    init_sequence_rms_norm_row_state(store, input, norm_weights, eps, rows_per_tile)
 }
 
 #[tile]
 pub fn init_prefill_sequence_gelu_state(
     store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
+    rows_per_tile: usize,
 ) -> Result<RasterSequenceUnaryState> {
-    init_sequence_gelu_row_state(store, input)
+    init_sequence_gelu_row_state(store, input, rows_per_tile)
 }
 
 #[tile]
@@ -586,8 +640,9 @@ pub fn init_prefill_sequence_scale_state(
     store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     scalar: Option<crate::shared::det_num::Act>,
+    rows_per_tile: usize,
 ) -> Result<RasterSequenceUnaryState> {
-    init_sequence_scale_row_state(store, input, scalar)
+    init_sequence_scale_row_state(store, input, scalar, rows_per_tile)
 }
 
 #[tile(kind = recursive)]
@@ -612,13 +667,24 @@ pub fn run_prefill_sequence_rms_norm(
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterActivationSequence> {
+    run_prefill_sequence_rms_norm_with_rows_per_tile(input, norm_weights, eps, 1)
+}
+
+#[sequence]
+pub fn run_prefill_sequence_rms_norm_with_rows_per_tile(
+    input: &RasterActivationSequence,
+    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
+    eps: Option<crate::shared::det_num::Acc>,
+    rows_per_tile: usize,
+) -> Result<RasterActivationSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
     let state = call_tile!(
         init_prefill_sequence_rms_norm_state,
         &mut store,
         input,
         norm_weights,
-        eps
+        eps,
+        rows_per_tile
     )?;
     let state =
         call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
@@ -629,8 +695,21 @@ pub fn run_prefill_sequence_rms_norm(
 pub fn run_prefill_sequence_gelu(
     input: &RasterActivationSequence,
 ) -> Result<RasterActivationSequence> {
+    run_prefill_sequence_gelu_with_rows_per_tile(input, 1)
+}
+
+#[sequence]
+pub fn run_prefill_sequence_gelu_with_rows_per_tile(
+    input: &RasterActivationSequence,
+    rows_per_tile: usize,
+) -> Result<RasterActivationSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(init_prefill_sequence_gelu_state, &mut store, input)?;
+    let state = call_tile!(
+        init_prefill_sequence_gelu_state,
+        &mut store,
+        input,
+        rows_per_tile
+    )?;
     let state =
         call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
     call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
@@ -641,8 +720,23 @@ pub fn run_prefill_sequence_scale(
     input: &RasterActivationSequence,
     scalar: Option<crate::shared::det_num::Act>,
 ) -> Result<RasterActivationSequence> {
+    run_prefill_sequence_scale_with_rows_per_tile(input, scalar, 1)
+}
+
+#[sequence]
+pub fn run_prefill_sequence_scale_with_rows_per_tile(
+    input: &RasterActivationSequence,
+    scalar: Option<crate::shared::det_num::Act>,
+    rows_per_tile: usize,
+) -> Result<RasterActivationSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(init_prefill_sequence_scale_state, &mut store, input, scalar)?;
+    let state = call_tile!(
+        init_prefill_sequence_scale_state,
+        &mut store,
+        input,
+        scalar,
+        rows_per_tile
+    )?;
     let state =
         call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
     call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
@@ -653,8 +747,9 @@ pub fn init_prefill_sequence_add_state(
     store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
+    rows_per_tile: usize,
 ) -> Result<RasterSequenceBinaryState> {
-    init_sequence_add_row_state(store, lhs, rhs)
+    init_sequence_add_row_state(store, lhs, rhs, rows_per_tile)
 }
 
 #[tile]
@@ -662,8 +757,9 @@ pub fn init_prefill_sequence_mul_state(
     store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
+    rows_per_tile: usize,
 ) -> Result<RasterSequenceBinaryState> {
-    init_sequence_mul_row_state(store, lhs, rhs)
+    init_sequence_mul_row_state(store, lhs, rhs, rows_per_tile)
 }
 
 #[tile(kind = recursive)]
@@ -687,8 +783,23 @@ pub fn run_prefill_sequence_add(
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
 ) -> Result<RasterActivationSequence> {
+    run_prefill_sequence_add_with_rows_per_tile(lhs, rhs, 1)
+}
+
+#[sequence]
+pub fn run_prefill_sequence_add_with_rows_per_tile(
+    lhs: &RasterActivationSequence,
+    rhs: &RasterActivationSequence,
+    rows_per_tile: usize,
+) -> Result<RasterActivationSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(init_prefill_sequence_add_state, &mut store, lhs, rhs)?;
+    let state = call_tile!(
+        init_prefill_sequence_add_state,
+        &mut store,
+        lhs,
+        rhs,
+        rows_per_tile
+    )?;
     let state = call_recur_tile_result!(
         transform_next_prefill_sequence_binary_row,
         state,
@@ -702,8 +813,23 @@ pub fn run_prefill_sequence_mul(
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
 ) -> Result<RasterActivationSequence> {
+    run_prefill_sequence_mul_with_rows_per_tile(lhs, rhs, 1)
+}
+
+#[sequence]
+pub fn run_prefill_sequence_mul_with_rows_per_tile(
+    lhs: &RasterActivationSequence,
+    rhs: &RasterActivationSequence,
+    rows_per_tile: usize,
+) -> Result<RasterActivationSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(init_prefill_sequence_mul_state, &mut store, lhs, rhs)?;
+    let state = call_tile!(
+        init_prefill_sequence_mul_state,
+        &mut store,
+        lhs,
+        rhs,
+        rows_per_tile
+    )?;
     let state = call_recur_tile_result!(
         transform_next_prefill_sequence_binary_row,
         state,
@@ -718,8 +844,9 @@ pub fn init_prefill_head_rms_norm_state(
     heads: &RasterAttentionHeadSequence,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
+    rows_per_tile: usize,
 ) -> Result<RasterHeadUnaryState> {
-    init_head_rms_norm_row_state(store, heads, norm_weights, eps)
+    init_head_rms_norm_row_state(store, heads, norm_weights, eps, rows_per_tile)
 }
 
 #[tile]
@@ -727,8 +854,9 @@ pub fn init_prefill_value_rms_norm_state(
     store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
     eps: Option<crate::shared::det_num::Acc>,
+    rows_per_tile: usize,
 ) -> Result<RasterHeadUnaryState> {
-    init_value_rms_norm_row_state(store, heads, eps)
+    init_value_rms_norm_row_state(store, heads, eps, rows_per_tile)
 }
 
 #[tile]
@@ -739,6 +867,7 @@ pub fn init_prefill_rope_state(
     freq_base_dim: usize,
     base: Option<crate::shared::det_num::Acc>,
     position_offset: usize,
+    rows_per_tile: usize,
 ) -> Result<RasterHeadUnaryState> {
     init_rope_row_state(
         store,
@@ -747,6 +876,7 @@ pub fn init_prefill_rope_state(
         freq_base_dim,
         base,
         position_offset,
+        rows_per_tile,
     )
 }
 
@@ -772,13 +902,24 @@ pub fn run_prefill_head_rms_norm(
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterAttentionHeadSequence> {
+    run_prefill_head_rms_norm_with_rows_per_tile(heads, norm_weights, eps, 1)
+}
+
+#[sequence]
+pub fn run_prefill_head_rms_norm_with_rows_per_tile(
+    heads: &RasterAttentionHeadSequence,
+    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
+    eps: Option<crate::shared::det_num::Acc>,
+    rows_per_tile: usize,
+) -> Result<RasterAttentionHeadSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
     let state = call_tile!(
         init_prefill_head_rms_norm_state,
         &mut store,
         heads,
         norm_weights,
-        eps
+        eps,
+        rows_per_tile
     )?;
     let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
     call_tile!(finalize_prefill_head_state, state, &mut store)
@@ -789,8 +930,23 @@ pub fn run_prefill_value_rms_norm(
     heads: &RasterAttentionHeadSequence,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterAttentionHeadSequence> {
+    run_prefill_value_rms_norm_with_rows_per_tile(heads, eps, 1)
+}
+
+#[sequence]
+pub fn run_prefill_value_rms_norm_with_rows_per_tile(
+    heads: &RasterAttentionHeadSequence,
+    eps: Option<crate::shared::det_num::Acc>,
+    rows_per_tile: usize,
+) -> Result<RasterAttentionHeadSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(init_prefill_value_rms_norm_state, &mut store, heads, eps)?;
+    let state = call_tile!(
+        init_prefill_value_rms_norm_state,
+        &mut store,
+        heads,
+        eps,
+        rows_per_tile
+    )?;
     let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
     call_tile!(finalize_prefill_head_state, state, &mut store)
 }
@@ -803,6 +959,25 @@ pub fn run_prefill_rope_heads(
     base: Option<crate::shared::det_num::Acc>,
     position_offset: usize,
 ) -> Result<RasterAttentionHeadSequence> {
+    run_prefill_rope_heads_with_rows_per_tile(
+        heads,
+        rotary_dim,
+        freq_base_dim,
+        base,
+        position_offset,
+        1,
+    )
+}
+
+#[sequence]
+pub fn run_prefill_rope_heads_with_rows_per_tile(
+    heads: &RasterAttentionHeadSequence,
+    rotary_dim: usize,
+    freq_base_dim: usize,
+    base: Option<crate::shared::det_num::Acc>,
+    position_offset: usize,
+    rows_per_tile: usize,
+) -> Result<RasterAttentionHeadSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
     let state = call_tile!(
         init_prefill_rope_state,
@@ -811,7 +986,8 @@ pub fn run_prefill_rope_heads(
         rotary_dim,
         freq_base_dim,
         base,
-        position_offset
+        position_offset,
+        rows_per_tile
     )?;
     let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
     call_tile!(finalize_prefill_head_state, state, &mut store)
@@ -947,6 +1123,9 @@ pub fn run_prefill_layer_sequence(
     donor_cache: Option<&RasterKvCache>,
     per_layer_input: Option<&RasterActivationSequence>,
     projection_rows_per_tile: usize,
+    attention_kv_rows_per_tile: usize,
+    sequence_rows_per_tile: usize,
+    head_rows_per_tile: usize,
 ) -> Result<(RasterActivationSequence, RasterKvCache)> {
     let scalars = call_tile!(read_prefill_layer_scalars, layer_source, layer.layer_idx)?;
     let input_norm_weights = call_tile!(
@@ -956,10 +1135,11 @@ pub fn run_prefill_layer_sequence(
         GemmaPrefillLayerNormKind::InputLayer
     )?;
     let normed = call_seq!(
-        run_prefill_sequence_rms_norm,
+        run_prefill_sequence_rms_norm_with_rows_per_tile,
         input,
         Some(&input_norm_weights),
         Some(scalars.rms_norm_eps),
+        sequence_rows_per_tile,
     )?;
 
     let q_projected = call_seq!(
@@ -1022,10 +1202,11 @@ pub fn run_prefill_layer_sequence(
         GemmaPrefillLayerNormKind::Query
     )?;
     let q_heads = call_seq!(
-        run_prefill_head_rms_norm,
+        run_prefill_head_rms_norm_with_rows_per_tile,
         &q_heads,
         Some(&q_norm_weights),
         Some(scalars.rms_norm_eps),
+        head_rows_per_tile,
     )?;
     let k_norm_weights = call_tile!(
         read_prefill_layer_norm_weights,
@@ -1034,10 +1215,11 @@ pub fn run_prefill_layer_sequence(
         GemmaPrefillLayerNormKind::Key
     )?;
     let k_heads = call_seq!(
-        run_prefill_head_rms_norm,
+        run_prefill_head_rms_norm_with_rows_per_tile,
         &k_heads,
         Some(&k_norm_weights),
         Some(scalars.rms_norm_eps),
+        head_rows_per_tile,
     )?;
     let v_heads = call_seq!(
         run_prefill_reshape_heads,
@@ -1046,25 +1228,28 @@ pub fn run_prefill_layer_sequence(
         layer.head_dim
     )?;
     let v_heads = call_seq!(
-        run_prefill_value_rms_norm,
+        run_prefill_value_rms_norm_with_rows_per_tile,
         &v_heads,
-        Some(scalars.rms_norm_eps)
+        Some(scalars.rms_norm_eps),
+        head_rows_per_tile
     )?;
     let q_heads = call_seq!(
-        run_prefill_rope_heads,
+        run_prefill_rope_heads_with_rows_per_tile,
         &q_heads,
         layer.partial_rotary_dim,
         layer.rope_freq_base_dim,
         scalars.rope_base,
         0,
+        head_rows_per_tile,
     )?;
     let k_heads = call_seq!(
-        run_prefill_rope_heads,
+        run_prefill_rope_heads_with_rows_per_tile,
         &k_heads,
         layer.partial_rotary_dim,
         layer.rope_freq_base_dim,
         scalars.rope_base,
         0,
+        head_rows_per_tile,
     )?;
 
     let layer_cache = if donor_cache.is_some() {
@@ -1085,6 +1270,7 @@ pub fn run_prefill_layer_sequence(
         &v_heads,
         donor_cache,
         attention_window,
+        attention_kv_rows_per_tile,
     )?;
     let attention_sequence = call_seq!(run_prefill_combine_heads, &attention_heads)?;
     let attention_output = call_seq!(
@@ -1103,12 +1289,18 @@ pub fn run_prefill_layer_sequence(
         GemmaPrefillLayerNormKind::PostAttention
     )?;
     let attention_output = call_seq!(
-        run_prefill_sequence_rms_norm,
+        run_prefill_sequence_rms_norm_with_rows_per_tile,
         &attention_output,
         Some(&post_attention_norm_weights),
         Some(scalars.rms_norm_eps),
+        sequence_rows_per_tile,
     )?;
-    let xs = call_seq!(run_prefill_sequence_add, input, &attention_output)?;
+    let xs = call_seq!(
+        run_prefill_sequence_add_with_rows_per_tile,
+        input,
+        &attention_output,
+        sequence_rows_per_tile
+    )?;
 
     let pre_feedforward_norm_weights = call_tile!(
         read_prefill_layer_norm_weights,
@@ -1117,10 +1309,11 @@ pub fn run_prefill_layer_sequence(
         GemmaPrefillLayerNormKind::PreFeedForward
     )?;
     let normed = call_seq!(
-        run_prefill_sequence_rms_norm,
+        run_prefill_sequence_rms_norm_with_rows_per_tile,
         &xs,
         Some(&pre_feedforward_norm_weights),
         Some(scalars.rms_norm_eps),
+        sequence_rows_per_tile,
     )?;
     let gate = call_seq!(
         project_sequence_with_prefill_source,
@@ -1131,7 +1324,11 @@ pub fn run_prefill_layer_sequence(
         layer.gate_proj_shape.rows,
         projection_rows_per_tile,
     )?;
-    let gate = call_seq!(run_prefill_sequence_gelu, &gate)?;
+    let gate = call_seq!(
+        run_prefill_sequence_gelu_with_rows_per_tile,
+        &gate,
+        sequence_rows_per_tile
+    )?;
     let up = call_seq!(
         project_sequence_with_prefill_source,
         &normed,
@@ -1141,7 +1338,12 @@ pub fn run_prefill_layer_sequence(
         layer.up_proj_shape.rows,
         projection_rows_per_tile,
     )?;
-    let ff_hidden = call_seq!(run_prefill_sequence_mul, &gate, &up)?;
+    let ff_hidden = call_seq!(
+        run_prefill_sequence_mul_with_rows_per_tile,
+        &gate,
+        &up,
+        sequence_rows_per_tile
+    )?;
     let ff_out = call_seq!(
         project_sequence_with_prefill_source,
         &ff_hidden,
@@ -1158,12 +1360,18 @@ pub fn run_prefill_layer_sequence(
         GemmaPrefillLayerNormKind::PostFeedForward
     )?;
     let ff_out = call_seq!(
-        run_prefill_sequence_rms_norm,
+        run_prefill_sequence_rms_norm_with_rows_per_tile,
         &ff_out,
         Some(&post_feedforward_norm_weights),
         Some(scalars.rms_norm_eps),
+        sequence_rows_per_tile,
     )?;
-    let mut xs = call_seq!(run_prefill_sequence_add, &xs, &ff_out)?;
+    let mut xs = call_seq!(
+        run_prefill_sequence_add_with_rows_per_tile,
+        &xs,
+        &ff_out,
+        sequence_rows_per_tile
+    )?;
 
     if let Some(per_layer_input) = per_layer_input {
         let gated = call_seq!(
@@ -1180,8 +1388,17 @@ pub fn run_prefill_layer_sequence(
                 .rows,
             projection_rows_per_tile,
         )?;
-        let gated = call_seq!(run_prefill_sequence_gelu, &gated)?;
-        let gated = call_seq!(run_prefill_sequence_mul, &gated, per_layer_input)?;
+        let gated = call_seq!(
+            run_prefill_sequence_gelu_with_rows_per_tile,
+            &gated,
+            sequence_rows_per_tile
+        )?;
+        let gated = call_seq!(
+            run_prefill_sequence_mul_with_rows_per_tile,
+            &gated,
+            per_layer_input,
+            sequence_rows_per_tile
+        )?;
         let projected = call_seq!(
             project_sequence_with_prefill_source,
             &gated,
@@ -1203,16 +1420,27 @@ pub fn run_prefill_layer_sequence(
             GemmaPrefillLayerNormKind::PlePostInput
         )?;
         let projected = call_seq!(
-            run_prefill_sequence_rms_norm,
+            run_prefill_sequence_rms_norm_with_rows_per_tile,
             &projected,
             Some(&ple_post_input_norm_weights),
             Some(scalars.rms_norm_eps),
+            sequence_rows_per_tile,
         )?;
-        xs = call_seq!(run_prefill_sequence_add, &xs, &projected)?;
+        xs = call_seq!(
+            run_prefill_sequence_add_with_rows_per_tile,
+            &xs,
+            &projected,
+            sequence_rows_per_tile
+        )?;
     }
 
     if scalars.layer_scalar.is_some() {
-        xs = call_seq!(run_prefill_sequence_scale, &xs, scalars.layer_scalar)?;
+        xs = call_seq!(
+            run_prefill_sequence_scale_with_rows_per_tile,
+            &xs,
+            scalars.layer_scalar,
+            sequence_rows_per_tile
+        )?;
     }
 
     Ok((xs, layer_cache))
@@ -1358,8 +1586,18 @@ mod tests {
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleLayerWeights,
         Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence, MatrixF32,
     };
+    use crate::RasterSizingControls;
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
+
+    fn raster_sizing(projection_rows_per_tile: usize) -> RasterSizingControls {
+        RasterSizingControls {
+            projection_rows_per_tile,
+            attention_kv_rows_per_tile: usize::MAX,
+            sequence_rows_per_tile: 1,
+            head_rows_per_tile: 1,
+        }
+    }
 
     #[test]
     fn single_layer_no_ple_matches_deterministic_prefill_layer() {
@@ -1398,7 +1636,8 @@ mod tests {
         let mut store = AuthenticatedRasterTensorStore::new();
 
         let state =
-            super::init_prefill_layer_state(&mut store, &input, &source, None, 1).expect("state");
+            super::init_prefill_layer_state(&mut store, &input, &source, None, raster_sizing(1))
+                .expect("state");
 
         let encoded = serde_json::to_string(&state).expect("serialize state");
         assert!(encoded.contains("current_activations_ref"));
@@ -1407,6 +1646,29 @@ mod tests {
         assert!(!encoded.contains("act_bits"));
         assert!(!encoded.contains("\"keys\""));
         assert!(!encoded.contains("\"values\""));
+    }
+
+    #[test]
+    fn prefill_layer_state_stays_ref_backed_after_layer_update() {
+        let (_path, model) = no_ple_model();
+        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+            .expect("source should build");
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let state =
+            super::init_prefill_layer_state(&mut store, &input, &source, None, raster_sizing(1))
+                .expect("state");
+
+        let (_done, state) = super::compute_next_prefill_layer_sequence(state, &source, &mut store)
+            .expect("layer should compute");
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+
+        assert!(encoded.contains("current_activations_ref"));
+        assert!(encoded.contains("prefill.layer.current.after.0"));
+        assert!(encoded.contains("layer_caches"));
+        assert!(encoded.contains("prefill.layer.cache.0.keys"));
+        assert!(encoded.contains("prefill.layer.cache.0.values"));
+        assert!(!encoded.contains("act_bits"));
     }
 
     #[test]
@@ -1481,8 +1743,9 @@ mod tests {
             vec![Act::from_num(0.0), Act::from_num(4.0)],
         ]]);
 
-        let row_output = run_prefill_attention_rows(&queries, &keys, &values, None, None)
-            .expect("row attention");
+        let row_output =
+            run_prefill_attention_rows(&queries, &keys, &values, None, None, usize::MAX)
+                .expect("row attention");
         let full_output = causal_attention_heads_with_cache(&queries, &keys, &values, None, None)
             .expect("full attention");
 
@@ -1503,8 +1766,9 @@ mod tests {
             vec![Act::from_num(3.0), Act::from_num(0.0)],
         ]]);
 
-        let row_output = run_prefill_attention_rows(&queries, &keys, &values, None, Some(2))
-            .expect("row attention");
+        let row_output =
+            run_prefill_attention_rows(&queries, &keys, &values, None, Some(2), usize::MAX)
+                .expect("row attention");
         let full_output =
             causal_attention_heads_with_cache(&queries, &keys, &values, None, Some(2))
                 .expect("full attention");
@@ -1544,6 +1808,7 @@ mod tests {
             &current_values,
             Some(&donor_cache),
             Some(1),
+            usize::MAX,
         )
         .expect("row attention");
         let full_output = causal_attention_heads_with_cache(
@@ -1575,8 +1840,9 @@ mod tests {
             vec![vec![Act::from_num(7.0)]],
         ]);
 
-        let row_output = run_prefill_attention_rows(&queries, &keys, &values, None, None)
-            .expect("row attention");
+        let row_output =
+            run_prefill_attention_rows(&queries, &keys, &values, None, None, usize::MAX)
+                .expect("row attention");
         let full_output = causal_attention_heads_with_cache(&queries, &keys, &values, None, None)
             .expect("full attention");
 
@@ -1589,10 +1855,22 @@ mod tests {
         let keys = queries.clone();
         let values = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(2.0)]]]);
         let mut store = AuthenticatedRasterTensorStore::new();
-        let state = init_prefill_attention_state(&mut store, &queries, &keys, &values, None, None)
-            .expect("attention state");
+        let state = init_prefill_attention_state(
+            &mut store,
+            &queries,
+            &keys,
+            &values,
+            None,
+            None,
+            usize::MAX,
+        )
+        .expect("attention state");
         let (done, state) = project_next_prefill_attention_row(state, &mut store)
-            .expect("first row should compute");
+            .expect("score chunk should compute");
+        assert!(!done);
+        assert!(!state.is_complete());
+        let (done, state) = project_next_prefill_attention_row(state, &mut store)
+            .expect("value chunk should compute");
         assert!(!done);
         assert!(state.is_complete());
 
@@ -1750,7 +2028,8 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
-        let error = run(&input, &source, None, 1).expect_err("self donor should fail");
+        let error =
+            run(&input, &source, None, raster_sizing(1)).expect_err("self donor should fail");
 
         assert!(error
             .to_string()
@@ -1782,7 +2061,8 @@ mod tests {
         let input_internal = InternalActivationSequence::from_det_values(rows);
         let input = activation_sequence_from_internal(input_internal.clone());
 
-        let raster = run(&input, &source, None, 2).expect("raster prefill layer should run");
+        let raster =
+            run(&input, &source, None, raster_sizing(2)).expect("raster prefill layer should run");
         let deterministic = deterministic_tiles::run_internal(input_internal, &model, None)
             .expect("deterministic prefill layer should run");
 
@@ -1820,7 +2100,8 @@ mod tests {
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let ple_inputs = ple_inputs(vec![vec![Act::from_num(0.5), Act::from_num(0.25)]]);
 
-        let error = run(&input, &source, Some(&ple_inputs), 1).expect_err("PLE input should fail");
+        let error = run(&input, &source, Some(&ple_inputs), raster_sizing(1))
+            .expect_err("PLE input should fail");
 
         assert!(error
             .to_string()
@@ -1839,7 +2120,8 @@ mod tests {
             Act::from_num(0.125),
         ]]);
 
-        let error = run(&input, &source, Some(&ple_inputs), 1).expect_err("PLE width should fail");
+        let error = run(&input, &source, Some(&ple_inputs), raster_sizing(1))
+            .expect_err("PLE width should fail");
 
         assert!(error
             .to_string()
@@ -1873,7 +2155,8 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
-        let error = run(&input, &source, None, 1).expect_err("zero layers should fail");
+        let error =
+            run(&input, &source, None, raster_sizing(1)).expect_err("zero layers should fail");
 
         assert!(error
             .to_string()
@@ -1887,7 +2170,8 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(Vec::new());
 
-        let error = run(&input, &source, None, 1).expect_err("empty input should fail");
+        let error =
+            run(&input, &source, None, raster_sizing(1)).expect_err("empty input should fail");
 
         assert!(error
             .to_string()
@@ -1904,7 +2188,8 @@ mod tests {
             crate::shared::transformer_kernels::build_activation_commitment(&[vec![1.0, 0.0]]),
         );
 
-        let error = run(&input, &source, None, 1).expect_err("f32-only input should fail");
+        let error =
+            run(&input, &source, None, raster_sizing(1)).expect_err("f32-only input should fail");
 
         assert!(error.to_string().contains("requires canonical activations"));
     }
@@ -1932,7 +2217,8 @@ mod tests {
         let input_internal = InternalActivationSequence::from_det_values(rows);
         let input = activation_sequence_from_internal(input_internal.clone());
 
-        let raster = run(&input, &source, ple_inputs, 1).expect("raster prefill layer should run");
+        let raster = run(&input, &source, ple_inputs, raster_sizing(1))
+            .expect("raster prefill layer should run");
         let deterministic = deterministic_tiles::run_internal(input_internal, model, ple_inputs)
             .expect("deterministic prefill layer should run");
 

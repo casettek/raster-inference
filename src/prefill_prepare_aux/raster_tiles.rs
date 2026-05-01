@@ -8,7 +8,9 @@ use crate::shared::raster_prefill_ple::{
     GemmaPleModelProjectionRowRequest, GemmaPleProjectionNormWeightsRequest,
     GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
 };
-use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
+use crate::shared::raster_row_store::{
+    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterTensorId,
+};
 use crate::shared::raster_transformer_kernels::{
     add_sequences, append_projection_chunk_to_state, finalize_sequence_projection_state,
     init_sequence_projection_state, rms_norm_sequence, scale_sequence,
@@ -22,16 +24,22 @@ use crate::shared::transformer::{
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillPleRasterState {
     token_ids: Vec<u32>,
-    input_activations: Option<RasterActivationSequence>,
+    input_activations_ref: Option<RasterActivationSequenceRef>,
     next_layer_idx: usize,
     layer_count: usize,
-    per_layer_inputs: Vec<Option<RasterActivationSequence>>,
+    per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
     has_ple_global: bool,
     projection_rows_per_tile: usize,
 }
 
 #[tile]
+pub fn init_prefill_ple_store() -> AuthenticatedRasterTensorStore {
+    AuthenticatedRasterTensorStore::new()
+}
+
+#[tile]
 pub fn init_prefill_ple_state(
+    store: &mut AuthenticatedRasterTensorStore,
     token_ids: &[u32],
     input_activations: &ActivationSequence,
     ple_source: &AuthenticatedGemmaPleSource,
@@ -42,7 +50,7 @@ pub fn init_prefill_ple_state(
     if !metadata.has_ple_global {
         return Ok(PrefillPleRasterState {
             token_ids: token_ids.to_vec(),
-            input_activations: None,
+            input_activations_ref: None,
             next_layer_idx: 0,
             layer_count: metadata.layer_count,
             per_layer_inputs: Vec::with_capacity(metadata.layer_count),
@@ -88,10 +96,14 @@ pub fn init_prefill_ple_state(
             first_layer.hidden_width
         );
     }
+    let input_activations_ref = store.insert_activation_sequence(
+        RasterTensorId::new("prefill.prepare_aux.input.initial")?,
+        input_activations,
+    )?;
 
     Ok(PrefillPleRasterState {
         token_ids: token_ids.to_vec(),
-        input_activations: Some(input_activations),
+        input_activations_ref: Some(input_activations_ref),
         next_layer_idx: 0,
         layer_count: metadata.layer_count,
         per_layer_inputs: Vec::with_capacity(metadata.layer_count),
@@ -104,6 +116,7 @@ pub fn init_prefill_ple_state(
 pub fn compute_next_prefill_ple_layer(
     mut state: PrefillPleRasterState,
     ple_source: &AuthenticatedGemmaPleSource,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, PrefillPleRasterState)> {
     if !state.has_ple_global || state.next_layer_idx >= state.layer_count {
         return Ok((true, state));
@@ -111,16 +124,24 @@ pub fn compute_next_prefill_ple_layer(
 
     let layer_idx = state.next_layer_idx;
     let layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx })?;
+    crate::trace::trace_event(format!(
+        "progress prefill.prepare_aux layer={}/{} ple={} tokens={}",
+        layer_idx + 1,
+        state.layer_count,
+        layer.has_ple,
+        state.token_ids.len()
+    ));
     if !layer.has_ple {
         state.per_layer_inputs.push(None);
         state.next_layer_idx += 1;
         return Ok((false, state));
     }
 
-    let input_activations = state
-        .input_activations
+    let input_activations_ref = state
+        .input_activations_ref
         .as_ref()
-        .ok_or_else(|| anyhow!("raster PLE state is missing input activations"))?;
+        .ok_or_else(|| anyhow!("raster PLE state is missing input activation ref"))?;
+    let input_activations = store.materialize_sequence(input_activations_ref)?;
     let projection_rows = layer.model_projection_rows.ok_or_else(|| {
         anyhow!("Gemma PLE layer {layer_idx} is missing model projection row metadata")
     })?;
@@ -132,7 +153,7 @@ pub fn compute_next_prefill_ple_layer(
 
     let projected = call_seq!(
         project_sequence_with_source,
-        input_activations,
+        &input_activations,
         ple_source,
         layer_idx,
         projection_rows,
@@ -144,13 +165,18 @@ pub fn compute_next_prefill_ple_layer(
     let combined = add_sequences(&embedded, &projected)?;
     let combined = scale_sequence(&combined, Some(scalars.input_scale))?;
 
-    state.per_layer_inputs.push(Some(combined));
+    let combined_ref = store.insert_activation_sequence(
+        RasterTensorId::new(format!("prefill.prepare_aux.per_layer_input.{layer_idx}"))?,
+        combined,
+    )?;
+    state.per_layer_inputs.push(Some(combined_ref));
     state.next_layer_idx += 1;
     Ok((false, state))
 }
 
 #[tile]
 pub fn finalize_prefill_ple_inputs(
+    store: &AuthenticatedRasterTensorStore,
     state: PrefillPleRasterState,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     if !state.has_ple_global {
@@ -168,8 +194,16 @@ pub fn finalize_prefill_ple_inputs(
         state
             .per_layer_inputs
             .into_iter()
-            .map(|input| input.map(internal_sequence_from_raster))
-            .collect(),
+            .map(|input| {
+                input
+                    .map(|input_ref| {
+                        store
+                            .materialize_sequence(&input_ref)
+                            .map(internal_sequence_from_raster)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?,
     )))
 }
 
@@ -203,6 +237,8 @@ pub fn project_next_ple_sequence_rows(
         .next_projection_row_idx()
         .saturating_add(state.rows_per_tile())
         .min(state.projection_rows());
+    let start_projection_row_idx = state.next_projection_row_idx();
+    let start_token_idx = state.next_token_idx();
     let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
     for row_idx in state.next_projection_row_idx()..end {
         rows.push(auth_read!(
@@ -211,6 +247,16 @@ pub fn project_next_ple_sequence_rows(
         )?);
     }
     append_projection_chunk_to_state(&mut state, store, &rows)?;
+    crate::trace::trace_event(format!(
+        "progress prefill.prepare_aux.projection layer={} token={}/{} projection_rows={}..{} of {} input_width={}",
+        layer_idx,
+        start_token_idx + 1,
+        state.token_count(),
+        start_projection_row_idx,
+        end,
+        state.projection_rows(),
+        state.input_width()
+    ));
     Ok((false, state))
 }
 
@@ -255,15 +301,22 @@ pub fn run(
     ple_source: &AuthenticatedGemmaPleSource,
     projection_rows_per_tile: usize,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
+    let mut store = call_tile!(init_prefill_ple_store);
     let state = call_tile!(
         init_prefill_ple_state,
+        &mut store,
         token_ids,
         input_activations,
         ple_source,
         projection_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(compute_next_prefill_ple_layer, state, ple_source)?;
-    call_tile!(finalize_prefill_ple_inputs, state)
+    let state = call_recur_tile_result!(
+        compute_next_prefill_ple_layer,
+        state,
+        ple_source,
+        &mut store
+    )?;
+    call_tile!(finalize_prefill_ple_inputs, &store, state)
 }
 
 fn raster_activation_sequence_from_embedding(
@@ -310,11 +363,12 @@ fn internal_sequence_from_raster(sequence: RasterActivationSequence) -> Internal
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::*;
     use crate::shared::det_num::{f32_to_acc, Act, Wgt};
     use crate::shared::raster_prefill_ple::{
         AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleScalars,
     };
+    use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
     use crate::shared::transformer::{
         ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
@@ -470,6 +524,64 @@ mod tests {
         .expect("native PLE should run");
 
         assert_eq!(raster.per_layer_inputs, native.per_layer_inputs);
+    }
+
+    #[test]
+    fn prefill_ple_state_serializes_refs_not_activation_rows() {
+        let fixture = PleFixture::single_layer().expect("fixture should build");
+        let token_ids = [0, 1];
+        let input = activation_sequence(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.5)],
+            vec![Act::from_num(-1.0), Act::from_num(2.0)],
+        ]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let state = init_prefill_ple_state(&mut store, &token_ids, &input, &fixture.source, 1)
+            .expect("init state");
+
+        let encoded = serde_json::to_string(&state).expect("serialize initial state");
+        assert!(encoded.contains("input_activations_ref"));
+        assert!(encoded.contains("per_layer_inputs"));
+        assert!(!encoded.contains("act_bits"));
+
+        let (_complete, state) = compute_next_prefill_ple_layer(state, &fixture.source, &mut store)
+            .expect("compute layer");
+        let encoded = serde_json::to_string(&state).expect("serialize computed state");
+        assert!(encoded.contains("prefill.prepare_aux.input.initial"));
+        assert!(encoded.contains("prefill.prepare_aux.per_layer_input.0"));
+        assert!(!encoded.contains("act_bits"));
+
+        let finalized = finalize_prefill_ple_inputs(&store, state)
+            .expect("finalize")
+            .expect("PLE inputs");
+        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
+            &token_ids,
+            input.clone_internal(),
+            &fixture.layers,
+            &fixture.native_ple_global,
+            0.0,
+            Some(f32_to_acc(0.0)),
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("native PLE should run");
+        assert_eq!(finalized.per_layer_inputs, native.per_layer_inputs);
+    }
+
+    #[test]
+    fn missing_input_ref_fails_closed() {
+        let fixture = PleFixture::single_layer().expect("fixture should build");
+        let token_ids = [0];
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let mut state = init_prefill_ple_state(&mut store, &token_ids, &input, &fixture.source, 1)
+            .expect("init state");
+        state.input_activations_ref = None;
+
+        let error = compute_next_prefill_ple_layer(state, &fixture.source, &mut store)
+            .expect_err("missing input ref should fail");
+
+        assert!(error
+            .to_string()
+            .contains("raster PLE state is missing input activation ref"));
     }
 
     #[test]

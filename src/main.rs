@@ -13,10 +13,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] [--raster] [--raster-projection-rows-per-tile <rows>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--raster] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use raster-authored tiles where implemented. Pass --raster-projection-rows-per-tile to bound raster projection row chunks."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use raster-authored tiles where implemented. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops."
     );
 }
 
@@ -84,6 +84,9 @@ fn run() -> anyhow::Result<()> {
             raster_tiles: cli_args.raster_tiles,
             raster_tokenizer_source,
             raster_projection_rows_per_tile: cli_args.raster_projection_rows_per_tile,
+            raster_attention_kv_rows_per_tile: cli_args.raster_attention_kv_rows_per_tile,
+            raster_sequence_rows_per_tile: cli_args.raster_sequence_rows_per_tile,
+            raster_head_rows_per_tile: cli_args.raster_head_rows_per_tile,
         },
     )?;
     match inference_outcome {
@@ -104,6 +107,9 @@ struct CliArgs {
     execution_mode: InferenceExecutionMode,
     raster_tiles: bool,
     raster_projection_rows_per_tile: Option<usize>,
+    raster_attention_kv_rows_per_tile: Option<usize>,
+    raster_sequence_rows_per_tile: Option<usize>,
+    raster_head_rows_per_tile: Option<usize>,
     terminal_checkpoint: Option<String>,
     model_id: String,
     tokenizer_path: PathBuf,
@@ -118,6 +124,9 @@ impl CliArgs {
         let mut execution_mode = InferenceExecutionMode::Fp32;
         let mut raster_tiles = false;
         let mut raster_projection_rows_per_tile = None;
+        let mut raster_attention_kv_rows_per_tile = None;
+        let mut raster_sequence_rows_per_tile = None;
+        let mut raster_head_rows_per_tile = None;
         let mut terminal_checkpoint = None;
         let mut positional_args = Vec::new();
         let mut args = args.into_iter();
@@ -139,6 +148,47 @@ impl CliArgs {
                     );
                     raster_projection_rows_per_tile =
                         Some(parse_raster_projection_rows_per_tile(value)?);
+                }
+                "--raster-attention-kv-rows-per-tile" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("expected a row count after {arg}"))?;
+                    raster_attention_kv_rows_per_tile =
+                        Some(parse_raster_attention_kv_rows_per_tile(&value)?);
+                }
+                _ if arg.starts_with("--raster-attention-kv-rows-per-tile=") => {
+                    let value = arg.split_once('=').map(|(_, value)| value).expect(
+                        "split_once should succeed for --raster-attention-kv-rows-per-tile=value",
+                    );
+                    raster_attention_kv_rows_per_tile =
+                        Some(parse_raster_attention_kv_rows_per_tile(value)?);
+                }
+                "--raster-sequence-rows-per-tile" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("expected a row count after {arg}"))?;
+                    raster_sequence_rows_per_tile =
+                        Some(parse_raster_sequence_rows_per_tile(&value)?);
+                }
+                _ if arg.starts_with("--raster-sequence-rows-per-tile=") => {
+                    let value = arg.split_once('=').map(|(_, value)| value).expect(
+                        "split_once should succeed for --raster-sequence-rows-per-tile=value",
+                    );
+                    raster_sequence_rows_per_tile =
+                        Some(parse_raster_sequence_rows_per_tile(value)?);
+                }
+                "--raster-head-rows-per-tile" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("expected a row count after {arg}"))?;
+                    raster_head_rows_per_tile = Some(parse_raster_head_rows_per_tile(&value)?);
+                }
+                _ if arg.starts_with("--raster-head-rows-per-tile=") => {
+                    let value = arg
+                        .split_once('=')
+                        .map(|(_, value)| value)
+                        .expect("split_once should succeed for --raster-head-rows-per-tile=value");
+                    raster_head_rows_per_tile = Some(parse_raster_head_rows_per_tile(value)?);
                 }
                 "--terminal-checkpoint" => {
                     let checkpoint_id = args
@@ -167,6 +217,15 @@ impl CliArgs {
         if raster_projection_rows_per_tile.is_some() && !raster_tiles {
             anyhow::bail!("--raster-projection-rows-per-tile requires --raster");
         }
+        if raster_attention_kv_rows_per_tile.is_some() && !raster_tiles {
+            anyhow::bail!("--raster-attention-kv-rows-per-tile requires --raster");
+        }
+        if raster_sequence_rows_per_tile.is_some() && !raster_tiles {
+            anyhow::bail!("--raster-sequence-rows-per-tile requires --raster");
+        }
+        if raster_head_rows_per_tile.is_some() && !raster_tiles {
+            anyhow::bail!("--raster-head-rows-per-tile requires --raster");
+        }
 
         if raster_tiles {
             execution_mode = InferenceExecutionMode::Deterministic;
@@ -177,6 +236,9 @@ impl CliArgs {
             execution_mode,
             raster_tiles,
             raster_projection_rows_per_tile,
+            raster_attention_kv_rows_per_tile,
+            raster_sequence_rows_per_tile,
+            raster_head_rows_per_tile,
             terminal_checkpoint,
             model_id: positional_args[0].clone(),
             tokenizer_path: PathBuf::from(&positional_args[1]),
@@ -193,6 +255,36 @@ fn parse_raster_projection_rows_per_tile(value: &str) -> anyhow::Result<usize> {
     })?;
     if rows == 0 {
         anyhow::bail!("raster projection rows per tile must be greater than zero");
+    }
+    Ok(rows)
+}
+
+fn parse_raster_attention_kv_rows_per_tile(value: &str) -> anyhow::Result<usize> {
+    let rows = value.parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("raster attention KV rows per tile must be a positive integer")
+    })?;
+    if rows == 0 {
+        anyhow::bail!("raster attention KV rows per tile must be greater than zero");
+    }
+    Ok(rows)
+}
+
+fn parse_raster_sequence_rows_per_tile(value: &str) -> anyhow::Result<usize> {
+    let rows = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("raster sequence rows per tile must be a positive integer"))?;
+    if rows == 0 {
+        anyhow::bail!("raster sequence rows per tile must be greater than zero");
+    }
+    Ok(rows)
+}
+
+fn parse_raster_head_rows_per_tile(value: &str) -> anyhow::Result<usize> {
+    let rows = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("raster head rows per tile must be a positive integer"))?;
+    if rows == 0 {
+        anyhow::bail!("raster head rows per tile must be greater than zero");
     }
     Ok(rows)
 }
@@ -271,6 +363,7 @@ mod tests {
         assert!(args.raster_tiles);
         assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
         assert_eq!(args.raster_projection_rows_per_tile, None);
+        assert_eq!(args.raster_attention_kv_rows_per_tile, None);
     }
 
     #[test]
@@ -288,6 +381,130 @@ mod tests {
         .expect("cli args should parse");
 
         assert_eq!(args.raster_projection_rows_per_tile, Some(4));
+    }
+
+    #[test]
+    fn parse_raster_attention_kv_rows_per_tile_flag() {
+        let args = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-attention-kv-rows-per-tile=8".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(args.raster_attention_kv_rows_per_tile, Some(8));
+    }
+
+    #[test]
+    fn parse_raster_attention_kv_rows_per_tile_rejects_zero() {
+        let error = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-attention-kv-rows-per-tile=0".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("zero rows per tile should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_raster_attention_kv_rows_per_tile_requires_raster() {
+        let error = CliArgs::parse([
+            "--raster-attention-kv-rows-per-tile=8".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("raster attention flag should require raster");
+
+        assert!(error
+            .to_string()
+            .contains("--raster-attention-kv-rows-per-tile requires --raster"));
+    }
+
+    #[test]
+    fn parse_raster_sequence_and_head_rows_per_tile_flags() {
+        let args = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-sequence-rows-per-tile=3".to_string(),
+            "--raster-head-rows-per-tile".to_string(),
+            "4".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(args.raster_sequence_rows_per_tile, Some(3));
+        assert_eq!(args.raster_head_rows_per_tile, Some(4));
+    }
+
+    #[test]
+    fn parse_raster_sequence_and_head_rows_per_tile_reject_zero() {
+        let sequence_error = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-sequence-rows-per-tile=0".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("zero sequence rows per tile should fail");
+        assert!(sequence_error.to_string().contains("greater than zero"));
+
+        let head_error = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-head-rows-per-tile=0".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("zero head rows per tile should fail");
+        assert!(head_error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_raster_sequence_and_head_rows_per_tile_require_raster() {
+        let sequence_error = CliArgs::parse([
+            "--raster-sequence-rows-per-tile=3".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("sequence rows flag should require raster");
+        assert!(sequence_error
+            .to_string()
+            .contains("--raster-sequence-rows-per-tile requires --raster"));
+
+        let head_error = CliArgs::parse([
+            "--raster-head-rows-per-tile=4".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("head rows flag should require raster");
+        assert!(head_error
+            .to_string()
+            .contains("--raster-head-rows-per-tile requires --raster"));
     }
 
     #[test]
