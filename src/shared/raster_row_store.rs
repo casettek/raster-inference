@@ -351,6 +351,37 @@ impl RasterTensorBuilderRef {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterProjectionOutputBuilderRef {
+    builder_ref: RasterTensorBuilderRef,
+    token_count: usize,
+    projection_rows: usize,
+    next_token_idx: usize,
+    next_projection_row_idx: usize,
+}
+
+impl RasterProjectionOutputBuilderRef {
+    pub fn next_token_idx(&self) -> usize {
+        self.next_token_idx
+    }
+
+    pub fn next_projection_row_idx(&self) -> usize {
+        self.next_projection_row_idx
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    pub fn projection_rows(&self) -> usize {
+        self.projection_rows
+    }
+
+    pub fn builder_ref(&self) -> &RasterTensorBuilderRef {
+        &self.builder_ref
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterKvCacheBuilderRef {
     keys: RasterTensorBuilderRef,
     values: RasterTensorBuilderRef,
@@ -392,6 +423,10 @@ enum BuilderRows {
     Sequence(Vec<RasterActivationRow>),
     Heads(Vec<Vec<RasterActivationRow>>),
     Kv(Vec<Vec<RasterActivationRow>>),
+    ProjectionOutput {
+        rows: Vec<RasterActivationRow>,
+        current_row_bits: Vec<i32>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -487,6 +522,24 @@ impl AuthenticatedRasterTensorStore {
         self.start_builder(id, RasterTensorKind::ActivationSequence, shape)
     }
 
+    pub fn start_projection_output_builder(
+        &mut self,
+        id: RasterTensorId,
+        token_count: usize,
+        projection_rows: usize,
+    ) -> Result<RasterProjectionOutputBuilderRef> {
+        let expected_shape = RasterTensorShape::sequence(token_count, projection_rows)?;
+        let builder_ref =
+            self.start_projection_builder(id, RasterTensorKind::PartialOutput, expected_shape)?;
+        Ok(RasterProjectionOutputBuilderRef {
+            builder_ref,
+            token_count,
+            projection_rows,
+            next_token_idx: 0,
+            next_projection_row_idx: 0,
+        })
+    }
+
     pub fn start_heads_builder(
         &mut self,
         id: RasterTensorId,
@@ -539,6 +592,82 @@ impl AuthenticatedRasterTensorStore {
             );
         }
         append_flat_row(builder, builder_ref, row_idx, row)
+    }
+
+    pub fn append_projection_output_chunk(
+        &mut self,
+        builder_ref: &mut RasterProjectionOutputBuilderRef,
+        token_idx: usize,
+        start_projection_row_idx: usize,
+        values: &[i32],
+    ) -> Result<()> {
+        if values.is_empty() {
+            bail!("projection output chunk must contain at least one value");
+        }
+        let builder = self.builder_mut(&builder_ref.builder_ref)?;
+        if builder.kind != RasterTensorKind::PartialOutput {
+            bail!("projection output append requires partial-output builder");
+        }
+        let RasterTensorShape::Sequence { row_count, width } = builder.expected_shape else {
+            bail!("projection output builder requires sequence shape");
+        };
+        if row_count != builder_ref.token_count || width != builder_ref.projection_rows {
+            bail!("projection output builder metadata mismatch");
+        }
+        if token_idx >= row_count {
+            bail!("projection output token {token_idx} is out of range for {row_count} rows");
+        }
+        if token_idx != builder_ref.next_token_idx {
+            bail!(
+                "projection output expected token {}, received {token_idx}",
+                builder_ref.next_token_idx
+            );
+        }
+        if start_projection_row_idx != builder_ref.next_projection_row_idx {
+            bail!(
+                "projection output token {token_idx} expected projection row {}, received {start_projection_row_idx}",
+                builder_ref.next_projection_row_idx
+            );
+        }
+        if values.len() > width.saturating_sub(start_projection_row_idx) {
+            bail!(
+                "projection output chunk overshoots row width {width}: start {start_projection_row_idx}, len {}",
+                values.len()
+            );
+        }
+
+        let BuilderRows::ProjectionOutput {
+            rows,
+            current_row_bits,
+        } = &mut builder.rows
+        else {
+            bail!("projection output append requires projection-output rows");
+        };
+        if rows.len() != token_idx {
+            bail!(
+                "projection output builder expected token {}, received {token_idx}",
+                rows.len()
+            );
+        }
+        if current_row_bits.len() != start_projection_row_idx {
+            bail!(
+                "projection output token {token_idx} has written {}, received start {start_projection_row_idx}",
+                current_row_bits.len()
+            );
+        }
+
+        current_row_bits.extend(values.iter().copied());
+        if current_row_bits.len() == width {
+            let row_bits = std::mem::take(current_row_bits);
+            rows.push(RasterActivationRow::from_act_bits(row_bits));
+            builder.rows_written += 1;
+            builder_ref.next_token_idx += 1;
+            builder_ref.next_projection_row_idx = 0;
+        } else {
+            builder_ref.next_projection_row_idx = current_row_bits.len();
+        }
+        update_builder_ref_from_state(builder, &mut builder_ref.builder_ref);
+        Ok(())
     }
 
     pub fn append_head_row(
@@ -631,6 +760,49 @@ impl AuthenticatedRasterTensorStore {
             );
         }
         self.insert_activation_sequence(builder_ref.id, RasterActivationSequence::from_rows(rows))
+    }
+
+    pub fn finalize_projection_output_builder(
+        &mut self,
+        builder_ref: RasterProjectionOutputBuilderRef,
+    ) -> Result<RasterActivationSequenceRef> {
+        if builder_ref.next_token_idx != builder_ref.token_count
+            || builder_ref.next_projection_row_idx != 0
+        {
+            bail!(
+                "projection output builder finalized at token {}, projection row {}, expected {} complete rows",
+                builder_ref.next_token_idx,
+                builder_ref.next_projection_row_idx,
+                builder_ref.token_count
+            );
+        }
+        let (shape, rows) = self.take_builder_rows(&builder_ref.builder_ref)?;
+        let RasterTensorShape::Sequence { row_count, .. } = shape else {
+            bail!("projection output finalization requires sequence shape");
+        };
+        let BuilderRows::ProjectionOutput {
+            rows,
+            current_row_bits,
+        } = rows
+        else {
+            bail!("projection output finalization received incompatible rows");
+        };
+        if !current_row_bits.is_empty() {
+            bail!(
+                "projection output finalized with partial row width {}",
+                current_row_bits.len()
+            );
+        }
+        if rows.len() != row_count {
+            bail!(
+                "projection output finalized with {} rows, expected {row_count}",
+                rows.len()
+            );
+        }
+        self.insert_activation_sequence(
+            builder_ref.builder_ref.id,
+            RasterActivationSequence::from_rows(rows),
+        )
     }
 
     pub fn finalize_heads_builder(
@@ -776,6 +948,43 @@ impl AuthenticatedRasterTensorStore {
             expected_shape: expected_shape.clone(),
             rows_written: 0,
             rows,
+            finalized: false,
+        };
+        let builder_ref = RasterTensorBuilderRef {
+            id: id.clone(),
+            kind,
+            expected_shape,
+            rows_written: 0,
+            running_commitment: builder_running_commitment(&builder),
+        };
+        self.builders.insert(id, builder);
+        Ok(builder_ref)
+    }
+
+    fn start_projection_builder(
+        &mut self,
+        id: RasterTensorId,
+        kind: RasterTensorKind,
+        expected_shape: RasterTensorShape,
+    ) -> Result<RasterTensorBuilderRef> {
+        if self.tensors.contains_key(&id) || self.builders.contains_key(&id) {
+            bail!(
+                "raster tensor id {} is already registered",
+                id.source_name()
+            );
+        }
+        ensure_kind_matches_shape(kind, &expected_shape)?;
+        let RasterTensorShape::Sequence { row_count, .. } = expected_shape else {
+            bail!("projection output builder requires sequence shape");
+        };
+        let builder = BuilderState {
+            kind,
+            expected_shape: expected_shape.clone(),
+            rows_written: 0,
+            rows: BuilderRows::ProjectionOutput {
+                rows: Vec::with_capacity(row_count),
+                current_row_bits: Vec::new(),
+            },
             finalized: false,
         };
         let builder_ref = RasterTensorBuilderRef {
@@ -1169,7 +1378,9 @@ fn append_nested_row(
 ) -> Result<()> {
     let rows = match &mut builder.rows {
         BuilderRows::Heads(rows) | BuilderRows::Kv(rows) => rows,
-        BuilderRows::Sequence(_) => bail!("nested append requires nested builder rows"),
+        BuilderRows::Sequence(_) | BuilderRows::ProjectionOutput { .. } => {
+            bail!("nested append requires nested builder rows")
+        }
     };
     let head = rows
         .get_mut(head_idx)
@@ -1190,6 +1401,10 @@ fn update_builder_after_append(
     builder_ref: &mut RasterTensorBuilderRef,
 ) {
     builder.rows_written += 1;
+    update_builder_ref_from_state(builder, builder_ref);
+}
+
+fn update_builder_ref_from_state(builder: &BuilderState, builder_ref: &mut RasterTensorBuilderRef) {
     builder_ref.rows_written = builder.rows_written;
     builder_ref.running_commitment = builder_running_commitment(builder);
 }
@@ -1202,6 +1417,16 @@ fn builder_running_commitment(builder: &BuilderState) -> String {
     match &builder.rows {
         BuilderRows::Sequence(rows) => update_rows(&mut hasher, rows),
         BuilderRows::Heads(rows) | BuilderRows::Kv(rows) => update_nested_rows(&mut hasher, rows),
+        BuilderRows::ProjectionOutput {
+            rows,
+            current_row_bits,
+        } => {
+            update_rows(&mut hasher, rows);
+            hasher.update((current_row_bits.len() as u64).to_le_bytes());
+            for bits in current_row_bits {
+                hasher.update(bits.to_le_bytes());
+            }
+        }
     }
     hex_digest(hasher.finalize())
 }
@@ -1523,6 +1748,117 @@ mod tests {
                 .current_len(),
             1
         );
+    }
+
+    #[test]
+    fn projection_output_builder_finalizes_chunked_token_rows() {
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let mut builder = store
+            .start_projection_output_builder(tensor_id("projection"), 2, 3)
+            .expect("builder");
+
+        store
+            .append_projection_output_chunk(&mut builder, 0, 0, &[1, 2])
+            .expect("append chunk");
+        assert_eq!(builder.next_token_idx(), 0);
+        assert_eq!(builder.next_projection_row_idx(), 2);
+        store
+            .append_projection_output_chunk(&mut builder, 0, 2, &[3])
+            .expect("append chunk");
+        store
+            .append_projection_output_chunk(&mut builder, 1, 0, &[4])
+            .expect("append chunk");
+        store
+            .append_projection_output_chunk(&mut builder, 1, 1, &[5, 6])
+            .expect("append chunk");
+
+        let output_ref = store
+            .finalize_projection_output_builder(builder)
+            .expect("finalize");
+        let output = store
+            .materialize_sequence(&output_ref)
+            .expect("materialize");
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output.width().expect("width"), 3);
+        assert_eq!(output.rows()[0].act_bits(), &[1, 2, 3]);
+        assert_eq!(output.rows()[1].act_bits(), &[4, 5, 6]);
+    }
+
+    #[test]
+    fn projection_output_builder_single_and_multi_value_chunks_match() {
+        let mut single_store = AuthenticatedRasterTensorStore::new();
+        let mut single = single_store
+            .start_projection_output_builder(tensor_id("single"), 1, 3)
+            .expect("builder");
+        single_store
+            .append_projection_output_chunk(&mut single, 0, 0, &[1])
+            .expect("append");
+        single_store
+            .append_projection_output_chunk(&mut single, 0, 1, &[2])
+            .expect("append");
+        single_store
+            .append_projection_output_chunk(&mut single, 0, 2, &[3])
+            .expect("append");
+        let single_ref = single_store
+            .finalize_projection_output_builder(single)
+            .expect("finalize");
+        let single_output = single_store
+            .materialize_sequence(&single_ref)
+            .expect("materialize");
+
+        let mut multi_store = AuthenticatedRasterTensorStore::new();
+        let mut multi = multi_store
+            .start_projection_output_builder(tensor_id("multi"), 1, 3)
+            .expect("builder");
+        multi_store
+            .append_projection_output_chunk(&mut multi, 0, 0, &[1, 2, 3])
+            .expect("append");
+        let multi_ref = multi_store
+            .finalize_projection_output_builder(multi)
+            .expect("finalize");
+        let multi_output = multi_store
+            .materialize_sequence(&multi_ref)
+            .expect("materialize");
+
+        assert_eq!(single_output, multi_output);
+    }
+
+    #[test]
+    fn projection_output_builder_fails_closed_for_invalid_chunks() {
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let mut builder = store
+            .start_projection_output_builder(tensor_id("projection"), 2, 3)
+            .expect("builder");
+
+        assert!(store
+            .append_projection_output_chunk(&mut builder, 1, 0, &[1])
+            .is_err());
+        assert!(store
+            .append_projection_output_chunk(&mut builder, 0, 1, &[1])
+            .is_err());
+        assert!(store
+            .append_projection_output_chunk(&mut builder, 0, 0, &[])
+            .is_err());
+        assert!(store
+            .append_projection_output_chunk(&mut builder, 0, 0, &[1, 2, 3, 4])
+            .is_err());
+
+        store
+            .append_projection_output_chunk(&mut builder, 0, 0, &[1])
+            .expect("append");
+        assert!(store
+            .append_projection_output_chunk(&mut builder, 0, 2, &[3])
+            .is_err());
+        assert!(store
+            .finalize_projection_output_builder(builder.clone())
+            .is_err());
+        store
+            .append_projection_output_chunk(&mut builder, 0, 1, &[2, 3])
+            .expect("append");
+        assert!(store
+            .append_projection_output_chunk(&mut builder, 0, 0, &[9])
+            .is_err());
     }
 
     #[test]

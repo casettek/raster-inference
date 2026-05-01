@@ -8,8 +8,9 @@ use crate::shared::raster_prefill_ple::{
     GemmaPleModelProjectionRowRequest, GemmaPleProjectionNormWeightsRequest,
     GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
 };
+use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::shared::raster_transformer_kernels::{
-    add_sequences, append_projection_row_to_state, finalize_sequence_projection_state,
+    add_sequences, append_projection_chunk_to_state, finalize_sequence_projection_state,
     init_sequence_projection_state, rms_norm_sequence, scale_sequence,
     validate_projection_rows_per_tile, RasterActivationRow, RasterActivationSequence,
     RasterSequenceProjectionState,
@@ -173,12 +174,18 @@ pub fn finalize_prefill_ple_inputs(
 }
 
 #[tile]
+pub fn init_ple_projection_store() -> AuthenticatedRasterTensorStore {
+    AuthenticatedRasterTensorStore::new()
+}
+
+#[tile]
 pub fn init_ple_sequence_projection(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     projection_rows: usize,
     projection_rows_per_tile: usize,
 ) -> Result<RasterSequenceProjectionState> {
-    init_sequence_projection_state(input, projection_rows, projection_rows_per_tile)
+    init_sequence_projection_state(store, input, projection_rows, projection_rows_per_tile)
 }
 
 #[tile(kind = recursive)]
@@ -186,33 +193,33 @@ pub fn project_next_ple_sequence_rows(
     mut state: RasterSequenceProjectionState,
     ple_source: &AuthenticatedGemmaPleSource,
     layer_idx: usize,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterSequenceProjectionState)> {
     if state.is_complete() {
         return Ok((true, state));
     }
 
     let end = state
-        .next_row_idx()
+        .next_projection_row_idx()
         .saturating_add(state.rows_per_tile())
         .min(state.projection_rows());
-    while state.next_row_idx() < end {
-        let row = auth_read!(
+    let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
+    for row_idx in state.next_projection_row_idx()..end {
+        rows.push(auth_read!(
             ple_source,
-            GemmaPleModelProjectionRowRequest {
-                layer_idx,
-                row_idx: state.next_row_idx(),
-            },
-        )?;
-        append_projection_row_to_state(&mut state, &row)?;
+            GemmaPleModelProjectionRowRequest { layer_idx, row_idx },
+        )?);
     }
+    append_projection_chunk_to_state(&mut state, store, &rows)?;
     Ok((false, state))
 }
 
 #[tile]
 pub fn finalize_ple_sequence_projection(
     state: RasterSequenceProjectionState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
-    finalize_sequence_projection_state(state)
+    finalize_sequence_projection_state(state, store)
 }
 
 #[sequence]
@@ -223,15 +230,22 @@ pub fn project_sequence_with_source(
     projection_rows: usize,
     projection_rows_per_tile: usize,
 ) -> Result<RasterActivationSequence> {
+    let mut store = call_tile!(init_ple_projection_store);
     let state = call_tile!(
         init_ple_sequence_projection,
+        &mut store,
         input,
         projection_rows,
         projection_rows_per_tile
     )?;
-    let state =
-        call_recur_tile_result!(project_next_ple_sequence_rows, state, ple_source, layer_idx)?;
-    call_tile!(finalize_ple_sequence_projection, state)
+    let state = call_recur_tile_result!(
+        project_next_ple_sequence_rows,
+        state,
+        ple_source,
+        layer_idx,
+        &mut store
+    )?;
+    call_tile!(finalize_ple_sequence_projection, state, &mut store)
 }
 
 #[sequence]

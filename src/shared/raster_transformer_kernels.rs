@@ -18,7 +18,8 @@ use crate::shared::raster_prefill_ple::GemmaPleModelProjectionRowRequest;
 use crate::shared::raster_row_store::{
     AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
     RasterHeadRowRequest, RasterKvCacheRef, RasterKvRowKind, RasterKvRowRequest,
-    RasterSequenceRowRequest, RasterTensorBuilderRef, RasterTensorId,
+    RasterProjectionOutputBuilderRef, RasterSequenceRowRequest, RasterTensorBuilderRef,
+    RasterTensorId,
 };
 use crate::shared::transformer::DetNumTensorSliceSource;
 
@@ -477,16 +478,23 @@ pub fn project_sequence(
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterSequenceProjectionState {
-    input: RasterActivationSequence,
-    next_row_idx: usize,
+    input_ref: RasterActivationSequenceRef,
+    output_builder_ref: RasterProjectionOutputBuilderRef,
+    next_token_idx: usize,
+    next_projection_row_idx: usize,
+    token_count: usize,
+    input_width: usize,
     projection_rows: usize,
     rows_per_tile: usize,
-    output_act_bits: Vec<Vec<i32>>,
 }
 
 impl RasterSequenceProjectionState {
-    pub fn next_row_idx(&self) -> usize {
-        self.next_row_idx
+    pub fn next_token_idx(&self) -> usize {
+        self.next_token_idx
+    }
+
+    pub fn next_projection_row_idx(&self) -> usize {
+        self.next_projection_row_idx
     }
 
     pub fn projection_rows(&self) -> usize {
@@ -498,7 +506,7 @@ impl RasterSequenceProjectionState {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.next_row_idx >= self.projection_rows
+        self.next_token_idx >= self.token_count
     }
 }
 
@@ -510,6 +518,7 @@ pub fn validate_projection_rows_per_tile(rows_per_tile: usize) -> Result<()> {
 }
 
 pub fn init_sequence_projection_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     projection_rows: usize,
     rows_per_tile: usize,
@@ -518,69 +527,111 @@ pub fn init_sequence_projection_state(
         bail!("deterministic linear projection requires at least one projection row");
     }
     validate_projection_rows_per_tile(rows_per_tile)?;
-    sequence_width(input)?;
+    let input_width = sequence_width(input)?;
+    let input_ref = store.insert_activation_sequence(
+        RasterTensorId::new("sequence.projection.input")?,
+        input.clone(),
+    )?;
+    let output_builder_ref = store.start_projection_output_builder(
+        RasterTensorId::new("sequence.projection.output")?,
+        input.len(),
+        projection_rows,
+    )?;
 
     Ok(RasterSequenceProjectionState {
-        input: input.clone(),
-        next_row_idx: 0,
+        input_ref,
+        output_builder_ref,
+        next_token_idx: 0,
+        next_projection_row_idx: 0,
+        token_count: input.len(),
+        input_width,
         projection_rows,
         rows_per_tile,
-        output_act_bits: vec![Vec::with_capacity(projection_rows); input.len()],
     })
 }
 
-pub fn append_projection_row_to_state(
+pub fn append_projection_chunk_to_state(
     state: &mut RasterSequenceProjectionState,
-    projection_row: &[Wgt],
+    store: &mut AuthenticatedRasterTensorStore,
+    projection_rows: &[Vec<Wgt>],
 ) -> Result<()> {
     if state.is_complete() {
         bail!(
-            "raster projection already completed {} rows",
+            "raster projection already completed {} token rows",
+            state.token_count
+        );
+    }
+    if projection_rows.is_empty() {
+        bail!("raster projection chunk requires at least one projection row");
+    }
+    if projection_rows.len() > state.rows_per_tile {
+        bail!(
+            "raster projection chunk has {} rows, exceeding rows_per_tile {}",
+            projection_rows.len(),
+            state.rows_per_tile
+        );
+    }
+    if projection_rows.len()
+        > state
+            .projection_rows
+            .saturating_sub(state.next_projection_row_idx)
+    {
+        bail!(
+            "raster projection chunk overshoots projection rows: start {}, len {}, total {}",
+            state.next_projection_row_idx,
+            projection_rows.len(),
             state.projection_rows
         );
     }
-    if state.output_act_bits.len() != state.input.len() {
+
+    let input_row = auth_read!(
+        store,
+        RasterSequenceRowRequest {
+            tensor_ref: state.input_ref.clone(),
+            row_idx: state.next_token_idx,
+        }
+    )?;
+    if input_row.width() != state.input_width {
         bail!(
-            "raster projection state has {} output rows for {} input rows",
-            state.output_act_bits.len(),
-            state.input.len()
+            "raster projection input row {} has width {}, expected {}",
+            state.next_token_idx,
+            input_row.width(),
+            state.input_width
         );
     }
-
-    for (token_idx, input_row) in state.input.rows().iter().enumerate() {
-        let projected = project_row_with_weights(input_row, projection_row)?;
-        state.output_act_bits[token_idx].push(projected.to_bits());
-    }
-    state.next_row_idx += 1;
+    let output_bits = projection_rows
+        .iter()
+        .map(|projection_row| {
+            project_row_with_weights(&input_row, projection_row)
+                .map(|projected| projected.to_bits())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    store.append_projection_output_chunk(
+        &mut state.output_builder_ref,
+        state.next_token_idx,
+        state.next_projection_row_idx,
+        &output_bits,
+    )?;
+    state.next_token_idx = state.output_builder_ref.next_token_idx();
+    state.next_projection_row_idx = state.output_builder_ref.next_projection_row_idx();
     Ok(())
 }
 
 pub fn finalize_sequence_projection_state(
     state: RasterSequenceProjectionState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
-    if state.next_row_idx != state.projection_rows {
+    if state.next_token_idx != state.token_count || state.next_projection_row_idx != 0 {
         bail!(
-            "raster projection completed {} rows, expected {}",
-            state.next_row_idx,
-            state.projection_rows
-        );
-    }
-    if let Some((row_idx, row)) = state
-        .output_act_bits
-        .iter()
-        .enumerate()
-        .find(|(_, row)| row.len() != state.projection_rows)
-    {
-        bail!(
-            "raster projection output row {row_idx} has width {}, expected {}",
-            row.len(),
-            state.projection_rows
+            "raster projection completed token {}, projection row {}, expected {} complete token rows",
+            state.next_token_idx,
+            state.next_projection_row_idx,
+            state.token_count
         );
     }
 
-    Ok(RasterActivationSequence::from_act_bits(
-        state.output_act_bits,
-    ))
+    let output_ref = store.finalize_projection_output_builder(state.output_builder_ref)?;
+    store.materialize_sequence(&output_ref)
 }
 
 pub fn project_sequence_with_source<S>(
@@ -605,24 +656,24 @@ pub fn project_sequence_with_source_chunked<S>(
 where
     S: AuthRead<GemmaPleModelProjectionRowRequest, Output = Vec<Wgt>>,
 {
-    let mut state = init_sequence_projection_state(input, projection_rows, rows_per_tile)?;
+    let mut store = AuthenticatedRasterTensorStore::new();
+    let mut state =
+        init_sequence_projection_state(&mut store, input, projection_rows, rows_per_tile)?;
     while !state.is_complete() {
         let end = state
-            .next_row_idx()
+            .next_projection_row_idx()
             .saturating_add(state.rows_per_tile())
             .min(state.projection_rows());
-        while state.next_row_idx() < end {
-            let row = auth_read!(
+        let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
+        for row_idx in state.next_projection_row_idx()..end {
+            rows.push(auth_read!(
                 source,
-                GemmaPleModelProjectionRowRequest {
-                    layer_idx,
-                    row_idx: state.next_row_idx(),
-                }
-            )?;
-            append_projection_row_to_state(&mut state, &row)?;
+                GemmaPleModelProjectionRowRequest { layer_idx, row_idx }
+            )?);
         }
+        append_projection_chunk_to_state(&mut state, &mut store, &rows)?;
     }
-    finalize_sequence_projection_state(state)
+    finalize_sequence_projection_state(state, &mut store)
 }
 
 pub(crate) fn det_num_tensor_slice_row_wgts(
@@ -707,25 +758,28 @@ pub fn project_sequence_with_prefill_source_chunked<S>(
 where
     S: AuthRead<GemmaPrefillLayerMatrixRowRequest, Output = Vec<Wgt>>,
 {
-    let mut state = init_sequence_projection_state(input, projection_rows, rows_per_tile)?;
+    let mut store = AuthenticatedRasterTensorStore::new();
+    let mut state =
+        init_sequence_projection_state(&mut store, input, projection_rows, rows_per_tile)?;
     while !state.is_complete() {
         let end = state
-            .next_row_idx()
+            .next_projection_row_idx()
             .saturating_add(state.rows_per_tile())
             .min(state.projection_rows());
-        while state.next_row_idx() < end {
-            let row = auth_read!(
+        let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
+        for row_idx in state.next_projection_row_idx()..end {
+            rows.push(auth_read!(
                 source,
                 GemmaPrefillLayerMatrixRowRequest {
                     layer_idx,
                     matrix,
-                    row_idx: state.next_row_idx(),
+                    row_idx,
                 }
-            )?;
-            append_projection_row_to_state(&mut state, &row)?;
+            )?);
         }
+        append_projection_chunk_to_state(&mut state, &mut store, &rows)?;
     }
-    finalize_sequence_projection_state(state)
+    finalize_sequence_projection_state(state, &mut store)
 }
 
 pub fn rms_norm_sequence(
@@ -2238,17 +2292,18 @@ fn validate_projection_rows(projection_rows: &[Vec<Wgt>]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_sequences, apply_rope_to_heads, attention_output_row, build_raster_kv_cache,
-        causal_attention_heads, causal_attention_heads_with_cache, combine_attention_heads,
-        compute_next_attention_row, compute_next_combine_heads_row, compute_next_head_unary_row,
-        compute_next_kv_cache_row, compute_next_reshape_heads_row,
+        add_sequences, append_projection_chunk_to_state, apply_rope_to_heads, attention_output_row,
+        build_raster_kv_cache, causal_attention_heads, causal_attention_heads_with_cache,
+        combine_attention_heads, compute_next_attention_row, compute_next_combine_heads_row,
+        compute_next_head_unary_row, compute_next_kv_cache_row, compute_next_reshape_heads_row,
         compute_next_sequence_binary_row, compute_next_sequence_unary_row,
         finalize_attention_row_state, finalize_combine_heads_state, finalize_head_unary_row_state,
         finalize_kv_cache_build_state, finalize_reshape_heads_state,
-        finalize_sequence_binary_row_state, finalize_sequence_unary_row_state, gelu_sequence,
-        init_attention_row_state, init_combine_heads_state, init_head_rms_norm_row_state,
-        init_kv_cache_build_state, init_reshape_heads_state, init_rope_row_state,
-        init_sequence_add_row_state, init_sequence_gelu_row_state, init_sequence_mul_row_state,
+        finalize_sequence_binary_row_state, finalize_sequence_projection_state,
+        finalize_sequence_unary_row_state, gelu_sequence, init_attention_row_state,
+        init_combine_heads_state, init_head_rms_norm_row_state, init_kv_cache_build_state,
+        init_reshape_heads_state, init_rope_row_state, init_sequence_add_row_state,
+        init_sequence_gelu_row_state, init_sequence_mul_row_state, init_sequence_projection_state,
         init_sequence_rms_norm_row_state, init_sequence_scale_row_state,
         init_value_rms_norm_row_state, mul_sequences, project_sequence,
         project_sequence_with_prefill_source, project_sequence_with_prefill_source_chunked,
@@ -2396,6 +2451,119 @@ mod tests {
 
         assert_eq!(scaled_bits(&one_row), scaled_bits(&two_rows));
         assert_eq!(scaled_bits(&one_row), scaled_bits(&oversized));
+    }
+
+    #[test]
+    fn projection_state_serializes_refs_and_builder_not_materialized_rows() {
+        let input = RasterActivationSequence::from_acts(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.5)],
+            vec![Act::from_num(-1.0), Act::from_num(2.0)],
+        ]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let state =
+            init_sequence_projection_state(&mut store, &input, 3, 2).expect("projection state");
+
+        let encoded = serde_json::to_string(&state).expect("serialize projection state");
+
+        assert!(encoded.contains("input_ref"));
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(encoded.contains("next_token_idx"));
+        assert!(encoded.contains("next_projection_row_idx"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("output_act_bits"));
+    }
+
+    #[test]
+    fn projection_state_computes_one_token_row_by_projection_chunk() {
+        let input = RasterActivationSequence::from_acts(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.5)],
+            vec![Act::from_num(-1.0), Act::from_num(2.0)],
+        ]);
+        let projection_rows = vec![
+            vec![Wgt::from_num(0.5), Wgt::from_num(1.0)],
+            vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)],
+            vec![Wgt::from_num(2.0), Wgt::from_num(-2.0)],
+        ];
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let mut state =
+            init_sequence_projection_state(&mut store, &input, projection_rows.len(), 2)
+                .expect("projection state");
+
+        append_projection_chunk_to_state(&mut state, &mut store, &projection_rows[..2])
+            .expect("first chunk");
+        assert_eq!(state.next_token_idx(), 0);
+        assert_eq!(state.next_projection_row_idx(), 2);
+        append_projection_chunk_to_state(&mut state, &mut store, &projection_rows[2..])
+            .expect("finish first token");
+        assert_eq!(state.next_token_idx(), 1);
+        assert_eq!(state.next_projection_row_idx(), 0);
+        append_projection_chunk_to_state(&mut state, &mut store, &projection_rows[..2])
+            .expect("second token first chunk");
+        append_projection_chunk_to_state(&mut state, &mut store, &projection_rows[2..])
+            .expect("second token final chunk");
+        assert!(state.is_complete());
+
+        let chunked = finalize_sequence_projection_state(state, &mut store).expect("finalize");
+        let full = project_sequence(&input, &projection_rows).expect("full projection");
+
+        assert_eq!(scaled_bits(&chunked), scaled_bits(&full));
+    }
+
+    #[test]
+    fn projection_state_fails_closed_for_invalid_init_and_chunks() {
+        let input =
+            RasterActivationSequence::from_acts(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+        let empty = RasterActivationSequence::from_acts(Vec::new());
+        let zero_width = RasterActivationSequence::from_act_bits(vec![Vec::new()]);
+
+        assert!(init_sequence_projection_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &input,
+            0,
+            1
+        )
+        .is_err());
+        assert!(init_sequence_projection_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &input,
+            1,
+            0
+        )
+        .is_err());
+        assert!(init_sequence_projection_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &empty,
+            1,
+            1
+        )
+        .is_err());
+        assert!(init_sequence_projection_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &zero_width,
+            1,
+            1
+        )
+        .is_err());
+
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let mut state = init_sequence_projection_state(&mut store, &input, 2, 1).expect("state");
+        assert!(append_projection_chunk_to_state(&mut state, &mut store, &[]).is_err());
+        assert!(append_projection_chunk_to_state(
+            &mut state,
+            &mut store,
+            &[
+                vec![Wgt::from_num(1.0), Wgt::from_num(0.0)],
+                vec![Wgt::from_num(0.0), Wgt::from_num(1.0)]
+            ]
+        )
+        .is_err());
+        append_projection_chunk_to_state(
+            &mut state,
+            &mut store,
+            &[vec![Wgt::from_num(1.0), Wgt::from_num(0.0)]],
+        )
+        .expect("first row");
+        assert!(finalize_sequence_projection_state(state.clone(), &mut store).is_err());
     }
 
     #[test]

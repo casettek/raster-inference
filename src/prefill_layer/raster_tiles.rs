@@ -16,7 +16,7 @@ use crate::shared::raster_row_store::{
     AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterKvCacheRef, RasterTensorId,
 };
 use crate::shared::raster_transformer_kernels::{
-    append_projection_row_to_state, compute_next_attention_row, compute_next_combine_heads_row,
+    append_projection_chunk_to_state, compute_next_attention_row, compute_next_combine_heads_row,
     compute_next_head_unary_row, compute_next_kv_cache_row, compute_next_reshape_heads_row,
     compute_next_sequence_binary_row, compute_next_sequence_unary_row,
     finalize_attention_row_state, finalize_combine_heads_state, finalize_head_unary_row_state,
@@ -378,11 +378,12 @@ pub fn run(
 
 #[tile]
 pub fn init_prefill_sequence_projection(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     projection_rows: usize,
     projection_rows_per_tile: usize,
 ) -> Result<RasterSequenceProjectionState> {
-    init_sequence_projection_state(input, projection_rows, projection_rows_per_tile)
+    init_sequence_projection_state(store, input, projection_rows, projection_rows_per_tile)
 }
 
 #[tile(kind = recursive)]
@@ -391,34 +392,37 @@ pub fn project_next_prefill_sequence_rows(
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer_idx: usize,
     matrix: GemmaPrefillLayerMatrixKind,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterSequenceProjectionState)> {
     if state.is_complete() {
         return Ok((true, state));
     }
 
     let end = state
-        .next_row_idx()
+        .next_projection_row_idx()
         .saturating_add(state.rows_per_tile())
         .min(state.projection_rows());
-    while state.next_row_idx() < end {
-        let row = auth_read!(
+    let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
+    for row_idx in state.next_projection_row_idx()..end {
+        rows.push(auth_read!(
             layer_source,
             crate::shared::raster_prefill_layer::GemmaPrefillLayerMatrixRowRequest {
                 layer_idx,
                 matrix,
-                row_idx: state.next_row_idx(),
+                row_idx,
             },
-        )?;
-        append_projection_row_to_state(&mut state, &row)?;
+        )?);
     }
+    append_projection_chunk_to_state(&mut state, store, &rows)?;
     Ok((false, state))
 }
 
 #[tile]
 pub fn finalize_prefill_sequence_projection(
     state: RasterSequenceProjectionState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
-    finalize_sequence_projection_state(state)
+    finalize_sequence_projection_state(state, store)
 }
 
 #[sequence]
@@ -430,8 +434,10 @@ pub fn project_sequence_with_prefill_source(
     projection_rows: usize,
     projection_rows_per_tile: usize,
 ) -> Result<RasterActivationSequence> {
+    let mut store = call_tile!(init_prefill_layer_store);
     let state = call_tile!(
         init_prefill_sequence_projection,
+        &mut store,
         input,
         projection_rows,
         projection_rows_per_tile
@@ -441,9 +447,10 @@ pub fn project_sequence_with_prefill_source(
         state,
         layer_source,
         layer_idx,
-        matrix
+        matrix,
+        &mut store
     )?;
-    call_tile!(finalize_prefill_sequence_projection, state)
+    call_tile!(finalize_prefill_sequence_projection, state, &mut store)
 }
 
 #[tile]
