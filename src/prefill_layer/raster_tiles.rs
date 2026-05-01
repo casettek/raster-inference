@@ -12,6 +12,9 @@ use crate::shared::raster_prefill_layer::{
     GemmaPrefillLayerNormWeightsRequest, GemmaPrefillLayerScalars, GemmaPrefillLayerScalarsRequest,
     GemmaPrefillLayerSourceMetadataRequest,
 };
+use crate::shared::raster_row_store::{
+    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterKvCacheRef, RasterTensorId,
+};
 use crate::shared::raster_transformer_kernels::{
     append_projection_row_to_state, compute_next_attention_row, compute_next_combine_heads_row,
     compute_next_head_unary_row, compute_next_kv_cache_row, compute_next_reshape_heads_row,
@@ -36,26 +39,33 @@ use crate::trace::trace_scope;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillLayerRasterState {
-    current_activations: RasterActivationSequence,
+    current_activations_ref: RasterActivationSequenceRef,
     next_layer_idx: usize,
     layer_count: usize,
-    layer_caches: Vec<RasterKvCache>,
-    per_layer_inputs: Vec<Option<RasterActivationSequence>>,
+    layer_caches: Vec<PrefillLayerCacheSlot>,
+    per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
     completed_layer_output_sha256s: Vec<String>,
     completed_layer_output_det_sha256s: Vec<Option<String>>,
     projection_rows_per_tile: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum PrefillLayerCacheSlot {
+    Empty { num_kv_heads: usize },
+    Ref(RasterKvCacheRef),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillLayerContext {
     layer_idx: usize,
     layer: GemmaPrefillLayerMetadata,
-    donor_cache: Option<RasterKvCache>,
-    per_layer_input: Option<RasterActivationSequence>,
+    donor_cache: Option<PrefillLayerCacheSlot>,
+    per_layer_input: Option<RasterActivationSequenceRef>,
 }
 
 #[tile]
 pub fn init_prefill_layer_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input_activations: &ActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
@@ -71,18 +81,30 @@ pub fn init_prefill_layer_state(
     if current_activations.is_empty() {
         bail!("transformer layer execution requires at least one activation row");
     }
+    let current_activations_ref = store.insert_activation_sequence(
+        RasterTensorId::new("prefill.layer.current.initial")?,
+        current_activations,
+    )?;
 
     let per_layer_inputs = (0..metadata.layer_count)
         .map(|layer_idx| {
-            ple_inputs
+            let input = ple_inputs
                 .and_then(|inputs| inputs.clone_layer_internal(layer_idx))
                 .map(|input| raster_activation_sequence_from_internal(&input))
+                .transpose()?;
+            input
+                .map(|input| {
+                    store.insert_activation_sequence(
+                        RasterTensorId::new(format!("prefill.layer.per_layer_input.{layer_idx}"))?,
+                        input,
+                    )
+                })
                 .transpose()
         })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(PrefillLayerRasterState {
-        current_activations,
+        current_activations_ref,
         next_layer_idx: 0,
         layer_count: metadata.layer_count,
         layer_caches: Vec::with_capacity(metadata.layer_count),
@@ -143,32 +165,49 @@ pub fn prepare_next_prefill_layer_context(
 pub fn compute_next_prefill_layer_sequence(
     state: PrefillLayerRasterState,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, PrefillLayerRasterState)> {
     if state.next_layer_idx >= state.layer_count {
         return Ok((true, state));
     }
 
     let context = call_tile!(prepare_next_prefill_layer_context, &state, layer_source)?;
+    let current_activations = call_tile!(
+        materialize_prefill_activation_sequence,
+        store,
+        &state.current_activations_ref
+    )?;
     let _trace = trace_scope(format!(
         "prefill.layer.raster layer={} tokens={} attention={:?} ple={} donor={:?}",
         context.layer_idx,
-        state.current_activations.len(),
+        current_activations.len(),
         context.layer.attention_kind,
         context.layer.has_ple,
         context.layer.kv_shared_layer_index
     ));
+    let donor_cache = context
+        .donor_cache
+        .as_ref()
+        .map(|cache| call_tile!(materialize_prefill_layer_cache, store, cache))
+        .transpose()?;
+    let per_layer_input = context
+        .per_layer_input
+        .as_ref()
+        .map(|input_ref| call_tile!(materialize_prefill_activation_sequence, store, input_ref))
+        .transpose()?;
     let (layer_output, layer_cache) = call_seq!(
         run_prefill_layer_sequence,
-        &state.current_activations,
+        &current_activations,
         layer_source,
         &context.layer,
-        context.donor_cache.as_ref(),
-        context.per_layer_input.as_ref(),
+        donor_cache.as_ref(),
+        per_layer_input.as_ref(),
         state.projection_rows_per_tile,
     )?;
 
     call_tile!(
         update_prefill_layer_state,
+        store,
         state,
         context.layer_idx,
         layer_output,
@@ -178,6 +217,7 @@ pub fn compute_next_prefill_layer_sequence(
 
 #[tile]
 pub fn update_prefill_layer_state(
+    store: &mut AuthenticatedRasterTensorStore,
     mut state: PrefillLayerRasterState,
     layer_idx: usize,
     layer_output: RasterActivationSequence,
@@ -190,21 +230,27 @@ pub fn update_prefill_layer_state(
         );
     }
 
-    state.current_activations = layer_output;
-    state.layer_caches.push(layer_cache);
+    state.current_activations_ref = store.insert_activation_sequence(
+        RasterTensorId::new(format!("prefill.layer.current.after.{layer_idx}"))?,
+        layer_output.clone(),
+    )?;
+    state
+        .layer_caches
+        .push(register_prefill_layer_cache(store, layer_idx, layer_cache)?);
     state.completed_layer_output_sha256s.push(
         crate::shared::transformer_kernels::build_activation_commitment(
-            &state.current_activations.to_f32_values(),
+            &layer_output.to_f32_values(),
         ),
     );
     state.completed_layer_output_det_sha256s.push(Some(
         crate::shared::transformer_kernels::build_det_activation_commitment(&raster_sequence_acts(
-            &state.current_activations,
+            &layer_output,
         )),
     ));
-    let current_activations = state.current_activations.to_f32_values();
-    let current_det_activations = raster_sequence_acts(&state.current_activations);
-    let layer_caches = layer_caches_from_raster(&state.layer_caches);
+    let current_activations = layer_output.to_f32_values();
+    let current_det_activations = raster_sequence_acts(&layer_output);
+    let raster_layer_caches = materialize_prefill_layer_caches(store, &state.layer_caches)?;
+    let layer_caches = layer_caches_from_raster(&raster_layer_caches);
     if crate::trace::trace_checkpoint(
         "prefill.layer",
         &json!({
@@ -249,6 +295,7 @@ pub fn update_prefill_layer_state(
 
 #[tile]
 pub fn finalize_prefill_layer_state(
+    store: &AuthenticatedRasterTensorStore,
     state: PrefillLayerRasterState,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     if state.next_layer_idx != state.layer_count {
@@ -259,8 +306,10 @@ pub fn finalize_prefill_layer_state(
         );
     }
 
-    let det_activations = raster_sequence_acts(&state.current_activations);
-    let values = state.current_activations.to_f32_values();
+    let current_activations =
+        materialize_prefill_activation_sequence_from_store(store, &state.current_activations_ref)?;
+    let det_activations = raster_sequence_acts(&current_activations);
+    let values = current_activations.to_f32_values();
     let mut activation_sequence = ActivationSequence::from_internal(
         InternalActivationSequence::from_det_values(det_activations.clone()),
         crate::shared::transformer_kernels::build_activation_commitment(&values),
@@ -272,10 +321,34 @@ pub fn finalize_prefill_layer_state(
         activation_sequence,
         state
             .layer_caches
-            .into_iter()
-            .map(layer_cache_from_raster)
-            .collect(),
+            .iter()
+            .map(|cache| {
+                materialize_prefill_layer_cache_from_store(store, cache)
+                    .map(layer_cache_from_raster)
+            })
+            .collect::<Result<Vec<_>>>()?,
     ))
+}
+
+#[tile]
+pub fn init_prefill_layer_store() -> AuthenticatedRasterTensorStore {
+    AuthenticatedRasterTensorStore::new()
+}
+
+#[tile]
+pub fn materialize_prefill_activation_sequence(
+    store: &AuthenticatedRasterTensorStore,
+    sequence_ref: &RasterActivationSequenceRef,
+) -> Result<RasterActivationSequence> {
+    materialize_prefill_activation_sequence_from_store(store, sequence_ref)
+}
+
+#[tile]
+pub fn materialize_prefill_layer_cache(
+    store: &AuthenticatedRasterTensorStore,
+    cache: &PrefillLayerCacheSlot,
+) -> Result<RasterKvCache> {
+    materialize_prefill_layer_cache_from_store(store, cache)
 }
 
 #[sequence]
@@ -285,15 +358,22 @@ pub fn run(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     projection_rows_per_tile: usize,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    let mut store = call_tile!(init_prefill_layer_store);
     let state = call_tile!(
         init_prefill_layer_state,
+        &mut store,
         input_activations,
         layer_source,
         ple_inputs,
         projection_rows_per_tile
     )?;
-    let state = call_recur_seq_result!(compute_next_prefill_layer_sequence, state, layer_source)?;
-    call_tile!(finalize_prefill_layer_state, state)
+    let state = call_recur_seq_result!(
+        compute_next_prefill_layer_sequence,
+        state,
+        layer_source,
+        &mut store
+    )?;
+    call_tile!(finalize_prefill_layer_state, &store, state)
 }
 
 #[tile]
@@ -422,28 +502,36 @@ pub fn resolve_prefill_attention_window(
 }
 
 #[tile]
+pub fn init_prefill_attention_store() -> AuthenticatedRasterTensorStore {
+    AuthenticatedRasterTensorStore::new()
+}
+
+#[tile]
 pub fn init_prefill_attention_state(
+    store: &mut AuthenticatedRasterTensorStore,
     queries: &RasterAttentionHeadSequence,
     keys: &RasterAttentionHeadSequence,
     values: &RasterAttentionHeadSequence,
     donor_cache: Option<&RasterKvCache>,
     attention_window: Option<usize>,
 ) -> Result<RasterAttentionRowState> {
-    init_attention_row_state(queries, keys, values, donor_cache, attention_window)
+    init_attention_row_state(store, queries, keys, values, donor_cache, attention_window)
 }
 
 #[tile(kind = recursive)]
 pub fn project_next_prefill_attention_row(
     state: RasterAttentionRowState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterAttentionRowState)> {
-    compute_next_attention_row(state)
+    compute_next_attention_row(state, store)
 }
 
 #[tile]
 pub fn finalize_prefill_attention_state(
+    store: &mut AuthenticatedRasterTensorStore,
     state: RasterAttentionRowState,
 ) -> Result<RasterAttentionHeadSequence> {
-    finalize_attention_row_state(state)
+    finalize_attention_row_state(state, store)
 }
 
 #[sequence]
@@ -454,54 +542,61 @@ pub fn run_prefill_attention_rows(
     donor_cache: Option<&RasterKvCache>,
     attention_window: Option<usize>,
 ) -> Result<RasterAttentionHeadSequence> {
+    let mut store = call_tile!(init_prefill_attention_store);
     let state = call_tile!(
         init_prefill_attention_state,
+        &mut store,
         queries,
         keys,
         values,
         donor_cache,
         attention_window
     )?;
-    let state = call_recur_tile_result!(project_next_prefill_attention_row, state)?;
-    call_tile!(finalize_prefill_attention_state, state)
+    let state = call_recur_tile_result!(project_next_prefill_attention_row, state, &mut store)?;
+    call_tile!(finalize_prefill_attention_state, &mut store, state)
 }
 
 #[tile]
 pub fn init_prefill_sequence_rms_norm_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterSequenceUnaryState> {
-    init_sequence_rms_norm_row_state(input, norm_weights, eps)
+    init_sequence_rms_norm_row_state(store, input, norm_weights, eps)
 }
 
 #[tile]
 pub fn init_prefill_sequence_gelu_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
 ) -> Result<RasterSequenceUnaryState> {
-    init_sequence_gelu_row_state(input)
+    init_sequence_gelu_row_state(store, input)
 }
 
 #[tile]
 pub fn init_prefill_sequence_scale_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     scalar: Option<crate::shared::det_num::Act>,
 ) -> Result<RasterSequenceUnaryState> {
-    init_sequence_scale_row_state(input, scalar)
+    init_sequence_scale_row_state(store, input, scalar)
 }
 
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_sequence_unary_row(
     state: RasterSequenceUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterSequenceUnaryState)> {
-    compute_next_sequence_unary_row(state)
+    compute_next_sequence_unary_row(state, store)
 }
 
 #[tile]
 pub fn finalize_prefill_sequence_unary_state(
     state: RasterSequenceUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
-    finalize_sequence_unary_row_state(state)
+    finalize_sequence_unary_row_state(state, store)
 }
 
 #[sequence]
@@ -510,23 +605,28 @@ pub fn run_prefill_sequence_rms_norm(
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterActivationSequence> {
+    let mut store = call_tile!(init_prefill_attention_store);
     let state = call_tile!(
         init_prefill_sequence_rms_norm_state,
+        &mut store,
         input,
         norm_weights,
         eps
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state)?;
-    call_tile!(finalize_prefill_sequence_unary_state, state)
+    let state =
+        call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
+    call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
 }
 
 #[sequence]
 pub fn run_prefill_sequence_gelu(
     input: &RasterActivationSequence,
 ) -> Result<RasterActivationSequence> {
-    let state = call_tile!(init_prefill_sequence_gelu_state, input)?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state)?;
-    call_tile!(finalize_prefill_sequence_unary_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(init_prefill_sequence_gelu_state, &mut store, input)?;
+    let state =
+        call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
+    call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
 }
 
 #[sequence]
@@ -534,39 +634,45 @@ pub fn run_prefill_sequence_scale(
     input: &RasterActivationSequence,
     scalar: Option<crate::shared::det_num::Act>,
 ) -> Result<RasterActivationSequence> {
-    let state = call_tile!(init_prefill_sequence_scale_state, input, scalar)?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state)?;
-    call_tile!(finalize_prefill_sequence_unary_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(init_prefill_sequence_scale_state, &mut store, input, scalar)?;
+    let state =
+        call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
+    call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
 }
 
 #[tile]
 pub fn init_prefill_sequence_add_state(
+    store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
 ) -> Result<RasterSequenceBinaryState> {
-    init_sequence_add_row_state(lhs, rhs)
+    init_sequence_add_row_state(store, lhs, rhs)
 }
 
 #[tile]
 pub fn init_prefill_sequence_mul_state(
+    store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
 ) -> Result<RasterSequenceBinaryState> {
-    init_sequence_mul_row_state(lhs, rhs)
+    init_sequence_mul_row_state(store, lhs, rhs)
 }
 
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_sequence_binary_row(
     state: RasterSequenceBinaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterSequenceBinaryState)> {
-    compute_next_sequence_binary_row(state)
+    compute_next_sequence_binary_row(state, store)
 }
 
 #[tile]
 pub fn finalize_prefill_sequence_binary_state(
     state: RasterSequenceBinaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
-    finalize_sequence_binary_row_state(state)
+    finalize_sequence_binary_row_state(state, store)
 }
 
 #[sequence]
@@ -574,9 +680,14 @@ pub fn run_prefill_sequence_add(
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
 ) -> Result<RasterActivationSequence> {
-    let state = call_tile!(init_prefill_sequence_add_state, lhs, rhs)?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_binary_row, state)?;
-    call_tile!(finalize_prefill_sequence_binary_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(init_prefill_sequence_add_state, &mut store, lhs, rhs)?;
+    let state = call_recur_tile_result!(
+        transform_next_prefill_sequence_binary_row,
+        state,
+        &mut store
+    )?;
+    call_tile!(finalize_prefill_sequence_binary_state, state, &mut store)
 }
 
 #[sequence]
@@ -584,51 +695,68 @@ pub fn run_prefill_sequence_mul(
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
 ) -> Result<RasterActivationSequence> {
-    let state = call_tile!(init_prefill_sequence_mul_state, lhs, rhs)?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_binary_row, state)?;
-    call_tile!(finalize_prefill_sequence_binary_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(init_prefill_sequence_mul_state, &mut store, lhs, rhs)?;
+    let state = call_recur_tile_result!(
+        transform_next_prefill_sequence_binary_row,
+        state,
+        &mut store
+    )?;
+    call_tile!(finalize_prefill_sequence_binary_state, state, &mut store)
 }
 
 #[tile]
 pub fn init_prefill_head_rms_norm_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterHeadUnaryState> {
-    init_head_rms_norm_row_state(heads, norm_weights, eps)
+    init_head_rms_norm_row_state(store, heads, norm_weights, eps)
 }
 
 #[tile]
 pub fn init_prefill_value_rms_norm_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterHeadUnaryState> {
-    init_value_rms_norm_row_state(heads, eps)
+    init_value_rms_norm_row_state(store, heads, eps)
 }
 
 #[tile]
 pub fn init_prefill_rope_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
     rotary_dim: usize,
     freq_base_dim: usize,
     base: Option<crate::shared::det_num::Acc>,
     position_offset: usize,
 ) -> Result<RasterHeadUnaryState> {
-    init_rope_row_state(heads, rotary_dim, freq_base_dim, base, position_offset)
+    init_rope_row_state(
+        store,
+        heads,
+        rotary_dim,
+        freq_base_dim,
+        base,
+        position_offset,
+    )
 }
 
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_head_row(
     state: RasterHeadUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterHeadUnaryState)> {
-    compute_next_head_unary_row(state)
+    compute_next_head_unary_row(state, store)
 }
 
 #[tile]
 pub fn finalize_prefill_head_state(
     state: RasterHeadUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterAttentionHeadSequence> {
-    finalize_head_unary_row_state(state)
+    finalize_head_unary_row_state(state, store)
 }
 
 #[sequence]
@@ -637,9 +765,16 @@ pub fn run_prefill_head_rms_norm(
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterAttentionHeadSequence> {
-    let state = call_tile!(init_prefill_head_rms_norm_state, heads, norm_weights, eps)?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state)?;
-    call_tile!(finalize_prefill_head_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(
+        init_prefill_head_rms_norm_state,
+        &mut store,
+        heads,
+        norm_weights,
+        eps
+    )?;
+    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
+    call_tile!(finalize_prefill_head_state, state, &mut store)
 }
 
 #[sequence]
@@ -647,9 +782,10 @@ pub fn run_prefill_value_rms_norm(
     heads: &RasterAttentionHeadSequence,
     eps: Option<crate::shared::det_num::Acc>,
 ) -> Result<RasterAttentionHeadSequence> {
-    let state = call_tile!(init_prefill_value_rms_norm_state, heads, eps)?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state)?;
-    call_tile!(finalize_prefill_head_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(init_prefill_value_rms_norm_state, &mut store, heads, eps)?;
+    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
+    call_tile!(finalize_prefill_head_state, state, &mut store)
 }
 
 #[sequence]
@@ -660,39 +796,44 @@ pub fn run_prefill_rope_heads(
     base: Option<crate::shared::det_num::Acc>,
     position_offset: usize,
 ) -> Result<RasterAttentionHeadSequence> {
+    let mut store = call_tile!(init_prefill_attention_store);
     let state = call_tile!(
         init_prefill_rope_state,
+        &mut store,
         heads,
         rotary_dim,
         freq_base_dim,
         base,
         position_offset
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state)?;
-    call_tile!(finalize_prefill_head_state, state)
+    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
+    call_tile!(finalize_prefill_head_state, state, &mut store)
 }
 
 #[tile]
 pub fn init_prefill_reshape_heads_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     num_heads: usize,
     head_dim: usize,
 ) -> Result<RasterReshapeHeadsState> {
-    init_reshape_heads_state(input, num_heads, head_dim)
+    init_reshape_heads_state(store, input, num_heads, head_dim)
 }
 
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_reshape_row(
     state: RasterReshapeHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterReshapeHeadsState)> {
-    compute_next_reshape_heads_row(state)
+    compute_next_reshape_heads_row(state, store)
 }
 
 #[tile]
 pub fn finalize_prefill_reshape_heads_state(
     state: RasterReshapeHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterAttentionHeadSequence> {
-    finalize_reshape_heads_state(state)
+    finalize_reshape_heads_state(state, store)
 }
 
 #[sequence]
@@ -701,60 +842,76 @@ pub fn run_prefill_reshape_heads(
     num_heads: usize,
     head_dim: usize,
 ) -> Result<RasterAttentionHeadSequence> {
-    let state = call_tile!(init_prefill_reshape_heads_state, input, num_heads, head_dim)?;
-    let state = call_recur_tile_result!(transform_next_prefill_reshape_row, state)?;
-    call_tile!(finalize_prefill_reshape_heads_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(
+        init_prefill_reshape_heads_state,
+        &mut store,
+        input,
+        num_heads,
+        head_dim
+    )?;
+    let state = call_recur_tile_result!(transform_next_prefill_reshape_row, state, &mut store)?;
+    call_tile!(finalize_prefill_reshape_heads_state, state, &mut store)
 }
 
 #[tile]
 pub fn init_prefill_combine_heads_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
 ) -> Result<RasterCombineHeadsState> {
-    init_combine_heads_state(heads)
+    init_combine_heads_state(store, heads)
 }
 
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_combine_row(
     state: RasterCombineHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterCombineHeadsState)> {
-    compute_next_combine_heads_row(state)
+    compute_next_combine_heads_row(state, store)
 }
 
 #[tile]
 pub fn finalize_prefill_combine_heads_state(
     state: RasterCombineHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
-    finalize_combine_heads_state(state)
+    finalize_combine_heads_state(state, store)
 }
 
 #[sequence]
 pub fn run_prefill_combine_heads(
     heads: &RasterAttentionHeadSequence,
 ) -> Result<RasterActivationSequence> {
-    let state = call_tile!(init_prefill_combine_heads_state, heads)?;
-    let state = call_recur_tile_result!(transform_next_prefill_combine_row, state)?;
-    call_tile!(finalize_prefill_combine_heads_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(init_prefill_combine_heads_state, &mut store, heads)?;
+    let state = call_recur_tile_result!(transform_next_prefill_combine_row, state, &mut store)?;
+    call_tile!(finalize_prefill_combine_heads_state, state, &mut store)
 }
 
 #[tile]
 pub fn init_prefill_kv_cache_state(
+    store: &mut AuthenticatedRasterTensorStore,
     keys: &RasterAttentionHeadSequence,
     values: &RasterAttentionHeadSequence,
     sliding_window: Option<usize>,
 ) -> Result<RasterKvCacheBuildState> {
-    init_kv_cache_build_state(keys, values, sliding_window)
+    init_kv_cache_build_state(store, keys, values, sliding_window)
 }
 
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_kv_cache_row(
     state: RasterKvCacheBuildState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterKvCacheBuildState)> {
-    compute_next_kv_cache_row(state)
+    compute_next_kv_cache_row(state, store)
 }
 
 #[tile]
-pub fn finalize_prefill_kv_cache_state(state: RasterKvCacheBuildState) -> Result<RasterKvCache> {
-    finalize_kv_cache_build_state(state)
+pub fn finalize_prefill_kv_cache_state(
+    state: RasterKvCacheBuildState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterKvCache> {
+    finalize_kv_cache_build_state(state, store)
 }
 
 #[sequence]
@@ -763,9 +920,16 @@ pub fn run_prefill_kv_cache(
     values: &RasterAttentionHeadSequence,
     sliding_window: Option<usize>,
 ) -> Result<RasterKvCache> {
-    let state = call_tile!(init_prefill_kv_cache_state, keys, values, sliding_window)?;
-    let state = call_recur_tile_result!(transform_next_prefill_kv_cache_row, state)?;
-    call_tile!(finalize_prefill_kv_cache_state, state)
+    let mut store = call_tile!(init_prefill_attention_store);
+    let state = call_tile!(
+        init_prefill_kv_cache_state,
+        &mut store,
+        keys,
+        values,
+        sliding_window
+    )?;
+    let state = call_recur_tile_result!(transform_next_prefill_kv_cache_row, state, &mut store)?;
+    call_tile!(finalize_prefill_kv_cache_state, state, &mut store)
 }
 
 #[sequence]
@@ -1048,7 +1212,7 @@ pub fn run_prefill_layer_sequence(
 }
 
 fn resolve_prefill_donor_cache_index(
-    layer_caches: &[RasterKvCache],
+    layer_caches: &[PrefillLayerCacheSlot],
     layer_idx: usize,
     layer: &GemmaPrefillLayerMetadata,
 ) -> Result<Option<usize>> {
@@ -1066,6 +1230,51 @@ fn resolve_prefill_donor_cache_index(
             Ok(donor_idx)
         })
         .transpose()
+}
+
+fn register_prefill_layer_cache(
+    store: &mut AuthenticatedRasterTensorStore,
+    layer_idx: usize,
+    cache: RasterKvCache,
+) -> Result<PrefillLayerCacheSlot> {
+    if cache.current_len() == 0 {
+        return Ok(PrefillLayerCacheSlot::Empty {
+            num_kv_heads: cache.head_count(),
+        });
+    }
+
+    Ok(PrefillLayerCacheSlot::Ref(store.insert_kv_cache(
+        RasterTensorId::new(format!("prefill.layer.cache.{layer_idx}.keys"))?,
+        RasterTensorId::new(format!("prefill.layer.cache.{layer_idx}.values"))?,
+        cache,
+    )?))
+}
+
+fn materialize_prefill_activation_sequence_from_store(
+    store: &AuthenticatedRasterTensorStore,
+    sequence_ref: &RasterActivationSequenceRef,
+) -> Result<RasterActivationSequence> {
+    store.materialize_sequence(sequence_ref)
+}
+
+fn materialize_prefill_layer_cache_from_store(
+    store: &AuthenticatedRasterTensorStore,
+    cache: &PrefillLayerCacheSlot,
+) -> Result<RasterKvCache> {
+    match cache {
+        PrefillLayerCacheSlot::Empty { num_kv_heads } => Ok(RasterKvCache::empty(*num_kv_heads)),
+        PrefillLayerCacheSlot::Ref(cache_ref) => store.materialize_kv_cache(cache_ref),
+    }
+}
+
+fn materialize_prefill_layer_caches(
+    store: &AuthenticatedRasterTensorStore,
+    caches: &[PrefillLayerCacheSlot],
+) -> Result<Vec<RasterKvCache>> {
+    caches
+        .iter()
+        .map(|cache| materialize_prefill_layer_cache_from_store(store, cache))
+        .collect()
 }
 
 fn raster_activation_sequence_from_activation(
@@ -1129,6 +1338,7 @@ mod tests {
     use crate::prefill_layer::deterministic_tiles;
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
+    use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
     use crate::shared::raster_transformer_kernels::{
         add_sequences, apply_rope_to_heads, build_raster_kv_cache,
         causal_attention_heads_with_cache, combine_attention_heads, gelu_sequence, mul_sequences,
@@ -1170,6 +1380,53 @@ mod tests {
             ],
         );
         assert_eq!(raster.1[0].current_len(), 1);
+    }
+
+    #[test]
+    fn prefill_layer_state_serializes_refs_not_materialized_rows() {
+        let (_path, model) = no_ple_model();
+        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+            .expect("source should build");
+        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+
+        let state =
+            super::init_prefill_layer_state(&mut store, &input, &source, None, 1).expect("state");
+
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+        assert!(encoded.contains("current_activations_ref"));
+        assert!(encoded.contains("layer_caches"));
+        assert!(encoded.contains("per_layer_inputs"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("\"keys\""));
+        assert!(!encoded.contains("\"values\""));
+    }
+
+    #[test]
+    fn prefill_layer_cache_slots_materialize_empty_and_ref_caches() {
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let empty = super::materialize_prefill_layer_cache_from_store(
+            &store,
+            &super::PrefillLayerCacheSlot::Empty { num_kv_heads: 2 },
+        )
+        .expect("empty cache");
+        assert_eq!(empty.head_count(), 2);
+        assert_eq!(empty.current_len(), 0);
+
+        let cache = RasterKvCache::from_heads(
+            vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
+                1.0,
+            )])]],
+            vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
+                2.0,
+            )])]],
+        )
+        .expect("cache");
+        let slot =
+            super::register_prefill_layer_cache(&mut store, 0, cache.clone()).expect("cache slot");
+        let materialized =
+            super::materialize_prefill_layer_cache_from_store(&store, &slot).expect("cache");
+        assert_eq!(materialized, cache);
     }
 
     #[test]
@@ -1295,21 +1552,47 @@ mod tests {
     }
 
     #[test]
+    fn prefill_attention_rows_match_grouped_kv_attention() {
+        let queries = RasterAttentionHeadSequence::from_acts(vec![
+            vec![vec![Act::from_num(1.0)]],
+            vec![vec![Act::from_num(2.0)]],
+            vec![vec![Act::from_num(3.0)]],
+            vec![vec![Act::from_num(4.0)]],
+        ]);
+        let keys = RasterAttentionHeadSequence::from_acts(vec![
+            vec![vec![Act::from_num(1.0)]],
+            vec![vec![Act::from_num(2.0)]],
+        ]);
+        let values = RasterAttentionHeadSequence::from_acts(vec![
+            vec![vec![Act::from_num(5.0)]],
+            vec![vec![Act::from_num(7.0)]],
+        ]);
+
+        let row_output = run_prefill_attention_rows(&queries, &keys, &values, None, None)
+            .expect("row attention");
+        let full_output = causal_attention_heads_with_cache(&queries, &keys, &values, None, None)
+            .expect("full attention");
+
+        assert_eq!(head_bits(&row_output), head_bits(&full_output));
+    }
+
+    #[test]
     fn prefill_attention_row_tile_reports_done_after_completion() {
         let queries = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(1.0)]]]);
         let keys = queries.clone();
         let values = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(2.0)]]]);
-        let state = init_prefill_attention_state(&queries, &keys, &values, None, None)
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let state = init_prefill_attention_state(&mut store, &queries, &keys, &values, None, None)
             .expect("attention state");
-        let (done, state) =
-            project_next_prefill_attention_row(state).expect("first row should compute");
+        let (done, state) = project_next_prefill_attention_row(state, &mut store)
+            .expect("first row should compute");
         assert!(!done);
         assert!(state.is_complete());
 
-        let (done, state) =
-            project_next_prefill_attention_row(state).expect("complete state should return done");
+        let (done, state) = project_next_prefill_attention_row(state, &mut store)
+            .expect("complete state should return done");
         assert!(done);
-        let output = finalize_prefill_attention_state(state).expect("finalize");
+        let output = finalize_prefill_attention_state(&mut store, state).expect("finalize");
         assert_eq!(
             output.heads()[0][0].act_bits(),
             &[Act::from_num(2.0).to_bits()]

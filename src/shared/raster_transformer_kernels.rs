@@ -15,6 +15,11 @@ use crate::shared::raster_prefill_layer::{
     GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMatrixRowRequest,
 };
 use crate::shared::raster_prefill_ple::GemmaPleModelProjectionRowRequest;
+use crate::shared::raster_row_store::{
+    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
+    RasterHeadRowRequest, RasterKvCacheRef, RasterKvRowKind, RasterKvRowRequest,
+    RasterSequenceRowRequest, RasterTensorBuilderRef, RasterTensorId,
+};
 use crate::shared::transformer::DetNumTensorSliceSource;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -119,15 +124,16 @@ pub struct RasterKvCache {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterAttentionRowState {
-    queries: RasterAttentionHeadSequence,
-    keys: RasterAttentionHeadSequence,
-    values: RasterAttentionHeadSequence,
-    donor_cache: Option<RasterKvCache>,
+    query_ref: RasterAttentionHeadsRef,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    donor_cache_ref: Option<RasterKvCacheRef>,
+    output_builder_ref: RasterTensorBuilderRef,
     attention_window: Option<usize>,
     next_query_head_idx: usize,
     next_query_token_idx: usize,
-    output_heads: Vec<Vec<RasterActivationRow>>,
     sequence_len: usize,
+    query_head_count: usize,
     kv_head_count: usize,
     kv_groups: usize,
 }
@@ -146,10 +152,12 @@ pub enum RasterSequenceUnaryOp {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterSequenceUnaryState {
-    input: RasterActivationSequence,
+    input_ref: RasterActivationSequenceRef,
+    output_builder_ref: RasterTensorBuilderRef,
     op: RasterSequenceUnaryOp,
     next_row_idx: usize,
-    output_rows: Vec<RasterActivationRow>,
+    row_count: usize,
+    width: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -160,11 +168,13 @@ pub enum RasterSequenceBinaryOp {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterSequenceBinaryState {
-    lhs: RasterActivationSequence,
-    rhs: RasterActivationSequence,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_builder_ref: RasterTensorBuilderRef,
     op: RasterSequenceBinaryOp,
     next_row_idx: usize,
-    output_rows: Vec<RasterActivationRow>,
+    row_count: usize,
+    width: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -186,41 +196,47 @@ pub enum RasterHeadUnaryOp {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterHeadUnaryState {
-    heads: RasterAttentionHeadSequence,
+    heads_ref: RasterAttentionHeadsRef,
+    output_builder_ref: RasterTensorBuilderRef,
     op: RasterHeadUnaryOp,
     next_head_idx: usize,
     next_token_idx: usize,
-    output_heads: Vec<Vec<RasterActivationRow>>,
+    head_count: usize,
     sequence_len: usize,
+    head_dim: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterReshapeHeadsState {
-    input: RasterActivationSequence,
+    input_ref: RasterActivationSequenceRef,
+    output_builder_ref: RasterTensorBuilderRef,
     num_heads: usize,
     head_dim: usize,
     next_row_idx: usize,
-    output_heads: Vec<Vec<RasterActivationRow>>,
+    row_count: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterCombineHeadsState {
-    heads: RasterAttentionHeadSequence,
+    heads_ref: RasterAttentionHeadsRef,
+    output_builder_ref: RasterTensorBuilderRef,
     next_token_idx: usize,
-    output_rows: Vec<RasterActivationRow>,
+    head_count: usize,
     sequence_len: usize,
+    head_dim: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterKvCacheBuildState {
-    keys: RasterAttentionHeadSequence,
-    values: RasterAttentionHeadSequence,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    output_builder_ref: crate::shared::raster_row_store::RasterKvCacheBuilderRef,
     retained_start: usize,
     next_head_idx: usize,
     next_token_idx: usize,
-    output_keys: Vec<Vec<RasterActivationRow>>,
-    output_values: Vec<Vec<RasterActivationRow>>,
+    head_count: usize,
     sequence_len: usize,
+    head_dim: usize,
 }
 
 impl RasterAttentionHeadSequence {
@@ -339,7 +355,7 @@ impl RasterKvCache {
 
 impl RasterAttentionRowState {
     pub fn is_complete(&self) -> bool {
-        self.next_query_head_idx >= self.queries.head_count()
+        self.next_query_head_idx >= self.query_head_count
     }
 
     pub fn next_query_head_idx(&self) -> usize {
@@ -353,25 +369,25 @@ impl RasterAttentionRowState {
 
 impl RasterSequenceUnaryState {
     pub fn is_complete(&self) -> bool {
-        self.next_row_idx >= self.input.len()
+        self.next_row_idx >= self.row_count
     }
 }
 
 impl RasterSequenceBinaryState {
     pub fn is_complete(&self) -> bool {
-        self.next_row_idx >= self.lhs.len()
+        self.next_row_idx >= self.row_count
     }
 }
 
 impl RasterHeadUnaryState {
     pub fn is_complete(&self) -> bool {
-        self.next_head_idx >= self.heads.head_count()
+        self.next_head_idx >= self.head_count
     }
 }
 
 impl RasterReshapeHeadsState {
     pub fn is_complete(&self) -> bool {
-        self.next_row_idx >= self.input.len()
+        self.next_row_idx >= self.row_count
     }
 }
 
@@ -383,7 +399,7 @@ impl RasterCombineHeadsState {
 
 impl RasterKvCacheBuildState {
     pub fn is_complete(&self) -> bool {
-        self.next_head_idx >= self.keys.head_count()
+        self.next_head_idx >= self.head_count
     }
 }
 
@@ -775,6 +791,7 @@ pub fn gelu_sequence(input: &RasterActivationSequence) -> Result<RasterActivatio
 }
 
 pub fn init_sequence_rms_norm_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     norm_weights: Option<&[Wgt]>,
     eps: Option<Acc>,
@@ -783,63 +800,93 @@ pub fn init_sequence_rms_norm_row_state(
         .ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical norm weights"))?;
     let eps = eps.ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical Acc epsilon"))?;
     validate_sequence_width(input, norm_weights.len(), "deterministic RMSNorm input")?;
+    let input_ref = store
+        .insert_activation_sequence(RasterTensorId::new("sequence.unary.input")?, input.clone())?;
+    let output_builder_ref = store.start_sequence_builder(
+        RasterTensorId::new("sequence.unary.output")?,
+        input.len(),
+        input.width()?,
+    )?;
 
     Ok(RasterSequenceUnaryState {
-        input: input.clone(),
+        input_ref,
+        output_builder_ref,
         op: RasterSequenceUnaryOp::RmsNorm {
             norm_weight_bits: norm_weights.iter().map(|weight| weight.to_bits()).collect(),
             eps_bits: eps.to_bits(),
         },
         next_row_idx: 0,
-        output_rows: Vec::with_capacity(input.len()),
+        row_count: input.len(),
+        width: input.width()?,
     })
 }
 
 pub fn init_sequence_gelu_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
 ) -> Result<RasterSequenceUnaryState> {
     validate_non_empty_sequence(input, "deterministic GELU")?;
+    let input_ref = store
+        .insert_activation_sequence(RasterTensorId::new("sequence.unary.input")?, input.clone())?;
+    let output_builder_ref = store.start_sequence_builder(
+        RasterTensorId::new("sequence.unary.output")?,
+        input.len(),
+        input.width()?,
+    )?;
 
     Ok(RasterSequenceUnaryState {
-        input: input.clone(),
+        input_ref,
+        output_builder_ref,
         op: RasterSequenceUnaryOp::Gelu,
         next_row_idx: 0,
-        output_rows: Vec::with_capacity(input.len()),
+        row_count: input.len(),
+        width: input.width()?,
     })
 }
 
 pub fn init_sequence_scale_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     scalar: Option<Act>,
 ) -> Result<RasterSequenceUnaryState> {
     let scalar = scalar
         .ok_or_else(|| anyhow!("deterministic sequence scaling requires canonical Act scalar"))?;
     validate_non_empty_sequence(input, "deterministic sequence scaling")?;
+    let input_ref = store
+        .insert_activation_sequence(RasterTensorId::new("sequence.unary.input")?, input.clone())?;
+    let output_builder_ref = store.start_sequence_builder(
+        RasterTensorId::new("sequence.unary.output")?,
+        input.len(),
+        input.width()?,
+    )?;
 
     Ok(RasterSequenceUnaryState {
-        input: input.clone(),
+        input_ref,
+        output_builder_ref,
         op: RasterSequenceUnaryOp::Scale {
             scalar_bits: scalar.to_bits(),
         },
         next_row_idx: 0,
-        output_rows: Vec::with_capacity(input.len()),
+        row_count: input.len(),
+        width: input.width()?,
     })
 }
 
 pub fn compute_next_sequence_unary_row(
     mut state: RasterSequenceUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterSequenceUnaryState)> {
     if state.is_complete() {
         return Ok((true, state));
     }
 
-    let row = state.input.rows().get(state.next_row_idx).ok_or_else(|| {
-        anyhow!(
-            "sequence unary row {} is out of range for {} rows",
-            state.next_row_idx,
-            state.input.len()
-        )
-    })?;
+    let row = auth_read!(
+        store,
+        RasterSequenceRowRequest {
+            tensor_ref: state.input_ref.clone(),
+            row_idx: state.next_row_idx,
+        }
+    )?;
     let output_row = match &state.op {
         RasterSequenceUnaryOp::RmsNorm {
             norm_weight_bits,
@@ -866,47 +913,49 @@ pub fn compute_next_sequence_unary_row(
                 .collect(),
         ),
     };
-    state.output_rows.push(output_row);
+    store.append_sequence_row(
+        &mut state.output_builder_ref,
+        state.next_row_idx,
+        output_row,
+    )?;
     state.next_row_idx += 1;
     Ok((false, state))
 }
 
 pub fn finalize_sequence_unary_row_state(
     state: RasterSequenceUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
     if !state.is_complete() {
         bail!(
             "sequence unary state completed {} rows, expected {}",
             state.next_row_idx,
-            state.input.len()
-        );
-    }
-    if state.output_rows.len() != state.input.len() {
-        bail!(
-            "sequence unary output has {} rows, expected {}",
-            state.output_rows.len(),
-            state.input.len()
+            state.row_count
         );
     }
 
-    Ok(RasterActivationSequence::from_rows(state.output_rows))
+    let output_ref = store.finalize_sequence_builder(state.output_builder_ref)?;
+    store.materialize_sequence(&output_ref)
 }
 
 pub fn init_sequence_add_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
 ) -> Result<RasterSequenceBinaryState> {
-    init_sequence_binary_row_state(lhs, rhs, RasterSequenceBinaryOp::Add)
+    init_sequence_binary_row_state(store, lhs, rhs, RasterSequenceBinaryOp::Add)
 }
 
 pub fn init_sequence_mul_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
 ) -> Result<RasterSequenceBinaryState> {
-    init_sequence_binary_row_state(lhs, rhs, RasterSequenceBinaryOp::Mul)
+    init_sequence_binary_row_state(store, lhs, rhs, RasterSequenceBinaryOp::Mul)
 }
 
 fn init_sequence_binary_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
     rhs: &RasterActivationSequence,
     op: RasterSequenceBinaryOp,
@@ -916,37 +965,49 @@ fn init_sequence_binary_row_state(
     if lhs.len() != rhs.len() {
         bail!("sequence length mismatch: {} vs {}", lhs.len(), rhs.len());
     }
+    let lhs_ref = store
+        .insert_activation_sequence(RasterTensorId::new("sequence.binary.lhs")?, lhs.clone())?;
+    let rhs_ref = store
+        .insert_activation_sequence(RasterTensorId::new("sequence.binary.rhs")?, rhs.clone())?;
+    let output_builder_ref = store.start_sequence_builder(
+        RasterTensorId::new("sequence.binary.output")?,
+        lhs.len(),
+        width,
+    )?;
 
     Ok(RasterSequenceBinaryState {
-        lhs: lhs.clone(),
-        rhs: rhs.clone(),
+        lhs_ref,
+        rhs_ref,
+        output_builder_ref,
         op,
         next_row_idx: 0,
-        output_rows: Vec::with_capacity(lhs.len()),
+        row_count: lhs.len(),
+        width,
     })
 }
 
 pub fn compute_next_sequence_binary_row(
     mut state: RasterSequenceBinaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterSequenceBinaryState)> {
     if state.is_complete() {
         return Ok((true, state));
     }
 
-    let lhs_row = state.lhs.rows().get(state.next_row_idx).ok_or_else(|| {
-        anyhow!(
-            "left sequence row {} is out of range for {} rows",
-            state.next_row_idx,
-            state.lhs.len()
-        )
-    })?;
-    let rhs_row = state.rhs.rows().get(state.next_row_idx).ok_or_else(|| {
-        anyhow!(
-            "right sequence row {} is out of range for {} rows",
-            state.next_row_idx,
-            state.rhs.len()
-        )
-    })?;
+    let lhs_row = auth_read!(
+        store,
+        RasterSequenceRowRequest {
+            tensor_ref: state.lhs_ref.clone(),
+            row_idx: state.next_row_idx,
+        }
+    )?;
+    let rhs_row = auth_read!(
+        store,
+        RasterSequenceRowRequest {
+            tensor_ref: state.rhs_ref.clone(),
+            row_idx: state.next_row_idx,
+        }
+    )?;
     let output_row = match state.op {
         RasterSequenceBinaryOp::Add => RasterActivationRow::from_acts(
             lhs_row
@@ -965,30 +1026,29 @@ pub fn compute_next_sequence_binary_row(
                 .collect(),
         ),
     };
-    state.output_rows.push(output_row);
+    store.append_sequence_row(
+        &mut state.output_builder_ref,
+        state.next_row_idx,
+        output_row,
+    )?;
     state.next_row_idx += 1;
     Ok((false, state))
 }
 
 pub fn finalize_sequence_binary_row_state(
     state: RasterSequenceBinaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
     if !state.is_complete() {
         bail!(
             "sequence binary state completed {} rows, expected {}",
             state.next_row_idx,
-            state.lhs.len()
-        );
-    }
-    if state.output_rows.len() != state.lhs.len() {
-        bail!(
-            "sequence binary output has {} rows, expected {}",
-            state.output_rows.len(),
-            state.lhs.len()
+            state.row_count
         );
     }
 
-    Ok(RasterActivationSequence::from_rows(state.output_rows))
+    let output_ref = store.finalize_sequence_builder(state.output_builder_ref)?;
+    store.materialize_sequence(&output_ref)
 }
 
 pub fn reshape_sequence_heads(
@@ -1126,6 +1186,7 @@ pub fn apply_rope_to_heads(
 }
 
 pub fn init_head_rms_norm_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
     norm_weights: Option<&[Wgt]>,
     eps: Option<Acc>,
@@ -1143,6 +1204,7 @@ pub fn init_head_rms_norm_row_state(
         );
     }
     init_head_unary_row_state(
+        store,
         heads,
         RasterHeadUnaryOp::RmsNorm {
             norm_weight_bits: norm_weights.iter().map(|weight| weight.to_bits()).collect(),
@@ -1152,6 +1214,7 @@ pub fn init_head_rms_norm_row_state(
 }
 
 pub fn init_value_rms_norm_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
     eps: Option<Acc>,
 ) -> Result<RasterHeadUnaryState> {
@@ -1159,6 +1222,7 @@ pub fn init_value_rms_norm_row_state(
         eps.ok_or_else(|| anyhow!("deterministic value RMSNorm requires canonical Acc epsilon"))?;
     attention_head_width(heads)?;
     init_head_unary_row_state(
+        store,
         heads,
         RasterHeadUnaryOp::ValueRmsNorm {
             eps_bits: eps.to_bits(),
@@ -1167,6 +1231,7 @@ pub fn init_value_rms_norm_row_state(
 }
 
 pub fn init_rope_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
     rotary_dim: usize,
     freq_base_dim: usize,
@@ -1183,6 +1248,7 @@ pub fn init_rope_row_state(
         attention_sequence_len(heads)?;
     }
     init_head_unary_row_state(
+        store,
         heads,
         RasterHeadUnaryOp::Rope {
             rotary_dim,
@@ -1194,25 +1260,36 @@ pub fn init_rope_row_state(
 }
 
 fn init_head_unary_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
     op: RasterHeadUnaryOp,
 ) -> Result<RasterHeadUnaryState> {
     let sequence_len = attention_sequence_len(heads)?;
-    let output_heads = (0..heads.head_count())
-        .map(|_| Vec::with_capacity(sequence_len))
-        .collect();
+    let head_count = heads.head_count();
+    let head_dim = attention_head_width(heads)?;
+    let heads_ref =
+        store.insert_attention_heads(RasterTensorId::new("head.unary.input")?, heads.clone())?;
+    let output_builder_ref = store.start_heads_builder(
+        RasterTensorId::new("head.unary.output")?,
+        head_count,
+        sequence_len,
+        head_dim,
+    )?;
     Ok(RasterHeadUnaryState {
-        heads: heads.clone(),
+        heads_ref,
+        output_builder_ref,
         op,
         next_head_idx: 0,
         next_token_idx: 0,
-        output_heads,
+        head_count,
         sequence_len,
+        head_dim,
     })
 }
 
 pub fn compute_next_head_unary_row(
     mut state: RasterHeadUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterHeadUnaryState)> {
     if state.is_complete() {
         return Ok((true, state));
@@ -1220,18 +1297,14 @@ pub fn compute_next_head_unary_row(
 
     let head_idx = state.next_head_idx;
     let token_idx = state.next_token_idx;
-    let head = state.heads.heads().get(head_idx).ok_or_else(|| {
-        anyhow!(
-            "head unary head {head_idx} is out of range for {} heads",
-            state.heads.head_count()
-        )
-    })?;
-    let row = head.get(token_idx).ok_or_else(|| {
-        anyhow!(
-            "head unary row {token_idx} is out of range for {} rows",
-            head.len()
-        )
-    })?;
+    let row = auth_read!(
+        store,
+        RasterHeadRowRequest {
+            tensor_ref: state.heads_ref.clone(),
+            head_idx,
+            token_idx,
+        }
+    )?;
     let output_row = match &state.op {
         RasterHeadUnaryOp::RmsNorm {
             norm_weight_bits,
@@ -1272,17 +1345,12 @@ pub fn compute_next_head_unary_row(
             }
         }
     };
-    let output_head_count = state.output_heads.len();
-    let output_head = state.output_heads.get_mut(head_idx).ok_or_else(|| {
-        anyhow!("head unary output head {head_idx} is out of range for {output_head_count} heads")
-    })?;
-    if output_head.len() != token_idx {
-        bail!(
-            "head unary output head {head_idx} has {} rows, expected {token_idx}",
-            output_head.len()
-        );
-    }
-    output_head.push(output_row);
+    store.append_head_row(
+        &mut state.output_builder_ref,
+        head_idx,
+        token_idx,
+        output_row,
+    )?;
 
     if token_idx + 1 < state.sequence_len {
         state.next_token_idx += 1;
@@ -1296,28 +1364,18 @@ pub fn compute_next_head_unary_row(
 
 pub fn finalize_head_unary_row_state(
     state: RasterHeadUnaryState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterAttentionHeadSequence> {
     if !state.is_complete() {
         bail!(
             "head unary state finalized at head {} token {}, expected {} heads",
             state.next_head_idx,
             state.next_token_idx,
-            state.heads.head_count()
+            state.head_count
         );
     }
-    if let Some((head_idx, head)) = state
-        .output_heads
-        .iter()
-        .enumerate()
-        .find(|(_, head)| head.len() != state.sequence_len)
-    {
-        bail!(
-            "head unary output head {head_idx} has {} rows, expected {}",
-            head.len(),
-            state.sequence_len
-        );
-    }
-    Ok(RasterAttentionHeadSequence::from_heads(state.output_heads))
+    let output_ref = store.finalize_heads_builder(state.output_builder_ref)?;
+    store.materialize_heads(&output_ref)
 }
 
 pub fn attention_output_row(
@@ -1482,6 +1540,7 @@ pub fn causal_attention_heads_with_cache(
 }
 
 pub fn init_attention_row_state(
+    store: &mut AuthenticatedRasterTensorStore,
     queries: &RasterAttentionHeadSequence,
     keys: &RasterAttentionHeadSequence,
     values: &RasterAttentionHeadSequence,
@@ -1532,20 +1591,39 @@ pub fn init_attention_row_state(
         }
     }
 
-    let output_heads = (0..queries.head_count())
-        .map(|_| Vec::with_capacity(sequence_len))
-        .collect();
+    let query_ref =
+        store.insert_attention_heads(RasterTensorId::new("attention.queries")?, queries.clone())?;
+    let key_ref =
+        store.insert_attention_heads(RasterTensorId::new("attention.keys")?, keys.clone())?;
+    let value_ref =
+        store.insert_attention_heads(RasterTensorId::new("attention.values")?, values.clone())?;
+    let donor_cache_ref = donor_cache
+        .map(|cache| {
+            store.insert_kv_cache(
+                RasterTensorId::new("attention.donor.keys")?,
+                RasterTensorId::new("attention.donor.values")?,
+                cache.clone(),
+            )
+        })
+        .transpose()?;
+    let output_builder_ref = store.start_heads_builder(
+        RasterTensorId::new("attention.output")?,
+        queries.head_count(),
+        sequence_len,
+        query_width,
+    )?;
 
     Ok(RasterAttentionRowState {
-        queries: queries.clone(),
-        keys: keys.clone(),
-        values: values.clone(),
-        donor_cache: donor_cache.cloned(),
+        query_ref,
+        key_ref,
+        value_ref,
+        donor_cache_ref,
+        output_builder_ref,
         attention_window,
         next_query_head_idx: 0,
         next_query_token_idx: 0,
-        output_heads,
         sequence_len,
+        query_head_count: queries.head_count(),
         kv_head_count,
         kv_groups: queries.head_count() / kv_head_count,
     })
@@ -1553,6 +1631,7 @@ pub fn init_attention_row_state(
 
 pub fn compute_next_attention_row(
     mut state: RasterAttentionRowState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterAttentionRowState)> {
     if state.is_complete() {
         return Ok((true, state));
@@ -1566,57 +1645,69 @@ pub fn compute_next_attention_row(
         .map(|window| query_idx.saturating_add(1).saturating_sub(window))
         .unwrap_or(0);
     let row_count = query_idx + 1 - start;
-    let query_head = state.queries.heads().get(query_head_idx).ok_or_else(|| {
-        anyhow!(
-            "attention query head {query_head_idx} is out of range for {} heads",
-            state.queries.head_count()
-        )
-    })?;
-    let query = query_head.get(query_idx).ok_or_else(|| {
-        anyhow!(
-            "attention query row {query_idx} is out of range for {} rows",
-            query_head.len()
-        )
-    })?;
-    let (key_rows, value_rows) = if let Some(cache) = &state.donor_cache {
-        (
-            cache.key_rows_window(kv_head_idx, start, row_count)?,
-            cache.value_rows_window(kv_head_idx, start, row_count)?,
-        )
+    let query = auth_read!(
+        store,
+        RasterHeadRowRequest {
+            tensor_ref: state.query_ref.clone(),
+            head_idx: query_head_idx,
+            token_idx: query_idx,
+        }
+    )?;
+    let (key_rows, value_rows) = if let Some(cache_ref) = &state.donor_cache_ref {
+        let mut key_rows = Vec::with_capacity(row_count);
+        let mut value_rows = Vec::with_capacity(row_count);
+        for token_idx in start..start + row_count {
+            key_rows.push(auth_read!(
+                store,
+                RasterKvRowRequest {
+                    cache_ref: cache_ref.clone(),
+                    row_kind: RasterKvRowKind::Key,
+                    head_idx: kv_head_idx,
+                    token_idx,
+                }
+            )?);
+            value_rows.push(auth_read!(
+                store,
+                RasterKvRowRequest {
+                    cache_ref: cache_ref.clone(),
+                    row_kind: RasterKvRowKind::Value,
+                    head_idx: kv_head_idx,
+                    token_idx,
+                }
+            )?);
+        }
+        (key_rows, value_rows)
     } else {
-        let key_head = state.keys.heads().get(kv_head_idx).ok_or_else(|| {
-            anyhow!(
-                "attention key head {kv_head_idx} is out of range for {} heads",
-                state.kv_head_count
-            )
-        })?;
-        let value_head = state.values.heads().get(kv_head_idx).ok_or_else(|| {
-            anyhow!(
-                "attention value head {kv_head_idx} is out of range for {} heads",
-                state.kv_head_count
-            )
-        })?;
-        (
-            key_head[start..=query_idx].to_vec(),
-            value_head[start..=query_idx].to_vec(),
-        )
+        let mut key_rows = Vec::with_capacity(row_count);
+        let mut value_rows = Vec::with_capacity(row_count);
+        for token_idx in start..start + row_count {
+            key_rows.push(auth_read!(
+                store,
+                RasterHeadRowRequest {
+                    tensor_ref: state.key_ref.clone(),
+                    head_idx: kv_head_idx,
+                    token_idx,
+                }
+            )?);
+            value_rows.push(auth_read!(
+                store,
+                RasterHeadRowRequest {
+                    tensor_ref: state.value_ref.clone(),
+                    head_idx: kv_head_idx,
+                    token_idx,
+                }
+            )?);
+        }
+        (key_rows, value_rows)
     };
 
-    let output_row = attention_output_row(query, &key_rows, &value_rows)?;
-    let output_head_count = state.output_heads.len();
-    let output_head = state.output_heads.get_mut(query_head_idx).ok_or_else(|| {
-        anyhow!(
-            "attention output head {query_head_idx} is out of range for {} heads",
-            output_head_count
-        )
-    })?;
-    if output_head.len() != query_idx {
-        bail!(
-            "attention output head {query_head_idx} has {} rows, expected {query_idx}",
-            output_head.len()
-        );
-    }
-    output_head.push(output_row);
+    let output_row = attention_output_row(&query, &key_rows, &value_rows)?;
+    store.append_head_row(
+        &mut state.output_builder_ref,
+        query_head_idx,
+        query_idx,
+        output_row,
+    )?;
 
     if query_idx + 1 < state.sequence_len {
         state.next_query_token_idx += 1;
@@ -1630,29 +1721,19 @@ pub fn compute_next_attention_row(
 
 pub fn finalize_attention_row_state(
     state: RasterAttentionRowState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterAttentionHeadSequence> {
     if !state.is_complete() {
         bail!(
             "attention row state finalized at head {} token {}, expected {} heads",
             state.next_query_head_idx,
             state.next_query_token_idx,
-            state.queries.head_count()
-        );
-    }
-    if let Some((head_idx, head)) = state
-        .output_heads
-        .iter()
-        .enumerate()
-        .find(|(_, head)| head.len() != state.sequence_len)
-    {
-        bail!(
-            "attention output head {head_idx} has {} rows, expected {}",
-            head.len(),
-            state.sequence_len
+            state.query_head_count
         );
     }
 
-    Ok(RasterAttentionHeadSequence::from_heads(state.output_heads))
+    let output_ref = store.finalize_heads_builder(state.output_builder_ref)?;
+    store.materialize_heads(&output_ref)
 }
 
 pub fn build_raster_kv_cache(
@@ -1677,6 +1758,7 @@ pub fn build_raster_kv_cache(
 }
 
 pub fn init_reshape_heads_state(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationSequence,
     num_heads: usize,
     head_dim: usize,
@@ -1691,42 +1773,49 @@ pub fn init_reshape_heads_state(
         .checked_mul(head_dim)
         .ok_or_else(|| anyhow!("attention reshape width overflowed"))?;
     validate_sequence_width(input, expected_width, "attention reshape input")?;
+    let input_ref =
+        store.insert_activation_sequence(RasterTensorId::new("reshape.input")?, input.clone())?;
+    let output_builder_ref = store.start_heads_builder(
+        RasterTensorId::new("reshape.output")?,
+        num_heads,
+        input.len(),
+        head_dim,
+    )?;
 
     Ok(RasterReshapeHeadsState {
-        input: input.clone(),
+        input_ref,
+        output_builder_ref,
         num_heads,
         head_dim,
         next_row_idx: 0,
-        output_heads: vec![Vec::with_capacity(input.len()); num_heads],
+        row_count: input.len(),
     })
 }
 
 pub fn compute_next_reshape_heads_row(
     mut state: RasterReshapeHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterReshapeHeadsState)> {
     if state.is_complete() {
         return Ok((true, state));
     }
 
-    let row = state.input.rows().get(state.next_row_idx).ok_or_else(|| {
-        anyhow!(
-            "attention reshape row {} is out of range for {} rows",
-            state.next_row_idx,
-            state.input.len()
-        )
-    })?;
+    let row = auth_read!(
+        store,
+        RasterSequenceRowRequest {
+            tensor_ref: state.input_ref.clone(),
+            row_idx: state.next_row_idx,
+        }
+    )?;
     let acts = row.acts();
     for head_idx in 0..state.num_heads {
         let start = head_idx * state.head_dim;
-        let head = state.output_heads.get_mut(head_idx).ok_or_else(|| {
-            anyhow!(
-                "attention reshape output head {head_idx} is out of range for {} heads",
-                state.num_heads
-            )
-        })?;
-        head.push(RasterActivationRow::from_acts(
-            acts[start..start + state.head_dim].to_vec(),
-        ));
+        store.append_head_row(
+            &mut state.output_builder_ref,
+            head_idx,
+            state.next_row_idx,
+            RasterActivationRow::from_acts(acts[start..start + state.head_dim].to_vec()),
+        )?;
     }
     state.next_row_idx += 1;
     Ok((false, state))
@@ -1734,67 +1823,75 @@ pub fn compute_next_reshape_heads_row(
 
 pub fn finalize_reshape_heads_state(
     state: RasterReshapeHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterAttentionHeadSequence> {
     if !state.is_complete() {
         bail!(
             "attention reshape completed {} rows, expected {}",
             state.next_row_idx,
-            state.input.len()
+            state.row_count
         );
     }
-    if let Some((head_idx, head)) = state
-        .output_heads
-        .iter()
-        .enumerate()
-        .find(|(_, head)| head.len() != state.input.len())
-    {
-        bail!(
-            "attention reshape output head {head_idx} has {} rows, expected {}",
-            head.len(),
-            state.input.len()
-        );
-    }
-    Ok(RasterAttentionHeadSequence::from_heads(state.output_heads))
+    let output_ref = store.finalize_heads_builder(state.output_builder_ref)?;
+    store.materialize_heads(&output_ref)
 }
 
 pub fn init_combine_heads_state(
+    store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
 ) -> Result<RasterCombineHeadsState> {
     let sequence_len = attention_sequence_len(heads)?;
-    attention_head_width(heads)?;
-    Ok(RasterCombineHeadsState {
-        heads: heads.clone(),
-        next_token_idx: 0,
-        output_rows: Vec::with_capacity(sequence_len),
+    let head_dim = attention_head_width(heads)?;
+    let head_count = heads.head_count();
+    let heads_ref =
+        store.insert_attention_heads(RasterTensorId::new("combine.input")?, heads.clone())?;
+    let output_builder_ref = store.start_sequence_builder(
+        RasterTensorId::new("combine.output")?,
         sequence_len,
+        head_count * head_dim,
+    )?;
+    Ok(RasterCombineHeadsState {
+        heads_ref,
+        output_builder_ref,
+        next_token_idx: 0,
+        head_count,
+        sequence_len,
+        head_dim,
     })
 }
 
 pub fn compute_next_combine_heads_row(
     mut state: RasterCombineHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterCombineHeadsState)> {
     if state.is_complete() {
         return Ok((true, state));
     }
 
     let mut row = Vec::new();
-    for head in state.heads.heads() {
-        let head_row = head.get(state.next_token_idx).ok_or_else(|| {
-            anyhow!(
-                "attention combine row {} is out of range for {} rows",
-                state.next_token_idx,
-                head.len()
-            )
-        })?;
+    for head_idx in 0..state.head_count {
+        let head_row = auth_read!(
+            store,
+            RasterHeadRowRequest {
+                tensor_ref: state.heads_ref.clone(),
+                head_idx,
+                token_idx: state.next_token_idx,
+            }
+        )?;
         row.extend(head_row.acts());
     }
-    state.output_rows.push(RasterActivationRow::from_acts(row));
+    store.append_sequence_row(
+        &mut state.output_builder_ref,
+        state.next_token_idx,
+        RasterActivationRow::from_acts(row),
+    )?;
     state.next_token_idx += 1;
     Ok((false, state))
 }
 
 pub fn finalize_combine_heads_state(
     state: RasterCombineHeadsState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<RasterActivationSequence> {
     if !state.is_complete() {
         bail!(
@@ -1803,38 +1900,48 @@ pub fn finalize_combine_heads_state(
             state.sequence_len
         );
     }
-    if state.output_rows.len() != state.sequence_len {
-        bail!(
-            "attention combine output has {} rows, expected {}",
-            state.output_rows.len(),
-            state.sequence_len
-        );
-    }
-    Ok(RasterActivationSequence::from_rows(state.output_rows))
+    let output_ref = store.finalize_sequence_builder(state.output_builder_ref)?;
+    store.materialize_sequence(&output_ref)
 }
 
 pub fn init_kv_cache_build_state(
+    store: &mut AuthenticatedRasterTensorStore,
     keys: &RasterAttentionHeadSequence,
     values: &RasterAttentionHeadSequence,
     sliding_window: Option<usize>,
 ) -> Result<RasterKvCacheBuildState> {
     validate_matching_attention_heads(keys, values, "key/value")?;
     let sequence_len = attention_sequence_len(keys)?;
+    let head_count = keys.head_count();
+    let head_dim = attention_head_width(keys)?;
     let retained_start = sliding_window.map_or(0, |window| sequence_len.saturating_sub(window));
+    let key_ref =
+        store.insert_attention_heads(RasterTensorId::new("kv.build.keys")?, keys.clone())?;
+    let value_ref =
+        store.insert_attention_heads(RasterTensorId::new("kv.build.values")?, values.clone())?;
+    let output_builder_ref = store.start_kv_cache_builder(
+        RasterTensorId::new("kv.build.output.keys")?,
+        RasterTensorId::new("kv.build.output.values")?,
+        head_count,
+        sequence_len.saturating_sub(retained_start),
+        head_dim,
+    )?;
     Ok(RasterKvCacheBuildState {
-        keys: keys.clone(),
-        values: values.clone(),
+        key_ref,
+        value_ref,
+        output_builder_ref,
         retained_start,
         next_head_idx: 0,
         next_token_idx: retained_start,
-        output_keys: vec![Vec::new(); keys.head_count()],
-        output_values: vec![Vec::new(); keys.head_count()],
+        head_count,
         sequence_len,
+        head_dim,
     })
 }
 
 pub fn compute_next_kv_cache_row(
     mut state: RasterKvCacheBuildState,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, RasterKvCacheBuildState)> {
     if state.is_complete() {
         return Ok((true, state));
@@ -1846,77 +1953,55 @@ pub fn compute_next_kv_cache_row(
         return Ok((false, state));
     }
 
-    let key_head = state.keys.heads().get(state.next_head_idx).ok_or_else(|| {
-        anyhow!(
-            "KV cache build key head {} is out of range for {} heads",
-            state.next_head_idx,
-            state.keys.head_count()
-        )
-    })?;
-    let value_head = state
-        .values
-        .heads()
-        .get(state.next_head_idx)
-        .ok_or_else(|| {
-            anyhow!(
-                "KV cache build value head {} is out of range for {} heads",
-                state.next_head_idx,
-                state.values.head_count()
-            )
-        })?;
-    let key_row = key_head.get(state.next_token_idx).ok_or_else(|| {
-        anyhow!(
-            "KV cache build key row {} is out of range for {} rows",
-            state.next_token_idx,
-            key_head.len()
-        )
-    })?;
-    let value_row = value_head.get(state.next_token_idx).ok_or_else(|| {
-        anyhow!(
-            "KV cache build value row {} is out of range for {} rows",
-            state.next_token_idx,
-            value_head.len()
-        )
-    })?;
-    state.output_keys[state.next_head_idx].push(key_row.clone());
-    state.output_values[state.next_head_idx].push(value_row.clone());
+    let key_row = auth_read!(
+        store,
+        RasterHeadRowRequest {
+            tensor_ref: state.key_ref.clone(),
+            head_idx: state.next_head_idx,
+            token_idx: state.next_token_idx,
+        }
+    )?;
+    let value_row = auth_read!(
+        store,
+        RasterHeadRowRequest {
+            tensor_ref: state.value_ref.clone(),
+            head_idx: state.next_head_idx,
+            token_idx: state.next_token_idx,
+        }
+    )?;
+    let output_token_idx = state.next_token_idx - state.retained_start;
+    store.append_kv_row(
+        state.output_builder_ref.keys_mut(),
+        RasterKvRowKind::Key,
+        state.next_head_idx,
+        output_token_idx,
+        key_row,
+    )?;
+    store.append_kv_row(
+        state.output_builder_ref.values_mut(),
+        RasterKvRowKind::Value,
+        state.next_head_idx,
+        output_token_idx,
+        value_row,
+    )?;
     state.next_token_idx += 1;
     Ok((false, state))
 }
 
-pub fn finalize_kv_cache_build_state(state: RasterKvCacheBuildState) -> Result<RasterKvCache> {
+pub fn finalize_kv_cache_build_state(
+    state: RasterKvCacheBuildState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<RasterKvCache> {
     if !state.is_complete() {
         bail!(
             "KV cache build finalized at head {} token {}, expected {} heads",
             state.next_head_idx,
             state.next_token_idx,
-            state.keys.head_count()
+            state.head_count
         );
     }
-    let expected_len = state.sequence_len.saturating_sub(state.retained_start);
-    if let Some((head_idx, head)) = state
-        .output_keys
-        .iter()
-        .enumerate()
-        .find(|(_, head)| head.len() != expected_len)
-    {
-        bail!(
-            "KV cache build key head {head_idx} has {} rows, expected {expected_len}",
-            head.len()
-        );
-    }
-    if let Some((head_idx, head)) = state
-        .output_values
-        .iter()
-        .enumerate()
-        .find(|(_, head)| head.len() != expected_len)
-    {
-        bail!(
-            "KV cache build value head {head_idx} has {} rows, expected {expected_len}",
-            head.len()
-        );
-    }
-    RasterKvCache::from_heads(state.output_keys, state.output_values)
+    let output_ref = store.finalize_kv_cache_builder(state.output_builder_ref)?;
+    store.materialize_kv_cache(&output_ref)
 }
 
 fn project_row(
@@ -2180,6 +2265,7 @@ mod tests {
         GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMatrixRowRequest,
     };
     use crate::shared::raster_prefill_ple::GemmaPleModelProjectionRowRequest;
+    use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
     use anyhow::{anyhow, Result};
     use std::collections::HashMap;
 
@@ -2451,8 +2537,11 @@ mod tests {
         let weights = vec![Wgt::from_num(1.0), Wgt::from_num(0.5)];
         let eps = Acc::from_num(0.001);
 
+        let mut store = AuthenticatedRasterTensorStore::new();
         let rms = run_sequence_unary_state(
-            init_sequence_rms_norm_row_state(&input, Some(&weights), Some(eps)).expect("init"),
+            init_sequence_rms_norm_row_state(&mut store, &input, Some(&weights), Some(eps))
+                .expect("init"),
+            &mut store,
         )
         .expect("rms");
         assert_eq!(
@@ -2460,15 +2549,22 @@ mod tests {
             scaled_bits(&rms_norm_sequence(&input, Some(&weights), Some(eps)).expect("full"))
         );
 
-        let gelu = run_sequence_unary_state(init_sequence_gelu_row_state(&input).expect("init"))
-            .expect("gelu");
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let gelu = run_sequence_unary_state(
+            init_sequence_gelu_row_state(&mut store, &input).expect("init"),
+            &mut store,
+        )
+        .expect("gelu");
         assert_eq!(
             scaled_bits(&gelu),
             scaled_bits(&gelu_sequence(&input).expect("full"))
         );
 
+        let mut store = AuthenticatedRasterTensorStore::new();
         let scale = run_sequence_unary_state(
-            init_sequence_scale_row_state(&input, Some(Act::from_num(0.5))).expect("init"),
+            init_sequence_scale_row_state(&mut store, &input, Some(Act::from_num(0.5)))
+                .expect("init"),
+            &mut store,
         )
         .expect("scale");
         assert_eq!(
@@ -2483,27 +2579,61 @@ mod tests {
         let empty = RasterActivationSequence::from_acts(Vec::new());
         let zero_width = RasterActivationSequence::from_act_bits(vec![Vec::new()]);
 
-        let error = init_sequence_rms_norm_row_state(&input, None, Some(Acc::from_num(0.0)))
-            .expect_err("missing weights should fail");
+        let error = init_sequence_rms_norm_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &input,
+            None,
+            Some(Acc::from_num(0.0)),
+        )
+        .expect_err("missing weights should fail");
         assert!(error.to_string().contains("canonical norm weights"));
 
-        let error = init_sequence_rms_norm_row_state(&input, Some(&[Wgt::from_num(1.0)]), None)
-            .expect_err("missing epsilon should fail");
+        let error = init_sequence_rms_norm_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &input,
+            Some(&[Wgt::from_num(1.0)]),
+            None,
+        )
+        .expect_err("missing epsilon should fail");
         assert!(error.to_string().contains("canonical Acc epsilon"));
 
-        let error =
-            init_sequence_rms_norm_row_state(&zero_width, Some(&[]), Some(Acc::from_num(0.0)))
-                .expect_err("zero-width RMSNorm should fail");
+        let error = init_sequence_rms_norm_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &zero_width,
+            Some(&[]),
+            Some(Acc::from_num(0.0)),
+        )
+        .expect_err("zero-width RMSNorm should fail");
         assert!(error.to_string().contains("non-zero width"));
 
-        let error = init_sequence_gelu_row_state(&empty).expect_err("empty GELU should fail");
+        let error =
+            init_sequence_gelu_row_state(&mut AuthenticatedRasterTensorStore::new(), &empty)
+                .expect_err("empty GELU should fail");
         assert!(error
             .to_string()
             .contains("requires at least one activation row"));
 
         let error =
-            init_sequence_scale_row_state(&input, None).expect_err("missing scalar should fail");
+            init_sequence_scale_row_state(&mut AuthenticatedRasterTensorStore::new(), &input, None)
+                .expect_err("missing scalar should fail");
         assert!(error.to_string().contains("canonical Act scalar"));
+    }
+
+    #[test]
+    fn sequence_unary_state_serializes_refs_not_materialized_rows() {
+        let input = RasterActivationSequence::from_acts(vec![
+            vec![Act::from_num(1.0), Act::from_num(-0.5)],
+            vec![Act::from_num(0.25), Act::from_num(0.75)],
+        ]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let state = init_sequence_gelu_row_state(&mut store, &input).expect("state");
+
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+
+        assert!(encoded.contains("input_ref"));
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("output_rows"));
     }
 
     #[test]
@@ -2517,17 +2647,23 @@ mod tests {
             vec![Act::from_num(-0.25), Act::from_num(1.0)],
         ]);
 
-        let added =
-            run_sequence_binary_state(init_sequence_add_row_state(&lhs, &rhs).expect("init add"))
-                .expect("add");
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let added = run_sequence_binary_state(
+            init_sequence_add_row_state(&mut store, &lhs, &rhs).expect("init add"),
+            &mut store,
+        )
+        .expect("add");
         assert_eq!(
             scaled_bits(&added),
             scaled_bits(&add_sequences(&lhs, &rhs).expect("full"))
         );
 
-        let multiplied =
-            run_sequence_binary_state(init_sequence_mul_row_state(&lhs, &rhs).expect("init mul"))
-                .expect("mul");
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let multiplied = run_sequence_binary_state(
+            init_sequence_mul_row_state(&mut store, &lhs, &rhs).expect("init mul"),
+            &mut store,
+        )
+        .expect("mul");
         assert_eq!(
             scaled_bits(&multiplied),
             scaled_bits(&mul_sequences(&lhs, &rhs).expect("full"))
@@ -2544,13 +2680,37 @@ mod tests {
             vec![Act::from_num(2.0)],
         ]);
 
-        let error = init_sequence_add_row_state(&lhs, &wrong_width)
-            .expect_err("width mismatch should fail");
+        let error = init_sequence_add_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &lhs,
+            &wrong_width,
+        )
+        .expect_err("width mismatch should fail");
         assert!(error.to_string().contains("right sequence row 0 has width"));
 
-        let error =
-            init_sequence_mul_row_state(&lhs, &wrong_len).expect_err("length mismatch should fail");
+        let error = init_sequence_mul_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &lhs,
+            &wrong_len,
+        )
+        .expect_err("length mismatch should fail");
         assert!(error.to_string().contains("sequence length mismatch"));
+    }
+
+    #[test]
+    fn sequence_binary_state_serializes_refs_not_materialized_rows() {
+        let lhs = RasterActivationSequence::from_acts(vec![vec![Act::from_num(1.0)]]);
+        let rhs = RasterActivationSequence::from_acts(vec![vec![Act::from_num(0.5)]]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let state = init_sequence_add_row_state(&mut store, &lhs, &rhs).expect("state");
+
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+
+        assert!(encoded.contains("lhs_ref"));
+        assert!(encoded.contains("rhs_ref"));
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("output_rows"));
     }
 
     #[test]
@@ -2677,8 +2837,11 @@ mod tests {
         let weights = vec![Wgt::from_num(1.0), Wgt::from_num(0.5)];
         let eps = Acc::from_num(0.001);
 
+        let mut store = AuthenticatedRasterTensorStore::new();
         let head_rms = run_head_unary_state(
-            init_head_rms_norm_row_state(&heads, Some(&weights), Some(eps)).expect("init"),
+            init_head_rms_norm_row_state(&mut store, &heads, Some(&weights), Some(eps))
+                .expect("init"),
+            &mut store,
         )
         .expect("head rms");
         assert_eq!(
@@ -2686,16 +2849,22 @@ mod tests {
             head_bits(&rms_norm_heads(&heads, Some(&weights), Some(eps)).expect("full"))
         );
 
-        let value_rms =
-            run_head_unary_state(init_value_rms_norm_row_state(&heads, Some(eps)).expect("init"))
-                .expect("value rms");
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let value_rms = run_head_unary_state(
+            init_value_rms_norm_row_state(&mut store, &heads, Some(eps)).expect("init"),
+            &mut store,
+        )
+        .expect("value rms");
         assert_eq!(
             head_bits(&value_rms),
             head_bits(&value_rms_norm_heads(&heads, Some(eps)).expect("full"))
         );
 
+        let mut store = AuthenticatedRasterTensorStore::new();
         let rope = run_head_unary_state(
-            init_rope_row_state(&heads, 2, 2, Some(Acc::from_num(10_000.0)), 3).expect("init rope"),
+            init_rope_row_state(&mut store, &heads, 2, 2, Some(Acc::from_num(10_000.0)), 3)
+                .expect("init rope"),
+            &mut store,
         )
         .expect("rope");
         assert_eq!(
@@ -2710,21 +2879,59 @@ mod tests {
     fn chunked_head_unary_ops_fail_closed() {
         let heads = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(1.0)]]]);
 
-        let error = init_head_rms_norm_row_state(&heads, None, Some(Acc::from_num(0.0)))
-            .expect_err("missing head weights should fail");
+        let error = init_head_rms_norm_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &heads,
+            None,
+            Some(Acc::from_num(0.0)),
+        )
+        .expect_err("missing head weights should fail");
         assert!(error.to_string().contains("canonical norm weights"));
 
-        let error = init_value_rms_norm_row_state(&heads, None)
-            .expect_err("missing value norm epsilon should fail");
+        let error =
+            init_value_rms_norm_row_state(&mut AuthenticatedRasterTensorStore::new(), &heads, None)
+                .expect_err("missing value norm epsilon should fail");
         assert!(error.to_string().contains("canonical Acc epsilon"));
 
-        let error = init_rope_row_state(&heads, 2, 2, Some(Acc::from_num(10_000.0)), 0)
-            .expect_err("rotary dim should fail");
+        let error = init_rope_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &heads,
+            2,
+            2,
+            Some(Acc::from_num(10_000.0)),
+            0,
+        )
+        .expect_err("rotary dim should fail");
         assert!(error.to_string().contains("exceeds attention head width"));
 
-        let error =
-            init_rope_row_state(&heads, 1, 2, None, 0).expect_err("missing rope base should fail");
+        let error = init_rope_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &heads,
+            1,
+            2,
+            None,
+            0,
+        )
+        .expect_err("missing rope base should fail");
         assert!(error.to_string().contains("canonical Acc base"));
+    }
+
+    #[test]
+    fn head_unary_state_serializes_refs_not_materialized_rows() {
+        let heads = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(1.0)],
+            vec![Act::from_num(2.0)],
+        ]]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let state = init_value_rms_norm_row_state(&mut store, &heads, Some(Acc::from_num(0.001)))
+            .expect("state");
+
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+
+        assert!(encoded.contains("heads_ref"));
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("output_heads"));
     }
 
     #[test]
@@ -2984,6 +3191,26 @@ mod tests {
     }
 
     #[test]
+    fn attention_row_state_serializes_refs_not_materialized_rows() {
+        let queries = RasterAttentionHeadSequence::from_acts(vec![vec![
+            vec![Act::from_num(1.0)],
+            vec![Act::from_num(1.0)],
+        ]]);
+        let keys = queries.clone();
+        let values = queries.clone();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let state = init_attention_row_state(&mut store, &queries, &keys, &values, None, None)
+            .expect("attention state");
+
+        let encoded = serde_json::to_string(&state).expect("state should serialize");
+
+        assert!(encoded.contains("query_ref"));
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("output_heads"));
+    }
+
+    #[test]
     fn attention_row_state_fails_closed_for_invalid_shapes() {
         let queries = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(1.0)]]]);
         let mismatched_width_keys = RasterAttentionHeadSequence::from_acts(vec![vec![vec![
@@ -2991,16 +3218,30 @@ mod tests {
             Act::from_num(2.0),
         ]]]);
         let values = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(1.0)]]]);
-        let error = init_attention_row_state(&queries, &mismatched_width_keys, &values, None, None)
-            .expect_err("width mismatch should fail");
+        let error = init_attention_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &queries,
+            &mismatched_width_keys,
+            &values,
+            None,
+            None,
+        )
+        .expect_err("width mismatch should fail");
         assert!(error.to_string().contains("head width mismatch"));
 
         let mismatched_len_keys = RasterAttentionHeadSequence::from_acts(vec![vec![
             vec![Act::from_num(1.0)],
             vec![Act::from_num(1.0)],
         ]]);
-        let error = init_attention_row_state(&queries, &mismatched_len_keys, &values, None, None)
-            .expect_err("sequence length mismatch should fail");
+        let error = init_attention_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &queries,
+            &mismatched_len_keys,
+            &values,
+            None,
+            None,
+        )
+        .expect_err("sequence length mismatch should fail");
         assert!(error.to_string().contains("sequence length mismatch"));
 
         let grouped_queries = RasterAttentionHeadSequence::from_acts(vec![
@@ -3016,9 +3257,15 @@ mod tests {
             vec![vec![Act::from_num(1.0)]],
             vec![vec![Act::from_num(2.0)]],
         ]);
-        let error =
-            init_attention_row_state(&grouped_queries, &grouped_keys, &grouped_values, None, None)
-                .expect_err("non-divisible grouped heads should fail");
+        let error = init_attention_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &grouped_queries,
+            &grouped_keys,
+            &grouped_values,
+            None,
+            None,
+        )
+        .expect_err("non-divisible grouped heads should fail");
         assert!(error.to_string().contains("must be divisible"));
 
         let donor_cache = RasterKvCache::from_heads(
@@ -3031,6 +3278,7 @@ mod tests {
         )
         .expect("cache should build");
         let error = init_attention_row_state(
+            &mut AuthenticatedRasterTensorStore::new(),
             &grouped_keys,
             &grouped_keys,
             &grouped_values,
@@ -3099,29 +3347,42 @@ mod tests {
             ],
         ]);
 
-        let reshaped =
-            run_reshape_heads_state(init_reshape_heads_state(&sequence, 2, 2).expect("init"))
-                .expect("reshape");
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let reshaped = run_reshape_heads_state(
+            init_reshape_heads_state(&mut store, &sequence, 2, 2).expect("init"),
+            &mut store,
+        )
+        .expect("reshape");
         let full_reshaped = reshape_sequence_heads(&sequence, 2, 2).expect("full reshape");
         assert_eq!(head_bits(&reshaped), head_bits(&full_reshaped));
 
-        let combined = run_combine_heads_state(init_combine_heads_state(&reshaped).expect("init"))
-            .expect("combine");
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let combined = run_combine_heads_state(
+            init_combine_heads_state(&mut store, &reshaped).expect("init"),
+            &mut store,
+        )
+        .expect("combine");
         assert_eq!(
             scaled_bits(&combined),
             scaled_bits(&combine_attention_heads(&reshaped).expect("full combine"))
         );
 
+        let mut store = AuthenticatedRasterTensorStore::new();
         let cache = run_kv_cache_build_state(
-            init_kv_cache_build_state(&reshaped, &full_reshaped, None).expect("init cache"),
+            init_kv_cache_build_state(&mut store, &reshaped, &full_reshaped, None)
+                .expect("init cache"),
+            &mut store,
         )
         .expect("cache");
         let full_cache =
             build_raster_kv_cache(&reshaped, &full_reshaped, None).expect("full cache");
         assert_eq!(cache, full_cache);
 
+        let mut store = AuthenticatedRasterTensorStore::new();
         let sliding_cache = run_kv_cache_build_state(
-            init_kv_cache_build_state(&reshaped, &full_reshaped, Some(1)).expect("init cache"),
+            init_kv_cache_build_state(&mut store, &reshaped, &full_reshaped, Some(1))
+                .expect("init cache"),
+            &mut store,
         )
         .expect("sliding cache");
         let full_sliding_cache =
@@ -3132,10 +3393,14 @@ mod tests {
     #[test]
     fn chunked_layout_helpers_fail_closed() {
         let sequence = RasterActivationSequence::from_acts(vec![vec![Act::from_num(1.0)]]);
-        let error = init_reshape_heads_state(&sequence, 0, 1).expect_err("zero heads should fail");
+        let error =
+            init_reshape_heads_state(&mut AuthenticatedRasterTensorStore::new(), &sequence, 0, 1)
+                .expect_err("zero heads should fail");
         assert!(error.to_string().contains("at least one head"));
 
-        let error = init_reshape_heads_state(&sequence, 1, 0).expect_err("zero dim should fail");
+        let error =
+            init_reshape_heads_state(&mut AuthenticatedRasterTensorStore::new(), &sequence, 1, 0)
+                .expect_err("zero dim should fail");
         assert!(error.to_string().contains("non-zero head dimension"));
 
         let ragged_heads = RasterAttentionHeadSequence::from_heads(vec![
@@ -3145,7 +3410,9 @@ mod tests {
                 RasterActivationRow::from_acts(vec![Act::from_num(2.0)]),
             ],
         ]);
-        let error = init_combine_heads_state(&ragged_heads).expect_err("ragged heads should fail");
+        let error =
+            init_combine_heads_state(&mut AuthenticatedRasterTensorStore::new(), &ragged_heads)
+                .expect_err("ragged heads should fail");
         assert!(error.to_string().contains("attention head 1 has 2 rows"));
 
         let keys = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(1.0)]]]);
@@ -3153,9 +3420,60 @@ mod tests {
             vec![vec![Act::from_num(1.0)]],
             vec![vec![Act::from_num(2.0)]],
         ]);
-        let error = init_kv_cache_build_state(&keys, &values, None)
-            .expect_err("cache head mismatch should fail");
+        let error = init_kv_cache_build_state(
+            &mut AuthenticatedRasterTensorStore::new(),
+            &keys,
+            &values,
+            None,
+        )
+        .expect_err("cache head mismatch should fail");
         assert!(error.to_string().contains("head count mismatch"));
+    }
+
+    #[test]
+    fn layout_and_kv_states_serialize_refs_not_materialized_rows() {
+        let sequence = RasterActivationSequence::from_acts(vec![
+            vec![
+                Act::from_num(1.0),
+                Act::from_num(2.0),
+                Act::from_num(3.0),
+                Act::from_num(4.0),
+            ],
+            vec![
+                Act::from_num(5.0),
+                Act::from_num(6.0),
+                Act::from_num(7.0),
+                Act::from_num(8.0),
+            ],
+        ]);
+        let heads = reshape_sequence_heads(&sequence, 2, 2).expect("heads");
+
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let reshape_state =
+            init_reshape_heads_state(&mut store, &sequence, 2, 2).expect("reshape state");
+        let encoded = serde_json::to_string(&reshape_state).expect("serialize reshape state");
+        assert!(encoded.contains("input_ref"));
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("output_heads"));
+
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let combine_state = init_combine_heads_state(&mut store, &heads).expect("combine state");
+        let encoded = serde_json::to_string(&combine_state).expect("serialize combine state");
+        assert!(encoded.contains("heads_ref"));
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("output_rows"));
+
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let kv_state =
+            init_kv_cache_build_state(&mut store, &heads, &heads, Some(1)).expect("kv state");
+        let encoded = serde_json::to_string(&kv_state).expect("serialize kv state");
+        assert!(encoded.contains("key_ref"));
+        assert!(encoded.contains("value_ref"));
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("act_bits"));
+        assert!(!encoded.contains("output_keys"));
     }
 
     #[test]
@@ -3256,62 +3574,68 @@ mod tests {
 
     fn run_sequence_unary_state(
         mut state: super::RasterSequenceUnaryState,
+        store: &mut AuthenticatedRasterTensorStore,
     ) -> Result<RasterActivationSequence> {
         while !state.is_complete() {
-            let (_done, next_state) = compute_next_sequence_unary_row(state)?;
+            let (_done, next_state) = compute_next_sequence_unary_row(state, store)?;
             state = next_state;
         }
-        finalize_sequence_unary_row_state(state)
+        finalize_sequence_unary_row_state(state, store)
     }
 
     fn run_sequence_binary_state(
         mut state: super::RasterSequenceBinaryState,
+        store: &mut AuthenticatedRasterTensorStore,
     ) -> Result<RasterActivationSequence> {
         while !state.is_complete() {
-            let (_done, next_state) = compute_next_sequence_binary_row(state)?;
+            let (_done, next_state) = compute_next_sequence_binary_row(state, store)?;
             state = next_state;
         }
-        finalize_sequence_binary_row_state(state)
+        finalize_sequence_binary_row_state(state, store)
     }
 
     fn run_head_unary_state(
         mut state: super::RasterHeadUnaryState,
+        store: &mut AuthenticatedRasterTensorStore,
     ) -> Result<RasterAttentionHeadSequence> {
         while !state.is_complete() {
-            let (_done, next_state) = compute_next_head_unary_row(state)?;
+            let (_done, next_state) = compute_next_head_unary_row(state, store)?;
             state = next_state;
         }
-        finalize_head_unary_row_state(state)
+        finalize_head_unary_row_state(state, store)
     }
 
     fn run_reshape_heads_state(
         mut state: super::RasterReshapeHeadsState,
+        store: &mut AuthenticatedRasterTensorStore,
     ) -> Result<RasterAttentionHeadSequence> {
         while !state.is_complete() {
-            let (_done, next_state) = compute_next_reshape_heads_row(state)?;
+            let (_done, next_state) = compute_next_reshape_heads_row(state, store)?;
             state = next_state;
         }
-        finalize_reshape_heads_state(state)
+        finalize_reshape_heads_state(state, store)
     }
 
     fn run_combine_heads_state(
         mut state: super::RasterCombineHeadsState,
+        store: &mut AuthenticatedRasterTensorStore,
     ) -> Result<RasterActivationSequence> {
         while !state.is_complete() {
-            let (_done, next_state) = compute_next_combine_heads_row(state)?;
+            let (_done, next_state) = compute_next_combine_heads_row(state, store)?;
             state = next_state;
         }
-        finalize_combine_heads_state(state)
+        finalize_combine_heads_state(state, store)
     }
 
     fn run_kv_cache_build_state(
         mut state: super::RasterKvCacheBuildState,
+        store: &mut AuthenticatedRasterTensorStore,
     ) -> Result<RasterKvCache> {
         while !state.is_complete() {
-            let (_done, next_state) = compute_next_kv_cache_row(state)?;
+            let (_done, next_state) = compute_next_kv_cache_row(state, store)?;
             state = next_state;
         }
-        finalize_kv_cache_build_state(state)
+        finalize_kv_cache_build_state(state, store)
     }
 
     fn run_attention_row_state(
@@ -3321,13 +3645,20 @@ mod tests {
         donor_cache: Option<&RasterKvCache>,
         attention_window: Option<usize>,
     ) -> Result<RasterAttentionHeadSequence> {
-        let mut state =
-            init_attention_row_state(queries, keys, values, donor_cache, attention_window)?;
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let mut state = init_attention_row_state(
+            &mut store,
+            queries,
+            keys,
+            values,
+            donor_cache,
+            attention_window,
+        )?;
         while !state.is_complete() {
-            let (_done, next_state) = compute_next_attention_row(state)?;
+            let (_done, next_state) = compute_next_attention_row(state, &mut store)?;
             state = next_state;
         }
-        finalize_attention_row_state(state)
+        finalize_attention_row_state(state, &mut store)
     }
 
     fn head_bits(sequence: &RasterAttentionHeadSequence) -> Vec<Vec<Vec<i32>>> {
