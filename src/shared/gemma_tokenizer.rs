@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 
 use crate::raster_authoring::AuthRead;
+use crate::shared::raster_tokenizer_store::RasterBpePieceSequenceRef;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaVocabEntry {
@@ -129,15 +130,20 @@ pub struct GemmaPreTokenizedText {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeState {
-    pub pieces: Vec<String>,
+    pub pieces_ref: RasterBpePieceSequenceRef,
+    pub piece_count: usize,
     pub add_special_tokens: bool,
     pub iteration: u64,
+    pub bpe_pairs_per_tile: usize,
+    pub bpe_pieces_per_tile: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeOutput {
-    pub pieces: Vec<String>,
+    pub pieces_ref: RasterBpePieceSequenceRef,
+    pub piece_count: usize,
     pub add_special_tokens: bool,
+    pub bpe_pieces_per_tile: usize,
 }
 
 impl GemmaTokenizerSpec {
@@ -432,18 +438,29 @@ impl AuthRead<GemmaBpeMergedTokenRequest> for AuthenticatedGemmaTokenizer {
 }
 
 impl GemmaBpeState {
-    pub fn new(pieces: Vec<String>, add_special_tokens: bool) -> Self {
+    pub fn new(
+        pieces_ref: RasterBpePieceSequenceRef,
+        add_special_tokens: bool,
+        bpe_pairs_per_tile: usize,
+        bpe_pieces_per_tile: usize,
+    ) -> Self {
+        let piece_count = pieces_ref.piece_count();
         Self {
-            pieces,
+            pieces_ref,
+            piece_count,
             add_special_tokens,
             iteration: 0,
+            bpe_pairs_per_tile,
+            bpe_pieces_per_tile,
         }
     }
 
     pub fn into_output(self) -> GemmaBpeOutput {
         GemmaBpeOutput {
-            pieces: self.pieces,
+            pieces_ref: self.pieces_ref,
+            piece_count: self.piece_count,
             add_special_tokens: self.add_special_tokens,
+            bpe_pieces_per_tile: self.bpe_pieces_per_tile,
         }
     }
 }

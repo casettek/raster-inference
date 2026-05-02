@@ -104,7 +104,7 @@ Invoke fallible recursive tiles with `call_recur_tile_result!`:
 let state = call_recur_tile_result!(step, state, source)?;
 ```
 
-Prompt preparation uses this for BPE merging. The native tokenizer repeatedly chooses the best merge candidate until no merge remains; the raster version makes that one replayable merge step over `GemmaBpeState`.
+Prompt preparation uses this for BPE merging. The native tokenizer repeatedly chooses the best merge candidate until no merge remains; the raster version makes one logical merge iteration a recursive sequence over compact refs, cursors, and bounded scan/apply states.
 
 ### 5. Replace File And Table Access With Authenticated Reads
 
@@ -136,7 +136,7 @@ Any value passed between tiles should be safe to serialize and replay:
 - avoid hidden handles into external libraries
 - avoid relying on map iteration order unless the map is only used behind authenticated read methods with deterministic request semantics
 
-For prompt preparation, `TokenizePromptInput`, `GemmaNormalizedText`, `GemmaPreTokenizedText`, `GemmaBpeState`, and `GemmaBpeOutput` make each tokenizer phase explicit and replayable.
+For prompt preparation, `TokenizePromptInput`, `GemmaNormalizedText`, `GemmaPreTokenizedText`, ref-backed `GemmaBpeState`, bounded BPE scan/apply states, and token-ID finalization state make each tokenizer phase explicit and replayable without serializing the scratch piece store through recursive state.
 
 ---
 
@@ -250,7 +250,7 @@ The current prompt-preparation raster path demonstrates the intended pattern:
 - simple native helpers like byte decoding, message construction, template rendering, and commitment hashing become direct `#[tile]` functions
 - native tokenization is decomposed into initialization, normalization, splitting, BPE initialization, recursive BPE merging, and final token-ID lookup
 - tokenizer metadata and lookup tables are accessed through `auth_read!`
-- BPE's dynamic merge loop is represented as a tail-recursive tile over `GemmaBpeState`
+- BPE's dynamic merge loop is represented as a tail-recursive sequence over `GemmaBpeState`; each iteration uses bounded recursive tiles for merge-candidate scanning and merge application over tokenizer scratch-store refs
 - the top-level `run` sequence composes the routine into the same `PromptPreparationState` returned by the native path
 
 Future raster routines should follow the same discipline: start from the native routine's result, expose every external dependency as an authenticated source, turn data-dependent loops into recursive state machines, and keep the sequence as a readable proof trace.

@@ -91,6 +91,8 @@ pub struct InferenceControls {
     pub raster_attention_kv_rows_per_tile: Option<usize>,
     pub raster_sequence_rows_per_tile: Option<usize>,
     pub raster_head_rows_per_tile: Option<usize>,
+    pub raster_tokenizer_bpe_pairs_per_tile: Option<usize>,
+    pub raster_tokenizer_bpe_pieces_per_tile: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +101,8 @@ pub struct RasterSizingControls {
     pub attention_kv_rows_per_tile: usize,
     pub sequence_rows_per_tile: usize,
     pub head_rows_per_tile: usize,
+    pub tokenizer_bpe_pairs_per_tile: usize,
+    pub tokenizer_bpe_pieces_per_tile: usize,
 }
 
 impl InferenceControls {
@@ -106,6 +110,10 @@ impl InferenceControls {
     pub const DEFAULT_RASTER_ATTENTION_KV_ROWS_PER_TILE: usize = 32;
     pub const DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE: usize = 1;
     pub const DEFAULT_RASTER_HEAD_ROWS_PER_TILE: usize = 1;
+    pub const DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE: usize =
+        crate::prompt_prepare::raster_tiles::DEFAULT_BPE_PAIRS_PER_TILE;
+    pub const DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE: usize =
+        crate::prompt_prepare::raster_tiles::DEFAULT_BPE_PIECES_PER_TILE;
 
     pub fn raster_projection_rows_per_tile(&self) -> Result<usize> {
         match self.raster_projection_rows_per_tile {
@@ -141,12 +149,34 @@ impl InferenceControls {
         }
     }
 
+    pub fn raster_tokenizer_bpe_pairs_per_tile(&self) -> Result<usize> {
+        match self.raster_tokenizer_bpe_pairs_per_tile {
+            Some(0) => {
+                anyhow::bail!("raster tokenizer BPE pairs per tile must be greater than zero")
+            }
+            Some(pairs) => Ok(pairs),
+            None => Ok(Self::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE),
+        }
+    }
+
+    pub fn raster_tokenizer_bpe_pieces_per_tile(&self) -> Result<usize> {
+        match self.raster_tokenizer_bpe_pieces_per_tile {
+            Some(0) => {
+                anyhow::bail!("raster tokenizer BPE pieces per tile must be greater than zero")
+            }
+            Some(pieces) => Ok(pieces),
+            None => Ok(Self::DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE),
+        }
+    }
+
     pub fn raster_sizing_controls(&self) -> Result<RasterSizingControls> {
         Ok(RasterSizingControls {
             projection_rows_per_tile: self.raster_projection_rows_per_tile()?,
             attention_kv_rows_per_tile: self.raster_attention_kv_rows_per_tile()?,
             sequence_rows_per_tile: self.raster_sequence_rows_per_tile()?,
             head_rows_per_tile: self.raster_head_rows_per_tile()?,
+            tokenizer_bpe_pairs_per_tile: self.raster_tokenizer_bpe_pairs_per_tile()?,
+            tokenizer_bpe_pieces_per_tile: self.raster_tokenizer_bpe_pieces_per_tile()?,
         })
     }
 
@@ -248,7 +278,16 @@ pub fn run_inference_with_controls(
                     let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
                         "raster tile inference requires an authenticated Gemma tokenizer",
                     )?;
-                    prompt_prepare::run_raster(request, model, tokenizer_source)?
+                    let raster_sizing_controls = raster_sizing_controls
+                        .as_ref()
+                        .expect("raster sizing controls should be validated");
+                    prompt_prepare::run_raster_with_tokenizer_controls(
+                        request,
+                        model,
+                        tokenizer_source,
+                        raster_sizing_controls.tokenizer_bpe_pairs_per_tile,
+                        raster_sizing_controls.tokenizer_bpe_pieces_per_tile,
+                    )?
                 } else {
                     run_prompt_prepare(request, model, tokenizer)?
                 };
@@ -662,6 +701,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("inference should pause");
@@ -714,6 +755,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("raster inference should pause after prefill prepare aux");
@@ -766,6 +809,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("raster inference should pause after prefill layer");
@@ -821,6 +866,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("inference should pause after the second prefill layer checkpoint");
@@ -869,6 +916,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("raster inference should pause after prefill finalize");
@@ -928,6 +977,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("hybrid raster inference should pause after prefill finalize");
@@ -988,6 +1039,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("raster inference should complete");
@@ -1040,6 +1093,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("hybrid raster inference should complete");
@@ -1104,6 +1159,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("raster inference should complete");
@@ -1159,6 +1216,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("raster inference should pause after output finalize");
@@ -1211,6 +1270,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("hybrid raster inference should pause after output finalize");
@@ -1267,6 +1328,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("hybrid raster inference should pause after decode finalize");
@@ -1320,6 +1383,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect_err("raster inference should reject fp32 requests");
@@ -1343,6 +1408,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect_err("raster decode-only inference should reject fp32 requests");
@@ -1386,6 +1453,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect_err("raster inference should reject fp32 models");
@@ -1427,6 +1496,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect_err("zero raster projection rows per tile should fail");
@@ -1468,6 +1539,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: Some(0),
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect_err("zero raster attention KV rows per tile should fail");
@@ -1509,6 +1582,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: Some(0),
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect_err("zero raster sequence rows per tile should fail");
@@ -1550,11 +1625,36 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: Some(0),
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect_err("zero raster head rows per tile should fail");
 
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn raster_sizing_controls_reject_zero_tokenizer_bpe_chunks() {
+        let pair_error = InferenceControls {
+            raster_tokenizer_bpe_pairs_per_tile: Some(0),
+            ..InferenceControls::default()
+        }
+        .raster_sizing_controls()
+        .expect_err("zero tokenizer pair chunk should fail");
+        assert!(pair_error
+            .to_string()
+            .contains("BPE pairs per tile must be greater than zero"));
+
+        let piece_error = InferenceControls {
+            raster_tokenizer_bpe_pieces_per_tile: Some(0),
+            ..InferenceControls::default()
+        }
+        .raster_sizing_controls()
+        .expect_err("zero tokenizer piece chunk should fail");
+        assert!(piece_error
+            .to_string()
+            .contains("BPE pieces per tile must be greater than zero"));
     }
 
     #[test]
@@ -1591,6 +1691,8 @@ mod tests {
                 raster_attention_kv_rows_per_tile: None,
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
             },
         )
         .expect("inference should pause");

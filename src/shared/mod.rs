@@ -8,6 +8,7 @@ pub mod raster_prefill_finalize;
 pub mod raster_prefill_layer;
 pub mod raster_prefill_ple;
 pub mod raster_row_store;
+pub mod raster_tokenizer_store;
 pub mod raster_transformer_kernels;
 pub mod transformer;
 pub mod transformer_kernels;

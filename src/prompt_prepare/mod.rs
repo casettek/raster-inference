@@ -45,3 +45,19 @@ pub fn run_raster(
 ) -> Result<PromptPreparationState> {
     raster_tiles::run(request, model, tokenizer)
 }
+
+pub fn run_raster_with_tokenizer_controls(
+    request: &InferenceRequest,
+    model: &crate::shared::input::ModelSpec,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+    bpe_pairs_per_tile: usize,
+    bpe_pieces_per_tile: usize,
+) -> Result<PromptPreparationState> {
+    raster_tiles::run_with_tokenizer_controls(
+        request,
+        model,
+        tokenizer,
+        bpe_pairs_per_tile,
+        bpe_pieces_per_tile,
+    )
+}

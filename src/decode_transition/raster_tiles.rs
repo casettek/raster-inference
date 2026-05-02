@@ -2964,6 +2964,10 @@ mod tests {
             attention_kv_rows_per_tile,
             sequence_rows_per_tile: 1,
             head_rows_per_tile: 1,
+            tokenizer_bpe_pairs_per_tile:
+                crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
+            tokenizer_bpe_pieces_per_tile:
+                crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE,
         }
     }
 

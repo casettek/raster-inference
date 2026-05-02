@@ -1,7 +1,9 @@
 use raster_inference::io::parse_gemma_tokenizer_spec_bytes;
 use raster_inference::load_gemma_tokenizer_spec_from_path;
 use raster_inference::output_finalize::raster_tiles::detokenize_output_tokens;
-use raster_inference::prompt_prepare::raster_tiles::tokenize_prompt;
+use raster_inference::prompt_prepare::raster_tiles::{
+    tokenize_prompt, tokenize_prompt_with_controls,
+};
 use raster_inference::shared::gemma_tokenizer::GemmaDecoderMetadataRequest;
 use raster_inference::AuthenticatedGemmaTokenizer;
 use std::path::PathBuf;
@@ -26,6 +28,26 @@ fn raster_gemma_tokenizer_matches_huggingface_for_supported_subset() {
             tokenize_prompt(prompt, &source, false).expect("Raster tokenizer should encode");
 
         assert_eq!(raster_ids, hf_ids, "token ids should match for {prompt:?}");
+    }
+}
+
+#[test]
+fn raster_gemma_tokenizer_chunk_controls_do_not_change_supported_subset() {
+    let tokenizer_json = minimal_gemma_tokenizer_json();
+    let spec = parse_gemma_tokenizer_spec_bytes(tokenizer_json.as_bytes())
+        .expect("Gemma tokenizer spec should parse");
+    let source = AuthenticatedGemmaTokenizer::new(spec);
+
+    for prompt in ["abab", "a b ab", "<bos>abab", "éab"] {
+        let tiny_chunk_ids =
+            tokenize_prompt_with_controls(prompt, &source, false, 1, 1).expect("tiny chunks");
+        let oversized_chunk_ids =
+            tokenize_prompt_with_controls(prompt, &source, false, 64, 64).expect("large chunks");
+
+        assert_eq!(
+            tiny_chunk_ids, oversized_chunk_ids,
+            "chunking should not change token ids for {prompt:?}"
+        );
     }
 }
 
