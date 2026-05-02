@@ -4,9 +4,13 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::raster_authoring::prelude::{
-    auth_read, call_recur_tile_result, call_tile, sequence, tile,
+    auth_read, call_recur_seq_result, call_recur_tile_result, call_seq, call_tile, sequence, tile,
 };
-use crate::shared::det_num::{softcap_act, Act};
+use crate::shared::det_num::{
+    acc_add_sat, add_sat, attention_score as det_attention_score, attention_softmax_exp_term,
+    attention_softmax_raw_weight, attention_softmax_residual, mac_bits, requantize, softcap_act,
+    Acc, Act,
+};
 use crate::shared::raster_decode_transition::{
     AuthenticatedGemmaDecodeTransitionSource, GemmaDecodeAttentionKind,
     GemmaDecodeEmbeddingRowRequest, GemmaDecodeFinalNormWeightsRequest,
@@ -17,16 +21,22 @@ use crate::shared::raster_decode_transition::{
     GemmaDecodePleScalarsRequest, GemmaDecodePleTokenEmbeddingRowRequest,
     GemmaDecodeProjectionRowRequest, GemmaDecodeTransitionMetadataRequest,
 };
+use crate::shared::raster_row_store::{
+    AuthenticatedRasterTensorStore, RasterAttentionHeadsRef, RasterHeadRowRequest,
+    RasterKvCacheRef, RasterKvRowKind, RasterKvRowRequest, RasterProjectionOutputBuilderRef,
+    RasterSequenceRowRequest, RasterTensorBuilderRef, RasterTensorId,
+};
 use crate::shared::raster_transformer_kernels::{
-    add_sequences, apply_rope_to_heads, attention_output_row, combine_attention_heads,
-    gelu_sequence, mul_sequences, project_row_with_weights, rms_norm_heads, rms_norm_sequence,
-    scale_sequence, value_rms_norm_heads, RasterActivationRow, RasterActivationSequence,
-    RasterAttentionHeadSequence, RasterKvCache,
+    add_sequences, apply_rope_to_heads, combine_attention_heads, gelu_sequence, mul_sequences,
+    project_row_with_weights, rms_norm_heads, rms_norm_sequence, scale_sequence,
+    validate_attention_kv_rows_per_tile, validate_projection_rows_per_tile, value_rms_norm_heads,
+    RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
 };
 use crate::shared::transformer::{
     ActivationSequence, InternalActivationSequence, InternalLogits, LayerKvCache, PrefillLogits,
     TransformerDecodeState, TransformerDecodeStepResult,
 };
+use crate::RasterSizingControls;
 
 use super::tiles::ActivationSequenceWithCache;
 
@@ -39,10 +49,18 @@ pub struct DecodeTransitionRasterState {
     token_count: usize,
     next_layer_idx: usize,
     layer_count: usize,
-    original_layer_caches: Vec<RasterKvCache>,
-    updated_layer_caches: Vec<RasterKvCache>,
+    original_layer_caches: Vec<DecodeLayerCacheSlot>,
+    updated_layer_caches: Vec<DecodeLayerCacheSlot>,
     completed_layer_output_sha256s: Vec<String>,
     completed_layer_output_det_sha256s: Vec<Option<String>>,
+    projection_rows_per_tile: usize,
+    attention_kv_rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum DecodeLayerCacheSlot {
+    Empty { num_kv_heads: usize },
+    Ref(RasterKvCacheRef),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -50,16 +68,109 @@ pub struct DecodeLogitsRasterState {
     normalized_final_position: RasterActivationRow,
     next_logit_idx: usize,
     logit_count: usize,
-    logit_bits: Vec<i32>,
+    output_builder_ref: RasterProjectionOutputBuilderRef,
     softcap_bits: Option<i32>,
+    projection_rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum DecodeProjectionKind {
+    LayerMatrix {
+        layer_idx: usize,
+        matrix: GemmaDecodeLayerMatrixKind,
+    },
+    PleModel {
+        layer_idx: usize,
+    },
+    FinalLogits,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeRowProjectionState {
+    input: RasterActivationRow,
+    projection_kind: DecodeProjectionKind,
+    next_projection_row_idx: usize,
+    projection_rows: usize,
+    input_width: usize,
+    output_builder_ref: RasterProjectionOutputBuilderRef,
+    rows_per_tile: usize,
+    softcap_bits: Option<i32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeAttentionState {
+    query_ref: RasterAttentionHeadsRef,
+    cache_ref: RasterKvCacheRef,
+    output_builder_ref: RasterTensorBuilderRef,
+    phase: DecodeAttentionPhase,
+    attention_id_prefix: String,
+    next_query_head_idx: usize,
+    query_head_count: usize,
+    kv_head_count: usize,
+    kv_groups: usize,
+    key_start: usize,
+    row_count: usize,
+    head_dim: usize,
+    kv_rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum DecodeAttentionPhase {
+    CollectScores {
+        score_builder_ref: RasterTensorBuilderRef,
+        next_kv_offset: usize,
+    },
+    FindSoftmaxMax {
+        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: Option<usize>,
+        max_logit_bits: i32,
+    },
+    SumSoftmaxExp {
+        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+    },
+    BuildRawSoftmaxWeights {
+        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        raw_weight_builder_ref: RasterTensorBuilderRef,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+        summed_weight_bits: i32,
+    },
+    CorrectSoftmaxResidual {
+        raw_weight_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        final_weight_builder_ref: RasterTensorBuilderRef,
+        next_weight_row_idx: usize,
+        max_index: usize,
+        residual_bits: i32,
+    },
+    ApplyValues {
+        weight_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        next_kv_offset: usize,
+        weighted_sum_acc_bits: Vec<i64>,
+    },
+}
+
+#[tile]
+pub fn init_decode_transition_store() -> AuthenticatedRasterTensorStore {
+    AuthenticatedRasterTensorStore::new()
 }
 
 #[tile]
 pub fn init_decode_transition_state(
+    store: &mut AuthenticatedRasterTensorStore,
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
     source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
 ) -> Result<DecodeTransitionRasterState> {
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
     let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
     if metadata.layer_count == 0 {
         bail!("transformer decode requires at least one layer");
@@ -88,7 +199,11 @@ pub fn init_decode_transition_state(
     let original_layer_caches = transformer_decode_state
         .layer_caches
         .iter()
-        .map(raster_cache_from_layer_cache)
+        .enumerate()
+        .map(|(layer_idx, cache)| {
+            let cache = raster_cache_from_layer_cache(cache)?;
+            register_decode_layer_cache(store, "decode.original.cache", layer_idx, cache)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(DecodeTransitionRasterState {
@@ -103,13 +218,16 @@ pub fn init_decode_transition_state(
         updated_layer_caches: Vec::with_capacity(metadata.layer_count),
         completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
         completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+        projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
+        attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
     })
 }
 
-#[tile(kind = recursive)]
+#[sequence(kind = recursive)]
 pub fn compute_next_decode_layer(
     mut state: DecodeTransitionRasterState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, DecodeTransitionRasterState)> {
     if state.next_layer_idx >= state.layer_count {
         return Ok((true, state));
@@ -130,17 +248,36 @@ pub fn compute_next_decode_layer(
         .get(layer_idx)
         .cloned()
         .ok_or_else(|| anyhow!("transformer decode cache {layer_idx} missing"))?;
-    let donor_cache = resolve_decode_donor_cache(&state.updated_layer_caches, layer_idx, &layer)?;
-    let per_layer_input =
-        compute_decode_ple_input(state.next_token, &state.decode_input, source, &layer)?;
-    let (layer_output, updated_cache) = run_basic_decode_layer(
+    let cache_value = materialize_decode_layer_cache_from_store(store, &cache)?;
+    let donor_cache_slot =
+        resolve_decode_donor_cache_slot(&state.updated_layer_caches, layer_idx, &layer)?;
+    let donor_cache_value = donor_cache_slot
+        .as_ref()
+        .map(|slot| materialize_decode_layer_cache_from_store(store, slot))
+        .transpose()?;
+    let per_layer_input = call_seq!(
+        compute_decode_ple_input,
+        store,
+        state.next_token,
+        &state.decode_input,
+        source,
+        &layer,
+        state.projection_rows_per_tile
+    )?;
+    let (layer_output, updated_cache) = call_seq!(
+        run_basic_decode_layer,
+        store,
         &state.current_activation,
         source,
         &layer,
         cache,
-        donor_cache,
+        cache_value,
+        donor_cache_slot,
+        donor_cache_value.as_ref(),
         per_layer_input.as_ref(),
         state.position,
+        state.projection_rows_per_tile,
+        state.attention_kv_rows_per_tile
     )?;
 
     state.current_activation = layer_output;
@@ -153,20 +290,6 @@ pub fn compute_next_decode_layer(
     state.completed_layer_output_det_sha256s.push(Some(
         crate::shared::transformer_kernels::build_det_vector_commitment(&current_activation_acts),
     ));
-    let mut checkpoint_layer_caches = state
-        .updated_layer_caches
-        .iter()
-        .cloned()
-        .map(layer_cache_from_raster)
-        .collect::<Vec<_>>();
-    checkpoint_layer_caches.extend(
-        state
-            .original_layer_caches
-            .iter()
-            .skip(layer_idx + 1)
-            .cloned()
-            .map(layer_cache_from_raster),
-    );
     let decode_input_values = state.decode_input.to_f32_values();
     let decode_input_acts = state.decode_input.acts();
     let current_activation_sha256 = state
@@ -179,28 +302,32 @@ pub fn compute_next_decode_layer(
         .last()
         .cloned()
         .unwrap_or(None);
-    crate::trace::trace_checkpoint(
+    crate::trace::trace_checkpoint_lazy_result(
         &format!(
             "decode.layer_token.layer_{layer_idx}.position_{}",
             state.position
         ),
-        &json!({
-            "execution_mode": "deterministic",
-            "token_id": state.next_token,
-            "position": state.position,
-            "next_layer_idx": layer_idx + 1,
-            "decode_input_activation": decode_input_values.clone(),
-            "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&decode_input_values),
-            "det_decode_input_activation_sha256": Some(crate::shared::transformer_kernels::build_det_vector_commitment(&decode_input_acts)),
-            "current_activation": current_activation_values,
-            "current_activation_sha256": current_activation_sha256,
-            "det_current_activation_sha256": det_current_activation_sha256,
-            "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
-            "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
-            "completed_layer_output_sha256s": state.completed_layer_output_sha256s.clone(),
-            "completed_layer_output_det_sha256s": state.completed_layer_output_det_sha256s.clone(),
-        }),
-    );
+        || {
+            let checkpoint_layer_caches =
+                materialize_decode_checkpoint_caches(store, &state, layer_idx)?;
+            Ok(json!({
+                "execution_mode": "deterministic",
+                "token_id": state.next_token,
+                "position": state.position,
+                "next_layer_idx": layer_idx + 1,
+                "decode_input_activation": decode_input_values.clone(),
+                "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&decode_input_values),
+                "det_decode_input_activation_sha256": Some(crate::shared::transformer_kernels::build_det_vector_commitment(&decode_input_acts)),
+                "current_activation": current_activation_values,
+                "current_activation_sha256": current_activation_sha256,
+                "det_current_activation_sha256": det_current_activation_sha256,
+                "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
+                "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
+                "completed_layer_output_sha256s": state.completed_layer_output_sha256s.clone(),
+                "completed_layer_output_det_sha256s": state.completed_layer_output_det_sha256s.clone(),
+            }))
+        },
+    )?;
 
     state.next_layer_idx += 1;
     Ok((false, state))
@@ -208,6 +335,7 @@ pub fn compute_next_decode_layer(
 
 #[tile]
 pub fn finalize_decode_layer_state(
+    store: &AuthenticatedRasterTensorStore,
     state: DecodeTransitionRasterState,
 ) -> Result<ActivationSequenceWithCache> {
     if state.next_layer_idx != state.layer_count {
@@ -239,6 +367,9 @@ pub fn finalize_decode_layer_state(
         activation_state,
         layer_caches: state
             .updated_layer_caches
+            .iter()
+            .map(|cache| materialize_decode_layer_cache_from_store(store, cache))
+            .collect::<Result<Vec<_>>>()?
             .into_iter()
             .map(layer_cache_from_raster)
             .collect(),
@@ -271,9 +402,12 @@ pub fn normalize_decode_final_position(
 
 #[tile]
 pub fn init_decode_logits_projection(
+    store: &mut AuthenticatedRasterTensorStore,
     normalized_final_position: RasterActivationRow,
     source: &AuthenticatedGemmaDecodeTransitionSource,
+    projection_rows_per_tile: usize,
 ) -> Result<DecodeLogitsRasterState> {
+    validate_projection_rows_per_tile(projection_rows_per_tile)?;
     let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
     if metadata.projection_rows == 0 {
         bail!("deterministic decode logits projection requires at least one projection row");
@@ -294,12 +428,18 @@ pub fn init_decode_logits_projection(
     }
 
     let scalars = auth_read!(source, GemmaDecodeFinalScalarsRequest)?;
+    let output_builder_ref = store.start_projection_output_builder(
+        RasterTensorId::new("decode.final.logits")?,
+        1,
+        metadata.projection_rows,
+    )?;
     Ok(DecodeLogitsRasterState {
         normalized_final_position,
         next_logit_idx: 0,
         logit_count: metadata.projection_rows,
-        logit_bits: Vec::with_capacity(metadata.projection_rows),
+        output_builder_ref,
         softcap_bits: scalars.final_logit_softcapping.map(Act::to_bits),
+        projection_rows_per_tile,
     })
 }
 
@@ -307,35 +447,45 @@ pub fn init_decode_logits_projection(
 pub fn project_next_decode_logit(
     mut state: DecodeLogitsRasterState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
+    store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, DecodeLogitsRasterState)> {
     if state.next_logit_idx >= state.logit_count {
         return Ok((true, state));
     }
-    if state.logit_bits.len() != state.next_logit_idx {
-        bail!(
-            "raster decode projection state has {} logits before row {}",
-            state.logit_bits.len(),
-            state.next_logit_idx
-        );
-    }
 
-    let projection_row = auth_read!(
-        source,
-        GemmaDecodeProjectionRowRequest {
-            row_idx: state.next_logit_idx,
-        },
-    )?;
-    let mut logit = project_row_with_weights(&state.normalized_final_position, &projection_row)?;
-    if let Some(softcap_bits) = state.softcap_bits {
-        logit = softcap_act(logit, Act::from_bits(softcap_bits));
+    let end = state
+        .next_logit_idx
+        .saturating_add(state.projection_rows_per_tile)
+        .min(state.logit_count);
+    let start_logit_idx = state.next_logit_idx;
+    let mut logit_bits = Vec::with_capacity(end - start_logit_idx);
+    while state.next_logit_idx < end {
+        let projection_row = auth_read!(
+            source,
+            GemmaDecodeProjectionRowRequest {
+                row_idx: state.next_logit_idx,
+            },
+        )?;
+        let mut logit =
+            project_row_with_weights(&state.normalized_final_position, &projection_row)?;
+        if let Some(softcap_bits) = state.softcap_bits {
+            logit = softcap_act(logit, Act::from_bits(softcap_bits));
+        }
+        logit_bits.push(logit.to_bits());
+        state.next_logit_idx += 1;
     }
-    state.logit_bits.push(logit.to_bits());
-    state.next_logit_idx += 1;
+    store.append_projection_output_chunk(
+        &mut state.output_builder_ref,
+        0,
+        start_logit_idx,
+        &logit_bits,
+    )?;
     Ok((false, state))
 }
 
 #[tile]
 pub fn finalize_decode_transition_result(
+    store: &mut AuthenticatedRasterTensorStore,
     state: DecodeLogitsRasterState,
     transformer_decode_state: TransformerDecodeState,
     final_hidden_state: ActivationSequence,
@@ -347,19 +497,14 @@ pub fn finalize_decode_transition_result(
             state.logit_count
         );
     }
-    if state.logit_bits.len() != state.logit_count {
-        bail!(
-            "raster decode projection stored {} logits, expected {}",
-            state.logit_bits.len(),
-            state.logit_count
-        );
-    }
-
-    let det_logits = state
-        .logit_bits
+    let logits_ref = store.finalize_projection_output_builder(state.output_builder_ref)?;
+    let logits_sequence = store.materialize_sequence(&logits_ref)?;
+    let det_logits = logits_sequence
+        .into_rows()
         .into_iter()
-        .map(Act::from_bits)
-        .collect::<Vec<_>>();
+        .next()
+        .ok_or_else(|| anyhow!("raster decode projection produced no logits row"))?
+        .acts();
     let internal_logits = InternalLogits::from_det_values(det_logits.clone());
     let final_logits_sha256 =
         crate::shared::transformer_kernels::build_vector_commitment(internal_logits.as_f32_slice());
@@ -383,24 +528,36 @@ pub fn run(
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
     source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
 ) -> Result<TransformerDecodeStepResult> {
+    let mut store = call_tile!(init_decode_transition_store);
     let state = call_tile!(
         init_decode_transition_state,
+        &mut store,
         transformer_decode_state.clone(),
         next_token,
-        source
+        source,
+        raster_sizing
     )?;
-    let state = call_recur_tile_result!(compute_next_decode_layer, state, source)?;
-    let layer_output = call_tile!(finalize_decode_layer_state, state)?;
+    let state = call_recur_seq_result!(compute_next_decode_layer, state, source, &mut store)?;
+    let layer_output = call_tile!(finalize_decode_layer_state, &store, state)?;
     let normalized = call_tile!(
         normalize_decode_final_position,
         &layer_output.activation_state,
         source
     )?;
-    let logits_state = call_tile!(init_decode_logits_projection, normalized, source)?;
-    let logits_state = call_recur_tile_result!(project_next_decode_logit, logits_state, source)?;
+    let logits_state = call_tile!(
+        init_decode_logits_projection,
+        &mut store,
+        normalized,
+        source,
+        raster_sizing.projection_rows_per_tile
+    )?;
+    let logits_state =
+        call_recur_tile_result!(project_next_decode_logit, logits_state, source, &mut store)?;
     call_tile!(
         finalize_decode_transition_result,
+        &mut store,
         logits_state,
         TransformerDecodeState {
             layer_caches: layer_output.layer_caches,
@@ -411,15 +568,21 @@ pub fn run(
     )
 }
 
+#[sequence]
 fn run_basic_decode_layer(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationRow,
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer: &GemmaDecodeLayerMetadata,
+    cache_slot: DecodeLayerCacheSlot,
     cache: RasterKvCache,
+    donor_cache_slot: Option<&DecodeLayerCacheSlot>,
     donor_cache: Option<&RasterKvCache>,
     per_layer_input: Option<&RasterActivationRow>,
     position: usize,
-) -> Result<(RasterActivationRow, RasterKvCache)> {
+    projection_rows_per_tile: usize,
+    attention_kv_rows_per_tile: usize,
+) -> Result<(RasterActivationRow, DecodeLayerCacheSlot)> {
     let scalars = auth_read!(
         source,
         GemmaDecodeLayerScalarsRequest {
@@ -439,8 +602,20 @@ fn run_basic_decode_layer(
         )?,
         scalars.rms_norm_eps,
     )?;
-    let (attention_output, updated_cache) =
-        run_decode_attention(&normed, source, layer, cache, donor_cache, position)?;
+    let (attention_output, updated_cache) = call_seq!(
+        run_decode_attention,
+        store,
+        &normed,
+        source,
+        layer,
+        cache_slot,
+        cache,
+        donor_cache_slot,
+        donor_cache,
+        position,
+        projection_rows_per_tile,
+        attention_kv_rows_per_tile
+    )?;
     let attention_output = rms_norm_row(
         &attention_output,
         &auth_read!(
@@ -466,28 +641,40 @@ fn run_basic_decode_layer(
         )?,
         scalars.rms_norm_eps,
     )?;
-    let gate = project_row_with_decode_source(
+    let gate = call_seq!(
+        project_row_with_decode_source,
+        store,
         &normed,
         source,
         layer.layer_idx,
         GemmaDecodeLayerMatrixKind::Gate,
         layer.gate_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.gate_proj", layer.layer_idx)
     )?;
     let gate = gelu_row(&gate)?;
-    let up = project_row_with_decode_source(
+    let up = call_seq!(
+        project_row_with_decode_source,
+        store,
         &normed,
         source,
         layer.layer_idx,
         GemmaDecodeLayerMatrixKind::Up,
         layer.up_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.up_proj", layer.layer_idx)
     )?;
     let ff_hidden = mul_rows(&gate, &up)?;
-    let ff_out = project_row_with_decode_source(
+    let ff_out = call_seq!(
+        project_row_with_decode_source,
+        store,
         &ff_hidden,
         source,
         layer.layer_idx,
         GemmaDecodeLayerMatrixKind::Down,
         layer.down_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.down_proj", layer.layer_idx)
     )?;
     let ff_out = rms_norm_row(
         &ff_out,
@@ -504,7 +691,9 @@ fn run_basic_decode_layer(
 
     if let Some(per_layer_input) = per_layer_input {
         let residual = xs.clone();
-        let gated = project_row_with_decode_source(
+        let gated = call_seq!(
+            project_row_with_decode_source,
+            store,
             &xs,
             source,
             layer.layer_idx,
@@ -515,10 +704,14 @@ fn run_basic_decode_layer(
                     anyhow!("Gemma decode layer metadata is missing PLE input gate shape")
                 })?
                 .rows,
+            projection_rows_per_tile,
+            format!("decode.layer.{}.ple.input_gate", layer.layer_idx)
         )?;
         let gated = gelu_row(&gated)?;
         let gated = mul_rows(&gated, per_layer_input)?;
-        let projected = project_row_with_decode_source(
+        let projected = call_seq!(
+            project_row_with_decode_source,
+            store,
             &gated,
             source,
             layer.layer_idx,
@@ -529,6 +722,8 @@ fn run_basic_decode_layer(
                     anyhow!("Gemma decode layer metadata is missing PLE layer projection shape")
                 })?
                 .rows,
+            projection_rows_per_tile,
+            format!("decode.layer.{}.ple.layer_projection", layer.layer_idx)
         )?;
         let projected = rms_norm_row(
             &projected,
@@ -551,14 +746,20 @@ fn run_basic_decode_layer(
     Ok((xs, updated_cache))
 }
 
+#[sequence]
 fn run_decode_attention(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationRow,
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer: &GemmaDecodeLayerMetadata,
+    cache_slot: DecodeLayerCacheSlot,
     cache: RasterKvCache,
+    donor_cache_slot: Option<&DecodeLayerCacheSlot>,
     donor_cache: Option<&RasterKvCache>,
     position: usize,
-) -> Result<(RasterActivationRow, RasterKvCache)> {
+    projection_rows_per_tile: usize,
+    attention_kv_rows_per_tile: usize,
+) -> Result<(RasterActivationRow, DecodeLayerCacheSlot)> {
     validate_row_width(input, layer.hidden_size, "decode attention input")?;
     let kv_groups = layer
         .num_heads
@@ -568,22 +769,32 @@ fn run_decode_attention(
         bail!("Gemma layer must have at least one KV group");
     }
 
-    let q_projected = project_row_with_decode_source(
+    let q_projected = call_seq!(
+        project_row_with_decode_source,
+        store,
         input,
         source,
         layer.layer_idx,
         GemmaDecodeLayerMatrixKind::Query,
         layer.q_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.q_proj", layer.layer_idx)
     )?;
-    let raw_k = project_row_with_decode_source(
+    let raw_k = call_seq!(
+        project_row_with_decode_source,
+        store,
         input,
         source,
         layer.layer_idx,
         GemmaDecodeLayerMatrixKind::Key,
         layer.k_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.k_proj", layer.layer_idx)
     )?;
     let raw_v = if layer.has_v_proj {
-        project_row_with_decode_source(
+        call_seq!(
+            project_row_with_decode_source,
+            store,
             input,
             source,
             layer.layer_idx,
@@ -592,6 +803,8 @@ fn run_decode_attention(
                 .v_proj_shape
                 .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing v_proj shape"))?
                 .rows,
+            projection_rows_per_tile,
+            format!("decode.layer.{}.v_proj", layer.layer_idx)
         )?
     } else if layer.attention_k_eq_v {
         raw_k.clone()
@@ -673,12 +886,23 @@ fn run_decode_attention(
         position,
     )?;
 
-    let updated_cache = if donor_cache.is_some() {
-        cache
+    let updated_cache_slot = if donor_cache.is_some() {
+        cache_slot
     } else {
-        append_decode_kv_cache(cache, &k_heads, &v_heads, layer.cache_sliding_window)?
+        let updated_cache =
+            append_decode_kv_cache(cache, &k_heads, &v_heads, layer.cache_sliding_window)?;
+        register_decode_layer_cache(
+            store,
+            "decode.updated.cache",
+            layer.layer_idx,
+            updated_cache,
+        )?
     };
-    let attention_cache = donor_cache.unwrap_or(&updated_cache);
+    let attention_cache_slot = donor_cache_slot.unwrap_or(&updated_cache_slot);
+    let attention_cache_ref = match attention_cache_slot {
+        DecodeLayerCacheSlot::Empty { .. } => bail!("decode attention cache is empty"),
+        DecodeLayerCacheSlot::Ref(cache_ref) => cache_ref.clone(),
+    };
     let attention_window = match layer.attention_kind {
         GemmaDecodeAttentionKind::Full => None,
         GemmaDecodeAttentionKind::Sliding => Some(
@@ -687,41 +911,45 @@ fn run_decode_attention(
                 .ok_or_else(|| anyhow!("sliding attention layer is missing a sliding window"))?,
         ),
     };
-    let mut output_heads = Vec::with_capacity(layer.num_heads);
-    for head_idx in 0..layer.num_heads {
-        let kv_head_idx = head_idx / kv_groups;
-        let key_start = attention_window
-            .map(|window| attention_cache.current_len().saturating_sub(window))
-            .unwrap_or(0);
-        let row_count = attention_cache.current_len().saturating_sub(key_start);
-        let key_rows = attention_cache.key_rows_window(kv_head_idx, key_start, row_count)?;
-        let value_rows = attention_cache.value_rows_window(kv_head_idx, key_start, row_count)?;
-        let query = q_heads
-            .heads()
-            .get(head_idx)
-            .and_then(|head| head.first())
-            .ok_or_else(|| anyhow!("decode query head {head_idx} is missing"))?;
-        output_heads.push(vec![attention_output_row(query, &key_rows, &value_rows)?]);
-    }
-    let attention_sequence =
-        combine_attention_heads(&RasterAttentionHeadSequence::from_heads(output_heads))?;
+    let q_heads_ref = store.insert_attention_heads(
+        RasterTensorId::new(format!("decode.layer.{}.q_heads", layer.layer_idx))?,
+        q_heads,
+    )?;
+    let attention_heads_ref = call_seq!(
+        compute_decode_attention_ref,
+        store,
+        q_heads_ref,
+        attention_cache_ref,
+        format!("decode.layer.{}.attention", layer.layer_idx),
+        attention_window,
+        attention_kv_rows_per_tile
+    )?;
+    let output_heads = store.materialize_heads(&attention_heads_ref)?;
+    let attention_sequence = combine_attention_heads(&output_heads)?;
     let attention_row = first_row(attention_sequence, "decode attention combine")?;
-    let projected = project_row_with_decode_source(
+    let projected = call_seq!(
+        project_row_with_decode_source,
+        store,
         &attention_row,
         source,
         layer.layer_idx,
         GemmaDecodeLayerMatrixKind::Output,
         layer.o_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.o_proj", layer.layer_idx)
     )?;
 
-    Ok((projected, updated_cache))
+    Ok((projected, updated_cache_slot))
 }
 
+#[sequence]
 fn compute_decode_ple_input(
+    store: &mut AuthenticatedRasterTensorStore,
     token_id: u32,
     decode_input: &RasterActivationRow,
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer: &GemmaDecodeLayerMetadata,
+    projection_rows_per_tile: usize,
 ) -> Result<Option<RasterActivationRow>> {
     if !layer.has_ple {
         return Ok(None);
@@ -742,56 +970,190 @@ fn compute_decode_ple_input(
     )?);
     let embedded = scale_row(&embedded, Some(scalars.embedding_scale))?;
 
-    let projected = project_row_with_ple_source(decode_input, source, layer.layer_idx, ple_width)?;
+    let projected = call_seq!(
+        project_row_with_ple_source,
+        store,
+        decode_input,
+        source,
+        layer.layer_idx,
+        ple_width,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.ple.model_projection", layer.layer_idx)
+    )?;
     let projected = scale_row(&projected, Some(scalars.projection_scalar))?;
     let projected = rms_norm_row(&projected, &norm_weights, scalars.rms_norm_eps)?;
     let combined = add_rows(&embedded, &projected)?;
     scale_row(&combined, Some(scalars.input_scale)).map(Some)
 }
 
+#[sequence]
 fn project_row_with_decode_source(
+    store: &mut AuthenticatedRasterTensorStore,
     input: &RasterActivationRow,
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer_idx: usize,
     matrix: GemmaDecodeLayerMatrixKind,
     projection_rows: usize,
+    rows_per_tile: usize,
+    output_id: String,
 ) -> Result<RasterActivationRow> {
+    let state = call_tile!(
+        init_decode_row_projection,
+        store,
+        input.clone(),
+        DecodeProjectionKind::LayerMatrix { layer_idx, matrix },
+        projection_rows,
+        rows_per_tile,
+        RasterTensorId::new(output_id)?,
+        None
+    )?;
+    let state =
+        call_recur_tile_result!(project_next_decode_projection_chunk, state, source, store)?;
+    call_tile!(finalize_decode_row_projection, store, state)
+}
+
+#[sequence]
+fn project_row_with_ple_source(
+    store: &mut AuthenticatedRasterTensorStore,
+    input: &RasterActivationRow,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    projection_rows: usize,
+    rows_per_tile: usize,
+    output_id: String,
+) -> Result<RasterActivationRow> {
+    let state = call_tile!(
+        init_decode_row_projection,
+        store,
+        input.clone(),
+        DecodeProjectionKind::PleModel { layer_idx },
+        projection_rows,
+        rows_per_tile,
+        RasterTensorId::new(output_id)?,
+        None
+    )?;
+    let state =
+        call_recur_tile_result!(project_next_decode_projection_chunk, state, source, store)?;
+    call_tile!(finalize_decode_row_projection, store, state)
+}
+
+#[tile]
+pub fn init_decode_row_projection(
+    store: &mut AuthenticatedRasterTensorStore,
+    input: RasterActivationRow,
+    projection_kind: DecodeProjectionKind,
+    projection_rows: usize,
+    rows_per_tile: usize,
+    output_id: RasterTensorId,
+    softcap_bits: Option<i32>,
+) -> Result<DecodeRowProjectionState> {
     if projection_rows == 0 {
-        bail!("deterministic decode linear projection requires at least one projection row");
+        bail!("deterministic decode projection requires at least one projection row");
     }
-    let mut output = Vec::with_capacity(projection_rows);
-    for row_idx in 0..projection_rows {
-        let row = auth_read!(
+    validate_projection_rows_per_tile(rows_per_tile)?;
+    let input_width = input.width();
+    let output_builder_ref =
+        store.start_projection_output_builder(output_id, 1, projection_rows)?;
+    Ok(DecodeRowProjectionState {
+        input,
+        projection_kind,
+        next_projection_row_idx: 0,
+        projection_rows,
+        input_width,
+        output_builder_ref,
+        rows_per_tile,
+        softcap_bits,
+    })
+}
+
+#[tile(kind = recursive)]
+pub fn project_next_decode_projection_chunk(
+    mut state: DecodeRowProjectionState,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<(bool, DecodeRowProjectionState)> {
+    if state.next_projection_row_idx >= state.projection_rows {
+        return Ok((true, state));
+    }
+    let end = state
+        .next_projection_row_idx
+        .saturating_add(state.rows_per_tile)
+        .min(state.projection_rows);
+    let start_projection_row_idx = state.next_projection_row_idx;
+    let mut output_bits = Vec::with_capacity(end - start_projection_row_idx);
+    while state.next_projection_row_idx < end {
+        let projection_row = read_decode_projection_row(
+            source,
+            &state.projection_kind,
+            state.next_projection_row_idx,
+        )?;
+        if projection_row.len() != state.input_width {
+            bail!(
+                "decode projection row {} has width {}, expected {}",
+                state.next_projection_row_idx,
+                projection_row.len(),
+                state.input_width
+            );
+        }
+        let mut projected = project_row_with_weights(&state.input, &projection_row)?;
+        if let Some(softcap_bits) = state.softcap_bits {
+            projected = softcap_act(projected, Act::from_bits(softcap_bits));
+        }
+        output_bits.push(projected.to_bits());
+        state.next_projection_row_idx += 1;
+    }
+    store.append_projection_output_chunk(
+        &mut state.output_builder_ref,
+        0,
+        start_projection_row_idx,
+        &output_bits,
+    )?;
+    Ok((false, state))
+}
+
+fn read_decode_projection_row(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    projection_kind: &DecodeProjectionKind,
+    row_idx: usize,
+) -> Result<Vec<crate::shared::det_num::Wgt>> {
+    match *projection_kind {
+        DecodeProjectionKind::LayerMatrix { layer_idx, matrix } => auth_read!(
             source,
             GemmaDecodeLayerMatrixRowRequest {
                 layer_idx,
                 matrix,
                 row_idx,
             },
-        )?;
-        output.push(project_row_with_weights(input, &row)?);
-    }
-    Ok(RasterActivationRow::from_acts(output))
-}
-
-fn project_row_with_ple_source(
-    input: &RasterActivationRow,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    projection_rows: usize,
-) -> Result<RasterActivationRow> {
-    if projection_rows == 0 {
-        bail!("deterministic decode PLE projection requires at least one projection row");
-    }
-    let mut output = Vec::with_capacity(projection_rows);
-    for row_idx in 0..projection_rows {
-        let row = auth_read!(
+        ),
+        DecodeProjectionKind::PleModel { layer_idx } => auth_read!(
             source,
             GemmaDecodePleModelProjectionRowRequest { layer_idx, row_idx },
-        )?;
-        output.push(project_row_with_weights(input, &row)?);
+        ),
+        DecodeProjectionKind::FinalLogits => {
+            auth_read!(source, GemmaDecodeProjectionRowRequest { row_idx })
+        }
     }
-    Ok(RasterActivationRow::from_acts(output))
+}
+
+#[tile]
+pub fn finalize_decode_row_projection(
+    store: &mut AuthenticatedRasterTensorStore,
+    state: DecodeRowProjectionState,
+) -> Result<RasterActivationRow> {
+    if state.next_projection_row_idx != state.projection_rows {
+        bail!(
+            "raster decode projection completed {} rows, expected {}",
+            state.next_projection_row_idx,
+            state.projection_rows
+        );
+    }
+    let output_ref = store.finalize_projection_output_builder(state.output_builder_ref)?;
+    let output = store.materialize_sequence(&output_ref)?;
+    output
+        .into_rows()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("raster decode projection produced no output row"))
 }
 
 fn reshape_row_heads(
@@ -804,6 +1166,468 @@ fn reshape_row_heads(
         num_heads,
         head_dim,
     )
+}
+
+#[sequence]
+fn compute_decode_attention_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    query_ref: RasterAttentionHeadsRef,
+    cache_ref: RasterKvCacheRef,
+    id_prefix: String,
+    attention_window: Option<usize>,
+    kv_rows_per_tile: usize,
+) -> Result<RasterAttentionHeadsRef> {
+    let state = call_tile!(
+        init_decode_attention_state_from_refs,
+        store,
+        query_ref,
+        cache_ref,
+        RasterTensorId::new(format!("{id_prefix}.output"))?,
+        id_prefix,
+        attention_window,
+        kv_rows_per_tile
+    )?;
+    let state = call_recur_tile_result!(compute_next_decode_attention_head, state, store)?;
+    call_tile!(finalize_decode_attention_state_ref, store, state)
+}
+
+#[tile]
+pub fn init_decode_attention_state_from_refs(
+    store: &mut AuthenticatedRasterTensorStore,
+    query_ref: RasterAttentionHeadsRef,
+    cache_ref: RasterKvCacheRef,
+    output_id: RasterTensorId,
+    attention_id_prefix: String,
+    attention_window: Option<usize>,
+    kv_rows_per_tile: usize,
+) -> Result<DecodeAttentionState> {
+    validate_attention_kv_rows_per_tile(kv_rows_per_tile)?;
+    let (query_head_count, query_sequence_len, head_dim) =
+        query_ref.tensor_ref().shape().heads_metadata()?;
+    if query_sequence_len != 1 {
+        bail!(
+            "decode attention query must contain exactly one token row, got {query_sequence_len}"
+        );
+    }
+    let (kv_head_count, cache_len, cache_head_dim) = cache_ref.shape().kv_cache_metadata()?;
+    if cache_head_dim != head_dim {
+        bail!("decode attention cache head width {cache_head_dim}, expected {head_dim}");
+    }
+    if query_head_count % kv_head_count != 0 {
+        bail!(
+            "decode attention query head count {} must be divisible by KV head count {}",
+            query_head_count,
+            kv_head_count
+        );
+    }
+    let key_start = attention_window
+        .map(|window| cache_len.saturating_sub(window))
+        .unwrap_or(0);
+    let row_count = cache_len.saturating_sub(key_start);
+    if row_count == 0 {
+        bail!("decode attention requires at least one visible KV row");
+    }
+    let output_builder_ref = store.start_heads_builder(output_id, query_head_count, 1, head_dim)?;
+    let phase = init_decode_attention_score_phase(store, &attention_id_prefix, 0, row_count)?;
+    Ok(DecodeAttentionState {
+        query_ref,
+        cache_ref,
+        output_builder_ref,
+        phase,
+        attention_id_prefix,
+        next_query_head_idx: 0,
+        query_head_count,
+        kv_head_count,
+        kv_groups: query_head_count / kv_head_count,
+        key_start,
+        row_count,
+        head_dim,
+        kv_rows_per_tile,
+    })
+}
+
+fn init_decode_attention_score_phase(
+    store: &mut AuthenticatedRasterTensorStore,
+    id_prefix: &str,
+    query_head_idx: usize,
+    visible_row_count: usize,
+) -> Result<DecodeAttentionPhase> {
+    let score_builder_ref = store.start_sequence_builder(
+        RasterTensorId::new(format!("{id_prefix}.scores.head_{query_head_idx}"))?,
+        visible_row_count,
+        1,
+    )?;
+    Ok(DecodeAttentionPhase::CollectScores {
+        score_builder_ref,
+        next_kv_offset: 0,
+    })
+}
+
+#[tile(kind = recursive)]
+pub fn compute_next_decode_attention_head(
+    mut state: DecodeAttentionState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<(bool, DecodeAttentionState)> {
+    if state.next_query_head_idx >= state.query_head_count {
+        return Ok((true, state));
+    }
+
+    let query_head_idx = state.next_query_head_idx;
+    let kv_head_idx = query_head_idx / state.kv_groups;
+    let query = auth_read!(
+        store,
+        RasterHeadRowRequest {
+            tensor_ref: state.query_ref.clone(),
+            head_idx: query_head_idx,
+            token_idx: 0,
+        }
+    )?;
+
+    match state.phase.clone() {
+        DecodeAttentionPhase::CollectScores {
+            mut score_builder_ref,
+            next_kv_offset,
+        } => {
+            let end = next_kv_offset
+                .saturating_add(state.kv_rows_per_tile)
+                .min(state.row_count);
+            for offset in next_kv_offset..end {
+                let token_idx = state.key_start + offset;
+                let key_row = read_decode_attention_kv_row(
+                    store,
+                    &state.cache_ref,
+                    RasterKvRowKind::Key,
+                    kv_head_idx,
+                    token_idx,
+                )?;
+                if key_row.width() != query.width() {
+                    bail!(
+                        "decode attention key row ({kv_head_idx}, {token_idx}) has width {}, expected {}",
+                        key_row.width(),
+                        query.width()
+                    );
+                }
+                let score = det_attention_score(&query.acts(), &key_row.acts());
+                store.append_sequence_row(
+                    &mut score_builder_ref,
+                    offset,
+                    RasterActivationRow::from_acts(vec![score]),
+                )?;
+            }
+            if end < state.row_count {
+                state.phase = DecodeAttentionPhase::CollectScores {
+                    score_builder_ref,
+                    next_kv_offset: end,
+                };
+                return Ok((false, state));
+            }
+            let score_ref = store.finalize_sequence_builder(score_builder_ref)?;
+            state.phase = DecodeAttentionPhase::FindSoftmaxMax {
+                score_ref,
+                next_score_row_idx: 0,
+                max_index: None,
+                max_logit_bits: 0,
+            };
+            Ok((false, state))
+        }
+        DecodeAttentionPhase::FindSoftmaxMax {
+            score_ref,
+            next_score_row_idx,
+            mut max_index,
+            mut max_logit_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(state.row_count);
+            for row_idx in next_score_row_idx..end {
+                let score = read_decode_attention_scalar_row(store, &score_ref, row_idx, "score")?;
+                let score_bits = score.to_bits();
+                if max_index.is_none() || score_bits > max_logit_bits {
+                    max_index = Some(row_idx);
+                    max_logit_bits = score_bits;
+                }
+            }
+            if end < state.row_count {
+                state.phase = DecodeAttentionPhase::FindSoftmaxMax {
+                    score_ref,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                };
+                return Ok((false, state));
+            }
+            let max_index = max_index
+                .ok_or_else(|| anyhow!("decode attention softmax requires at least one score"))?;
+            state.phase = DecodeAttentionPhase::SumSoftmaxExp {
+                score_ref,
+                next_score_row_idx: 0,
+                max_index,
+                max_logit_bits,
+                sum_exp_bits: 0,
+            };
+            Ok((false, state))
+        }
+        DecodeAttentionPhase::SumSoftmaxExp {
+            score_ref,
+            next_score_row_idx,
+            max_index,
+            max_logit_bits,
+            mut sum_exp_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(state.row_count);
+            let max_logit = Act::from_bits(max_logit_bits);
+            let mut sum_exp = Acc::from_bits(sum_exp_bits);
+            for row_idx in next_score_row_idx..end {
+                let score = read_decode_attention_scalar_row(store, &score_ref, row_idx, "score")?;
+                let exp_term = attention_softmax_exp_term(score, max_logit);
+                sum_exp = acc_add_sat(sum_exp, exp_term);
+            }
+            sum_exp_bits = sum_exp.to_bits();
+            if end < state.row_count {
+                state.phase = DecodeAttentionPhase::SumSoftmaxExp {
+                    score_ref,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                    sum_exp_bits,
+                };
+                return Ok((false, state));
+            }
+            if sum_exp_bits == 0 {
+                bail!("decode attention softmax exp sum is zero");
+            }
+            let raw_weight_builder_ref = store.start_sequence_builder(
+                RasterTensorId::new(format!(
+                    "{}.raw_weights.head_{query_head_idx}",
+                    state.attention_id_prefix
+                ))?,
+                state.row_count,
+                1,
+            )?;
+            state.phase = DecodeAttentionPhase::BuildRawSoftmaxWeights {
+                score_ref,
+                raw_weight_builder_ref,
+                next_score_row_idx: 0,
+                max_index,
+                max_logit_bits,
+                sum_exp_bits,
+                summed_weight_bits: 0,
+            };
+            Ok((false, state))
+        }
+        DecodeAttentionPhase::BuildRawSoftmaxWeights {
+            score_ref,
+            mut raw_weight_builder_ref,
+            next_score_row_idx,
+            max_index,
+            max_logit_bits,
+            sum_exp_bits,
+            mut summed_weight_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(state.row_count);
+            let max_logit = Act::from_bits(max_logit_bits);
+            let sum_exp = Acc::from_bits(sum_exp_bits);
+            let mut summed_weight = Act::from_bits(summed_weight_bits);
+            for row_idx in next_score_row_idx..end {
+                let score = read_decode_attention_scalar_row(store, &score_ref, row_idx, "score")?;
+                let exp_term = attention_softmax_exp_term(score, max_logit);
+                let weight = attention_softmax_raw_weight(exp_term, sum_exp);
+                store.append_sequence_row(
+                    &mut raw_weight_builder_ref,
+                    row_idx,
+                    RasterActivationRow::from_acts(vec![weight]),
+                )?;
+                summed_weight = add_sat(summed_weight, weight);
+            }
+            summed_weight_bits = summed_weight.to_bits();
+            if end < state.row_count {
+                state.phase = DecodeAttentionPhase::BuildRawSoftmaxWeights {
+                    score_ref,
+                    raw_weight_builder_ref,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                    sum_exp_bits,
+                    summed_weight_bits,
+                };
+                return Ok((false, state));
+            }
+            let raw_weight_ref = store.finalize_sequence_builder(raw_weight_builder_ref)?;
+            let final_weight_builder_ref = store.start_sequence_builder(
+                RasterTensorId::new(format!(
+                    "{}.weights.head_{query_head_idx}",
+                    state.attention_id_prefix
+                ))?,
+                state.row_count,
+                1,
+            )?;
+            let residual = attention_softmax_residual(Act::from_bits(summed_weight_bits));
+            state.phase = DecodeAttentionPhase::CorrectSoftmaxResidual {
+                raw_weight_ref,
+                final_weight_builder_ref,
+                next_weight_row_idx: 0,
+                max_index,
+                residual_bits: residual.to_bits(),
+            };
+            Ok((false, state))
+        }
+        DecodeAttentionPhase::CorrectSoftmaxResidual {
+            raw_weight_ref,
+            mut final_weight_builder_ref,
+            next_weight_row_idx,
+            max_index,
+            residual_bits,
+        } => {
+            let end = next_weight_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(state.row_count);
+            let residual = Act::from_bits(residual_bits);
+            for row_idx in next_weight_row_idx..end {
+                let mut weight =
+                    read_decode_attention_scalar_row(store, &raw_weight_ref, row_idx, "weight")?;
+                if row_idx == max_index {
+                    weight = add_sat(weight, residual);
+                }
+                store.append_sequence_row(
+                    &mut final_weight_builder_ref,
+                    row_idx,
+                    RasterActivationRow::from_acts(vec![weight]),
+                )?;
+            }
+            if end < state.row_count {
+                state.phase = DecodeAttentionPhase::CorrectSoftmaxResidual {
+                    raw_weight_ref,
+                    final_weight_builder_ref,
+                    next_weight_row_idx: end,
+                    max_index,
+                    residual_bits,
+                };
+                return Ok((false, state));
+            }
+            let weight_ref = store.finalize_sequence_builder(final_weight_builder_ref)?;
+            state.phase = DecodeAttentionPhase::ApplyValues {
+                weight_ref,
+                next_kv_offset: 0,
+                weighted_sum_acc_bits: vec![0; query.width()],
+            };
+            Ok((false, state))
+        }
+        DecodeAttentionPhase::ApplyValues {
+            weight_ref,
+            next_kv_offset,
+            mut weighted_sum_acc_bits,
+        } => {
+            let end = next_kv_offset
+                .saturating_add(state.kv_rows_per_tile)
+                .min(state.row_count);
+            for offset in next_kv_offset..end {
+                let token_idx = state.key_start + offset;
+                let weight =
+                    read_decode_attention_scalar_row(store, &weight_ref, offset, "weight")?;
+                let value_row = read_decode_attention_kv_row(
+                    store,
+                    &state.cache_ref,
+                    RasterKvRowKind::Value,
+                    kv_head_idx,
+                    token_idx,
+                )?;
+                if value_row.width() != weighted_sum_acc_bits.len() {
+                    bail!(
+                        "decode attention value row ({kv_head_idx}, {token_idx}) has width {}, expected {}",
+                        value_row.width(),
+                        weighted_sum_acc_bits.len()
+                    );
+                }
+                for (acc_bits, value) in weighted_sum_acc_bits.iter_mut().zip(value_row.acts()) {
+                    *acc_bits = mac_bits(*acc_bits, value.to_bits(), weight.to_bits());
+                }
+            }
+            if end < state.row_count {
+                state.phase = DecodeAttentionPhase::ApplyValues {
+                    weight_ref,
+                    next_kv_offset: end,
+                    weighted_sum_acc_bits,
+                };
+                return Ok((false, state));
+            }
+            let output_row = RasterActivationRow::from_acts(
+                weighted_sum_acc_bits
+                    .into_iter()
+                    .map(|bits| requantize(Acc::from_bits(bits)))
+                    .collect(),
+            );
+            store.append_head_row(&mut state.output_builder_ref, query_head_idx, 0, output_row)?;
+            state.next_query_head_idx += 1;
+            if state.next_query_head_idx < state.query_head_count {
+                state.phase = init_decode_attention_score_phase(
+                    store,
+                    &state.attention_id_prefix,
+                    state.next_query_head_idx,
+                    state.row_count,
+                )?;
+            }
+            Ok((false, state))
+        }
+    }
+}
+
+fn read_decode_attention_kv_row(
+    store: &AuthenticatedRasterTensorStore,
+    cache_ref: &RasterKvCacheRef,
+    row_kind: RasterKvRowKind,
+    head_idx: usize,
+    token_idx: usize,
+) -> Result<RasterActivationRow> {
+    auth_read!(
+        store,
+        RasterKvRowRequest {
+            cache_ref: cache_ref.clone(),
+            row_kind,
+            head_idx,
+            token_idx,
+        }
+    )
+}
+
+fn read_decode_attention_scalar_row(
+    store: &AuthenticatedRasterTensorStore,
+    tensor_ref: &crate::shared::raster_row_store::RasterActivationSequenceRef,
+    row_idx: usize,
+    label: &str,
+) -> Result<Act> {
+    let row = auth_read!(
+        store,
+        RasterSequenceRowRequest {
+            tensor_ref: tensor_ref.clone(),
+            row_idx,
+        }
+    )?;
+    if row.width() != 1 {
+        bail!(
+            "decode attention {label} row {row_idx} has width {}, expected 1",
+            row.width()
+        );
+    }
+    Ok(row.acts()[0])
+}
+
+#[tile]
+pub fn finalize_decode_attention_state_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    state: DecodeAttentionState,
+) -> Result<RasterAttentionHeadsRef> {
+    if state.next_query_head_idx != state.query_head_count {
+        bail!(
+            "decode attention finalized at head {}, expected {} heads",
+            state.next_query_head_idx,
+            state.query_head_count
+        );
+    }
+    store.finalize_heads_builder(state.output_builder_ref)
 }
 
 fn append_decode_kv_cache(
@@ -846,11 +1670,65 @@ fn append_decode_kv_cache(
     RasterKvCache::from_heads(updated_keys, updated_values)
 }
 
-fn resolve_decode_donor_cache<'a>(
-    layer_caches: &'a [RasterKvCache],
+fn register_decode_layer_cache(
+    store: &mut AuthenticatedRasterTensorStore,
+    id_prefix: &str,
+    layer_idx: usize,
+    cache: RasterKvCache,
+) -> Result<DecodeLayerCacheSlot> {
+    if cache.current_len() == 0 {
+        return Ok(DecodeLayerCacheSlot::Empty {
+            num_kv_heads: cache.head_count(),
+        });
+    }
+    let cache_ref = store.insert_kv_cache(
+        RasterTensorId::new(format!("{id_prefix}.{layer_idx}.keys"))?,
+        RasterTensorId::new(format!("{id_prefix}.{layer_idx}.values"))?,
+        cache,
+    )?;
+    Ok(DecodeLayerCacheSlot::Ref(cache_ref))
+}
+
+fn materialize_decode_layer_cache_from_store(
+    store: &AuthenticatedRasterTensorStore,
+    cache: &DecodeLayerCacheSlot,
+) -> Result<RasterKvCache> {
+    match cache {
+        DecodeLayerCacheSlot::Empty { num_kv_heads } => Ok(RasterKvCache::empty(*num_kv_heads)),
+        DecodeLayerCacheSlot::Ref(cache_ref) => store.materialize_kv_cache(cache_ref),
+    }
+}
+
+fn materialize_decode_checkpoint_caches(
+    store: &AuthenticatedRasterTensorStore,
+    state: &DecodeTransitionRasterState,
+    layer_idx: usize,
+) -> Result<Vec<LayerKvCache>> {
+    let mut caches = state
+        .updated_layer_caches
+        .iter()
+        .map(|cache| {
+            materialize_decode_layer_cache_from_store(store, cache).map(layer_cache_from_raster)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    caches.extend(
+        state
+            .original_layer_caches
+            .iter()
+            .skip(layer_idx + 1)
+            .map(|cache| {
+                materialize_decode_layer_cache_from_store(store, cache).map(layer_cache_from_raster)
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(caches)
+}
+
+fn resolve_decode_donor_cache_slot<'a>(
+    layer_caches: &'a [DecodeLayerCacheSlot],
     layer_idx: usize,
     layer: &GemmaDecodeLayerMetadata,
-) -> Result<Option<&'a RasterKvCache>> {
+) -> Result<Option<&'a DecodeLayerCacheSlot>> {
     layer
         .kv_shared_layer_index
         .map(|donor_idx| {
@@ -997,15 +1875,20 @@ fn validate_row_width(row: &RasterActivationRow, expected_width: usize, label: &
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{
+        init_decode_logits_projection, init_decode_transition_state, init_decode_transition_store,
+        run,
+    };
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::input::InferenceExecutionMode;
     use crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource;
+    use crate::shared::raster_transformer_kernels::RasterActivationRow;
     use crate::shared::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
         GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, TransformerDecodeState,
     };
+    use crate::RasterSizingControls;
     use anyhow::{Context, Result};
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
@@ -1018,7 +1901,8 @@ mod tests {
             .expect("source should build");
         let decode_state = decode_state_with_cache(1);
 
-        let raster = run(decode_state.clone(), 1, &source).expect("raster decode should run");
+        let raster = run(decode_state.clone(), 1, &source, raster_sizing(1))
+            .expect("raster decode should run");
         let deterministic = crate::decode_transition::run_with_mode(
             decode_state,
             1,
@@ -1036,13 +1920,97 @@ mod tests {
     }
 
     #[test]
+    fn raster_decode_transition_matches_across_projection_and_attention_chunks() {
+        let (_path, model) = no_ple_model(false);
+        let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
+            .expect("source should build");
+        let decode_state = decode_state_with_cache(3);
+        let deterministic = crate::decode_transition::run_with_mode(
+            decode_state.clone(),
+            1,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("deterministic decode should run");
+
+        for sizing in [
+            raster_sizing_with_attention(1, 1),
+            raster_sizing_with_attention(2, 1),
+            raster_sizing_with_attention(8, 2),
+        ] {
+            let raster =
+                run(decode_state.clone(), 1, &source, sizing).expect("raster decode should run");
+
+            assert_eq!(raster.activation_state, deterministic.activation_state);
+            assert_eq!(raster.prefill_logits, deterministic.prefill_logits);
+            assert_eq!(
+                raster.transformer_decode_state,
+                deterministic.transformer_decode_state
+            );
+        }
+    }
+
+    #[test]
+    fn raster_decode_rejects_zero_sizing_controls() {
+        let (_path, model) = no_ple_model(false);
+        let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
+            .expect("source should build");
+        let decode_state = decode_state_with_cache(1);
+
+        let projection_error = run(
+            decode_state.clone(),
+            1,
+            &source,
+            raster_sizing_with_attention(0, 1),
+        )
+        .expect_err("zero projection chunk should fail");
+        assert!(projection_error
+            .to_string()
+            .contains("projection rows per tile"));
+
+        let attention_error = run(decode_state, 1, &source, raster_sizing_with_attention(1, 0))
+            .expect_err("zero attention chunk should fail");
+        assert!(attention_error
+            .to_string()
+            .contains("attention KV rows per tile"));
+    }
+
+    #[test]
+    fn decode_recursive_state_serializes_refs_and_builders() {
+        let (_path, model) = no_ple_model(false);
+        let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
+            .expect("source should build");
+        let decode_state = decode_state_with_cache(2);
+        let mut store = init_decode_transition_store();
+        let state =
+            init_decode_transition_state(&mut store, decode_state, 1, &source, raster_sizing(1))
+                .expect("state should initialize");
+        let encoded = serde_json::to_string(&state).expect("state should serialize");
+
+        assert!(encoded.contains("original_layer_caches"));
+        assert!(encoded.contains("Ref"));
+        assert!(!encoded.contains("\"keys\":[[["));
+        assert!(!encoded.contains("\"values\":[[["));
+
+        let normalized =
+            RasterActivationRow::from_acts(vec![Act::from_num(0.0), Act::from_num(0.0)]);
+        let logits_state =
+            init_decode_logits_projection(&mut store, normalized, &source, 1).expect("logits init");
+        let encoded = serde_json::to_string(&logits_state).expect("logits state should serialize");
+
+        assert!(encoded.contains("output_builder_ref"));
+        assert!(!encoded.contains("logit_bits"));
+    }
+
+    #[test]
     fn raster_decode_transition_matches_sliding_cache_window() {
         let (_path, model) = no_ple_model(true);
         let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
             .expect("source should build");
         let decode_state = decode_state_with_cache(2);
 
-        let raster = run(decode_state.clone(), 1, &source).expect("raster decode should run");
+        let raster = run(decode_state.clone(), 1, &source, raster_sizing(1))
+            .expect("raster decode should run");
         let deterministic = crate::decode_transition::run_with_mode(
             decode_state,
             1,
@@ -1075,7 +2043,8 @@ mod tests {
             token_count: 1,
         };
 
-        let error = run(decode_state, 1, &source).expect_err("f32 cache should fail");
+        let error =
+            run(decode_state, 1, &source, raster_sizing(1)).expect_err("f32 cache should fail");
 
         assert!(error.to_string().contains("canonical layer cache keys"));
     }
@@ -1181,6 +2150,22 @@ mod tests {
                 rms_norm_eps_det: Some(Acc::from_num(0.0)),
             },
         )
+    }
+
+    fn raster_sizing(projection_rows_per_tile: usize) -> RasterSizingControls {
+        raster_sizing_with_attention(projection_rows_per_tile, 1)
+    }
+
+    fn raster_sizing_with_attention(
+        projection_rows_per_tile: usize,
+        attention_kv_rows_per_tile: usize,
+    ) -> RasterSizingControls {
+        RasterSizingControls {
+            projection_rows_per_tile,
+            attention_kv_rows_per_tile,
+            sequence_rows_per_tile: 1,
+            head_rows_per_tile: 1,
+        }
     }
 
     fn decode_state_with_cache(cache_len: usize) -> TransformerDecodeState {

@@ -420,6 +420,7 @@ pub fn run_inference_with_controls(
                         tokenizer_source,
                         transformer_model,
                         request.execution_mode,
+                        raster_sizing_controls.expect("raster sizing controls should be validated"),
                     )?
                 } else {
                     run_output_decode_with_mode(

@@ -12,12 +12,15 @@ use crate::shared::{
     },
 };
 
+const DEFAULT_DECODE_SELECT_LOGITS_PER_TILE: usize = 32;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DecodeSelectArgmaxState {
     next_token_idx: usize,
     logit_count: usize,
     best_token_id: u32,
     best_logit_bits: i32,
+    logits_per_tile: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -51,6 +54,7 @@ pub fn init_select_next_token(
         logit_count: metadata.logit_count,
         best_token_id: 0,
         best_logit_bits,
+        logits_per_tile: DEFAULT_DECODE_SELECT_LOGITS_PER_TILE,
     })
 }
 
@@ -63,18 +67,24 @@ pub fn scan_next_token_logit(
         return Ok((true, state));
     }
 
-    let candidate_bits = auth_read!(
-        logits_source,
-        DecodeSelectLogitRequest {
-            token_idx: state.next_token_idx,
-        },
-    )?;
-    if candidate_wins(state.best_logit_bits, candidate_bits) {
-        state.best_token_id = u32::try_from(state.next_token_idx)
-            .map_err(|_| anyhow!("raster decode selected token index exceeds u32"))?;
-        state.best_logit_bits = candidate_bits;
+    let end = state
+        .next_token_idx
+        .saturating_add(state.logits_per_tile)
+        .min(state.logit_count);
+    while state.next_token_idx < end {
+        let candidate_bits = auth_read!(
+            logits_source,
+            DecodeSelectLogitRequest {
+                token_idx: state.next_token_idx,
+            },
+        )?;
+        if candidate_wins(state.best_logit_bits, candidate_bits) {
+            state.best_token_id = u32::try_from(state.next_token_idx)
+                .map_err(|_| anyhow!("raster decode selected token index exceeds u32"))?;
+            state.best_logit_bits = candidate_bits;
+        }
+        state.next_token_idx += 1;
     }
-    state.next_token_idx += 1;
 
     Ok((false, state))
 }
@@ -160,7 +170,8 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_token, check_stop_condition, finalize_selected_token, run, DecodeSelectArgmaxState,
+        append_token, check_stop_condition, finalize_selected_token, run, scan_next_token_logit,
+        DecodeSelectArgmaxState,
     };
     use crate::shared::{
         det_num::Act, input::InferenceExecutionMode, output::OutputDecodeStopReason,
@@ -257,10 +268,31 @@ mod tests {
             logit_count: 2,
             best_token_id: 0,
             best_logit_bits: 0,
+            logits_per_tile: 1,
         })
         .expect_err("incomplete scan should fail");
 
         assert!(error.to_string().contains("scanned 1 logits"));
+    }
+
+    #[test]
+    fn scan_next_token_logit_bounds_work_per_recursive_step() {
+        let source = source((0..40).map(Act::from_bits).collect());
+        let state = DecodeSelectArgmaxState {
+            next_token_idx: 1,
+            logit_count: 40,
+            best_token_id: 0,
+            best_logit_bits: 0,
+            logits_per_tile: 7,
+        };
+
+        let (done, state) =
+            scan_next_token_logit(state, &source).expect("scan chunk should succeed");
+
+        assert!(!done);
+        assert_eq!(state.next_token_idx, 8);
+        assert_eq!(state.best_token_id, 7);
+        assert_eq!(state.best_logit_bits, 7);
     }
 
     #[test]

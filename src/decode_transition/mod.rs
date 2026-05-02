@@ -7,6 +7,7 @@ use crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionS
 use crate::shared::transformer::{
     Gemma4TransformerModel, TransformerDecodeState, TransformerDecodeStepResult,
 };
+use crate::RasterSizingControls;
 
 pub mod deterministic_tiles;
 pub mod raster_tiles;
@@ -112,8 +113,9 @@ pub fn run_raster(
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
     source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
 ) -> Result<TransformerDecodeStepResult> {
-    raster_tiles::run(transformer_decode_state, next_token, source)
+    raster_tiles::run(transformer_decode_state, next_token, source, raster_sizing)
 }
 
 pub fn finalize(decode_state: &DecodeState) -> Result<()> {

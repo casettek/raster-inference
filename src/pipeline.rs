@@ -9,6 +9,7 @@ use crate::shared::transformer::{
     TransformerDecodeStepResult, TransformerPrefillResult, TransformerStateTransitionState,
 };
 use crate::trace::{trace_event, trace_scope};
+use crate::RasterSizingControls;
 
 pub fn validate_sampling_config(sampling: &SamplingConfig) -> Result<usize> {
     const DEFAULT_TEMPERATURE: f32 = 1.0;
@@ -288,6 +289,7 @@ pub fn run_output_decode_with_mode(
         false,
         false,
         None,
+        None,
     )
 }
 
@@ -310,6 +312,7 @@ pub(crate) fn run_output_decode_with_mode_and_raster_select(
         true,
         false,
         None,
+        None,
     )
 }
 
@@ -321,6 +324,7 @@ pub(crate) fn run_output_decode_with_mode_and_raster_tiles(
     raster_tokenizer: &AuthenticatedGemmaTokenizer,
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
+    raster_sizing: RasterSizingControls,
 ) -> Result<OutputDecodeState> {
     run_output_decode_with_mode_internal(
         prompt_token_ids,
@@ -332,6 +336,7 @@ pub(crate) fn run_output_decode_with_mode_and_raster_tiles(
         true,
         true,
         Some(raster_tokenizer),
+        Some(raster_sizing),
     )
 }
 
@@ -345,6 +350,7 @@ fn run_output_decode_with_mode_internal(
     raster_select_token: bool,
     raster_decode_transition: bool,
     raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
+    raster_sizing: Option<RasterSizingControls>,
 ) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
@@ -404,7 +410,12 @@ fn run_output_decode_with_mode_internal(
                     format!("decode.transition.position_{}", transformer_decode_state.position),
                     transformer_model,
                 )?;
-            crate::decode_transition::run_raster(transformer_decode_state, next_token, &source)?
+            crate::decode_transition::run_raster(
+                transformer_decode_state,
+                next_token,
+                &source,
+                raster_sizing.expect("raster decode transition requires sizing controls"),
+            )?
         } else {
             crate::decode_transition::run_with_mode(
                 transformer_decode_state,
