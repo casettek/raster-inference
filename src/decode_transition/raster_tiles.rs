@@ -23,8 +23,9 @@ use crate::shared::raster_decode_transition::{
 };
 use crate::shared::raster_row_store::{
     AuthenticatedRasterTensorStore, RasterAttentionHeadsRef, RasterHeadRowRequest,
-    RasterKvCacheRef, RasterKvRowKind, RasterKvRowRequest, RasterProjectionOutputBuilderRef,
-    RasterSequenceRowRequest, RasterTensorBuilderRef, RasterTensorId,
+    RasterKvCacheBuilderRef, RasterKvCacheRef, RasterKvRowKind, RasterKvRowRequest,
+    RasterProjectionOutputBuilderRef, RasterSequenceRowRequest, RasterTensorBuilderRef,
+    RasterTensorId,
 };
 use crate::shared::raster_transformer_kernels::{
     add_sequences, apply_rope_to_heads, combine_attention_heads, gelu_sequence, mul_sequences,
@@ -119,9 +120,21 @@ struct DecodeLayerContext {
     layer_idx: usize,
     layer: GemmaDecodeLayerMetadata,
     cache_slot: DecodeLayerCacheSlot,
-    cache: RasterKvCache,
     donor_cache_slot: Option<DecodeLayerCacheSlot>,
-    donor_cache: Option<RasterKvCache>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeKvCacheAppendState {
+    old_cache_ref: Option<RasterKvCacheRef>,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    output_builder_ref: RasterKvCacheBuilderRef,
+    retained_old_start: usize,
+    retained_old_len: usize,
+    next_head_idx: usize,
+    next_old_offset: usize,
+    head_count: usize,
+    rows_per_tile: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -243,7 +256,7 @@ pub fn compute_next_decode_layer(
         return Ok((true, state));
     }
 
-    let context = call_tile!(prepare_next_decode_layer_context, store, &state, source)?;
+    let context = call_tile!(prepare_next_decode_layer_context, &state, source)?;
     let _trace = crate::trace::trace_scope(format!(
         "decode.layer.det layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
         state.next_token,
@@ -269,9 +282,7 @@ pub fn compute_next_decode_layer(
         source,
         &context.layer,
         context.cache_slot,
-        context.cache,
         context.donor_cache_slot.as_ref(),
-        context.donor_cache.as_ref(),
         per_layer_input.as_ref(),
         state.position,
         state.projection_rows_per_tile,
@@ -291,7 +302,6 @@ pub fn compute_next_decode_layer(
 
 #[tile]
 fn prepare_next_decode_layer_context(
-    store: &AuthenticatedRasterTensorStore,
     state: &DecodeTransitionRasterState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
 ) -> Result<DecodeLayerContext> {
@@ -302,20 +312,13 @@ fn prepare_next_decode_layer_context(
         .get(layer_idx)
         .cloned()
         .ok_or_else(|| anyhow!("transformer decode cache {layer_idx} missing"))?;
-    let cache = materialize_decode_layer_cache_from_store(store, &cache_slot)?;
     let donor_cache_slot =
         resolve_decode_donor_cache_slot(&state.updated_layer_caches, layer_idx, &layer)?.cloned();
-    let donor_cache = donor_cache_slot
-        .as_ref()
-        .map(|slot| materialize_decode_layer_cache_from_store(store, slot))
-        .transpose()?;
     Ok(DecodeLayerContext {
         layer_idx,
         layer,
         cache_slot,
-        cache,
         donor_cache_slot,
-        donor_cache,
     })
 }
 
@@ -412,6 +415,7 @@ pub fn finalize_decode_layer_state(
 
     Ok(ActivationSequenceWithCache {
         activation_state,
+        // Public decode outputs still expose materialized layer caches for compatibility.
         layer_caches: state
             .updated_layer_caches
             .iter()
@@ -622,9 +626,7 @@ fn run_basic_decode_layer(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer: &GemmaDecodeLayerMetadata,
     cache_slot: DecodeLayerCacheSlot,
-    cache: RasterKvCache,
     donor_cache_slot: Option<&DecodeLayerCacheSlot>,
-    donor_cache: Option<&RasterKvCache>,
     per_layer_input: Option<&RasterActivationRow>,
     position: usize,
     projection_rows_per_tile: usize,
@@ -638,9 +640,7 @@ fn run_basic_decode_layer(
         source,
         layer,
         cache_slot,
-        cache,
         donor_cache_slot,
-        donor_cache,
         position,
         projection_rows_per_tile,
         attention_kv_rows_per_tile
@@ -680,9 +680,7 @@ fn run_decode_attention_block(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer: &GemmaDecodeLayerMetadata,
     cache_slot: DecodeLayerCacheSlot,
-    cache: RasterKvCache,
     donor_cache_slot: Option<&DecodeLayerCacheSlot>,
-    donor_cache: Option<&RasterKvCache>,
     position: usize,
     projection_rows_per_tile: usize,
     attention_kv_rows_per_tile: usize,
@@ -702,9 +700,7 @@ fn run_decode_attention_block(
         source,
         layer,
         cache_slot,
-        cache,
         donor_cache_slot,
-        donor_cache,
         position,
         projection_rows_per_tile,
         attention_kv_rows_per_tile
@@ -1041,22 +1037,30 @@ fn apply_decode_rope_to_heads(
     )
 }
 
-#[tile]
+#[sequence]
 fn update_decode_attention_cache(
     store: &mut AuthenticatedRasterTensorStore,
     cache_slot: DecodeLayerCacheSlot,
-    cache: RasterKvCache,
     use_donor_cache: bool,
-    k_heads: &RasterAttentionHeadSequence,
-    v_heads: &RasterAttentionHeadSequence,
+    k_heads_ref: RasterAttentionHeadsRef,
+    v_heads_ref: RasterAttentionHeadsRef,
     layer_idx: usize,
     cache_window: Option<usize>,
+    rows_per_tile: usize,
 ) -> Result<DecodeLayerCacheSlot> {
     if use_donor_cache {
         return Ok(cache_slot);
     }
-    let updated_cache = append_decode_kv_cache(cache, k_heads, v_heads, cache_window)?;
-    register_decode_layer_cache(store, "decode.updated.cache", layer_idx, updated_cache)
+    call_seq!(
+        append_decode_kv_cache_ref,
+        store,
+        cache_slot,
+        k_heads_ref,
+        v_heads_ref,
+        layer_idx,
+        cache_window,
+        rows_per_tile
+    )
 }
 
 #[tile]
@@ -1094,6 +1098,30 @@ fn insert_decode_attention_query_heads(
 }
 
 #[tile]
+fn insert_decode_attention_key_heads(
+    store: &mut AuthenticatedRasterTensorStore,
+    layer_idx: usize,
+    k_heads: RasterAttentionHeadSequence,
+) -> Result<RasterAttentionHeadsRef> {
+    store.insert_attention_heads(
+        RasterTensorId::new(format!("decode.layer.{layer_idx}.k_heads"))?,
+        k_heads,
+    )
+}
+
+#[tile]
+fn insert_decode_attention_value_heads(
+    store: &mut AuthenticatedRasterTensorStore,
+    layer_idx: usize,
+    v_heads: RasterAttentionHeadSequence,
+) -> Result<RasterAttentionHeadsRef> {
+    store.insert_attention_heads(
+        RasterTensorId::new(format!("decode.layer.{layer_idx}.v_heads"))?,
+        v_heads,
+    )
+}
+
+#[tile]
 fn materialize_decode_attention_output_row(
     store: &AuthenticatedRasterTensorStore,
     attention_heads_ref: &RasterAttentionHeadsRef,
@@ -1110,9 +1138,7 @@ fn run_decode_attention(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer: &GemmaDecodeLayerMetadata,
     cache_slot: DecodeLayerCacheSlot,
-    cache: RasterKvCache,
     donor_cache_slot: Option<&DecodeLayerCacheSlot>,
-    donor_cache: Option<&RasterKvCache>,
     position: usize,
     projection_rows_per_tile: usize,
     attention_kv_rows_per_tile: usize,
@@ -1218,26 +1244,39 @@ fn run_decode_attention(
         position
     )?;
 
-    let updated_cache_slot = call_tile!(
-        update_decode_attention_cache,
-        store,
-        cache_slot,
-        cache,
-        donor_cache.is_some(),
-        &k_heads,
-        &v_heads,
-        layer.layer_idx,
-        layer.cache_sliding_window
-    )?;
-    let attention_cache_slot = donor_cache_slot.unwrap_or(&updated_cache_slot);
-    let attention_cache_ref = call_tile!(resolve_decode_attention_cache_ref, attention_cache_slot)?;
-    let attention_window = call_tile!(resolve_decode_attention_window, layer)?;
     let q_heads_ref = call_tile!(
         insert_decode_attention_query_heads,
         store,
         layer.layer_idx,
         q_heads
     )?;
+    let k_heads_ref = call_tile!(
+        insert_decode_attention_key_heads,
+        store,
+        layer.layer_idx,
+        k_heads
+    )?;
+    let v_heads_ref = call_tile!(
+        insert_decode_attention_value_heads,
+        store,
+        layer.layer_idx,
+        v_heads
+    )?;
+
+    let updated_cache_slot = call_seq!(
+        update_decode_attention_cache,
+        store,
+        cache_slot,
+        donor_cache_slot.is_some(),
+        k_heads_ref,
+        v_heads_ref,
+        layer.layer_idx,
+        layer.cache_sliding_window,
+        attention_kv_rows_per_tile
+    )?;
+    let attention_cache_slot = donor_cache_slot.unwrap_or(&updated_cache_slot);
+    let attention_cache_ref = call_tile!(resolve_decode_attention_cache_ref, attention_cache_slot)?;
+    let attention_window = call_tile!(resolve_decode_attention_window, layer)?;
     let attention_heads_ref = call_seq!(
         compute_decode_attention_ref,
         store,
@@ -1999,44 +2038,219 @@ pub fn finalize_decode_attention_state_ref(
     store.finalize_heads_builder(state.output_builder_ref)
 }
 
-fn append_decode_kv_cache(
-    cache: RasterKvCache,
-    keys: &RasterAttentionHeadSequence,
-    values: &RasterAttentionHeadSequence,
+#[sequence]
+fn append_decode_kv_cache_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    cache_slot: DecodeLayerCacheSlot,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    layer_idx: usize,
     cache_window: Option<usize>,
-) -> Result<RasterKvCache> {
-    if keys.head_count() != values.head_count() || keys.head_count() != cache.head_count() {
-        bail!(
-            "decode cache head count mismatch: cache {} keys {} values {}",
-            cache.head_count(),
-            keys.head_count(),
-            values.head_count()
-        );
+    rows_per_tile: usize,
+) -> Result<DecodeLayerCacheSlot> {
+    let state = call_tile!(
+        init_decode_kv_cache_append_state,
+        store,
+        cache_slot,
+        key_ref,
+        value_ref,
+        RasterTensorId::new(format!("decode.updated.cache.{layer_idx}.keys"))?,
+        RasterTensorId::new(format!("decode.updated.cache.{layer_idx}.values"))?,
+        cache_window,
+        rows_per_tile
+    )?;
+    let state = call_recur_tile_result!(compute_next_decode_kv_cache_append_row, state, store)?;
+    call_tile!(finalize_decode_kv_cache_append_state, store, state)
+}
+
+#[tile]
+fn init_decode_kv_cache_append_state(
+    store: &mut AuthenticatedRasterTensorStore,
+    cache_slot: DecodeLayerCacheSlot,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    keys_id: RasterTensorId,
+    values_id: RasterTensorId,
+    cache_window: Option<usize>,
+    rows_per_tile: usize,
+) -> Result<DecodeKvCacheAppendState> {
+    validate_attention_kv_rows_per_tile(rows_per_tile)?;
+    if cache_window == Some(0) {
+        bail!("decode cache sliding window must retain at least one row");
     }
-    let mut updated_keys = cache.keys().to_vec();
-    let mut updated_values = cache.values().to_vec();
-    for head_idx in 0..keys.head_count() {
-        let key_row = keys
-            .heads()
-            .get(head_idx)
-            .and_then(|head| head.first())
-            .ok_or_else(|| anyhow!("decode key head {head_idx} is missing"))?
-            .clone();
-        let value_row = values
-            .heads()
-            .get(head_idx)
-            .and_then(|head| head.first())
-            .ok_or_else(|| anyhow!("decode value head {head_idx} is missing"))?
-            .clone();
-        updated_keys[head_idx].push(key_row);
-        updated_values[head_idx].push(value_row);
-        if let Some(window) = cache_window {
-            let retained = updated_keys[head_idx].len().saturating_sub(window);
-            updated_keys[head_idx] = updated_keys[head_idx][retained..].to_vec();
-            updated_values[head_idx] = updated_values[head_idx][retained..].to_vec();
+    let (head_count, key_sequence_len, head_dim) = key_ref.tensor_ref().shape().heads_metadata()?;
+    let (value_head_count, value_sequence_len, value_head_dim) =
+        value_ref.tensor_ref().shape().heads_metadata()?;
+    if head_count != value_head_count
+        || key_sequence_len != value_sequence_len
+        || head_dim != value_head_dim
+    {
+        bail!("decode cache append key/value attention heads shape mismatch");
+    }
+    if key_sequence_len != 1 {
+        bail!("decode cache append expects one-token K/V heads, got {key_sequence_len} rows");
+    }
+
+    let (old_cache_ref, old_len) = match cache_slot {
+        DecodeLayerCacheSlot::Empty { num_kv_heads } => {
+            if num_kv_heads != head_count {
+                bail!(
+                    "decode empty cache head count {num_kv_heads}, expected projected {head_count}"
+                );
+            }
+            (None, 0)
+        }
+        DecodeLayerCacheSlot::Ref(cache_ref) => {
+            let (cache_head_count, cache_len, cache_head_dim) =
+                cache_ref.shape().kv_cache_metadata()?;
+            if cache_head_count != head_count {
+                bail!(
+                    "decode cache head count {cache_head_count}, expected projected {head_count}"
+                );
+            }
+            if cache_head_dim != head_dim {
+                bail!("decode cache head width {cache_head_dim}, expected projected {head_dim}");
+            }
+            (Some(cache_ref), cache_len)
+        }
+    };
+
+    let retained_start = cache_window
+        .map(|window| old_len.saturating_add(1).saturating_sub(window))
+        .unwrap_or(0)
+        .min(old_len);
+    let retained_old_len = old_len.saturating_sub(retained_start);
+    let output_builder_ref = store.start_kv_cache_builder(
+        keys_id,
+        values_id,
+        head_count,
+        retained_old_len + 1,
+        head_dim,
+    )?;
+
+    Ok(DecodeKvCacheAppendState {
+        old_cache_ref,
+        key_ref,
+        value_ref,
+        output_builder_ref,
+        retained_old_start: retained_start,
+        retained_old_len,
+        next_head_idx: 0,
+        next_old_offset: 0,
+        head_count,
+        rows_per_tile,
+    })
+}
+
+#[tile(kind = recursive)]
+fn compute_next_decode_kv_cache_append_row(
+    mut state: DecodeKvCacheAppendState,
+    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<(bool, DecodeKvCacheAppendState)> {
+    if state.next_head_idx >= state.head_count {
+        return Ok((true, state));
+    }
+
+    if state.next_old_offset < state.retained_old_len {
+        let old_cache_ref = state.old_cache_ref.as_ref().ok_or_else(|| {
+            anyhow!("decode cache append has retained rows without old cache ref")
+        })?;
+        let end = state
+            .next_old_offset
+            .saturating_add(state.rows_per_tile)
+            .min(state.retained_old_len);
+        for old_offset in state.next_old_offset..end {
+            let input_token_idx = state.retained_old_start + old_offset;
+            let key_row = auth_read!(
+                store,
+                RasterKvRowRequest {
+                    cache_ref: old_cache_ref.clone(),
+                    row_kind: RasterKvRowKind::Key,
+                    head_idx: state.next_head_idx,
+                    token_idx: input_token_idx,
+                }
+            )?;
+            let value_row = auth_read!(
+                store,
+                RasterKvRowRequest {
+                    cache_ref: old_cache_ref.clone(),
+                    row_kind: RasterKvRowKind::Value,
+                    head_idx: state.next_head_idx,
+                    token_idx: input_token_idx,
+                }
+            )?;
+            store.append_kv_row(
+                state.output_builder_ref.keys_mut(),
+                RasterKvRowKind::Key,
+                state.next_head_idx,
+                old_offset,
+                key_row,
+            )?;
+            store.append_kv_row(
+                state.output_builder_ref.values_mut(),
+                RasterKvRowKind::Value,
+                state.next_head_idx,
+                old_offset,
+                value_row,
+            )?;
+        }
+        state.next_old_offset = end;
+        if state.next_old_offset < state.retained_old_len {
+            return Ok((false, state));
         }
     }
-    RasterKvCache::from_heads(updated_keys, updated_values)
+
+    let output_token_idx = state.retained_old_len;
+    let key_row = auth_read!(
+        store,
+        RasterHeadRowRequest {
+            tensor_ref: state.key_ref.clone(),
+            head_idx: state.next_head_idx,
+            token_idx: 0,
+        }
+    )?;
+    let value_row = auth_read!(
+        store,
+        RasterHeadRowRequest {
+            tensor_ref: state.value_ref.clone(),
+            head_idx: state.next_head_idx,
+            token_idx: 0,
+        }
+    )?;
+    store.append_kv_row(
+        state.output_builder_ref.keys_mut(),
+        RasterKvRowKind::Key,
+        state.next_head_idx,
+        output_token_idx,
+        key_row,
+    )?;
+    store.append_kv_row(
+        state.output_builder_ref.values_mut(),
+        RasterKvRowKind::Value,
+        state.next_head_idx,
+        output_token_idx,
+        value_row,
+    )?;
+    state.next_head_idx += 1;
+    state.next_old_offset = 0;
+    Ok((false, state))
+}
+
+#[tile]
+fn finalize_decode_kv_cache_append_state(
+    store: &mut AuthenticatedRasterTensorStore,
+    state: DecodeKvCacheAppendState,
+) -> Result<DecodeLayerCacheSlot> {
+    if state.next_head_idx != state.head_count {
+        bail!(
+            "decode cache append finalized at head {}, expected {} heads",
+            state.next_head_idx,
+            state.head_count
+        );
+    }
+    Ok(DecodeLayerCacheSlot::Ref(
+        store.finalize_kv_cache_builder(state.output_builder_ref)?,
+    ))
 }
 
 fn register_decode_layer_cache(
@@ -2073,6 +2287,7 @@ fn materialize_decode_checkpoint_caches(
     state: &DecodeTransitionRasterState,
     layer_idx: usize,
 ) -> Result<Vec<LayerKvCache>> {
+    // Checkpoint payloads keep the legacy full-cache shape; replay paths stay ref-backed.
     let mut caches = state
         .updated_layer_caches
         .iter()
@@ -2230,13 +2445,18 @@ fn validate_row_width(row: &RasterActivationRow, expected_width: usize, label: &
 #[cfg(test)]
 mod tests {
     use super::{
+        append_decode_kv_cache_ref, compute_next_decode_layer, finalize_decode_layer_state,
         init_decode_logits_projection, init_decode_transition_state, init_decode_transition_store,
-        run,
+        materialize_decode_layer_cache_from_store, prepare_next_decode_layer_context,
+        register_decode_layer_cache, run, DecodeLayerCacheSlot,
     };
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::input::InferenceExecutionMode;
     use crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource;
-    use crate::shared::raster_transformer_kernels::RasterActivationRow;
+    use crate::shared::raster_row_store::RasterTensorId;
+    use crate::shared::raster_transformer_kernels::{
+        RasterActivationRow, RasterAttentionHeadSequence, RasterKvCache,
+    };
     use crate::shared::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
@@ -2357,30 +2577,165 @@ mod tests {
     }
 
     #[test]
+    fn decode_layer_context_serializes_cache_refs_without_materialized_rows() {
+        let (_path, model) = no_ple_model(false);
+        let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
+            .expect("source should build");
+        let decode_state = decode_state_with_cache(2);
+        let mut store = init_decode_transition_store();
+        let state =
+            init_decode_transition_state(&mut store, decode_state, 1, &source, raster_sizing(1))
+                .expect("state should initialize");
+
+        let context =
+            prepare_next_decode_layer_context(&state, &source).expect("context should prepare");
+        let encoded = serde_json::to_string(&context).expect("context should serialize");
+
+        assert!(encoded.contains("cache_slot"));
+        assert!(encoded.contains("Ref"));
+        assert!(!encoded.contains("\"keys\":[[["));
+        assert!(!encoded.contains("\"values\":[[["));
+        assert!(!encoded.contains("act_bits"));
+        assert_eq!(store.materialization_counts().1, 0);
+    }
+
+    #[test]
+    fn decode_layer_replay_avoids_kv_materialization_until_public_boundary() {
+        let (_path, model) = no_ple_model(false);
+        let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
+            .expect("source should build");
+        let decode_state = decode_state_with_cache(2);
+        let mut store = init_decode_transition_store();
+        let state =
+            init_decode_transition_state(&mut store, decode_state, 1, &source, raster_sizing(1))
+                .expect("state should initialize");
+        assert_eq!(store.materialization_counts().1, 0);
+
+        let (_done, state) =
+            compute_next_decode_layer(state, &source, &mut store).expect("layer should compute");
+        assert_eq!(
+            store.materialization_counts().1,
+            0,
+            "normal decode layer replay should not materialize full KV caches"
+        );
+
+        finalize_decode_layer_state(&store, state).expect("public layer output should finalize");
+        assert!(
+            store.materialization_counts().1 > 0,
+            "public/cache compatibility boundary should materialize KV caches"
+        );
+    }
+
+    #[test]
+    fn decode_ref_cache_append_handles_empty_and_sliding_windows() {
+        let mut store = init_decode_transition_store();
+        let key_ref = store
+            .insert_attention_heads(
+                RasterTensorId::new("test.empty.key").expect("key id"),
+                heads_from_rows(&[&[7]]),
+            )
+            .expect("key ref");
+        let value_ref = store
+            .insert_attention_heads(
+                RasterTensorId::new("test.empty.value").expect("value id"),
+                heads_from_rows(&[&[8]]),
+            )
+            .expect("value ref");
+        let empty_slot = DecodeLayerCacheSlot::Empty { num_kv_heads: 1 };
+
+        let appended =
+            append_decode_kv_cache_ref(&mut store, empty_slot, key_ref, value_ref, 0, None, 1)
+                .expect("empty append should build ref");
+        let appended = materialize_decode_layer_cache_from_store(&store, &appended).expect("cache");
+        assert_eq!(cache_key_bits(&appended), vec![vec![7]]);
+        assert_eq!(cache_value_bits(&appended), vec![vec![8]]);
+
+        let old_cache = RasterKvCache::from_heads(
+            vec![rows_from_bits(&[1, 2, 3])],
+            vec![rows_from_bits(&[11, 12, 13])],
+        )
+        .expect("old cache");
+        let old_slot = register_decode_layer_cache(&mut store, "test.old", 0, old_cache)
+            .expect("old cache slot");
+        let key_ref = store
+            .insert_attention_heads(
+                RasterTensorId::new("test.sliding.key").expect("key id"),
+                heads_from_rows(&[&[4]]),
+            )
+            .expect("key ref");
+        let value_ref = store
+            .insert_attention_heads(
+                RasterTensorId::new("test.sliding.value").expect("value id"),
+                heads_from_rows(&[&[14]]),
+            )
+            .expect("value ref");
+
+        let appended =
+            append_decode_kv_cache_ref(&mut store, old_slot, key_ref, value_ref, 1, Some(2), 1)
+                .expect("sliding append should build ref");
+        let appended = materialize_decode_layer_cache_from_store(&store, &appended).expect("cache");
+        assert_eq!(cache_key_bits(&appended), vec![vec![3, 4]]);
+        assert_eq!(cache_value_bits(&appended), vec![vec![13, 14]]);
+    }
+
+    #[test]
+    fn decode_ref_cache_append_rejects_invalid_shapes() {
+        let mut store = init_decode_transition_store();
+        let key_ref = store
+            .insert_attention_heads(
+                RasterTensorId::new("test.bad.key").expect("key id"),
+                heads_from_rows(&[&[1]]),
+            )
+            .expect("key ref");
+        let value_ref = store
+            .insert_attention_heads(
+                RasterTensorId::new("test.bad.value").expect("value id"),
+                heads_from_rows(&[&[2]]),
+            )
+            .expect("value ref");
+
+        let error = append_decode_kv_cache_ref(
+            &mut store,
+            DecodeLayerCacheSlot::Empty { num_kv_heads: 2 },
+            key_ref,
+            value_ref,
+            0,
+            None,
+            1,
+        )
+        .expect_err("head mismatch should fail");
+
+        assert!(error.to_string().contains("empty cache head count"));
+    }
+
+    #[test]
     fn raster_decode_transition_matches_sliding_cache_window() {
         let (_path, model) = no_ple_model(true);
         let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
             .expect("source should build");
-        let decode_state = decode_state_with_cache(2);
 
-        let raster = run(decode_state.clone(), 1, &source, raster_sizing(1))
-            .expect("raster decode should run");
-        let deterministic = crate::decode_transition::run_with_mode(
-            decode_state,
-            1,
-            &model,
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("deterministic decode should run");
+        for cache_len in [0, 1, 2, 3] {
+            let decode_state = decode_state_with_cache(cache_len);
+            let raster = run(decode_state.clone(), 1, &source, raster_sizing(1))
+                .expect("raster decode should run");
+            let deterministic = crate::decode_transition::run_with_mode(
+                decode_state,
+                1,
+                &model,
+                InferenceExecutionMode::Deterministic,
+            )
+            .expect("deterministic decode should run");
 
-        assert_eq!(
-            raster.transformer_decode_state.layer_caches[0].current_len(),
-            1
-        );
-        assert_eq!(
-            raster.transformer_decode_state,
-            deterministic.transformer_decode_state
-        );
+            assert_eq!(
+                raster.transformer_decode_state.layer_caches[0].current_len(),
+                1,
+                "sliding cache should retain one row for cache length {cache_len}"
+            );
+            assert_eq!(
+                raster.transformer_decode_state, deterministic.transformer_decode_state,
+                "sliding decode parity failed for cache length {cache_len}"
+            );
+        }
     }
 
     #[test]
@@ -2633,6 +2988,44 @@ mod tests {
             position: cache_len,
             token_count: cache_len,
         }
+    }
+
+    fn heads_from_rows(heads: &[&[i32]]) -> RasterAttentionHeadSequence {
+        RasterAttentionHeadSequence::from_heads(
+            heads
+                .iter()
+                .map(|rows| rows_from_bits(rows))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn rows_from_bits(bits: &[i32]) -> Vec<RasterActivationRow> {
+        bits.iter()
+            .map(|bits| RasterActivationRow::from_acts(vec![Act::from_bits(*bits)]))
+            .collect()
+    }
+
+    fn cache_key_bits(cache: &RasterKvCache) -> Vec<Vec<i32>> {
+        cache
+            .keys()
+            .iter()
+            .map(|head| head.iter().map(first_act_bits).collect())
+            .collect()
+    }
+
+    fn cache_value_bits(cache: &RasterKvCache) -> Vec<Vec<i32>> {
+        cache
+            .values()
+            .iter()
+            .map(|head| head.iter().map(first_act_bits).collect())
+            .collect()
+    }
+
+    fn first_act_bits(row: &RasterActivationRow) -> i32 {
+        row.acts()
+            .first()
+            .expect("test row should have one value")
+            .to_bits()
     }
 
     fn identity_matrix() -> Vec<Vec<Wgt>> {
