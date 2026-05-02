@@ -74,6 +74,12 @@ pub enum PrefillLayerCacheSlot {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PrefillLayerOutputRefs {
+    pub final_hidden_states_ref: RasterActivationSequenceRef,
+    pub layer_caches: Vec<PrefillLayerCacheSlot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillLayerContext {
     layer_idx: usize,
     layer: GemmaPrefillLayerMetadata,
@@ -426,10 +432,9 @@ fn trace_prefill_layer_token_checkpoints(
 }
 
 #[tile]
-pub fn finalize_prefill_layer_state(
-    store: &AuthenticatedRasterTensorStore,
+pub fn finalize_prefill_layer_refs(
     state: PrefillLayerRasterState,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+) -> Result<PrefillLayerOutputRefs> {
     if state.next_layer_idx != state.layer_count {
         bail!(
             "raster prefill layer finalized after {} layers, expected {}",
@@ -438,8 +443,22 @@ pub fn finalize_prefill_layer_state(
         );
     }
 
+    Ok(PrefillLayerOutputRefs {
+        final_hidden_states_ref: state.current_activations_ref,
+        layer_caches: state.layer_caches,
+    })
+}
+
+#[tile]
+pub fn materialize_prefill_layer_output_refs(
+    store: &AuthenticatedRasterTensorStore,
+    refs: &PrefillLayerOutputRefs,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    // Public/dev compatibility boundary. The proof-shaped prefill path carries
+    // `PrefillLayerOutputRefs` forward and materializes only for public results
+    // and checkpoint payloads.
     let current_activations =
-        materialize_prefill_activation_sequence_from_store(store, &state.current_activations_ref)?;
+        materialize_prefill_activation_sequence_from_store(store, &refs.final_hidden_states_ref)?;
     let det_activations = raster_sequence_acts(&current_activations);
     let values = current_activations.to_f32_values();
     let mut activation_sequence = ActivationSequence::from_internal(
@@ -451,8 +470,7 @@ pub fn finalize_prefill_layer_state(
 
     Ok((
         activation_sequence,
-        state
-            .layer_caches
+        refs.layer_caches
             .iter()
             .map(|cache| {
                 materialize_prefill_layer_cache_from_store(store, cache)
@@ -460,6 +478,15 @@ pub fn finalize_prefill_layer_state(
             })
             .collect::<Result<Vec<_>>>()?,
     ))
+}
+
+#[tile]
+pub fn finalize_prefill_layer_state(
+    store: &AuthenticatedRasterTensorStore,
+    state: PrefillLayerRasterState,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    let refs = finalize_prefill_layer_refs(state)?;
+    materialize_prefill_layer_output_refs(store, &refs)
 }
 
 #[tile]
@@ -504,13 +531,13 @@ pub fn run_materialized_compat(
 }
 
 #[sequence]
-pub fn run_with_store(
+pub fn run_refs_with_store(
     store: &mut AuthenticatedRasterTensorStore,
     input_activations: &ActivationSequence,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
     raster_sizing: RasterSizingControls,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+) -> Result<PrefillLayerOutputRefs> {
     let state = call_tile!(
         init_prefill_layer_state,
         store,
@@ -525,7 +552,26 @@ pub fn run_with_store(
         layer_source,
         store
     )?;
-    call_tile!(finalize_prefill_layer_state, store, state)
+    call_tile!(finalize_prefill_layer_refs, state)
+}
+
+#[sequence]
+pub fn run_with_store(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_activations: &ActivationSequence,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    raster_sizing: RasterSizingControls,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    let refs = call_seq!(
+        run_refs_with_store,
+        store,
+        input_activations,
+        layer_source,
+        ple_input_refs,
+        raster_sizing
+    )?;
+    call_tile!(materialize_prefill_layer_output_refs, store, &refs)
 }
 
 #[tile]
@@ -2897,6 +2943,35 @@ mod tests {
         assert!(encoded.contains("prefill.layer.cache.0.keys"));
         assert!(encoded.contains("prefill.layer.cache.0.values"));
         assert!(!encoded.contains("act_bits"));
+    }
+
+    #[test]
+    fn prefill_layer_ref_entrypoint_materializes_to_existing_result() {
+        let (_path, model) = no_ple_model();
+        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+            .expect("source should build");
+        let input = activation_sequence(vec![
+            vec![Act::from_num(1.0), Act::from_num(0.0)],
+            vec![Act::from_num(0.0), Act::from_num(1.0)],
+        ]);
+        let mut store = AuthenticatedRasterTensorStore::new();
+
+        let refs = super::run_refs_with_store(&mut store, &input, &source, None, raster_sizing(1))
+            .expect("ref-backed layer should run");
+        assert_eq!(store.materialization_counts(), (0, 0));
+
+        let materialized = super::materialize_prefill_layer_output_refs(&store, &refs)
+            .expect("materialize ref-backed layer output");
+        let deterministic = deterministic_tiles::run_internal(input.clone_internal(), &model, None)
+            .expect("deterministic prefill layer should run");
+
+        assert_eq!(materialized.0.activations, deterministic.0.activations);
+        assert_eq!(
+            materialized.0.det_activations_sha256,
+            deterministic.0.det_activations_sha256
+        );
+        assert_eq!(materialized.1, deterministic.1);
+        assert_eq!(refs.layer_caches.len(), deterministic.1.len());
     }
 
     #[test]

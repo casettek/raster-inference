@@ -341,9 +341,11 @@ pub fn run_inference_with_controls(
                 trace::phase_finished(PhaseId::InputEmbedding);
 
                 trace::phase_started(PhaseId::TransformerStateTransition);
-                let (final_hidden_states, layer_caches) = if use_raster_prefill {
+                let prefill = if use_raster_prefill {
                     let mut raster_prefill_store =
                         crate::shared::raster_row_store::AuthenticatedRasterTensorStore::new();
+                    let raster_sizing =
+                        raster_sizing_controls.expect("raster sizing controls should be validated");
                     let ple_source =
                         crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource::from_model(
                             model.model_id.clone(),
@@ -353,10 +355,7 @@ pub fn run_inference_with_controls(
                         &prompt_preparation.prompt_token_ids,
                         &ple_source,
                         &token_embeddings,
-                        raster_sizing_controls
-                            .as_ref()
-                            .map(|controls| controls.projection_rows_per_tile)
-                            .expect("raster projection rows per tile should be validated"),
+                        raster_sizing.projection_rows_per_tile,
                         &mut raster_prefill_store,
                     )?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
@@ -374,12 +373,35 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    prefill_layer::run_raster_with_store(
+                    let layer_refs = prefill_layer::run_raster_refs_with_store(
                         &mut raster_prefill_store,
                         &token_embeddings,
                         &layer_source,
                         ple_input_refs.as_ref(),
-                        raster_sizing_controls.expect("raster sizing controls should be validated"),
+                        raster_sizing,
+                    )?;
+                    if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                        trace::phase_paused(PhaseId::TransformerStateTransition);
+                        return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                            terminal_checkpoint_id,
+                            input_embedding,
+                            transformer_state_transition: None,
+                            output_decode: None,
+                            raster_tile_invocations: None,
+                        }));
+                    }
+                    let finalize_source =
+                    crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource::from_model(
+                        model.model_id.clone(),
+                        transformer_model,
+                    )?;
+                    prefill_finalize::run_raster_refs_with_store(
+                        &mut raster_prefill_store,
+                        &prompt_preparation.prompt_token_ids,
+                        &finalize_source,
+                        layer_refs.final_hidden_states_ref,
+                        layer_refs.layer_caches,
+                        raster_sizing.projection_rows_per_tile,
                     )?
                 } else {
                     let ple_inputs = run_prefill_prepare_aux(
@@ -398,40 +420,23 @@ pub fn run_inference_with_controls(
                             raster_tile_invocations: None,
                         }));
                     }
-                    prefill_layer::run_with_mode_internal(
-                        token_embeddings.clone_internal(),
-                        transformer_model,
-                        ple_inputs.as_ref(),
-                        request.execution_mode,
-                    )?
-                };
-                if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
-                    trace::phase_paused(PhaseId::TransformerStateTransition);
-                    return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                        terminal_checkpoint_id,
-                        input_embedding,
-                        transformer_state_transition: None,
-                        output_decode: None,
-                        raster_tile_invocations: None,
-                    }));
-                }
-                let prefill = if use_raster_prefill {
-                    let finalize_source =
-                    crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource::from_model(
-                        model.model_id.clone(),
-                        transformer_model,
-                    )?;
-                    prefill_finalize::run_raster(
-                        &prompt_preparation.prompt_token_ids,
-                        &finalize_source,
-                        final_hidden_states,
-                        layer_caches,
-                        raster_sizing_controls
-                            .as_ref()
-                            .map(|controls| controls.projection_rows_per_tile)
-                            .expect("raster projection rows per tile should be validated"),
-                    )?
-                } else {
+                    let (final_hidden_states, layer_caches) =
+                        prefill_layer::run_with_mode_internal(
+                            token_embeddings.clone_internal(),
+                            transformer_model,
+                            ple_inputs.as_ref(),
+                            request.execution_mode,
+                        )?;
+                    if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                        trace::phase_paused(PhaseId::TransformerStateTransition);
+                        return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                            terminal_checkpoint_id,
+                            input_embedding,
+                            transformer_state_transition: None,
+                            output_decode: None,
+                            raster_tile_invocations: None,
+                        }));
+                    }
                     run_prefill_finalize(
                         &prompt_preparation.prompt_token_ids,
                         transformer_model,

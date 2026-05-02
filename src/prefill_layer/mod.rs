@@ -73,6 +73,22 @@ pub fn run_raster_with_store(
     )
 }
 
+pub fn run_raster_refs_with_store(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_activations: &ActivationSequence,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    raster_sizing: RasterSizingControls,
+) -> Result<raster_tiles::PrefillLayerOutputRefs> {
+    raster_tiles::run_refs_with_store(
+        store,
+        input_activations,
+        layer_source,
+        ple_input_refs,
+        raster_sizing,
+    )
+}
+
 pub(crate) fn run_with_mode_internal(
     input_activations: InternalActivationSequence,
     model: &Gemma4TransformerModel,
