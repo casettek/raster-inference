@@ -1234,6 +1234,59 @@ mod tests {
     }
 
     #[test]
+    fn run_inference_with_controls_raster_decode_only_can_pause_after_decode_finalize() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: Some("decode.finalize".to_string()),
+                raster_tiles: true,
+                raster_decode_only: true,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: Some(2),
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
+            },
+        )
+        .expect("hybrid raster inference should pause after decode finalize");
+
+        match paused {
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "decode.finalize");
+                let output_decode = state
+                    .output_decode
+                    .expect("partial output decode state should be present");
+                assert_eq!(output_decode.generated_token_ids, vec![0]);
+                assert_eq!(output_decode.generated_text, "raster-hello");
+                assert_eq!(output_decode.generated_token_count, 1);
+                assert_eq!(output_decode.decode_transition_states.len(), 1);
+            }
+            InferenceRunOutcome::Completed(_) => panic!("expected paused hybrid raster inference"),
+        }
+    }
+
+    #[test]
     fn run_inference_with_controls_raster_tiles_rejects_non_deterministic_request() {
         let tokenizer = test_tokenizer();
         let model = test_model_spec();

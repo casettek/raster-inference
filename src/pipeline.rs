@@ -428,7 +428,41 @@ fn run_output_decode_with_mode_internal(
         decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
         crate::decode_transition::finalize(&decode_state)?;
+        if crate::trace::reached_terminal_checkpoint_id().is_some() {
+            let mut output_decode_state =
+                build_current_output_decode_state(&decode_state, tokenizer, raster_tokenizer)?;
+            output_decode_state.decode_transition_states = decode_transition_states;
+            return Ok(output_decode_state);
+        }
     }
+}
+
+fn build_current_output_decode_state(
+    decode_state: &crate::shared::output::DecodeState,
+    tokenizer: &Tokenizer,
+    raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
+) -> Result<OutputDecodeState> {
+    if let Some(raster_tokenizer) = raster_tokenizer {
+        return crate::output_finalize::raster_tiles::run(
+            &decode_state.generated_token_ids,
+            raster_tokenizer,
+        );
+    }
+
+    let generated_token_ids = decode_state.generated_token_ids.clone();
+    let generated_text =
+        crate::output_finalize::tiles::detokenize_output_tokens(tokenizer, &generated_token_ids)?;
+    let generated_token_ids_sha256 =
+        crate::output_finalize::tiles::build_output_decode_commitment(&generated_token_ids)?;
+
+    Ok(OutputDecodeState {
+        generated_token_count: generated_token_ids.len(),
+        generated_token_ids,
+        generated_token_ids_sha256,
+        generated_text,
+        stop_reason: crate::shared::output::OutputDecodeStopReason::MaxNewTokens,
+        decode_transition_states: Vec::new(),
+    })
 }
 
 #[cfg(test)]
