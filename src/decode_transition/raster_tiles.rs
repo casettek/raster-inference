@@ -115,6 +115,16 @@ pub struct DecodeAttentionState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct DecodeLayerContext {
+    layer_idx: usize,
+    layer: GemmaDecodeLayerMetadata,
+    cache_slot: DecodeLayerCacheSlot,
+    cache: RasterKvCache,
+    donor_cache_slot: Option<DecodeLayerCacheSlot>,
+    donor_cache: Option<RasterKvCache>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 enum DecodeAttentionPhase {
     CollectScores {
         score_builder_ref: RasterTensorBuilderRef,
@@ -225,7 +235,7 @@ pub fn init_decode_transition_state(
 
 #[sequence(kind = recursive)]
 pub fn compute_next_decode_layer(
-    mut state: DecodeTransitionRasterState,
+    state: DecodeTransitionRasterState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
     store: &mut AuthenticatedRasterTensorStore,
 ) -> Result<(bool, DecodeTransitionRasterState)> {
@@ -233,35 +243,23 @@ pub fn compute_next_decode_layer(
         return Ok((true, state));
     }
 
-    let layer_idx = state.next_layer_idx;
-    let layer = auth_read!(source, GemmaDecodeLayerMetadataRequest { layer_idx })?;
+    let context = call_tile!(prepare_next_decode_layer_context, store, &state, source)?;
     let _trace = crate::trace::trace_scope(format!(
         "decode.layer.det layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
         state.next_token,
         state.position,
-        layer.attention_kind,
-        layer.has_ple,
-        layer.kv_shared_layer_index
+        context.layer.attention_kind,
+        context.layer.has_ple,
+        context.layer.kv_shared_layer_index,
+        layer_idx = context.layer_idx
     ));
-    let cache = state
-        .original_layer_caches
-        .get(layer_idx)
-        .cloned()
-        .ok_or_else(|| anyhow!("transformer decode cache {layer_idx} missing"))?;
-    let cache_value = materialize_decode_layer_cache_from_store(store, &cache)?;
-    let donor_cache_slot =
-        resolve_decode_donor_cache_slot(&state.updated_layer_caches, layer_idx, &layer)?;
-    let donor_cache_value = donor_cache_slot
-        .as_ref()
-        .map(|slot| materialize_decode_layer_cache_from_store(store, slot))
-        .transpose()?;
     let per_layer_input = call_seq!(
         compute_decode_ple_input,
         store,
         state.next_token,
         &state.decode_input,
         source,
-        &layer,
+        &context.layer,
         state.projection_rows_per_tile
     )?;
     let (layer_output, updated_cache) = call_seq!(
@@ -269,17 +267,66 @@ pub fn compute_next_decode_layer(
         store,
         &state.current_activation,
         source,
-        &layer,
-        cache,
-        cache_value,
-        donor_cache_slot,
-        donor_cache_value.as_ref(),
+        &context.layer,
+        context.cache_slot,
+        context.cache,
+        context.donor_cache_slot.as_ref(),
+        context.donor_cache.as_ref(),
         per_layer_input.as_ref(),
         state.position,
         state.projection_rows_per_tile,
         state.attention_kv_rows_per_tile
     )?;
 
+    let state = call_tile!(
+        update_decode_layer_state,
+        store,
+        state,
+        context.layer_idx,
+        layer_output,
+        updated_cache
+    )?;
+    Ok((false, state))
+}
+
+#[tile]
+fn prepare_next_decode_layer_context(
+    store: &AuthenticatedRasterTensorStore,
+    state: &DecodeTransitionRasterState,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<DecodeLayerContext> {
+    let layer_idx = state.next_layer_idx;
+    let layer = auth_read!(source, GemmaDecodeLayerMetadataRequest { layer_idx })?;
+    let cache_slot = state
+        .original_layer_caches
+        .get(layer_idx)
+        .cloned()
+        .ok_or_else(|| anyhow!("transformer decode cache {layer_idx} missing"))?;
+    let cache = materialize_decode_layer_cache_from_store(store, &cache_slot)?;
+    let donor_cache_slot =
+        resolve_decode_donor_cache_slot(&state.updated_layer_caches, layer_idx, &layer)?.cloned();
+    let donor_cache = donor_cache_slot
+        .as_ref()
+        .map(|slot| materialize_decode_layer_cache_from_store(store, slot))
+        .transpose()?;
+    Ok(DecodeLayerContext {
+        layer_idx,
+        layer,
+        cache_slot,
+        cache,
+        donor_cache_slot,
+        donor_cache,
+    })
+}
+
+#[tile]
+fn update_decode_layer_state(
+    store: &AuthenticatedRasterTensorStore,
+    mut state: DecodeTransitionRasterState,
+    layer_idx: usize,
+    layer_output: RasterActivationRow,
+    updated_cache: DecodeLayerCacheSlot,
+) -> Result<DecodeTransitionRasterState> {
     state.current_activation = layer_output;
     state.updated_layer_caches.push(updated_cache);
     let current_activation_values = state.current_activation.to_f32_values();
@@ -330,7 +377,7 @@ pub fn compute_next_decode_layer(
     )?;
 
     state.next_layer_idx += 1;
-    Ok((false, state))
+    Ok(state)
 }
 
 #[tile]
@@ -583,24 +630,70 @@ fn run_basic_decode_layer(
     projection_rows_per_tile: usize,
     attention_kv_rows_per_tile: usize,
 ) -> Result<(RasterActivationRow, DecodeLayerCacheSlot)> {
-    let scalars = auth_read!(
-        source,
-        GemmaDecodeLayerScalarsRequest {
-            layer_idx: layer.layer_idx,
-        },
-    )?;
-
-    let residual = input.clone();
-    let normed = rms_norm_row(
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer.layer_idx)?;
+    let (xs, updated_cache) = call_seq!(
+        run_decode_attention_block,
+        store,
         input,
-        &auth_read!(
-            source,
-            GemmaDecodeLayerNormWeightsRequest {
-                layer_idx: layer.layer_idx,
-                norm: GemmaDecodeLayerNormKind::InputLayer,
-            },
-        )?,
+        source,
+        layer,
+        cache_slot,
+        cache,
+        donor_cache_slot,
+        donor_cache,
+        position,
+        projection_rows_per_tile,
+        attention_kv_rows_per_tile
+    )?;
+    let xs = call_seq!(
+        run_decode_mlp_block,
+        store,
+        &xs,
+        source,
+        layer,
         scalars.rms_norm_eps,
+        projection_rows_per_tile
+    )?;
+    let xs = if let Some(per_layer_input) = per_layer_input {
+        call_seq!(
+            run_decode_ple_block,
+            store,
+            &xs,
+            per_layer_input,
+            source,
+            layer,
+            scalars.rms_norm_eps,
+            projection_rows_per_tile
+        )?
+    } else {
+        xs
+    };
+    let xs = call_tile!(scale_decode_row_optional, &xs, scalars.layer_scalar)?;
+
+    Ok((xs, updated_cache))
+}
+
+#[sequence]
+fn run_decode_attention_block(
+    store: &mut AuthenticatedRasterTensorStore,
+    input: &RasterActivationRow,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer: &GemmaDecodeLayerMetadata,
+    cache_slot: DecodeLayerCacheSlot,
+    cache: RasterKvCache,
+    donor_cache_slot: Option<&DecodeLayerCacheSlot>,
+    donor_cache: Option<&RasterKvCache>,
+    position: usize,
+    projection_rows_per_tile: usize,
+    attention_kv_rows_per_tile: usize,
+) -> Result<(RasterActivationRow, DecodeLayerCacheSlot)> {
+    let residual = input.clone();
+    let normed = call_seq!(
+        rms_norm_decode_layer_row,
+        input,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::InputLayer
     )?;
     let (attention_output, updated_cache) = call_seq!(
         run_decode_attention,
@@ -616,30 +709,39 @@ fn run_basic_decode_layer(
         projection_rows_per_tile,
         attention_kv_rows_per_tile
     )?;
-    let attention_output = rms_norm_row(
+    let attention_output = call_seq!(
+        rms_norm_decode_layer_row,
         &attention_output,
-        &auth_read!(
-            source,
-            GemmaDecodeLayerNormWeightsRequest {
-                layer_idx: layer.layer_idx,
-                norm: GemmaDecodeLayerNormKind::PostAttention,
-            },
-        )?,
-        scalars.rms_norm_eps,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::PostAttention
     )?;
-    let mut xs = add_rows(&residual, &attention_output)?;
+    let xs = call_tile!(add_decode_rows, &residual, &attention_output)?;
+    Ok((xs, updated_cache))
+}
 
-    let residual = xs.clone();
-    let normed = rms_norm_row(
-        &xs,
-        &auth_read!(
-            source,
-            GemmaDecodeLayerNormWeightsRequest {
-                layer_idx: layer.layer_idx,
-                norm: GemmaDecodeLayerNormKind::PreFeedForward,
-            },
-        )?,
-        scalars.rms_norm_eps,
+#[sequence]
+fn run_decode_mlp_block(
+    store: &mut AuthenticatedRasterTensorStore,
+    input: &RasterActivationRow,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer: &GemmaDecodeLayerMetadata,
+    rms_norm_eps: Acc,
+    projection_rows_per_tile: usize,
+) -> Result<RasterActivationRow> {
+    let residual = input.clone();
+    let norm_weights = call_tile!(
+        read_decode_layer_norm_weights,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::PreFeedForward
+    )?;
+    let normed = call_tile!(
+        rms_norm_decode_row,
+        input,
+        &norm_weights,
+        rms_norm_eps,
+        "decode MLP pre-feedforward RMSNorm"
     )?;
     let gate = call_seq!(
         project_row_with_decode_source,
@@ -652,7 +754,7 @@ fn run_basic_decode_layer(
         projection_rows_per_tile,
         format!("decode.layer.{}.gate_proj", layer.layer_idx)
     )?;
-    let gate = gelu_row(&gate)?;
+    let gate = call_tile!(gelu_decode_row, &gate)?;
     let up = call_seq!(
         project_row_with_decode_source,
         store,
@@ -664,7 +766,7 @@ fn run_basic_decode_layer(
         projection_rows_per_tile,
         format!("decode.layer.{}.up_proj", layer.layer_idx)
     )?;
-    let ff_hidden = mul_rows(&gate, &up)?;
+    let ff_hidden = call_tile!(mul_decode_rows, &gate, &up)?;
     let ff_out = call_seq!(
         project_row_with_decode_source,
         store,
@@ -676,74 +778,329 @@ fn run_basic_decode_layer(
         projection_rows_per_tile,
         format!("decode.layer.{}.down_proj", layer.layer_idx)
     )?;
-    let ff_out = rms_norm_row(
-        &ff_out,
-        &auth_read!(
-            source,
-            GemmaDecodeLayerNormWeightsRequest {
-                layer_idx: layer.layer_idx,
-                norm: GemmaDecodeLayerNormKind::PostFeedForward,
-            },
-        )?,
-        scalars.rms_norm_eps,
+    let norm_weights = call_tile!(
+        read_decode_layer_norm_weights,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::PostFeedForward
     )?;
-    xs = add_rows(&residual, &ff_out)?;
+    let ff_out = call_tile!(
+        rms_norm_decode_row,
+        &ff_out,
+        &norm_weights,
+        rms_norm_eps,
+        "decode MLP post-feedforward RMSNorm"
+    )?;
+    call_tile!(add_decode_rows, &residual, &ff_out)
+}
 
-    if let Some(per_layer_input) = per_layer_input {
-        let residual = xs.clone();
-        let gated = call_seq!(
-            project_row_with_decode_source,
-            store,
-            &xs,
-            source,
-            layer.layer_idx,
-            GemmaDecodeLayerMatrixKind::PleInputGate,
-            layer
-                .ple_input_gate_shape
-                .ok_or_else(|| {
-                    anyhow!("Gemma decode layer metadata is missing PLE input gate shape")
-                })?
-                .rows,
-            projection_rows_per_tile,
-            format!("decode.layer.{}.ple.input_gate", layer.layer_idx)
-        )?;
-        let gated = gelu_row(&gated)?;
-        let gated = mul_rows(&gated, per_layer_input)?;
-        let projected = call_seq!(
-            project_row_with_decode_source,
-            store,
-            &gated,
-            source,
-            layer.layer_idx,
-            GemmaDecodeLayerMatrixKind::PleLayerProjection,
-            layer
-                .ple_layer_projection_shape
-                .ok_or_else(|| {
-                    anyhow!("Gemma decode layer metadata is missing PLE layer projection shape")
-                })?
-                .rows,
-            projection_rows_per_tile,
-            format!("decode.layer.{}.ple.layer_projection", layer.layer_idx)
-        )?;
-        let projected = rms_norm_row(
-            &projected,
-            &auth_read!(
-                source,
-                GemmaDecodeLayerNormWeightsRequest {
-                    layer_idx: layer.layer_idx,
-                    norm: GemmaDecodeLayerNormKind::PlePostInput,
-                },
-            )?,
-            scalars.rms_norm_eps,
-        )?;
-        xs = add_rows(&residual, &projected)?;
+#[sequence]
+fn run_decode_ple_block(
+    store: &mut AuthenticatedRasterTensorStore,
+    input: &RasterActivationRow,
+    per_layer_input: &RasterActivationRow,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer: &GemmaDecodeLayerMetadata,
+    rms_norm_eps: Acc,
+    projection_rows_per_tile: usize,
+) -> Result<RasterActivationRow> {
+    let residual = input.clone();
+    let gated = call_seq!(
+        project_row_with_decode_source,
+        store,
+        input,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerMatrixKind::PleInputGate,
+        call_tile!(decode_ple_input_gate_rows, layer)?,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.ple.input_gate", layer.layer_idx)
+    )?;
+    let gated = call_tile!(gelu_decode_row, &gated)?;
+    let gated = call_tile!(mul_decode_rows, &gated, per_layer_input)?;
+    let projected = call_seq!(
+        project_row_with_decode_source,
+        store,
+        &gated,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerMatrixKind::PleLayerProjection,
+        call_tile!(decode_ple_layer_projection_rows, layer)?,
+        projection_rows_per_tile,
+        format!("decode.layer.{}.ple.layer_projection", layer.layer_idx)
+    )?;
+    let norm_weights = call_tile!(
+        read_decode_layer_norm_weights,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::PlePostInput
+    )?;
+    let projected = call_tile!(
+        rms_norm_decode_row,
+        &projected,
+        &norm_weights,
+        rms_norm_eps,
+        "decode PLE post-input RMSNorm"
+    )?;
+    call_tile!(add_decode_rows, &residual, &projected)
+}
+
+#[sequence]
+fn rms_norm_decode_layer_row(
+    row: &RasterActivationRow,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    norm: GemmaDecodeLayerNormKind,
+) -> Result<RasterActivationRow> {
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
+    call_tile!(
+        rms_norm_decode_row,
+        row,
+        &norm_weights,
+        scalars.rms_norm_eps,
+        "decode layer RMSNorm"
+    )
+}
+
+#[tile]
+fn read_decode_layer_scalars(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+) -> Result<crate::shared::raster_decode_transition::GemmaDecodeLayerScalars> {
+    auth_read!(source, GemmaDecodeLayerScalarsRequest { layer_idx })
+}
+
+#[tile]
+fn read_decode_layer_norm_weights(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    norm: GemmaDecodeLayerNormKind,
+) -> Result<Vec<crate::shared::det_num::Wgt>> {
+    auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest { layer_idx, norm }
+    )
+}
+
+#[tile]
+fn rms_norm_decode_row(
+    row: &RasterActivationRow,
+    norm_weights: &[crate::shared::det_num::Wgt],
+    eps: crate::shared::det_num::Acc,
+    label: &str,
+) -> Result<RasterActivationRow> {
+    first_row(
+        rms_norm_sequence(
+            &RasterActivationSequence::from_rows(vec![row.clone()]),
+            Some(norm_weights),
+            Some(eps),
+        )?,
+        label,
+    )
+}
+
+#[tile]
+fn add_decode_rows(
+    lhs: &RasterActivationRow,
+    rhs: &RasterActivationRow,
+) -> Result<RasterActivationRow> {
+    add_rows(lhs, rhs)
+}
+
+#[tile]
+fn mul_decode_rows(
+    lhs: &RasterActivationRow,
+    rhs: &RasterActivationRow,
+) -> Result<RasterActivationRow> {
+    mul_rows(lhs, rhs)
+}
+
+#[tile]
+fn gelu_decode_row(row: &RasterActivationRow) -> Result<RasterActivationRow> {
+    gelu_row(row)
+}
+
+#[tile]
+fn scale_decode_row_optional(
+    row: &RasterActivationRow,
+    scalar: Option<Act>,
+) -> Result<RasterActivationRow> {
+    if scalar.is_none() {
+        return Ok(row.clone());
     }
+    scale_row(row, scalar)
+}
 
-    if scalars.layer_scalar.is_some() {
-        xs = scale_row(&xs, scalars.layer_scalar)?;
+#[tile]
+fn decode_ple_input_gate_rows(layer: &GemmaDecodeLayerMetadata) -> Result<usize> {
+    Ok(layer
+        .ple_input_gate_shape
+        .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing PLE input gate shape"))?
+        .rows)
+}
+
+#[tile]
+fn decode_ple_layer_projection_rows(layer: &GemmaDecodeLayerMetadata) -> Result<usize> {
+    Ok(layer
+        .ple_layer_projection_shape
+        .ok_or_else(|| {
+            anyhow!("Gemma decode layer metadata is missing PLE layer projection shape")
+        })?
+        .rows)
+}
+
+#[tile]
+fn validate_decode_attention_context(
+    input: &RasterActivationRow,
+    layer: &GemmaDecodeLayerMetadata,
+) -> Result<()> {
+    validate_row_width(input, layer.hidden_size, "decode attention input")?;
+    let kv_groups = layer
+        .num_heads
+        .checked_div(layer.num_kv_heads)
+        .ok_or_else(|| anyhow!("invalid Gemma head configuration"))?;
+    if kv_groups == 0 {
+        bail!("Gemma layer must have at least one KV group");
     }
+    Ok(())
+}
 
-    Ok((xs, updated_cache))
+#[tile]
+fn clone_decode_key_as_value(raw_k: &RasterActivationRow) -> Result<RasterActivationRow> {
+    Ok(raw_k.clone())
+}
+
+#[tile]
+fn reshape_decode_row_heads(
+    row: RasterActivationRow,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<RasterAttentionHeadSequence> {
+    reshape_row_heads(row, num_heads, head_dim)
+}
+
+#[sequence]
+fn rms_norm_decode_attention_heads(
+    heads: &RasterAttentionHeadSequence,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    norm: GemmaDecodeLayerNormKind,
+) -> Result<RasterAttentionHeadSequence> {
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
+    call_tile!(
+        rms_norm_decode_heads,
+        heads,
+        &norm_weights,
+        scalars.rms_norm_eps
+    )
+}
+
+#[tile]
+fn rms_norm_decode_heads(
+    heads: &RasterAttentionHeadSequence,
+    norm_weights: &[crate::shared::det_num::Wgt],
+    eps: crate::shared::det_num::Acc,
+) -> Result<RasterAttentionHeadSequence> {
+    rms_norm_heads(heads, Some(norm_weights), Some(eps))
+}
+
+#[sequence]
+fn value_rms_norm_decode_attention_heads(
+    heads: &RasterAttentionHeadSequence,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+) -> Result<RasterAttentionHeadSequence> {
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    call_tile!(value_rms_norm_decode_heads, heads, scalars.rms_norm_eps)
+}
+
+#[tile]
+fn value_rms_norm_decode_heads(
+    heads: &RasterAttentionHeadSequence,
+    eps: crate::shared::det_num::Acc,
+) -> Result<RasterAttentionHeadSequence> {
+    value_rms_norm_heads(heads, Some(eps))
+}
+
+#[tile]
+fn apply_decode_rope_to_heads(
+    heads: &RasterAttentionHeadSequence,
+    partial_rotary_dim: usize,
+    rope_freq_base_dim: usize,
+    rope_base: Option<Acc>,
+    position: usize,
+) -> Result<RasterAttentionHeadSequence> {
+    apply_rope_to_heads(
+        heads,
+        partial_rotary_dim,
+        rope_freq_base_dim,
+        rope_base,
+        position,
+    )
+}
+
+#[tile]
+fn update_decode_attention_cache(
+    store: &mut AuthenticatedRasterTensorStore,
+    cache_slot: DecodeLayerCacheSlot,
+    cache: RasterKvCache,
+    use_donor_cache: bool,
+    k_heads: &RasterAttentionHeadSequence,
+    v_heads: &RasterAttentionHeadSequence,
+    layer_idx: usize,
+    cache_window: Option<usize>,
+) -> Result<DecodeLayerCacheSlot> {
+    if use_donor_cache {
+        return Ok(cache_slot);
+    }
+    let updated_cache = append_decode_kv_cache(cache, k_heads, v_heads, cache_window)?;
+    register_decode_layer_cache(store, "decode.updated.cache", layer_idx, updated_cache)
+}
+
+#[tile]
+fn resolve_decode_attention_cache_ref(
+    attention_cache_slot: &DecodeLayerCacheSlot,
+) -> Result<RasterKvCacheRef> {
+    match attention_cache_slot {
+        DecodeLayerCacheSlot::Empty { .. } => bail!("decode attention cache is empty"),
+        DecodeLayerCacheSlot::Ref(cache_ref) => Ok(cache_ref.clone()),
+    }
+}
+
+#[tile]
+fn resolve_decode_attention_window(layer: &GemmaDecodeLayerMetadata) -> Result<Option<usize>> {
+    match layer.attention_kind {
+        GemmaDecodeAttentionKind::Full => Ok(None),
+        GemmaDecodeAttentionKind::Sliding => {
+            Ok(Some(layer.sliding_window.ok_or_else(|| {
+                anyhow!("sliding attention layer is missing a sliding window")
+            })?))
+        }
+    }
+}
+
+#[tile]
+fn insert_decode_attention_query_heads(
+    store: &mut AuthenticatedRasterTensorStore,
+    layer_idx: usize,
+    q_heads: RasterAttentionHeadSequence,
+) -> Result<RasterAttentionHeadsRef> {
+    store.insert_attention_heads(
+        RasterTensorId::new(format!("decode.layer.{layer_idx}.q_heads"))?,
+        q_heads,
+    )
+}
+
+#[tile]
+fn materialize_decode_attention_output_row(
+    store: &AuthenticatedRasterTensorStore,
+    attention_heads_ref: &RasterAttentionHeadsRef,
+) -> Result<RasterActivationRow> {
+    let output_heads = store.materialize_heads(attention_heads_ref)?;
+    let attention_sequence = combine_attention_heads(&output_heads)?;
+    first_row(attention_sequence, "decode attention combine")
 }
 
 #[sequence]
@@ -760,14 +1117,7 @@ fn run_decode_attention(
     projection_rows_per_tile: usize,
     attention_kv_rows_per_tile: usize,
 ) -> Result<(RasterActivationRow, DecodeLayerCacheSlot)> {
-    validate_row_width(input, layer.hidden_size, "decode attention input")?;
-    let kv_groups = layer
-        .num_heads
-        .checked_div(layer.num_kv_heads)
-        .ok_or_else(|| anyhow!("invalid Gemma head configuration"))?;
-    if kv_groups == 0 {
-        bail!("Gemma layer must have at least one KV group");
-    }
+    call_tile!(validate_decode_attention_context, input, layer)?;
 
     let q_projected = call_seq!(
         project_row_with_decode_source,
@@ -807,113 +1157,86 @@ fn run_decode_attention(
             format!("decode.layer.{}.v_proj", layer.layer_idx)
         )?
     } else if layer.attention_k_eq_v {
-        raw_k.clone()
+        call_tile!(clone_decode_key_as_value, &raw_k)?
     } else {
         bail!("Gemma layer is missing v_proj without attention_k_eq_v enabled");
     };
 
-    let q_heads = reshape_row_heads(q_projected, layer.num_heads, layer.head_dim)?;
-    let k_heads = reshape_row_heads(raw_k, layer.num_kv_heads, layer.head_dim)?;
-    let v_heads = reshape_row_heads(raw_v, layer.num_kv_heads, layer.head_dim)?;
-    let q_heads = rms_norm_heads(
+    let q_heads = call_tile!(
+        reshape_decode_row_heads,
+        q_projected,
+        layer.num_heads,
+        layer.head_dim
+    )?;
+    let k_heads = call_tile!(
+        reshape_decode_row_heads,
+        raw_k,
+        layer.num_kv_heads,
+        layer.head_dim
+    )?;
+    let v_heads = call_tile!(
+        reshape_decode_row_heads,
+        raw_v,
+        layer.num_kv_heads,
+        layer.head_dim
+    )?;
+    let q_heads = call_seq!(
+        rms_norm_decode_attention_heads,
         &q_heads,
-        Some(&auth_read!(
-            source,
-            GemmaDecodeLayerNormWeightsRequest {
-                layer_idx: layer.layer_idx,
-                norm: GemmaDecodeLayerNormKind::Query,
-            },
-        )?),
-        Some(
-            auth_read!(
-                source,
-                GemmaDecodeLayerScalarsRequest {
-                    layer_idx: layer.layer_idx,
-                },
-            )?
-            .rms_norm_eps,
-        ),
-    )?;
-    let k_heads = rms_norm_heads(
-        &k_heads,
-        Some(&auth_read!(
-            source,
-            GemmaDecodeLayerNormWeightsRequest {
-                layer_idx: layer.layer_idx,
-                norm: GemmaDecodeLayerNormKind::Key,
-            },
-        )?),
-        Some(
-            auth_read!(
-                source,
-                GemmaDecodeLayerScalarsRequest {
-                    layer_idx: layer.layer_idx,
-                },
-            )?
-            .rms_norm_eps,
-        ),
-    )?;
-    let v_heads = value_rms_norm_heads(
-        &v_heads,
-        Some(
-            auth_read!(
-                source,
-                GemmaDecodeLayerScalarsRequest {
-                    layer_idx: layer.layer_idx,
-                },
-            )?
-            .rms_norm_eps,
-        ),
-    )?;
-    let scalars = auth_read!(
         source,
-        GemmaDecodeLayerScalarsRequest {
-            layer_idx: layer.layer_idx,
-        },
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::Query
     )?;
-    let q_heads = apply_rope_to_heads(
+    let k_heads = call_seq!(
+        rms_norm_decode_attention_heads,
+        &k_heads,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::Key
+    )?;
+    let v_heads = call_seq!(
+        value_rms_norm_decode_attention_heads,
+        &v_heads,
+        source,
+        layer.layer_idx
+    )?;
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer.layer_idx)?;
+    let q_heads = call_tile!(
+        apply_decode_rope_to_heads,
         &q_heads,
         layer.partial_rotary_dim,
         layer.rope_freq_base_dim,
         scalars.rope_base,
-        position,
+        position
     )?;
-    let k_heads = apply_rope_to_heads(
+    let k_heads = call_tile!(
+        apply_decode_rope_to_heads,
         &k_heads,
         layer.partial_rotary_dim,
         layer.rope_freq_base_dim,
         scalars.rope_base,
-        position,
+        position
     )?;
 
-    let updated_cache_slot = if donor_cache.is_some() {
-        cache_slot
-    } else {
-        let updated_cache =
-            append_decode_kv_cache(cache, &k_heads, &v_heads, layer.cache_sliding_window)?;
-        register_decode_layer_cache(
-            store,
-            "decode.updated.cache",
-            layer.layer_idx,
-            updated_cache,
-        )?
-    };
+    let updated_cache_slot = call_tile!(
+        update_decode_attention_cache,
+        store,
+        cache_slot,
+        cache,
+        donor_cache.is_some(),
+        &k_heads,
+        &v_heads,
+        layer.layer_idx,
+        layer.cache_sliding_window
+    )?;
     let attention_cache_slot = donor_cache_slot.unwrap_or(&updated_cache_slot);
-    let attention_cache_ref = match attention_cache_slot {
-        DecodeLayerCacheSlot::Empty { .. } => bail!("decode attention cache is empty"),
-        DecodeLayerCacheSlot::Ref(cache_ref) => cache_ref.clone(),
-    };
-    let attention_window = match layer.attention_kind {
-        GemmaDecodeAttentionKind::Full => None,
-        GemmaDecodeAttentionKind::Sliding => Some(
-            layer
-                .sliding_window
-                .ok_or_else(|| anyhow!("sliding attention layer is missing a sliding window"))?,
-        ),
-    };
-    let q_heads_ref = store.insert_attention_heads(
-        RasterTensorId::new(format!("decode.layer.{}.q_heads", layer.layer_idx))?,
-        q_heads,
+    let attention_cache_ref = call_tile!(resolve_decode_attention_cache_ref, attention_cache_slot)?;
+    let attention_window = call_tile!(resolve_decode_attention_window, layer)?;
+    let q_heads_ref = call_tile!(
+        insert_decode_attention_query_heads,
+        store,
+        layer.layer_idx,
+        q_heads
     )?;
     let attention_heads_ref = call_seq!(
         compute_decode_attention_ref,
@@ -924,9 +1247,11 @@ fn run_decode_attention(
         attention_window,
         attention_kv_rows_per_tile
     )?;
-    let output_heads = store.materialize_heads(&attention_heads_ref)?;
-    let attention_sequence = combine_attention_heads(&output_heads)?;
-    let attention_row = first_row(attention_sequence, "decode attention combine")?;
+    let attention_row = call_tile!(
+        materialize_decode_attention_output_row,
+        store,
+        &attention_heads_ref
+    )?;
     let projected = call_seq!(
         project_row_with_decode_source,
         store,
@@ -955,20 +1280,20 @@ fn compute_decode_ple_input(
         return Ok(None);
     }
 
-    let ple_width = layer
-        .ple_input_gate_shape
-        .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing PLE input gate shape"))?
-        .rows;
-    let scalars = auth_read!(source, GemmaDecodePleScalarsRequest)?;
-    let norm_weights = auth_read!(source, GemmaDecodePleProjectionNormWeightsRequest)?;
-    let embedded = RasterActivationRow::from_acts(auth_read!(
+    let ple_width = call_tile!(decode_ple_input_gate_rows, layer)?;
+    let scalars = call_tile!(read_decode_ple_scalars, source)?;
+    let norm_weights = call_tile!(read_decode_ple_projection_norm_weights, source)?;
+    let embedded = call_tile!(
+        read_decode_ple_token_embedding,
         source,
-        GemmaDecodePleTokenEmbeddingRowRequest {
-            layer_idx: layer.layer_idx,
-            token_id,
-        },
-    )?);
-    let embedded = scale_row(&embedded, Some(scalars.embedding_scale))?;
+        layer.layer_idx,
+        token_id
+    )?;
+    let embedded = call_tile!(
+        scale_decode_row_optional,
+        &embedded,
+        Some(scalars.embedding_scale)
+    )?;
 
     let projected = call_seq!(
         project_row_with_ple_source,
@@ -980,10 +1305,54 @@ fn compute_decode_ple_input(
         projection_rows_per_tile,
         format!("decode.layer.{}.ple.model_projection", layer.layer_idx)
     )?;
-    let projected = scale_row(&projected, Some(scalars.projection_scalar))?;
-    let projected = rms_norm_row(&projected, &norm_weights, scalars.rms_norm_eps)?;
-    let combined = add_rows(&embedded, &projected)?;
-    scale_row(&combined, Some(scalars.input_scale)).map(Some)
+    let projected = call_tile!(
+        scale_decode_row_optional,
+        &projected,
+        Some(scalars.projection_scalar)
+    )?;
+    let projected = call_tile!(
+        rms_norm_decode_row,
+        &projected,
+        &norm_weights,
+        scalars.rms_norm_eps,
+        "decode PLE input RMSNorm"
+    )?;
+    let combined = call_tile!(add_decode_rows, &embedded, &projected)?;
+    call_tile!(
+        scale_decode_row_optional,
+        &combined,
+        Some(scalars.input_scale)
+    )
+    .map(Some)
+}
+
+#[tile]
+fn read_decode_ple_scalars(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<crate::shared::raster_decode_transition::GemmaDecodePleScalars> {
+    auth_read!(source, GemmaDecodePleScalarsRequest)
+}
+
+#[tile]
+fn read_decode_ple_projection_norm_weights(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<Vec<crate::shared::det_num::Wgt>> {
+    auth_read!(source, GemmaDecodePleProjectionNormWeightsRequest)
+}
+
+#[tile]
+fn read_decode_ple_token_embedding(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    token_id: u32,
+) -> Result<RasterActivationRow> {
+    Ok(RasterActivationRow::from_acts(auth_read!(
+        source,
+        GemmaDecodePleTokenEmbeddingRowRequest {
+            layer_idx,
+            token_id,
+        },
+    )?))
 }
 
 #[sequence]
@@ -1802,21 +2171,6 @@ fn layer_cache_from_raster(cache: RasterKvCache) -> LayerKvCache {
     )
 }
 
-fn rms_norm_row(
-    row: &RasterActivationRow,
-    norm_weights: &[crate::shared::det_num::Wgt],
-    eps: crate::shared::det_num::Acc,
-) -> Result<RasterActivationRow> {
-    first_row(
-        rms_norm_sequence(
-            &RasterActivationSequence::from_rows(vec![row.clone()]),
-            Some(norm_weights),
-            Some(eps),
-        )?,
-        "deterministic decode RMSNorm",
-    )
-}
-
 fn scale_row(row: &RasterActivationRow, scalar: Option<Act>) -> Result<RasterActivationRow> {
     first_row(
         scale_sequence(
@@ -2030,6 +2384,37 @@ mod tests {
     }
 
     #[test]
+    fn raster_decode_transition_matches_deterministic_with_attention_k_eq_v() {
+        let (_path, mut model) = no_ple_model(false);
+        model.layers[0].v_proj = None;
+        model.layers[0].attention_k_eq_v = true;
+        assert_raster_matches_deterministic(&model, decode_state_with_cache(2));
+    }
+
+    #[test]
+    fn raster_decode_transition_matches_deterministic_with_layer_scalar() {
+        let (_path, mut model) = no_ple_model(false);
+        model.layers[0].layer_scalar = Some(0.5);
+        model.layers[0].layer_scalar_det = Some(Act::from_num(0.5));
+        assert_raster_matches_deterministic(&model, decode_state_with_cache(2));
+    }
+
+    #[test]
+    fn raster_decode_transition_matches_deterministic_with_ple() {
+        let (_paths, model) = ple_model();
+        assert_raster_matches_deterministic(&model, decode_state_with_cache(2));
+    }
+
+    #[test]
+    fn raster_decode_transition_matches_deterministic_with_donor_cache() {
+        let (_path, mut model) = no_ple_model(false);
+        let mut donor_layer = model.layers[0].clone();
+        donor_layer.kv_shared_layer_index = Some(0);
+        model.layers.push(donor_layer);
+        assert_raster_matches_deterministic(&model, decode_state_with_layer_count(2, 2));
+    }
+
+    #[test]
     fn raster_decode_rejects_f32_only_cache() {
         let (_path, model) = no_ple_model(false);
         let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
@@ -2058,6 +2443,35 @@ mod tests {
             .expect_err("fp32 model should fail");
 
         assert!(error.to_string().contains(".detwgt artifact"));
+    }
+
+    fn assert_raster_matches_deterministic(
+        model: &Gemma4TransformerModel,
+        decode_state: TransformerDecodeState,
+    ) {
+        let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", model)
+            .expect("source should build");
+        let raster = run(
+            decode_state.clone(),
+            1,
+            &source,
+            raster_sizing_with_attention(2, 1),
+        )
+        .expect("raster decode should run");
+        let deterministic = crate::decode_transition::run_with_mode(
+            decode_state,
+            1,
+            model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("deterministic decode should run");
+
+        assert_eq!(raster.activation_state, deterministic.activation_state);
+        assert_eq!(raster.prefill_logits, deterministic.prefill_logits);
+        assert_eq!(
+            raster.transformer_decode_state,
+            deterministic.transformer_decode_state
+        );
     }
 
     fn no_ple_model(sliding: bool) -> (PathBuf, Gemma4TransformerModel) {
@@ -2152,6 +2566,36 @@ mod tests {
         )
     }
 
+    fn ple_model() -> (Vec<PathBuf>, Gemma4TransformerModel) {
+        let (base_path, mut model) = no_ple_model(false);
+        let hidden_width = 2;
+        let (ple_layer_path, ple_layer_sources) =
+            write_det_matrices(vec![identity_matrix(), identity_matrix()])
+                .expect("fixture PLE layer weights should write");
+        let mut ple_layer_sources = ple_layer_sources.into_iter();
+        model.layers[0].ple = Some(crate::Gemma4PleLayerWeights {
+            input_gate: det_matrix(ple_layer_sources.next().expect("PLE input gate")),
+            layer_projection: det_matrix(ple_layer_sources.next().expect("PLE layer projection")),
+            post_input_norm_weight: vec![1.0; hidden_width],
+            post_input_norm_weight_det: Some(vec![Wgt::from_num(1.0); hidden_width]),
+        });
+
+        let (ple_global_path, ple_global_sources) =
+            write_det_matrices(vec![identity_matrix(), identity_matrix()])
+                .expect("fixture PLE global weights should write");
+        let mut ple_global_sources = ple_global_sources.into_iter();
+        model.ple_global = Some(crate::Gemma4PleGlobalWeights::from_det_num_sources(
+            vec![ple_global_sources.next().expect("PLE token embeddings")],
+            vec![ple_global_sources.next().expect("PLE model projection")],
+            vec![1.0; hidden_width],
+            1.0,
+            1.0,
+            1.0,
+        ));
+
+        (vec![base_path, ple_layer_path, ple_global_path], model)
+    }
+
     fn raster_sizing(projection_rows_per_tile: usize) -> RasterSizingControls {
         raster_sizing_with_attention(projection_rows_per_tile, 1)
     }
@@ -2169,15 +2613,23 @@ mod tests {
     }
 
     fn decode_state_with_cache(cache_len: usize) -> TransformerDecodeState {
+        decode_state_with_layer_count(1, cache_len)
+    }
+
+    fn decode_state_with_layer_count(
+        layer_count: usize,
+        cache_len: usize,
+    ) -> TransformerDecodeState {
         let key_rows = (0..cache_len)
             .map(|_| vec![Act::from_num(0.0), Act::from_num(0.0)])
             .collect::<VecDeque<_>>();
         let value_rows = key_rows.clone();
         TransformerDecodeState {
-            layer_caches: vec![LayerKvCache::from_det_heads(
-                vec![key_rows],
-                vec![value_rows],
-            )],
+            layer_caches: (0..layer_count)
+                .map(|_| {
+                    LayerKvCache::from_det_heads(vec![key_rows.clone()], vec![value_rows.clone()])
+                })
+                .collect(),
             position: cache_len,
             token_count: cache_len,
         }
