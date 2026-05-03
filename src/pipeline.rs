@@ -386,7 +386,13 @@ fn run_output_decode_with_mode_internal(
         if stop_condition.is_some() {
             trace_event("output.detokenize");
             let mut output_decode_state = if let Some(raster_tokenizer) = raster_tokenizer {
-                crate::output_finalize::run_raster(decode_state, raster_tokenizer)?
+                crate::output_finalize::run_raster_with_byte_flush_bytes_per_tile(
+                    decode_state,
+                    raster_tokenizer,
+                    raster_sizing
+                        .expect("raster output finalize requires sizing controls")
+                        .output_byte_flush_bytes_per_tile,
+                )?
             } else {
                 crate::output_finalize::run(decode_state, tokenizer)?
             };
@@ -429,8 +435,12 @@ fn run_output_decode_with_mode_internal(
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
         crate::decode_transition::finalize(&decode_state)?;
         if crate::trace::reached_terminal_checkpoint_id().is_some() {
-            let mut output_decode_state =
-                build_current_output_decode_state(&decode_state, tokenizer, raster_tokenizer)?;
+            let mut output_decode_state = build_current_output_decode_state(
+                &decode_state,
+                tokenizer,
+                raster_tokenizer,
+                raster_sizing,
+            )?;
             output_decode_state.decode_transition_states = decode_transition_states;
             return Ok(output_decode_state);
         }
@@ -441,11 +451,15 @@ fn build_current_output_decode_state(
     decode_state: &crate::shared::output::DecodeState,
     tokenizer: &Tokenizer,
     raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
+    raster_sizing: Option<RasterSizingControls>,
 ) -> Result<OutputDecodeState> {
     if let Some(raster_tokenizer) = raster_tokenizer {
-        return crate::output_finalize::raster_tiles::run(
+        return crate::output_finalize::raster_tiles::run_with_byte_flush_bytes_per_tile(
             &decode_state.generated_token_ids,
             raster_tokenizer,
+            raster_sizing
+                .expect("raster output finalize requires sizing controls")
+                .output_byte_flush_bytes_per_tile,
         );
     }
 

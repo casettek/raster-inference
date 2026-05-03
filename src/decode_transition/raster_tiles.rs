@@ -2968,6 +2968,8 @@ mod tests {
                 crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
             tokenizer_bpe_pieces_per_tile:
                 crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE,
+            output_byte_flush_bytes_per_tile:
+                crate::InferenceControls::DEFAULT_RASTER_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
         }
     }
 

@@ -13,10 +13,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] [--raster] [--raster-decode-only] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--raster] [--raster-decode-only] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use raster-authored tiles where implemented. Pass --raster-decode-only with --raster to run deterministic native prefill through prefill.finalize, then use raster output decode. Pass --raster-trace-tiles to print verbose raster progress logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use raster-authored tiles where implemented. Pass --raster-decode-only with --raster to run deterministic native prefill through prefill.finalize, then use raster output decode. Pass --raster-trace-tiles to print verbose raster progress logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
     );
 }
 
@@ -85,6 +85,7 @@ fn run() -> anyhow::Result<()> {
         raster_head_rows_per_tile: cli_args.raster_head_rows_per_tile,
         raster_tokenizer_bpe_pairs_per_tile: cli_args.raster_tokenizer_bpe_pairs_per_tile,
         raster_tokenizer_bpe_pieces_per_tile: cli_args.raster_tokenizer_bpe_pieces_per_tile,
+        raster_output_byte_flush_bytes_per_tile: cli_args.raster_output_byte_flush_bytes_per_tile,
     };
     let run_inference =
         || run_inference_with_controls(&request, &model, &tokenizer, &transformer_model, &controls);
@@ -118,6 +119,7 @@ struct CliArgs {
     raster_head_rows_per_tile: Option<usize>,
     raster_tokenizer_bpe_pairs_per_tile: Option<usize>,
     raster_tokenizer_bpe_pieces_per_tile: Option<usize>,
+    raster_output_byte_flush_bytes_per_tile: Option<usize>,
     terminal_checkpoint: Option<String>,
     model_id: String,
     tokenizer_path: PathBuf,
@@ -139,6 +141,7 @@ impl CliArgs {
         let mut raster_head_rows_per_tile = None;
         let mut raster_tokenizer_bpe_pairs_per_tile = None;
         let mut raster_tokenizer_bpe_pieces_per_tile = None;
+        let mut raster_output_byte_flush_bytes_per_tile = None;
         let mut terminal_checkpoint = None;
         let mut positional_args = Vec::new();
         let mut args = args.into_iter();
@@ -233,6 +236,21 @@ impl CliArgs {
                     raster_tokenizer_bpe_pieces_per_tile =
                         Some(parse_raster_tokenizer_bpe_pieces_per_tile(value)?);
                 }
+                "--raster-output-byte-flush-bytes-per-tile" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("expected a byte count after {arg}"))?;
+                    raster_output_byte_flush_bytes_per_tile =
+                        Some(parse_raster_output_byte_flush_bytes_per_tile(&value)?);
+                }
+                _ if arg.starts_with("--raster-output-byte-flush-bytes-per-tile=") => {
+                    let value = arg
+                        .split_once('=')
+                        .map(|(_, value)| value)
+                        .expect("split_once should succeed for --raster-output-byte-flush-bytes-per-tile=value");
+                    raster_output_byte_flush_bytes_per_tile =
+                        Some(parse_raster_output_byte_flush_bytes_per_tile(value)?);
+                }
                 "--terminal-checkpoint" => {
                     let checkpoint_id = args
                         .next()
@@ -278,6 +296,9 @@ impl CliArgs {
         if raster_tokenizer_bpe_pieces_per_tile.is_some() && !raster_tiles {
             anyhow::bail!("--raster-tokenizer-bpe-pieces-per-tile requires --raster");
         }
+        if raster_output_byte_flush_bytes_per_tile.is_some() && !raster_tiles {
+            anyhow::bail!("--raster-output-byte-flush-bytes-per-tile requires --raster");
+        }
 
         if raster_tiles {
             execution_mode = InferenceExecutionMode::Deterministic;
@@ -295,6 +316,7 @@ impl CliArgs {
             raster_head_rows_per_tile,
             raster_tokenizer_bpe_pairs_per_tile,
             raster_tokenizer_bpe_pieces_per_tile,
+            raster_output_byte_flush_bytes_per_tile,
             terminal_checkpoint,
             model_id: positional_args[0].clone(),
             tokenizer_path: PathBuf::from(&positional_args[1]),
@@ -363,6 +385,16 @@ fn parse_raster_tokenizer_bpe_pieces_per_tile(value: &str) -> anyhow::Result<usi
         anyhow::bail!("raster tokenizer BPE pieces per tile must be greater than zero");
     }
     Ok(pieces)
+}
+
+fn parse_raster_output_byte_flush_bytes_per_tile(value: &str) -> anyhow::Result<usize> {
+    let bytes = value.parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("raster output byte flush bytes per tile must be a positive integer")
+    })?;
+    if bytes == 0 {
+        anyhow::bail!("raster output byte flush bytes per tile must be greater than zero");
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -442,6 +474,7 @@ mod tests {
         assert!(!args.raster_trace_tiles);
         assert_eq!(args.raster_projection_rows_per_tile, None);
         assert_eq!(args.raster_attention_kv_rows_per_tile, None);
+        assert_eq!(args.raster_output_byte_flush_bytes_per_tile, None);
     }
 
     #[test]
@@ -568,6 +601,58 @@ mod tests {
         assert!(piece_error
             .to_string()
             .contains("--raster-tokenizer-bpe-pieces-per-tile requires --raster"));
+    }
+
+    #[test]
+    fn parse_raster_output_byte_flush_chunk_flag() {
+        let args = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-output-byte-flush-bytes-per-tile=1048576".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(
+            args.raster_output_byte_flush_bytes_per_tile,
+            Some(1_048_576)
+        );
+    }
+
+    #[test]
+    fn parse_raster_output_byte_flush_chunk_flag_rejects_zero() {
+        let error = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-output-byte-flush-bytes-per-tile=0".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("zero byte flush chunk size should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_raster_output_byte_flush_chunk_flag_requires_raster() {
+        let error = CliArgs::parse([
+            "--raster-output-byte-flush-bytes-per-tile=1048576".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("output byte flush chunk flag should require raster");
+
+        assert!(error
+            .to_string()
+            .contains("--raster-output-byte-flush-bytes-per-tile requires --raster"));
     }
 
     #[test]

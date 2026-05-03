@@ -17,7 +17,7 @@ use crate::shared::{
     },
 };
 
-const OUTPUT_BYTE_FLUSH_BYTES_PER_TILE: usize = 16;
+pub const DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE: usize = 16;
 const INVALID_UTF8_REPLACEMENT: &str = "�";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -99,7 +99,9 @@ pub fn init_output_detokenize(
     token_source: &AuthenticatedOutputTokenIdsSource,
     tokenizer: &AuthenticatedGemmaTokenizer,
     store: &mut AuthenticatedOutputFinalizeStore,
+    byte_flush_bytes_per_tile: usize,
 ) -> Result<OutputDetokenizeState> {
+    validate_output_byte_flush_bytes_per_tile(byte_flush_bytes_per_tile)?;
     let token_metadata = auth_read!(token_source, OutputTokenIdsMetadataRequest)?;
     let metadata = auth_read!(tokenizer, GemmaDecoderMetadataRequest)?;
     if !metadata.byte_fallback {
@@ -119,8 +121,15 @@ pub fn init_output_detokenize(
         replacement_content: metadata.replacement_content,
         byte_fallback: metadata.byte_fallback,
         phase: OutputDetokenizePhase::ReadNextToken,
-        byte_flush_bytes_per_tile: OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+        byte_flush_bytes_per_tile,
     })
+}
+
+pub fn validate_output_byte_flush_bytes_per_tile(bytes_per_tile: usize) -> Result<()> {
+    if bytes_per_tile == 0 {
+        bail!("raster output byte flush bytes per tile must be greater than zero");
+    }
+    Ok(())
 }
 
 #[tile(kind = recursive)]
@@ -332,16 +341,24 @@ pub fn finalize_output_detokenize_refs(
 }
 
 #[sequence]
-pub fn detokenize_output_tokens_ref(
+pub fn detokenize_output_tokens_ref_with_byte_flush_bytes_per_tile(
     token_source: &AuthenticatedOutputTokenIdsSource,
     tokenizer: &AuthenticatedGemmaTokenizer,
     store: &mut AuthenticatedOutputFinalizeStore,
+    byte_flush_bytes_per_tile: usize,
 ) -> Result<OutputDetokenizeRefs> {
+    validate_output_byte_flush_bytes_per_tile(byte_flush_bytes_per_tile)?;
     if let Some(refs) = call_tile!(empty_detokenized_output_ref, token_source, store)? {
         return Ok(refs);
     }
 
-    let state = call_tile!(init_output_detokenize, token_source, tokenizer, store)?;
+    let state = call_tile!(
+        init_output_detokenize,
+        token_source,
+        tokenizer,
+        store,
+        byte_flush_bytes_per_tile
+    )?;
     let state = call_recur_tile_result!(
         decode_next_output_token,
         state,
@@ -353,10 +370,26 @@ pub fn detokenize_output_tokens_ref(
 }
 
 #[sequence]
-pub fn detokenize_output_tokens(
+pub fn detokenize_output_tokens_ref(
+    token_source: &AuthenticatedOutputTokenIdsSource,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+    store: &mut AuthenticatedOutputFinalizeStore,
+) -> Result<OutputDetokenizeRefs> {
+    detokenize_output_tokens_ref_with_byte_flush_bytes_per_tile(
+        token_source,
+        tokenizer,
+        store,
+        DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+    )
+}
+
+#[sequence]
+pub fn detokenize_output_tokens_with_byte_flush_bytes_per_tile(
     token_ids: &[u32],
     tokenizer: &AuthenticatedGemmaTokenizer,
+    byte_flush_bytes_per_tile: usize,
 ) -> Result<String> {
+    validate_output_byte_flush_bytes_per_tile(byte_flush_bytes_per_tile)?;
     if let Some(text) = call_tile!(empty_detokenized_output, token_ids) {
         return Ok(text);
     }
@@ -364,12 +397,25 @@ pub fn detokenize_output_tokens(
     let token_source = AuthenticatedOutputTokenIdsSource::from_token_ids("generated", token_ids)?;
     let mut store = AuthenticatedOutputFinalizeStore::new();
     let refs = call_seq!(
-        detokenize_output_tokens_ref,
+        detokenize_output_tokens_ref_with_byte_flush_bytes_per_tile,
         &token_source,
         tokenizer,
-        &mut store
+        &mut store,
+        byte_flush_bytes_per_tile
     )?;
     store.materialize_text(&refs.text_ref)
+}
+
+#[sequence]
+pub fn detokenize_output_tokens(
+    token_ids: &[u32],
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<String> {
+    detokenize_output_tokens_with_byte_flush_bytes_per_tile(
+        token_ids,
+        tokenizer,
+        DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+    )
 }
 
 #[tile]
@@ -405,24 +451,52 @@ pub fn finalize_output_decode(
 }
 
 #[sequence]
+pub fn run_ref_with_store_with_byte_flush_bytes_per_tile(
+    token_source: &AuthenticatedOutputTokenIdsSource,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+    store: &mut AuthenticatedOutputFinalizeStore,
+    byte_flush_bytes_per_tile: usize,
+) -> Result<OutputDecodeRefs> {
+    let detokenized = call_seq!(
+        detokenize_output_tokens_ref_with_byte_flush_bytes_per_tile,
+        token_source,
+        tokenizer,
+        store,
+        byte_flush_bytes_per_tile
+    )?;
+    Ok(call_tile!(finalize_output_decode_refs, detokenized))
+}
+
+#[sequence]
 pub fn run_ref_with_store(
     token_source: &AuthenticatedOutputTokenIdsSource,
     tokenizer: &AuthenticatedGemmaTokenizer,
     store: &mut AuthenticatedOutputFinalizeStore,
 ) -> Result<OutputDecodeRefs> {
-    let detokenized = call_seq!(detokenize_output_tokens_ref, token_source, tokenizer, store)?;
-    Ok(call_tile!(finalize_output_decode_refs, detokenized))
+    run_ref_with_store_with_byte_flush_bytes_per_tile(
+        token_source,
+        tokenizer,
+        store,
+        DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+    )
 }
 
 #[sequence]
-pub fn run(
+pub fn run_with_byte_flush_bytes_per_tile(
     generated_token_ids: &[u32],
     tokenizer: &AuthenticatedGemmaTokenizer,
+    byte_flush_bytes_per_tile: usize,
 ) -> Result<OutputDecodeState> {
     let token_source =
         AuthenticatedOutputTokenIdsSource::from_token_ids("generated", generated_token_ids)?;
     let mut store = AuthenticatedOutputFinalizeStore::new();
-    let refs = call_seq!(run_ref_with_store, &token_source, tokenizer, &mut store)?;
+    let refs = call_seq!(
+        run_ref_with_store_with_byte_flush_bytes_per_tile,
+        &token_source,
+        tokenizer,
+        &mut store,
+        byte_flush_bytes_per_tile
+    )?;
     let generated_token_ids = token_source.materialize_token_ids(&refs.generated_token_ids_ref)?;
     let generated_text = store.materialize_text(&refs.generated_text_ref)?;
     Ok(call_tile!(
@@ -433,11 +507,24 @@ pub fn run(
     ))
 }
 
+#[sequence]
+pub fn run(
+    generated_token_ids: &[u32],
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<OutputDecodeState> {
+    run_with_byte_flush_bytes_per_tile(
+        generated_token_ids,
+        tokenizer,
+        DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         build_output_decode_commitment, decode_next_output_token, detokenize_output_tokens,
-        init_output_detokenize, run, run_ref_with_store,
+        detokenize_output_tokens_with_byte_flush_bytes_per_tile, init_output_detokenize, run,
+        run_ref_with_store, DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
     };
     use crate::raster_authoring::{start_tile_invocation_counting, stop_tile_invocation_counting};
     use crate::shared::gemma_tokenizer::{
@@ -529,6 +616,49 @@ mod tests {
     }
 
     #[test]
+    fn detokenize_output_tokens_honors_byte_flush_chunk_size() {
+        let token_ids = std::iter::repeat([6, 7])
+            .take(20)
+            .flatten()
+            .collect::<Vec<_>>();
+
+        start_tile_invocation_counting();
+        let default_text = detokenize_output_tokens(&token_ids, &test_tokenizer_source())
+            .expect("default chunking should decode");
+        let default_invocations =
+            stop_tile_invocation_counting().expect("tile counting should be active");
+
+        start_tile_invocation_counting();
+        let wide_text = detokenize_output_tokens_with_byte_flush_bytes_per_tile(
+            &token_ids,
+            &test_tokenizer_source(),
+            64,
+        )
+        .expect("wide chunking should decode");
+        let wide_invocations =
+            stop_tile_invocation_counting().expect("tile counting should be active");
+
+        assert_eq!(default_text, wide_text);
+        assert_eq!(wide_text, "é".repeat(20));
+        assert!(
+            wide_invocations < default_invocations,
+            "larger byte flush chunks should require fewer tile invocations"
+        );
+    }
+
+    #[test]
+    fn detokenize_output_tokens_rejects_zero_byte_flush_chunk_size() {
+        let error = detokenize_output_tokens_with_byte_flush_bytes_per_tile(
+            &[6],
+            &test_tokenizer_source(),
+            0,
+        )
+        .expect_err("zero byte flush chunk size should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
     fn build_output_decode_commitment_hashes_generated_token_ids_only() {
         let digest = build_output_decode_commitment(&[4, 5]).expect("commitment should build");
         assert_eq!(
@@ -582,8 +712,13 @@ mod tests {
             AuthenticatedOutputTokenIdsSource::from_token_ids("generated", &token_ids)
                 .expect("token source should build");
         let mut store = AuthenticatedOutputFinalizeStore::new();
-        let state = init_output_detokenize(&token_source, &test_tokenizer_source(), &mut store)
-            .expect("state should initialize");
+        let state = init_output_detokenize(
+            &token_source,
+            &test_tokenizer_source(),
+            &mut store,
+            DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+        )
+        .expect("state should initialize");
 
         let value = serde_json::to_value(&state).expect("state should serialize");
 
@@ -601,8 +736,13 @@ mod tests {
         let token_source = AuthenticatedOutputTokenIdsSource::from_token_ids("generated", &[6])
             .expect("token source should build");
         let mut store = AuthenticatedOutputFinalizeStore::new();
-        let state = init_output_detokenize(&token_source, &test_tokenizer_source(), &mut store)
-            .expect("state should initialize");
+        let state = init_output_detokenize(
+            &token_source,
+            &test_tokenizer_source(),
+            &mut store,
+            DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+        )
+        .expect("state should initialize");
         let (_done, state) =
             decode_next_output_token(state, &token_source, &test_tokenizer_source(), &mut store)
                 .expect("first token should decode");

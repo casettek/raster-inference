@@ -42,8 +42,24 @@ pub fn run_raster(
     decode_state: DecodeState,
     tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<OutputDecodeState> {
+    run_raster_with_byte_flush_bytes_per_tile(
+        decode_state,
+        tokenizer,
+        raster_tiles::DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+    )
+}
+
+pub fn run_raster_with_byte_flush_bytes_per_tile(
+    decode_state: DecodeState,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+    byte_flush_bytes_per_tile: usize,
+) -> Result<OutputDecodeState> {
     let generated_token_count = decode_state.generated_token_ids.len();
-    let output = raster_tiles::run(&decode_state.generated_token_ids, tokenizer)?;
+    let output = raster_tiles::run_with_byte_flush_bytes_per_tile(
+        &decode_state.generated_token_ids,
+        tokenizer,
+        byte_flush_bytes_per_tile,
+    )?;
     let stop_reason = output.stop_reason.clone();
     crate::trace::trace_checkpoint(
         "output.finalize",
