@@ -42,7 +42,7 @@ pub fn run_raster(
     request: &InferenceRequest,
     model: &crate::shared::input::ModelSpec,
     tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<PromptPreparationState> {
+) -> Result<raster_tiles::RasterPromptPreparationResult> {
     raster_tiles::run(request, model, tokenizer)
 }
 
@@ -52,7 +52,7 @@ pub fn run_raster_with_tokenizer_controls(
     tokenizer: &AuthenticatedGemmaTokenizer,
     bpe_pairs_per_tile: usize,
     bpe_pieces_per_tile: usize,
-) -> Result<PromptPreparationState> {
+) -> Result<raster_tiles::RasterPromptPreparationResult> {
     raster_tiles::run_with_tokenizer_controls(
         request,
         model,

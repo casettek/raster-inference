@@ -309,6 +309,15 @@ prompt token refs
   -> generated token/text refs
 ```
 
+## Current Migration Status
+
+The first handoff migration is intentionally a hard routine-boundary refactor:
+
+- Raster prompt prepare now exits as prompt token refs plus the tokenizer store needed to serve authenticated token reads.
+- Raster inference is expected to terminate at the `prompt.prepare` boundary for this slice.
+- Input embedding has not yet been refactored to consume `RasterTokenIdSequenceRef`; that is the next routine boundary.
+- No materializing compatibility adapter should be added to make raster prompt prepare look like the old materialized `PromptPreparationState`.
+
 ## Non-Goals
 
 - Do not make every scalar a store object.

@@ -1,3 +1,4 @@
+use anyhow::Result;
 use raster_inference::io::parse_gemma_tokenizer_spec_bytes;
 use raster_inference::load_gemma_tokenizer_spec_from_path;
 use raster_inference::output_finalize::raster_tiles::detokenize_output_tokens;
@@ -5,6 +6,7 @@ use raster_inference::prompt_prepare::raster_tiles::{
     tokenize_prompt, tokenize_prompt_with_controls,
 };
 use raster_inference::shared::gemma_tokenizer::GemmaDecoderMetadataRequest;
+use raster_inference::shared::raster_artifact_store::{self, RasterTokenIdSequenceRef};
 use raster_inference::AuthenticatedGemmaTokenizer;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -24,8 +26,10 @@ fn raster_gemma_tokenizer_matches_huggingface_for_supported_subset() {
             .expect("HF tokenizer should encode")
             .get_ids()
             .to_vec();
-        let raster_ids =
+        let raster =
             tokenize_prompt(prompt, &source, false).expect("Raster tokenizer should encode");
+        let raster_ids = materialize_token_ids(&raster.token_ids_ref)
+            .expect("Raster token ids should materialize");
 
         assert_eq!(raster_ids, hf_ids, "token ids should match for {prompt:?}");
     }
@@ -39,10 +43,14 @@ fn raster_gemma_tokenizer_chunk_controls_do_not_change_supported_subset() {
     let source = AuthenticatedGemmaTokenizer::new(spec);
 
     for prompt in ["abab", "a b ab", "<bos>abab", "éab"] {
-        let tiny_chunk_ids =
+        let tiny_chunk =
             tokenize_prompt_with_controls(prompt, &source, false, 1, 1).expect("tiny chunks");
-        let oversized_chunk_ids =
+        let tiny_chunk_ids = materialize_token_ids(&tiny_chunk.token_ids_ref)
+            .expect("tiny chunk token ids should materialize");
+        let oversized_chunk =
             tokenize_prompt_with_controls(prompt, &source, false, 64, 64).expect("large chunks");
+        let oversized_chunk_ids = materialize_token_ids(&oversized_chunk.token_ids_ref)
+            .expect("oversized chunk token ids should materialize");
 
         assert_eq!(
             tiny_chunk_ids, oversized_chunk_ids,
@@ -163,13 +171,25 @@ fn gemma_tokenizer_without_decoder_still_loads_for_encode_only_use() {
         .expect("encode-only tokenizer spec should parse without decoder metadata");
     let source = AuthenticatedGemmaTokenizer::new(spec);
 
-    let encoded = tokenize_prompt("ab", &source, false).expect("encode path should still work");
+    let encoded_ref = tokenize_prompt("ab", &source, false).expect("encode path should still work");
+    let encoded = materialize_token_ids(&encoded_ref.token_ids_ref)
+        .expect("encoded token ids should materialize");
     assert_eq!(encoded, vec![3]);
     let error = raster_inference::auth_read!(&source, GemmaDecoderMetadataRequest)
         .expect_err("decoder metadata should be required for raster output decode");
     assert!(error
         .to_string()
         .contains("missing supported decoder metadata"));
+}
+
+fn materialize_token_ids(token_ids_ref: &RasterTokenIdSequenceRef) -> Result<Vec<u32>> {
+    (0..token_ids_ref.token_count())
+        .map(|token_idx| {
+            let read = raster_artifact_store::read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
+            raster_artifact_store::verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
+            raster_artifact_store::decode_token_id_leaf(read.payload())
+        })
+        .collect()
 }
 
 fn minimal_gemma_tokenizer_json() -> String {

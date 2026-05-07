@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 
 use crate::raster_authoring::AuthRead;
-use crate::shared::raster_tokenizer_store::RasterBpePieceSequenceRef;
+use crate::shared::raster_artifact_store::RasterBpePieceSequenceRef;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaVocabEntry {

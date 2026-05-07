@@ -101,6 +101,9 @@ fn run() -> anyhow::Result<()> {
         InferenceRunOutcome::Paused(paused_state) => {
             println!("{}", serde_json::to_string_pretty(&paused_state)?);
         }
+        InferenceRunOutcome::RasterPromptPrepared(prompt_state) => {
+            println!("{}", serde_json::to_string_pretty(&prompt_state)?);
+        }
     }
 
     Ok(())
