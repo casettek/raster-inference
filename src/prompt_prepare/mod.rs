@@ -11,6 +11,7 @@ use self::tiles::{
 };
 
 pub mod raster_tiles;
+mod raster_utils;
 pub mod tiles;
 
 pub fn run(

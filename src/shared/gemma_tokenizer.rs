@@ -1,9 +1,20 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
+use serde::Serialize;
 
 use crate::shared::artifact_io::AuthRead;
+use crate::shared::external_artifacts::{
+    register_external_source_leaves, CommittedExternalSource, ExternalSourceId, ExternalSourceRef,
+};
 use crate::shared::raster_artifact_store::RasterBpePieceSequenceRef;
+
+const GEMMA_TOKENIZER_SOURCE_KIND: &str = "gemma_tokenizer";
+const GEMMA_TOKENIZER_SOURCE_DOMAIN: &str = "raster-external-source-gemma-tokenizer-merkle-v1";
+const GEMMA_TOKENIZER_SOURCE_CHUNK_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaVocabEntry {
@@ -43,6 +54,7 @@ pub struct GemmaTokenizerSpec {
     merge_by_pair: HashMap<String, HashMap<String, usize>>,
     special_tokens_by_length: Vec<GemmaAddedToken>,
     decoder_metadata: Option<GemmaDecoderMetadata>,
+    source_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +93,19 @@ pub struct GemmaDecodedToken {
 pub struct GemmaBpeMergeCandidate {
     pub merge_index: usize,
     pub rank: usize,
+}
+
+#[derive(Serialize)]
+struct GemmaTokenizerSourcePayload<'a> {
+    tokenizer_sha256: &'a str,
+    vocab: &'a [GemmaVocabEntry],
+    merges: &'a [GemmaBpeMerge],
+    added_tokens: &'a [GemmaAddedToken],
+    unk_token: &'a str,
+    byte_fallback: bool,
+    space_replacement: &'a str,
+    split_pattern: &'a str,
+    decoder_metadata: &'a Option<GemmaDecoderMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +199,7 @@ impl GemmaTokenizerSpec {
             space_replacement,
             split_pattern,
             decoder_metadata,
+            None,
         )
     }
 
@@ -187,6 +213,7 @@ impl GemmaTokenizerSpec {
         space_replacement: String,
         split_pattern: String,
         decoder_metadata: Option<GemmaDecoderMetadata>,
+        source_payload: Option<Vec<u8>>,
     ) -> Result<Self> {
         if vocab.is_empty() {
             bail!("Gemma tokenizer spec requires a non-empty vocab");
@@ -269,6 +296,20 @@ impl GemmaTokenizerSpec {
                 .then(left.content.cmp(&right.content))
         });
 
+        let source_payload = source_payload.unwrap_or_else(|| {
+            canonical_tokenizer_source_payload(GemmaTokenizerSourcePayload {
+                tokenizer_sha256: &tokenizer_sha256,
+                vocab: &vocab,
+                merges: &merges,
+                added_tokens: &added_tokens,
+                unk_token: &unk_token,
+                byte_fallback,
+                space_replacement: &space_replacement,
+                split_pattern: &split_pattern,
+                decoder_metadata: &decoder_metadata,
+            })
+        });
+
         Ok(Self {
             tokenizer_sha256,
             vocab,
@@ -285,6 +326,7 @@ impl GemmaTokenizerSpec {
             merge_by_pair,
             special_tokens_by_length,
             decoder_metadata,
+            source_payload,
         })
     }
 
@@ -344,6 +386,32 @@ impl AuthenticatedGemmaTokenizer {
     pub fn identifier(&self) -> &str {
         &self.identifier
     }
+
+    pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
+        let source_ref = register_external_source_leaves(
+            ExternalSourceId::new(self.identifier.clone())?,
+            GEMMA_TOKENIZER_SOURCE_KIND,
+            GEMMA_TOKENIZER_SOURCE_DOMAIN,
+            source_payload_chunks(&self.spec.source_payload),
+        )?;
+        register_native_committed_tokenizer(source_ref.root(), self)?;
+        Ok(source_ref)
+    }
+
+    pub fn committed_source(&self) -> Result<CommittedExternalSource> {
+        Ok(CommittedExternalSource::new(self.committed_source_ref()?))
+    }
+
+    fn metadata(&self) -> GemmaTokenizerMetadata {
+        GemmaTokenizerMetadata {
+            tokenizer_sha256: self.spec.tokenizer_sha256.clone(),
+            unk_token: self.spec.unk_token.clone(),
+            unk_token_id: self.spec.unk_token_id,
+            byte_fallback: self.spec.byte_fallback,
+            space_replacement: self.spec.space_replacement.clone(),
+            split_pattern: self.spec.split_pattern.clone(),
+        }
+    }
 }
 
 impl From<GemmaTokenizerSpec> for AuthenticatedGemmaTokenizer {
@@ -356,14 +424,7 @@ impl AuthRead<GemmaTokenizerMetadataRequest> for AuthenticatedGemmaTokenizer {
     type Output = GemmaTokenizerMetadata;
 
     fn auth_read(&self, _request: GemmaTokenizerMetadataRequest) -> Result<Self::Output> {
-        Ok(GemmaTokenizerMetadata {
-            tokenizer_sha256: self.spec.tokenizer_sha256.clone(),
-            unk_token: self.spec.unk_token.clone(),
-            unk_token_id: self.spec.unk_token_id,
-            byte_fallback: self.spec.byte_fallback,
-            space_replacement: self.spec.space_replacement.clone(),
-            split_pattern: self.spec.split_pattern.clone(),
-        })
+        Ok(self.metadata())
     }
 }
 
@@ -435,6 +496,102 @@ impl AuthRead<GemmaBpeMergedTokenRequest> for AuthenticatedGemmaTokenizer {
             .bpe_merge_by_index(request.merge_index)
             .map(|merge| merge.merged.clone()))
     }
+}
+
+impl AuthRead<GemmaTokenizerMetadataRequest> for CommittedExternalSource {
+    type Output = GemmaTokenizerMetadata;
+
+    fn auth_read(&self, request: GemmaTokenizerMetadataRequest) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaDecoderMetadataRequest> for CommittedExternalSource {
+    type Output = GemmaDecoderMetadata;
+
+    fn auth_read(&self, request: GemmaDecoderMetadataRequest) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl<'a> AuthRead<GemmaTokenIdRequest<'a>> for CommittedExternalSource {
+    type Output = Option<u32>;
+
+    fn auth_read(&self, request: GemmaTokenIdRequest<'a>) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaTokenByIdRequest> for CommittedExternalSource {
+    type Output = Option<GemmaDecodedToken>;
+
+    fn auth_read(&self, request: GemmaTokenByIdRequest) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl<'a> AuthRead<GemmaBpeMergeRequest<'a>> for CommittedExternalSource {
+    type Output = Option<GemmaBpeMergeCandidate>;
+
+    fn auth_read(&self, request: GemmaBpeMergeRequest<'a>) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaBpeMergedTokenRequest> for CommittedExternalSource {
+    type Output = Option<String>;
+
+    fn auth_read(&self, request: GemmaBpeMergedTokenRequest) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+thread_local! {
+    static NATIVE_COMMITTED_TOKENIZERS: RefCell<HashMap<String, AuthenticatedGemmaTokenizer>> =
+        RefCell::new(HashMap::new());
+}
+
+fn register_native_committed_tokenizer(
+    root: &str,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<()> {
+    NATIVE_COMMITTED_TOKENIZERS.with(|sources_ref| {
+        let mut sources = sources_ref.borrow_mut();
+        match sources.get(root) {
+            Some(existing) if existing != tokenizer => {
+                bail!("committed tokenizer root {root} is already registered with different data")
+            }
+            Some(_) => Ok(()),
+            None => {
+                sources.insert(root.to_string(), tokenizer.clone());
+                Ok(())
+            }
+        }
+    })
+}
+
+fn with_native_committed_tokenizer<T>(
+    root: &str,
+    f: impl FnOnce(&AuthenticatedGemmaTokenizer) -> Result<T>,
+) -> Result<T> {
+    NATIVE_COMMITTED_TOKENIZERS.with(|sources_ref| {
+        let sources = sources_ref.borrow();
+        let tokenizer = sources
+            .get(root)
+            .ok_or_else(|| anyhow!("committed tokenizer root {root} is not registered natively"))?;
+        f(tokenizer)
+    })
+}
+
+fn canonical_tokenizer_source_payload(payload: GemmaTokenizerSourcePayload<'_>) -> Vec<u8> {
+    serde_json::to_vec(&payload).expect("canonical tokenizer payload should serialize")
+}
+
+fn source_payload_chunks(payload: &[u8]) -> Vec<Vec<u8>> {
+    payload
+        .chunks(GEMMA_TOKENIZER_SOURCE_CHUNK_BYTES)
+        .map(|chunk| chunk.to_vec())
+        .collect()
 }
 
 impl GemmaBpeState {
@@ -695,6 +852,48 @@ mod tests {
             )
             .expect("merged token should read"),
             Some("ab".to_string())
+        );
+    }
+
+    #[test]
+    fn committed_tokenizer_reads_match_authenticated_source() {
+        let source = AuthenticatedGemmaTokenizer::new(test_spec());
+        let committed = source
+            .committed_source()
+            .expect("tokenizer source should commit");
+        let source_ref = source
+            .committed_source_ref()
+            .expect("tokenizer source ref should be idempotent");
+
+        assert_eq!(committed.root(), source_ref.root());
+        assert_eq!(
+            crate::auth_read!(&committed, GemmaTokenIdRequest { token: "ab" })
+                .expect("token id should read"),
+            Some(3)
+        );
+        assert_eq!(
+            crate::auth_read!(
+                &committed,
+                GemmaBpeMergeRequest {
+                    left: "a",
+                    right: "b",
+                },
+            )
+            .expect("merge should read")
+            .expect("merge should exist")
+            .rank,
+            0
+        );
+        assert_eq!(
+            crate::auth_read!(
+                &committed,
+                GemmaBpeMergeRequest {
+                    left: "missing",
+                    right: "pair",
+                },
+            )
+            .expect("missing merge should read"),
+            None
         );
     }
 

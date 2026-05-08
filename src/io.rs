@@ -999,6 +999,7 @@ pub fn parse_gemma_tokenizer_spec_bytes(raw: &[u8]) -> Result<GemmaTokenizerSpec
         tokenizer.normalizer.content,
         tokenizer.pre_tokenizer.pattern.string,
         decoder_metadata,
+        Some(raw.to_vec()),
     )
 }
 
