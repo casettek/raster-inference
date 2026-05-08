@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 
-use crate::raster_authoring::AuthRead;
+use crate::shared::artifact_io::AuthRead;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedOutputTokenIdsSource {
@@ -521,7 +521,7 @@ mod tests {
         AuthenticatedOutputFinalizeStore, AuthenticatedOutputTokenIdsSource, OutputTextBuilderRef,
         OutputTokenIdRequest, OutputTokenIdsMetadataRequest,
     };
-    use crate::raster_authoring::AuthRead;
+    use crate::shared::artifact_io::AuthRead;
 
     #[test]
     fn token_source_reads_by_index_with_metadata() {

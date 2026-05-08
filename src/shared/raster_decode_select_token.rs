@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::raster_authoring::AuthRead;
+use crate::shared::artifact_io::AuthRead;
 use crate::shared::transformer::InternalLogits;
 
 #[derive(Debug, Clone)]
@@ -99,7 +99,7 @@ mod tests {
         AuthenticatedDecodeSelectLogitsSource, DecodeSelectLogitRequest,
         DecodeSelectLogitsMetadataRequest,
     };
-    use crate::raster_authoring::AuthRead;
+    use crate::shared::artifact_io::AuthRead;
     use crate::shared::{det_num::Act, transformer::InternalLogits};
 
     #[test]

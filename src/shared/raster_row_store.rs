@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 
-use crate::raster_authoring::AuthRead;
+use crate::shared::artifact_io::AuthRead;
 use crate::shared::raster_transformer_kernels::{
     RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
 };

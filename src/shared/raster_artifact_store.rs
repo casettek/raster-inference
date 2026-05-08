@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashMap};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 
 use crate::shared::merkle::{merkle_proof, merkle_root, verify_merkle_proof, MerkleProof};
 use crate::shared::raster_transformer_kernels::RasterActivationRow;
@@ -453,6 +453,17 @@ impl RasterArtifactStore {
         Ok(())
     }
 
+    pub fn append_leaf_by_builder_root(
+        &mut self,
+        builder_root: &str,
+        leaf_idx: usize,
+        payload: Vec<u8>,
+    ) -> Result<String> {
+        let mut builder_ref = self.builder_ref_for_root(builder_root)?;
+        self.append_leaf(&mut builder_ref, leaf_idx, payload)?;
+        Ok(builder_ref.running_root().to_string())
+    }
+
     pub fn append_activation_row(
         &mut self,
         builder_ref: &mut RasterArtifactBuilderRef,
@@ -473,6 +484,11 @@ impl RasterArtifactStore {
             );
         }
         self.append_leaf(builder_ref, row_idx, activation_row_leaf(row))
+    }
+
+    pub fn finalize_builder_by_root(&mut self, builder_root: &str) -> Result<RasterArtifactRef> {
+        let builder_ref = self.builder_ref_for_root(builder_root)?;
+        self.finalize_builder(builder_ref)
     }
 
     pub fn finalize_builder(
@@ -535,6 +551,43 @@ impl RasterArtifactStore {
             leaf_idx,
             payload,
             proof,
+        })
+    }
+
+    pub fn artifact_ref_for_root(&self, root: &str) -> Result<RasterArtifactRef> {
+        let mut matches = self.artifacts.iter().filter_map(|(id, artifact)| {
+            let actual_root = artifact_root(&artifact.metadata, &artifact.leaves);
+            (actual_root == root).then_some((id, artifact))
+        });
+        let Some((id, artifact)) = matches.next() else {
+            bail!("raster artifact root {root} is not registered");
+        };
+        if matches.next().is_some() {
+            bail!("raster artifact root {root} matches multiple registered artifacts");
+        }
+        Ok(RasterArtifactRef {
+            id: id.clone(),
+            metadata: artifact.metadata.clone(),
+            root: root.to_string(),
+        })
+    }
+
+    fn builder_ref_for_root(&self, root: &str) -> Result<RasterArtifactBuilderRef> {
+        let mut matches = self.builders.iter().filter_map(|(id, state)| {
+            let running_root = artifact_root(&state.metadata, &state.leaves);
+            (running_root == root).then_some((id, state, running_root))
+        });
+        let Some((id, state, running_root)) = matches.next() else {
+            bail!("raster artifact builder root {root} is not registered");
+        };
+        if matches.next().is_some() {
+            bail!("raster artifact builder root {root} matches multiple registered builders");
+        }
+        Ok(RasterArtifactBuilderRef {
+            id: id.clone(),
+            metadata: state.metadata.clone(),
+            leaves_written: state.leaves.len(),
+            running_root,
         })
     }
 
@@ -631,12 +684,28 @@ pub fn append_leaf(
     with_artifact_store(|store| store.append_leaf(builder_ref, leaf_idx, payload))
 }
 
+pub fn append_leaf_by_builder_root(
+    builder_root: &str,
+    leaf_idx: usize,
+    payload: Vec<u8>,
+) -> Result<String> {
+    with_artifact_store(|store| store.append_leaf_by_builder_root(builder_root, leaf_idx, payload))
+}
+
 pub fn finalize_builder(builder_ref: RasterArtifactBuilderRef) -> Result<RasterArtifactRef> {
     with_artifact_store(|store| store.finalize_builder(builder_ref))
 }
 
+pub fn finalize_builder_by_root(builder_root: &str) -> Result<RasterArtifactRef> {
+    with_artifact_store(|store| store.finalize_builder_by_root(builder_root))
+}
+
 pub fn read_leaf(artifact_ref: &RasterArtifactRef, leaf_idx: usize) -> Result<RasterArtifactRead> {
     read_artifact_store(|store| store.read_leaf(artifact_ref, leaf_idx))
+}
+
+pub fn artifact_ref_for_root(root: &str) -> Result<RasterArtifactRef> {
+    read_artifact_store(|store| store.artifact_ref_for_root(root))
 }
 
 pub fn verify_artifact_read(
@@ -659,18 +728,6 @@ pub fn verify_artifact_read(
     )
 }
 
-pub fn token_id_leaf(token_id: u32) -> Vec<u8> {
-    token_id.to_le_bytes().to_vec()
-}
-
-pub fn bpe_piece_leaf(piece: &str) -> Vec<u8> {
-    let bytes = piece.as_bytes();
-    let mut payload = Vec::with_capacity(8 + bytes.len());
-    payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    payload.extend_from_slice(bytes);
-    payload
-}
-
 pub fn activation_row_leaf(row: &RasterActivationRow) -> Vec<u8> {
     let mut payload = Vec::with_capacity(8 + row.width() * std::mem::size_of::<i32>());
     payload.extend_from_slice(&(row.width() as u64).to_le_bytes());
@@ -678,29 +735,6 @@ pub fn activation_row_leaf(row: &RasterActivationRow) -> Vec<u8> {
         payload.extend_from_slice(&bits.to_le_bytes());
     }
     payload
-}
-
-pub fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
-    let bytes: [u8; 4] = payload
-        .try_into()
-        .context("token-id leaf payload must be exactly four bytes")?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-pub fn decode_bpe_piece_leaf(payload: &[u8]) -> Result<String> {
-    if payload.len() < 8 {
-        bail!("BPE piece leaf payload is too short");
-    }
-    let len = u64::from_le_bytes(
-        payload[0..8]
-            .try_into()
-            .expect("slice length checked above"),
-    ) as usize;
-    let bytes = &payload[8..];
-    if bytes.len() != len {
-        bail!("BPE piece leaf length mismatch: {} vs {len}", bytes.len());
-    }
-    String::from_utf8(bytes.to_vec()).context("BPE piece leaf is not valid UTF-8")
 }
 
 fn artifact_ref(id: RasterArtifactId, state: &ArtifactBuilderState) -> RasterArtifactRef {
@@ -752,6 +786,43 @@ mod tests {
 
     fn artifact_id(name: &str) -> RasterArtifactId {
         RasterArtifactId::new(name).expect("artifact id")
+    }
+
+    fn token_id_leaf(token_id: u32) -> Vec<u8> {
+        token_id.to_le_bytes().to_vec()
+    }
+
+    fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
+        if payload.len() != 4 {
+            bail!("token-id leaf payload must be exactly four bytes");
+        }
+        Ok(u32::from_le_bytes(
+            payload.try_into().expect("payload length checked above"),
+        ))
+    }
+
+    fn bpe_piece_leaf(piece: &str) -> Vec<u8> {
+        let bytes = piece.as_bytes();
+        let mut payload = Vec::with_capacity(8 + bytes.len());
+        payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        payload.extend_from_slice(bytes);
+        payload
+    }
+
+    fn decode_bpe_piece_leaf(payload: &[u8]) -> Result<String> {
+        if payload.len() < 8 {
+            bail!("BPE piece leaf payload is too short");
+        }
+        let len = u64::from_le_bytes(
+            payload[0..8]
+                .try_into()
+                .expect("slice length checked above"),
+        ) as usize;
+        let bytes = &payload[8..];
+        if bytes.len() != len {
+            bail!("BPE piece leaf length mismatch: {} vs {len}", bytes.len());
+        }
+        String::from_utf8(bytes.to_vec()).map_err(Into::into)
     }
 
     fn start_token_builder(
@@ -866,6 +937,45 @@ mod tests {
         let read = store.read_leaf(&artifact_ref, 1).expect("read");
         assert_eq!(read.payload(), b"b");
         verify_artifact_read(&artifact_ref, &read).expect("read should verify");
+    }
+
+    #[test]
+    fn resolves_artifact_ref_by_root() {
+        let mut store = RasterArtifactStore::new();
+        let mut builder = start_token_builder(&mut store, "tokens", 1);
+        append_token_id(&mut store, &mut builder, 0, 17).expect("token");
+        let token_ref = finalize_token_builder(&mut store, builder);
+
+        let resolved = store
+            .artifact_ref_for_root(token_ref.root())
+            .expect("root should resolve");
+
+        assert_eq!(resolved, *token_ref.artifact_ref());
+    }
+
+    #[test]
+    fn appends_and_finalizes_builder_by_root() {
+        let mut store = RasterArtifactStore::new();
+        let builder = start_token_builder(&mut store, "tokens", 2);
+        let builder_root = builder.running_root().to_string();
+
+        let builder_root = store
+            .append_leaf_by_builder_root(&builder_root, 0, token_id_leaf(17))
+            .expect("first token append should update root");
+        let builder_root = store
+            .append_leaf_by_builder_root(&builder_root, 1, token_id_leaf(23))
+            .expect("second token append should update root");
+        let token_ref = RasterTokenIdSequenceRef::new(
+            store
+                .finalize_builder_by_root(&builder_root)
+                .expect("builder root should finalize"),
+        )
+        .expect("typed token ref");
+
+        assert_eq!(
+            materialize_token_ids(&store, &token_ref).expect("token ids"),
+            vec![17, 23]
+        );
     }
 
     #[test]

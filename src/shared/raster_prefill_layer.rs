@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::raster_authoring::AuthRead;
+use crate::shared::artifact_io::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
 use crate::shared::transformer::{

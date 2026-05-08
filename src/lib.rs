@@ -322,11 +322,10 @@ pub fn run_inference_with_controls(
                     trace::trace_checkpoint(
                         "prompt.prepare",
                         &json!({
-                            "prompt_bytes_ref": raster_prompt_preparation.state.prompt_bytes_ref.clone(),
-                            "prompt_text_ref": raster_prompt_preparation.state.prompt_text_ref.clone(),
-                            "rendered_prompt_ref": raster_prompt_preparation.state.rendered_prompt_ref.clone(),
-                            "normalized_prompt_ref": raster_prompt_preparation.state.normalized_prompt_ref.clone(),
-                            "prompt_token_ids_ref": raster_prompt_preparation.state.prompt_token_ids_ref.clone(),
+                            "prompt_bytes_root": raster_prompt_preparation.state.prompt_bytes_root.clone(),
+                            "prompt_text_root": raster_prompt_preparation.state.prompt_text_root.clone(),
+                            "rendered_prompt_root": raster_prompt_preparation.state.rendered_prompt_root.clone(),
+                            "normalized_prompt_root": raster_prompt_preparation.state.normalized_prompt_root.clone(),
                             "prompt_token_count": raster_prompt_preparation.state.prompt_token_count,
                             "prompt_token_ids_root": raster_prompt_preparation.state.prompt_token_ids_root.clone(),
                             "sampling": request.sampling.clone(),
@@ -836,10 +835,7 @@ mod tests {
             InferenceRunOutcome::RasterPromptPrepared(state) => {
                 assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
                 assert_eq!(state.prompt_preparation.prompt_token_count, 1);
-                assert_eq!(
-                    state.prompt_preparation.prompt_token_ids_root,
-                    state.prompt_preparation.prompt_token_ids_ref.root()
-                );
+                assert!(!state.prompt_preparation.prompt_token_ids_root.is_empty());
             }
             InferenceRunOutcome::Completed(_) | InferenceRunOutcome::Paused(_) => {
                 panic!("expected raster prompt boundary")

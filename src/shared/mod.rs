@@ -1,4 +1,6 @@
+pub mod artifact_io;
 pub mod det_num;
+pub mod external_artifacts;
 pub mod gemma_tokenizer;
 pub mod input;
 pub mod merkle;

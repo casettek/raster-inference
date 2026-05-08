@@ -3,7 +3,7 @@ use std::fs::File;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::auth_read;
-use crate::raster_authoring::AuthRead;
+use crate::shared::artifact_io::AuthRead;
 use crate::shared::det_num::{
     acc_add_sat, act_to_f32, add_sat, attention_score as det_attention_score,
     attention_softmax as det_attention_softmax, attention_softmax_exp_term,
@@ -3424,7 +3424,7 @@ mod tests {
         rms_norm_sequence, scale_sequence, value_rms_norm_heads, RasterActivationRow,
         RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
     };
-    use crate::raster_authoring::AuthRead;
+    use crate::shared::artifact_io::AuthRead;
     use crate::shared::det_num::{
         add_sat, attention_score, attention_softmax, attention_weighted_sum, gelu_pytorch_tanh_act,
         mul_sat, rms_norm, rope_rotate_pairs, scale_act, value_rms_norm, Acc, Act, Wgt,

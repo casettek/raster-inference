@@ -1,5 +1,6 @@
 use std::{cell::Cell, marker::PhantomData};
 
+pub use crate::shared::artifact_io::{auth_read, AuthRead};
 pub use raster_authoring_macros::{sequence, tile};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -42,22 +43,6 @@ impl<T> External<T> {
 
 pub fn external<T>(name: impl Into<String>) -> External<T> {
     External::new(name)
-}
-
-pub trait AuthRead<Request> {
-    type Output;
-
-    fn auth_read(&self, request: Request) -> anyhow::Result<Self::Output>;
-}
-
-pub fn auth_read<Source, Request>(
-    source: &Source,
-    request: Request,
-) -> anyhow::Result<<Source as AuthRead<Request>>::Output>
-where
-    Source: AuthRead<Request> + ?Sized,
-{
-    source.auth_read(request)
 }
 
 thread_local! {
@@ -178,7 +163,7 @@ macro_rules! external {
 #[macro_export]
 macro_rules! auth_read {
     ($source:expr, $request:expr $(,)?) => {
-        $crate::raster_authoring::auth_read($source, $request)
+        $crate::shared::artifact_io::ArtifactIo::auth_read($source, $request)
     };
 }
 

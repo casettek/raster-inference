@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::raster_artifact_store::{RasterArtifactRef, RasterTokenIdSequenceRef};
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
@@ -98,11 +96,10 @@ pub struct PromptPreparationState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RasterPromptPreparationState {
-    pub prompt_bytes_ref: RasterArtifactRef,
-    pub prompt_text_ref: RasterArtifactRef,
-    pub rendered_prompt_ref: RasterArtifactRef,
-    pub normalized_prompt_ref: RasterArtifactRef,
-    pub prompt_token_ids_ref: RasterTokenIdSequenceRef,
-    pub prompt_token_count: usize,
+    pub prompt_bytes_root: String,
+    pub prompt_text_root: String,
+    pub rendered_prompt_root: String,
+    pub normalized_prompt_root: String,
     pub prompt_token_ids_root: String,
+    pub prompt_token_count: usize,
 }

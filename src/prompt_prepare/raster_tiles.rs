@@ -3,8 +3,9 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 
 use crate::raster_authoring::prelude::{
-    auth_read, call_recur_seq_result, call_recur_tile_result, call_seq, call_tile, sequence, tile,
+    call_recur_seq_result, call_recur_tile_result, call_seq, call_tile, sequence, tile,
 };
+use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::gemma_tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest, GemmaBpeOutput,
     GemmaBpeState, GemmaNormalizedText, GemmaPreTokenizedText, GemmaSpecialTokenAtRequest,
@@ -15,8 +16,8 @@ use crate::shared::input::{
     TextDecodingPolicy, TextMessage,
 };
 use crate::shared::raster_artifact_store::{
-    self, RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactRef,
-    RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
+    RasterArtifactId, RasterArtifactMetadata, RasterArtifactRef, RasterBpePieceSequenceRef,
+    RasterTokenIdSequenceRef,
 };
 
 pub const DEFAULT_BPE_PAIRS_PER_TILE: usize = 64;
@@ -58,17 +59,18 @@ pub struct RasterPromptPreparationResult {
     pub state: RasterPromptPreparationState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterTokenizationResult {
-    pub token_ids_ref: RasterTokenIdSequenceRef,
+    pub token_ids_root: String,
+    pub token_count: usize,
 }
 
 #[derive(Debug, Clone)]
 struct RasterPromptBootstrap {
-    prompt_bytes_ref: RasterArtifactRef,
-    prompt_text_ref: RasterArtifactRef,
-    rendered_prompt_ref: RasterArtifactRef,
-    normalized_prompt_ref: RasterArtifactRef,
+    prompt_bytes_root: String,
+    prompt_text_root: String,
+    rendered_prompt_root: String,
+    normalized_prompt_root: String,
     bpe_state: GemmaBpeState,
 }
 
@@ -88,7 +90,7 @@ pub struct GemmaBpeScanCandidate {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeScanState {
-    pub pieces_ref: RasterBpePieceSequenceRef,
+    pub pieces_root: String,
     pub piece_count: usize,
     pub next_pair_idx: usize,
     pub best_candidate: Option<GemmaBpeScanCandidate>,
@@ -97,8 +99,8 @@ pub struct GemmaBpeScanState {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeApplyState {
-    pub input_pieces_ref: RasterBpePieceSequenceRef,
-    pub output_builder_ref: RasterArtifactBuilderRef,
+    pub input_pieces_root: String,
+    pub output_builder_root: String,
     pub input_piece_count: usize,
     pub merge_piece_idx: usize,
     pub merged: String,
@@ -112,9 +114,9 @@ pub struct GemmaBpeApplyState {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaTokenIdFinalizeState {
-    pub pieces_ref: RasterBpePieceSequenceRef,
+    pub pieces_root: String,
     pub piece_count: usize,
-    pub token_ids_builder_ref: RasterArtifactBuilderRef,
+    pub token_ids_builder_root: String,
     pub next_piece_idx: usize,
     pub pieces_per_tile: usize,
 }
@@ -183,7 +185,7 @@ pub fn normalize_tokenize_prompt(
     input_ref: &TokenizePromptInput,
     tokenizer_ref: &AuthenticatedGemmaTokenizer,
 ) -> Result<GemmaNormalizedText> {
-    let metadata = auth_read!(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
+    let metadata = ArtifactIo::auth_read(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
 
     Ok(GemmaNormalizedText {
         text: input_ref
@@ -197,7 +199,7 @@ pub fn split_tokenize_prompt(
     normalized: GemmaNormalizedText,
     tokenizer_ref: &AuthenticatedGemmaTokenizer,
 ) -> Result<GemmaPreTokenizedText> {
-    let metadata = auth_read!(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
+    let metadata = ArtifactIo::auth_read(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
     if metadata.split_pattern != " " {
         bail!(
             "Gemma tokenizer split pattern {} is not supported",
@@ -213,7 +215,7 @@ pub fn split_tokenize_prompt(
 
 #[tile]
 pub fn init_artifact_store() {
-    raster_artifact_store::reset_artifact_store();
+    ArtifactIo::reset_store();
 }
 
 pub fn init_bpe_tokenize_prompt(
@@ -223,25 +225,20 @@ pub fn init_bpe_tokenize_prompt(
     bpe_pieces_per_tile: usize,
 ) -> Result<GemmaBpeState> {
     ensure_tokenizer_controls(bpe_pairs_per_tile, bpe_pieces_per_tile)?;
-    let metadata = auth_read!(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
+    let metadata = ArtifactIo::auth_read(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
     let mut pieces = Vec::new();
     for segment in pre_tokenized.segments {
         pieces.extend(initial_bpe_pieces(&segment, tokenizer_ref, &metadata)?);
     }
 
-    let mut pieces_builder = raster_artifact_store::start_builder(
+    let mut pieces_builder = ArtifactIo::start_builder(
         artifact_id("bpe-pieces-0")?,
         RasterArtifactMetadata::open_bpe_pieces(),
     )?;
     for (piece_idx, piece) in pieces.iter().enumerate() {
-        raster_artifact_store::append_leaf(
-            &mut pieces_builder,
-            piece_idx,
-            raster_artifact_store::bpe_piece_leaf(piece),
-        )?;
+        ArtifactIo::append_leaf(&mut pieces_builder, piece_idx, bpe_piece_leaf(piece))?;
     }
-    let pieces_ref =
-        RasterBpePieceSequenceRef::new(raster_artifact_store::finalize_builder(pieces_builder)?)?;
+    let pieces_ref = RasterBpePieceSequenceRef::new(ArtifactIo::finalize_builder(pieces_builder)?)?;
     Ok(GemmaBpeState::new(
         pieces_ref,
         pre_tokenized.add_special_tokens,
@@ -296,25 +293,25 @@ fn bootstrap_raster_prompt(
     )?;
 
     Ok(RasterPromptBootstrap {
-        prompt_bytes_ref,
-        prompt_text_ref,
-        rendered_prompt_ref,
-        normalized_prompt_ref,
+        prompt_bytes_root: prompt_bytes_ref.root().to_string(),
+        prompt_text_root: prompt_text_ref.root().to_string(),
+        rendered_prompt_root: rendered_prompt_ref.root().to_string(),
+        normalized_prompt_root: normalized_prompt_ref.root().to_string(),
         bpe_state,
     })
 }
 
 #[tile]
-pub fn init_bpe_merge_scan(state_ref: &GemmaBpeState) -> Result<GemmaBpeScanState> {
-    if state_ref.bpe_pairs_per_tile == 0 {
+pub fn init_bpe_merge_scan(state: &GemmaBpeState) -> Result<GemmaBpeScanState> {
+    if state.bpe_pairs_per_tile == 0 {
         bail!("raster tokenizer BPE pairs per tile must be greater than zero");
     }
     Ok(GemmaBpeScanState {
-        pieces_ref: state_ref.pieces_ref.clone(),
-        piece_count: state_ref.piece_count,
+        pieces_root: state.pieces_root.clone(),
+        piece_count: state.piece_count,
         next_pair_idx: 0,
         best_candidate: None,
-        bpe_pairs_per_tile: state_ref.bpe_pairs_per_tile,
+        bpe_pairs_per_tile: state.bpe_pairs_per_tile,
     })
 }
 
@@ -336,8 +333,8 @@ pub fn scan_bpe_merge_candidates(
         .saturating_add(state.bpe_pairs_per_tile)
         .min(pair_count);
     for pair_idx in state.next_pair_idx..end_pair_idx {
-        let pair = read_bpe_pair(&state.pieces_ref, pair_idx)?;
-        if let Some(rule) = auth_read!(
+        let pair = read_bpe_pair(&state.pieces_root, state.piece_count, pair_idx)?;
+        if let Some(rule) = ArtifactIo::auth_read(
             tokenizer_ref,
             GemmaBpeMergeRequest {
                 left: &pair.left,
@@ -376,7 +373,7 @@ pub fn finalize_bpe_merge_scan(
     let Some(candidate) = state.best_candidate else {
         return Ok(None);
     };
-    let merged = auth_read!(
+    let merged = ArtifactIo::auth_read(
         tokenizer_ref,
         GemmaBpeMergedTokenRequest {
             merge_index: candidate.merge_index,
@@ -398,37 +395,37 @@ pub fn finalize_bpe_merge_scan(
 
 #[tile]
 pub fn init_apply_bpe_merge(
-    state_ref: &GemmaBpeState,
+    state: &GemmaBpeState,
     selection: GemmaBpeMergeSelection,
 ) -> Result<GemmaBpeApplyState> {
-    if state_ref.bpe_pieces_per_tile == 0 {
+    if state.bpe_pieces_per_tile == 0 {
         bail!("raster tokenizer BPE pieces per tile must be greater than zero");
     }
-    if selection.piece_idx + 1 >= state_ref.piece_count {
+    if selection.piece_idx + 1 >= state.piece_count {
         bail!(
             "BPE merge index {} is out of range for {} pieces",
             selection.piece_idx,
-            state_ref.piece_count
+            state.piece_count
         );
     }
 
-    let output_builder_ref = raster_artifact_store::start_builder(
-        artifact_id(format!("bpe-pieces-{}", state_ref.iteration + 1))?,
+    let output_builder_ref = ArtifactIo::start_builder(
+        artifact_id(format!("bpe-pieces-{}", state.iteration + 1))?,
         RasterArtifactMetadata::open_bpe_pieces(),
     )?;
 
     Ok(GemmaBpeApplyState {
-        input_pieces_ref: state_ref.pieces_ref.clone(),
-        output_builder_ref,
-        input_piece_count: state_ref.piece_count,
+        input_pieces_root: state.pieces_root.clone(),
+        output_builder_root: output_builder_ref.running_root().to_string(),
+        input_piece_count: state.piece_count,
         merge_piece_idx: selection.piece_idx,
         merged: selection.merged,
         input_cursor: 0,
         output_cursor: 0,
-        add_special_tokens: state_ref.add_special_tokens,
-        iteration: state_ref.iteration,
-        bpe_pairs_per_tile: state_ref.bpe_pairs_per_tile,
-        bpe_pieces_per_tile: state_ref.bpe_pieces_per_tile,
+        add_special_tokens: state.add_special_tokens,
+        iteration: state.iteration,
+        bpe_pairs_per_tile: state.bpe_pairs_per_tile,
+        bpe_pieces_per_tile: state.bpe_pieces_per_tile,
     })
 }
 
@@ -449,21 +446,21 @@ pub fn apply_bpe_merge_chunk(mut state: GemmaBpeApplyState) -> Result<(bool, Gem
         .min(max_output_cursor);
     while state.output_cursor < output_limit {
         if state.input_cursor == state.merge_piece_idx {
-            raster_artifact_store::append_leaf(
-                &mut state.output_builder_ref,
+            state.output_builder_root = ArtifactIo::append_leaf_by_builder_root(
+                &state.output_builder_root,
                 state.output_cursor,
-                raster_artifact_store::bpe_piece_leaf(&state.merged),
+                bpe_piece_leaf(&state.merged),
             )?;
             state.input_cursor += 2;
             state.output_cursor += 1;
             continue;
         }
 
-        let piece = read_bpe_piece(&state.input_pieces_ref, state.input_cursor)?;
-        raster_artifact_store::append_leaf(
-            &mut state.output_builder_ref,
+        let piece = read_bpe_piece(&state.input_pieces_root, state.input_cursor)?;
+        state.output_builder_root = ArtifactIo::append_leaf_by_builder_root(
+            &state.output_builder_root,
             state.output_cursor,
-            raster_artifact_store::bpe_piece_leaf(&piece),
+            bpe_piece_leaf(&piece),
         )?;
         state.input_cursor += 1;
         state.output_cursor += 1;
@@ -481,8 +478,8 @@ pub fn finalize_apply_bpe_merge(state: GemmaBpeApplyState) -> Result<GemmaBpeSta
             state.output_cursor
         );
     }
-    let pieces_ref = RasterBpePieceSequenceRef::new(raster_artifact_store::finalize_builder(
-        state.output_builder_ref,
+    let pieces_ref = RasterBpePieceSequenceRef::new(ArtifactIo::finalize_builder_by_root(
+        &state.output_builder_root,
     )?)?;
     let mut next_state = GemmaBpeState::new(
         pieces_ref,
@@ -517,14 +514,14 @@ pub fn finalize_bpe_tokenize_prompt(state: GemmaBpeState) -> Result<GemmaBpeOutp
 
 #[tile]
 pub fn init_token_id_finalization(output: GemmaBpeOutput) -> Result<GemmaTokenIdFinalizeState> {
-    let token_ids_builder_ref = raster_artifact_store::start_builder(
+    let token_ids_builder_ref = ArtifactIo::start_builder(
         artifact_id("prompt-token-ids")?,
         RasterArtifactMetadata::open_token_ids(),
     )?;
     Ok(GemmaTokenIdFinalizeState {
-        pieces_ref: output.pieces_ref,
+        pieces_root: output.pieces_root,
         piece_count: output.piece_count,
-        token_ids_builder_ref,
+        token_ids_builder_root: token_ids_builder_ref.running_root().to_string(),
         next_piece_idx: 0,
         pieces_per_tile: output.bpe_pieces_per_tile,
     })
@@ -547,13 +544,13 @@ pub fn finalize_next_token_ids(
         .saturating_add(state.pieces_per_tile)
         .min(state.piece_count);
     for piece_idx in state.next_piece_idx..end_piece_idx {
-        let piece = read_bpe_piece(&state.pieces_ref, piece_idx)?;
-        let token_id = auth_read!(tokenizer_ref, GemmaTokenIdRequest { token: &piece })?
+        let piece = read_bpe_piece(&state.pieces_root, piece_idx)?;
+        let token_id = ArtifactIo::auth_read(tokenizer_ref, GemmaTokenIdRequest { token: &piece })?
             .with_context(|| format!("Gemma tokenizer piece {piece:?} is missing from vocab"))?;
-        raster_artifact_store::append_leaf(
-            &mut state.token_ids_builder_ref,
+        state.token_ids_builder_root = ArtifactIo::append_leaf_by_builder_root(
+            &state.token_ids_builder_root,
             piece_idx,
-            raster_artifact_store::token_id_leaf(token_id),
+            token_id_leaf(token_id),
         )?;
     }
     state.next_piece_idx = end_piece_idx;
@@ -564,7 +561,7 @@ pub fn finalize_next_token_ids(
 #[tile]
 pub fn finalize_tokenize_prompt(
     state: GemmaTokenIdFinalizeState,
-) -> Result<RasterTokenIdSequenceRef> {
+) -> Result<RasterTokenizationResult> {
     if state.next_piece_idx != state.piece_count {
         bail!(
             "token-id finalization stopped at piece {}, expected {}",
@@ -572,9 +569,13 @@ pub fn finalize_tokenize_prompt(
             state.piece_count
         );
     }
-    RasterTokenIdSequenceRef::new(raster_artifact_store::finalize_builder(
-        state.token_ids_builder_ref,
-    )?)
+    let token_ids_ref = RasterTokenIdSequenceRef::new(ArtifactIo::finalize_builder_by_root(
+        &state.token_ids_builder_root,
+    )?)?;
+    Ok(RasterTokenizationResult {
+        token_ids_root: token_ids_ref.root().to_string(),
+        token_count: token_ids_ref.token_count(),
+    })
 }
 
 struct BpePair {
@@ -582,23 +583,25 @@ struct BpePair {
     right: String,
 }
 
-fn read_bpe_piece(pieces_ref: &RasterBpePieceSequenceRef, piece_idx: usize) -> Result<String> {
-    let read = raster_artifact_store::read_leaf(pieces_ref.artifact_ref(), piece_idx)?;
-    raster_artifact_store::verify_artifact_read(pieces_ref.artifact_ref(), &read)?;
-    raster_artifact_store::decode_bpe_piece_leaf(read.payload())
+fn read_bpe_piece(pieces_root: &str, piece_idx: usize) -> Result<String> {
+    let pieces_ref =
+        RasterBpePieceSequenceRef::new(ArtifactIo::artifact_ref_for_root(pieces_root)?)?;
+    let read = ArtifactIo::read_leaf(pieces_ref.artifact_ref(), piece_idx)?;
+    ArtifactIo::verify_artifact_read(pieces_ref.artifact_ref(), &read)?;
+    decode_bpe_piece_leaf(read.payload())
 }
 
-fn read_bpe_pair(pieces_ref: &RasterBpePieceSequenceRef, pair_idx: usize) -> Result<BpePair> {
-    if pair_idx >= pieces_ref.piece_count().saturating_sub(1) {
+fn read_bpe_pair(pieces_root: &str, piece_count: usize, pair_idx: usize) -> Result<BpePair> {
+    if pair_idx >= piece_count.saturating_sub(1) {
         bail!(
             "BPE pair {} is out of range for {} pieces",
             pair_idx,
-            pieces_ref.piece_count()
+            piece_count
         );
     }
     Ok(BpePair {
-        left: read_bpe_piece(pieces_ref, pair_idx)?,
-        right: read_bpe_piece(pieces_ref, pair_idx + 1)?,
+        left: read_bpe_piece(pieces_root, pair_idx)?,
+        right: read_bpe_piece(pieces_root, pair_idx + 1)?,
     })
 }
 
@@ -609,7 +612,7 @@ fn store_byte_artifact(
     bytes: &[u8],
 ) -> Result<RasterArtifactRef> {
     let leaves = bytes.iter().map(|byte| vec![*byte]).collect::<Vec<_>>();
-    raster_artifact_store::insert_artifact(
+    ArtifactIo::insert_artifact(
         artifact_id(name)?,
         RasterArtifactMetadata::open(kind, domain, Vec::new())?,
         leaves,
@@ -623,7 +626,7 @@ fn store_text_artifact(
     text: &str,
 ) -> Result<RasterArtifactRef> {
     let leaves = text.chars().map(text_char_leaf).collect::<Vec<_>>();
-    raster_artifact_store::insert_artifact(
+    ArtifactIo::insert_artifact(
         artifact_id(name)?,
         RasterArtifactMetadata::open(kind, domain, Vec::new())?,
         leaves,
@@ -633,7 +636,35 @@ fn store_text_artifact(
 fn text_char_leaf(ch: char) -> Vec<u8> {
     let mut buffer = [0; 4];
     let text = ch.encode_utf8(&mut buffer);
-    raster_artifact_store::bpe_piece_leaf(text)
+    bpe_piece_leaf(text)
+}
+
+fn token_id_leaf(token_id: u32) -> Vec<u8> {
+    token_id.to_le_bytes().to_vec()
+}
+
+fn bpe_piece_leaf(piece: &str) -> Vec<u8> {
+    let bytes = piece.as_bytes();
+    let mut payload = Vec::with_capacity(8 + bytes.len());
+    payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+fn decode_bpe_piece_leaf(payload: &[u8]) -> Result<String> {
+    if payload.len() < 8 {
+        bail!("BPE piece leaf payload is too short");
+    }
+    let len = u64::from_le_bytes(
+        payload[0..8]
+            .try_into()
+            .expect("slice length checked above"),
+    ) as usize;
+    let bytes = &payload[8..];
+    if bytes.len() != len {
+        bail!("BPE piece leaf length mismatch: {} vs {len}", bytes.len());
+    }
+    String::from_utf8(bytes.to_vec()).context("BPE piece leaf is not valid UTF-8")
 }
 
 fn split_merged_with_previous(text_ref: &str, pattern_ref: &str) -> Vec<String> {
@@ -667,7 +698,7 @@ fn initial_bpe_pieces(
     let mut byte_idx = 0;
 
     while byte_idx < segment_ref.len() {
-        if let Some(token) = auth_read!(
+        if let Some(token) = ArtifactIo::auth_read(
             tokenizer_ref,
             GemmaSpecialTokenAtRequest {
                 input: segment_ref,
@@ -684,7 +715,7 @@ fn initial_bpe_pieces(
             .next()
             .expect("byte_idx should point at a char boundary");
         let piece = ch.to_string();
-        if auth_read!(tokenizer_ref, GemmaTokenIdRequest { token: &piece })?.is_some() {
+        if ArtifactIo::auth_read(tokenizer_ref, GemmaTokenIdRequest { token: &piece })?.is_some() {
             pieces.push(piece);
         } else if metadata_ref.byte_fallback {
             for byte in piece.as_bytes() {
@@ -752,8 +783,7 @@ pub fn tokenize_prompt_with_controls(
     let token_id_state = call_tile!(init_token_id_finalization, output)?;
     let token_id_state =
         call_recur_tile_result!(finalize_next_token_ids, token_id_state, tokenizer_ref)?;
-    let token_ids_ref = call_tile!(finalize_tokenize_prompt, token_id_state)?;
-    Ok(RasterTokenizationResult { token_ids_ref })
+    call_tile!(finalize_tokenize_prompt, token_id_state)
 }
 
 pub fn build_prompt_commitment(prompt_token_ids_ref: &[u32]) -> Result<String> {
@@ -765,29 +795,26 @@ pub fn build_prompt_commitment(prompt_token_ids_ref: &[u32]) -> Result<String> {
 }
 
 #[tile]
-pub fn build_prompt_commitment_from_ref(
-    token_ids_ref: &RasterTokenIdSequenceRef,
-) -> Result<String> {
-    Ok(token_ids_ref.root().to_string())
+pub fn build_prompt_commitment_from_root(token_ids_root: &str) -> Result<String> {
+    Ok(token_ids_root.to_string())
 }
 
 #[tile]
 pub fn finalize_raster_prompt_preparation(
-    prompt_bytes_ref: RasterArtifactRef,
-    prompt_text_ref: RasterArtifactRef,
-    rendered_prompt_ref: RasterArtifactRef,
-    normalized_prompt_ref: RasterArtifactRef,
-    prompt_token_ids_ref: RasterTokenIdSequenceRef,
+    prompt_bytes_root: String,
+    prompt_text_root: String,
+    rendered_prompt_root: String,
+    normalized_prompt_root: String,
     prompt_token_ids_root: String,
+    prompt_token_count: usize,
 ) -> Result<RasterPromptPreparationState> {
     Ok(RasterPromptPreparationState {
-        prompt_bytes_ref,
-        prompt_text_ref,
-        rendered_prompt_ref,
-        normalized_prompt_ref,
-        prompt_token_count: prompt_token_ids_ref.token_count(),
-        prompt_token_ids_ref,
+        prompt_bytes_root,
+        prompt_text_root,
+        rendered_prompt_root,
+        normalized_prompt_root,
         prompt_token_ids_root,
+        prompt_token_count,
     })
 }
 
@@ -832,24 +859,27 @@ pub fn run_with_tokenizer_controls(
     let token_id_state = call_tile!(init_token_id_finalization, output)?;
     let token_id_state =
         call_recur_tile_result!(finalize_next_token_ids, token_id_state, tokenizer_ref)?;
-    let token_ids_ref = call_tile!(finalize_tokenize_prompt, token_id_state)?;
-    let prompt_token_ids_root = call_tile!(build_prompt_commitment_from_ref, &token_ids_ref)?;
+    let tokenization = call_tile!(finalize_tokenize_prompt, token_id_state)?;
+    let prompt_token_ids_root = call_tile!(
+        build_prompt_commitment_from_root,
+        &tokenization.token_ids_root
+    )?;
 
     let state = call_tile!(
         finalize_raster_prompt_preparation,
-        bootstrap.prompt_bytes_ref,
-        bootstrap.prompt_text_ref,
-        bootstrap.rendered_prompt_ref,
-        bootstrap.normalized_prompt_ref,
-        token_ids_ref,
-        prompt_token_ids_root
+        bootstrap.prompt_bytes_root,
+        bootstrap.prompt_text_root,
+        bootstrap.rendered_prompt_root,
+        bootstrap.normalized_prompt_root,
+        prompt_token_ids_root,
+        tokenization.token_count
     )?;
     Ok(RasterPromptPreparationResult { state })
 }
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
     use super::{
         build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes,
@@ -918,14 +948,14 @@ mod tests {
     }
 
     #[test]
-    fn finalize_tokenize_prompt_returns_token_id_ref() {
+    fn finalize_tokenize_prompt_returns_token_id_root() {
         let tokenizer = test_tokenizer_source();
         super::init_artifact_store();
         let pieces_ref =
             insert_bpe_piece_sequence_for_test("pieces", vec!["a".to_string(), "ab".to_string()])
                 .expect("pieces should insert");
         let mut state = init_token_id_finalization(GemmaBpeOutput {
-            pieces_ref,
+            pieces_root: pieces_ref.root().to_string(),
             piece_count: 2,
             add_special_tokens: false,
             bpe_pieces_per_tile: 1,
@@ -939,19 +969,24 @@ mod tests {
                 break;
             }
         }
-        let token_ids_ref = finalize_tokenize_prompt(state).expect("token ids should finalize");
+        let tokenization = finalize_tokenize_prompt(state).expect("token ids should finalize");
         let token_ids =
-            materialize_token_ids(&token_ids_ref).expect("token ids should materialize");
+            materialize_token_ids(&tokenization.token_ids_root, tokenization.token_count)
+                .expect("token ids should materialize");
 
         assert_eq!(token_ids, vec![1, 3]);
+        let serialized =
+            serde_json::to_string(&tokenization).expect("tokenization should serialize");
+        assert!(!serialized.contains("token_ids_ref"));
     }
 
     #[test]
     fn tokenize_prompt_applies_recursive_bpe_merges() {
         let tokenization =
             tokenize_prompt("ab", &test_tokenizer_source(), false).expect("prompt should tokenize");
-        let token_ids = materialize_token_ids(&tokenization.token_ids_ref)
-            .expect("token ids should materialize");
+        let token_ids =
+            materialize_token_ids(&tokenization.token_ids_root, tokenization.token_count)
+                .expect("token ids should materialize");
 
         assert_eq!(token_ids, vec![3]);
     }
@@ -974,8 +1009,10 @@ mod tests {
         let serialized = serde_json::to_string(&state).expect("state should serialize");
         assert!(!serialized.contains(r#""a""#));
         assert!(!serialized.contains(r#""b""#));
+        assert!(!serialized.contains("pieces_ref"));
         assert_eq!(
-            materialize_bpe_pieces(&state.pieces_ref).expect("pieces should materialize"),
+            materialize_bpe_pieces(&state.pieces_root, state.piece_count)
+                .expect("pieces should materialize"),
             vec!["a", "b"]
         );
     }
@@ -984,8 +1021,9 @@ mod tests {
     fn tokenize_prompt_uses_byte_fallback_for_unknown_chars() {
         let tokenization =
             tokenize_prompt("é", &test_tokenizer_source(), false).expect("prompt should tokenize");
-        let token_ids = materialize_token_ids(&tokenization.token_ids_ref)
-            .expect("token ids should materialize");
+        let token_ids =
+            materialize_token_ids(&tokenization.token_ids_root, tokenization.token_count)
+                .expect("token ids should materialize");
 
         assert_eq!(token_ids, vec![10, 11]);
     }
@@ -998,16 +1036,18 @@ mod tests {
         let larger_chunks =
             tokenize_prompt_with_controls("aba", &tokenizer, false, 8, 8).expect("larger chunks");
 
-        let tiny_token_ids = materialize_token_ids(&tiny_chunks.token_ids_ref)
-            .expect("tiny token ids should materialize");
-        let larger_token_ids = materialize_token_ids(&larger_chunks.token_ids_ref)
-            .expect("larger token ids should materialize");
+        let tiny_token_ids =
+            materialize_token_ids(&tiny_chunks.token_ids_root, tiny_chunks.token_count)
+                .expect("tiny token ids should materialize");
+        let larger_token_ids =
+            materialize_token_ids(&larger_chunks.token_ids_root, larger_chunks.token_count)
+                .expect("larger token ids should materialize");
         assert_eq!(tiny_token_ids, larger_token_ids);
         assert_eq!(tiny_token_ids, vec![12]);
     }
 
     #[test]
-    fn run_with_tokenizer_controls_returns_ref_backed_prompt_state() {
+    fn run_with_tokenizer_controls_returns_root_backed_prompt_state() {
         let request = crate::shared::input::InferenceRequest {
             prompt_bytes: b"ab".to_vec(),
             text_decoding_policy: TextDecodingPolicy::Utf8,
@@ -1028,17 +1068,18 @@ mod tests {
 
         let result = run_with_tokenizer_controls(&request, &model, &test_tokenizer_source(), 1, 1)
             .expect("raster prompt refs should build");
-        let token_ids = materialize_token_ids(&result.state.prompt_token_ids_ref)
-            .expect("token ids should materialize for test assertions");
+        let token_ids = materialize_token_ids(
+            &result.state.prompt_token_ids_root,
+            result.state.prompt_token_count,
+        )
+        .expect("token ids should materialize for test assertions");
         let serialized = serde_json::to_string(&result.state).expect("state should serialize");
 
         assert_eq!(token_ids, vec![3]);
         assert_eq!(result.state.prompt_token_count, 1);
-        assert_eq!(
-            result.state.prompt_token_ids_root,
-            result.state.prompt_token_ids_ref.root()
-        );
         assert!(!serialized.contains("prompt_token_ids\":["));
+        assert!(!serialized.contains("prompt_token_ids_ref"));
+        assert!(!serialized.contains("prompt_bytes_ref"));
     }
 
     #[test]
@@ -1063,27 +1104,37 @@ mod tests {
             raster_artifact_store::append_leaf(
                 &mut builder,
                 piece_idx,
-                raster_artifact_store::bpe_piece_leaf(piece),
+                super::bpe_piece_leaf(piece),
             )?;
         }
         RasterBpePieceSequenceRef::new(raster_artifact_store::finalize_builder(builder)?)
     }
 
-    fn materialize_bpe_pieces(pieces_ref: &RasterBpePieceSequenceRef) -> Result<Vec<String>> {
-        (0..pieces_ref.piece_count())
-            .map(|piece_idx| super::read_bpe_piece(pieces_ref, piece_idx))
+    fn materialize_bpe_pieces(pieces_root: &str, piece_count: usize) -> Result<Vec<String>> {
+        (0..piece_count)
+            .map(|piece_idx| super::read_bpe_piece(pieces_root, piece_idx))
             .collect()
     }
 
-    fn materialize_token_ids(token_ids_ref: &RasterTokenIdSequenceRef) -> Result<Vec<u32>> {
-        (0..token_ids_ref.token_count())
+    fn materialize_token_ids(token_ids_root: &str, token_count: usize) -> Result<Vec<u32>> {
+        let token_ids_ref = RasterTokenIdSequenceRef::new(
+            raster_artifact_store::artifact_ref_for_root(token_ids_root)?,
+        )?;
+        (0..token_count)
             .map(|token_idx| {
                 let read =
                     raster_artifact_store::read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
                 raster_artifact_store::verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
-                raster_artifact_store::decode_token_id_leaf(read.payload())
+                decode_token_id_leaf(read.payload())
             })
             .collect()
+    }
+
+    fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
+        let bytes: [u8; 4] = payload
+            .try_into()
+            .context("token-id leaf payload must be exactly four bytes")?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn test_tokenizer_source() -> AuthenticatedGemmaTokenizer {
