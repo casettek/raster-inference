@@ -6,7 +6,6 @@ use crate::raster_authoring::prelude::{
     call_recur_seq_result, call_recur_tile_result, call_tile, sequence, tile,
 };
 use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::external_artifacts::{CommittedExternalSource, ExternalSourceRef};
 use crate::shared::gemma_tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest, GemmaBpeOutput,
     GemmaBpeState, GemmaNormalizedText, GemmaPreTokenizedText, GemmaTokenIdRequest,
@@ -71,7 +70,7 @@ pub struct RasterPromptInputRoots {
     pub prompt_text_root: String,
     pub rendered_prompt_root: String,
     pub normalized_prompt_root: String,
-    pub tokenizer_source_ref: ExternalSourceRef,
+    pub tokenizer_source_root: String,
     pub bpe_state: GemmaBpeState,
 }
 
@@ -299,14 +298,14 @@ pub fn prepare_raster_prompt_input_roots(
         bpe_pairs_per_tile,
         bpe_pieces_per_tile,
     )?;
-    let tokenizer_source_ref = tokenizer.committed_source_ref()?;
+    let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
 
     Ok(RasterPromptInputRoots {
         prompt_bytes_root: prompt_bytes_ref.root().to_string(),
         prompt_text_root: prompt_text_ref.root().to_string(),
         rendered_prompt_root: rendered_prompt_ref.root().to_string(),
         normalized_prompt_root: normalized_prompt_ref.root().to_string(),
-        tokenizer_source_ref,
+        tokenizer_source_root,
         bpe_state,
     })
 }
@@ -328,7 +327,7 @@ pub fn init_bpe_merge_scan(state: &GemmaBpeState) -> Result<GemmaBpeScanState> {
 #[tile(kind = recursive)]
 pub fn scan_bpe_merge_candidates(
     mut state: GemmaBpeScanState,
-    tokenizer: &CommittedExternalSource,
+    tokenizer_source_root: &str,
 ) -> Result<(bool, GemmaBpeScanState)> {
     let pair_count = state.piece_count.saturating_sub(1);
     if state.next_pair_idx >= pair_count {
@@ -345,7 +344,7 @@ pub fn scan_bpe_merge_candidates(
     for pair_idx in state.next_pair_idx..end_pair_idx {
         let pair = read_bpe_pair(&state.pieces_root, state.piece_count, pair_idx)?;
         if let Some(rule) = ArtifactIo::auth_read(
-            tokenizer,
+            tokenizer_source_root,
             GemmaBpeMergeRequest {
                 left: &pair.left,
                 right: &pair.right,
@@ -371,7 +370,7 @@ pub fn scan_bpe_merge_candidates(
 #[tile]
 pub fn finalize_bpe_merge_scan(
     state: GemmaBpeScanState,
-    tokenizer: &CommittedExternalSource,
+    tokenizer_source_root: &str,
 ) -> Result<Option<GemmaBpeMergeSelection>> {
     let pair_count = state.piece_count.saturating_sub(1);
     if state.next_pair_idx != pair_count {
@@ -384,7 +383,7 @@ pub fn finalize_bpe_merge_scan(
         return Ok(None);
     };
     let merged = ArtifactIo::auth_read(
-        tokenizer,
+        tokenizer_source_root,
         GemmaBpeMergedTokenRequest {
             merge_index: candidate.merge_index,
         },
@@ -504,11 +503,13 @@ pub fn finalize_apply_bpe_merge(state: GemmaBpeApplyState) -> Result<GemmaBpeSta
 #[sequence]
 pub fn merge_bpe_tokenize_prompt(
     state: GemmaBpeState,
-    tokenizer: &CommittedExternalSource,
+    tokenizer_source_root: &str,
 ) -> Result<(bool, GemmaBpeState)> {
     let scan_state = call_tile!(init_bpe_merge_scan, &state)?;
-    let scan_state = call_recur_tile_result!(scan_bpe_merge_candidates, scan_state, tokenizer)?;
-    let Some(selection) = call_tile!(finalize_bpe_merge_scan, scan_state, tokenizer)? else {
+    let scan_state =
+        call_recur_tile_result!(scan_bpe_merge_candidates, scan_state, tokenizer_source_root)?;
+    let Some(selection) = call_tile!(finalize_bpe_merge_scan, scan_state, tokenizer_source_root)?
+    else {
         return Ok((true, state));
     };
     let apply_state = call_tile!(init_apply_bpe_merge, &state, selection)?;
@@ -540,7 +541,7 @@ pub fn init_token_id_finalization(output: GemmaBpeOutput) -> Result<GemmaTokenId
 #[tile(kind = recursive)]
 pub fn finalize_next_token_ids(
     mut state: GemmaTokenIdFinalizeState,
-    tokenizer: &CommittedExternalSource,
+    tokenizer_source_root: &str,
 ) -> Result<(bool, GemmaTokenIdFinalizeState)> {
     if state.pieces_per_tile == 0 {
         bail!("raster tokenizer token-id pieces per tile must be greater than zero");
@@ -555,8 +556,11 @@ pub fn finalize_next_token_ids(
         .min(state.piece_count);
     for piece_idx in state.next_piece_idx..end_piece_idx {
         let piece = read_bpe_piece(&state.pieces_root, piece_idx)?;
-        let token_id = ArtifactIo::auth_read(tokenizer, GemmaTokenIdRequest { token: &piece })?
-            .with_context(|| format!("Gemma tokenizer piece {piece:?} is missing from vocab"))?;
+        let token_id =
+            ArtifactIo::auth_read(tokenizer_source_root, GemmaTokenIdRequest { token: &piece })?
+                .with_context(|| {
+                    format!("Gemma tokenizer piece {piece:?} is missing from vocab")
+                })?;
         state.token_ids_builder_root = ArtifactIo::append_leaf_by_builder_root(
             &state.token_ids_builder_root,
             piece_idx,
@@ -619,21 +623,27 @@ pub fn tokenize_prompt_with_controls(
         bpe_pairs_per_tile,
         bpe_pieces_per_tile,
     )?;
-    let tokenizer_source_ref = tokenizer_ref.committed_source_ref()?;
-    tokenize_bpe_state(state, tokenizer_source_ref)
+    let tokenizer_source_root = tokenizer_ref.committed_source_ref()?.root().to_string();
+    tokenize_bpe_state(state, tokenizer_source_root)
 }
 
 #[sequence]
 pub fn tokenize_bpe_state(
     state: GemmaBpeState,
-    tokenizer_source_ref: ExternalSourceRef,
+    tokenizer_source_root: String,
 ) -> Result<RasterTokenizationResult> {
-    let tokenizer = CommittedExternalSource::new(tokenizer_source_ref);
-    let state = call_recur_seq_result!(merge_bpe_tokenize_prompt, state, &tokenizer)?;
+    let state = call_recur_seq_result!(
+        merge_bpe_tokenize_prompt,
+        state,
+        tokenizer_source_root.as_str()
+    )?;
     let output = call_tile!(finalize_bpe_tokenize_prompt, state)?;
     let token_id_state = call_tile!(init_token_id_finalization, output)?;
-    let token_id_state =
-        call_recur_tile_result!(finalize_next_token_ids, token_id_state, &tokenizer)?;
+    let token_id_state = call_recur_tile_result!(
+        finalize_next_token_ids,
+        token_id_state,
+        tokenizer_source_root.as_str()
+    )?;
     call_tile!(finalize_tokenize_prompt, token_id_state)
 }
 
@@ -704,13 +714,18 @@ pub fn run_with_tokenizer_controls(
 pub fn run_from_input_roots(
     input_roots: RasterPromptInputRoots,
 ) -> Result<RasterPromptPreparationResult> {
-    let tokenizer = CommittedExternalSource::new(input_roots.tokenizer_source_ref);
-    let bpe_state =
-        call_recur_seq_result!(merge_bpe_tokenize_prompt, input_roots.bpe_state, &tokenizer)?;
+    let bpe_state = call_recur_seq_result!(
+        merge_bpe_tokenize_prompt,
+        input_roots.bpe_state,
+        input_roots.tokenizer_source_root.as_str()
+    )?;
     let output = call_tile!(finalize_bpe_tokenize_prompt, bpe_state)?;
     let token_id_state = call_tile!(init_token_id_finalization, output)?;
-    let token_id_state =
-        call_recur_tile_result!(finalize_next_token_ids, token_id_state, &tokenizer)?;
+    let token_id_state = call_recur_tile_result!(
+        finalize_next_token_ids,
+        token_id_state,
+        input_roots.tokenizer_source_root.as_str()
+    )?;
     let tokenization = call_tile!(finalize_tokenize_prompt, token_id_state)?;
     let prompt_token_ids_root = call_tile!(
         build_prompt_commitment_from_root,
@@ -802,9 +817,11 @@ mod tests {
     #[test]
     fn finalize_tokenize_prompt_returns_token_id_root() {
         let tokenizer = test_tokenizer_source();
-        let tokenizer = tokenizer
-            .committed_source()
-            .expect("tokenizer source should commit");
+        let tokenizer_source_root = tokenizer
+            .committed_source_ref()
+            .expect("tokenizer source should commit")
+            .root()
+            .to_string();
         super::init_artifact_store();
         let pieces_ref =
             insert_bpe_piece_sequence_for_test("pieces", vec!["a".to_string(), "ab".to_string()])
@@ -817,8 +834,8 @@ mod tests {
         })
         .expect("token id finalization should init");
         loop {
-            let (done, next_state) =
-                finalize_next_token_ids(state, &tokenizer).expect("token ids should advance");
+            let (done, next_state) = finalize_next_token_ids(state, &tokenizer_source_root)
+                .expect("token ids should advance");
             state = next_state;
             if done {
                 break;

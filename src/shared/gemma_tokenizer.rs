@@ -546,6 +546,54 @@ impl AuthRead<GemmaBpeMergedTokenRequest> for CommittedExternalSource {
     }
 }
 
+impl AuthRead<GemmaTokenizerMetadataRequest> for str {
+    type Output = GemmaTokenizerMetadata;
+
+    fn auth_read(&self, request: GemmaTokenizerMetadataRequest) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaDecoderMetadataRequest> for str {
+    type Output = GemmaDecoderMetadata;
+
+    fn auth_read(&self, request: GemmaDecoderMetadataRequest) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl<'a> AuthRead<GemmaTokenIdRequest<'a>> for str {
+    type Output = Option<u32>;
+
+    fn auth_read(&self, request: GemmaTokenIdRequest<'a>) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaTokenByIdRequest> for str {
+    type Output = Option<GemmaDecodedToken>;
+
+    fn auth_read(&self, request: GemmaTokenByIdRequest) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl<'a> AuthRead<GemmaBpeMergeRequest<'a>> for str {
+    type Output = Option<GemmaBpeMergeCandidate>;
+
+    fn auth_read(&self, request: GemmaBpeMergeRequest<'a>) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaBpeMergedTokenRequest> for str {
+    type Output = Option<String>;
+
+    fn auth_read(&self, request: GemmaBpeMergedTokenRequest) -> Result<Self::Output> {
+        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+    }
+}
+
 thread_local! {
     static NATIVE_COMMITTED_TOKENIZERS: RefCell<HashMap<String, AuthenticatedGemmaTokenizer>> =
         RefCell::new(HashMap::new());

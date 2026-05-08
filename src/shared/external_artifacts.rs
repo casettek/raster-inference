@@ -154,6 +154,12 @@ impl CommittedExternalSource {
         Self { source_ref }
     }
 
+    pub fn from_root(root: &str) -> Result<Self> {
+        Ok(Self {
+            source_ref: external_source_ref_for_root(root)?,
+        })
+    }
+
     pub fn source_ref(&self) -> &ExternalSourceRef {
         &self.source_ref
     }
