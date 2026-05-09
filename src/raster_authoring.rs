@@ -72,9 +72,9 @@ pub fn record_tile_invocation() {
 
 pub mod prelude {
     pub use crate::{
-        auth_read, call_recur_seq, call_recur_seq_result, call_recur_tile, call_recur_tile_result,
-        call_seq, call_tile, external, raster_authoring::sequence, raster_authoring::tile,
-        raster_authoring::AuthRead, raster_authoring::External, raster_authoring::ExternalRef,
+        auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, external,
+        raster_authoring::sequence, raster_authoring::tile, raster_authoring::AuthRead,
+        raster_authoring::External, raster_authoring::ExternalRef,
     };
 }
 
@@ -112,16 +112,6 @@ macro_rules! call_seq {
 
 #[macro_export]
 macro_rules! call_recur_tile {
-    ($tile:ident $(,)?) => {
-        $crate::__raster_authoring_run_recur_tile!($tile)
-    };
-    ($tile:ident, $($args:expr),+ $(,)?) => {
-        $crate::__raster_authoring_run_recur_tile!($tile, $($args),+)
-    };
-}
-
-#[macro_export]
-macro_rules! call_recur_tile_result {
     ($tile:ident, $state:expr $(,)?) => {
         $crate::__raster_authoring_run_recur_tile_result!($tile, $state)
     };
@@ -132,16 +122,6 @@ macro_rules! call_recur_tile_result {
 
 #[macro_export]
 macro_rules! call_recur_seq {
-    ($sequence:ident $(,)?) => {
-        $crate::__raster_authoring_run_recur_sequence!($sequence)
-    };
-    ($sequence:ident, $($args:expr),+ $(,)?) => {
-        $crate::__raster_authoring_run_recur_sequence!($sequence, $($args),+)
-    };
-}
-
-#[macro_export]
-macro_rules! call_recur_seq_result {
     ($sequence:ident, $state:expr $(,)?) => {
         $crate::__raster_authoring_run_recur_sequence_result!($sequence, $state)
     };
@@ -388,24 +368,6 @@ mod tests {
     }
 
     #[tile(kind = recur)]
-    fn count_to(current: u64, goal: u64) -> (bool, u64, u64) {
-        if current >= goal {
-            (true, current, goal)
-        } else {
-            (false, current + 1, goal)
-        }
-    }
-
-    #[tile(kind = recur)]
-    fn double_until_at_least_ten(value: u32) -> (bool, u32) {
-        if value >= 10 {
-            (true, value)
-        } else {
-            (false, value * 2)
-        }
-    }
-
-    #[tile(kind = recur)]
     fn fallible_double_until_at_least_ten(value: u32) -> anyhow::Result<(bool, u32)> {
         if value >= 10 {
             Ok((true, value))
@@ -429,26 +391,6 @@ mod tests {
             anyhow::bail!("step failed");
         }
         Ok((false, value + 1))
-    }
-
-    #[sequence(kind = recur)]
-    fn add_sequence_until_at_least_ten(value: u32) -> (bool, u32) {
-        let value = call_tile!(add_one, value);
-
-        if value >= 10 {
-            (true, value)
-        } else {
-            (false, value)
-        }
-    }
-
-    #[sequence(kind = recur)]
-    fn add_sequence_until_goal(current: u64, goal: u64) -> (bool, u64, u64) {
-        if current >= goal {
-            (true, current, goal)
-        } else {
-            (false, current + 1, goal)
-        }
     }
 
     #[sequence(kind = recur)]
@@ -491,26 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn recursive_tile_macro_runs_until_done_for_single_state() {
-        assert_eq!(call_recur_tile!(double_until_at_least_ten, 2), 16);
-    }
-
-    #[test]
-    fn recursive_tile_macro_runs_until_done_for_tuple_state() {
-        assert_eq!(call_recur_tile!(count_to, 0, 3), (3, 3));
-    }
-
-    #[test]
-    fn recursive_sequence_macro_runs_until_done_for_single_state() {
-        assert_eq!(call_recur_seq!(add_sequence_until_at_least_ten, 7), 10);
-    }
-
-    #[test]
-    fn recursive_sequence_macro_runs_until_done_for_tuple_state() {
-        assert_eq!(call_recur_seq!(add_sequence_until_goal, 0, 3), (3, 3));
-    }
-
-    #[test]
     fn external_macro_creates_typed_reference() {
         let external = external!("seed");
         let external: External<u64> = external;
@@ -539,30 +461,29 @@ mod tests {
     #[test]
     fn fallible_recursive_tile_macro_runs_until_done() {
         let value =
-            call_recur_tile_result!(fallible_double_until_at_least_ten, 2).expect("recursive tile");
+            call_recur_tile!(fallible_double_until_at_least_ten, 2).expect("recursive tile");
 
         assert_eq!(value, 16);
     }
 
     #[test]
     fn fallible_recursive_tile_macro_accepts_context() {
-        let value =
-            call_recur_tile_result!(fallible_count_until_context, 0, 3).expect("recursive tile");
+        let value = call_recur_tile!(fallible_count_until_context, 0, 3).expect("recursive tile");
 
         assert_eq!(value, 3);
     }
 
     #[test]
     fn fallible_recursive_tile_macro_propagates_errors() {
-        let error = call_recur_tile_result!(fallible_step_that_fails, 0)
-            .expect_err("recursive tile should fail");
+        let error =
+            call_recur_tile!(fallible_step_that_fails, 0).expect_err("recursive tile should fail");
 
         assert!(error.to_string().contains("step failed"));
     }
 
     #[test]
     fn fallible_recursive_sequence_macro_runs_until_done() {
-        let value = call_recur_seq_result!(fallible_add_sequence_until_at_least_ten, 7)
+        let value = call_recur_seq!(fallible_add_sequence_until_at_least_ten, 7)
             .expect("recursive sequence");
 
         assert_eq!(value, 10);
@@ -570,15 +491,15 @@ mod tests {
 
     #[test]
     fn fallible_recursive_sequence_macro_accepts_context() {
-        let value = call_recur_seq_result!(fallible_add_sequence_until_goal, 0, 3)
-            .expect("recursive sequence");
+        let value =
+            call_recur_seq!(fallible_add_sequence_until_goal, 0, 3).expect("recursive sequence");
 
         assert_eq!(value, 3);
     }
 
     #[test]
     fn fallible_recursive_sequence_macro_propagates_errors() {
-        let error = call_recur_seq_result!(fallible_sequence_step_that_fails, 0)
+        let error = call_recur_seq!(fallible_sequence_step_that_fails, 0)
             .expect_err("recursive sequence should fail");
 
         assert!(error.to_string().contains("sequence step failed"));
@@ -592,8 +513,14 @@ mod tests {
         super::start_tile_invocation_counting();
         assert_eq!(call_tile!(add_one, 1), 2);
         assert_eq!(call_seq!(add_sequence, 1), 2);
-        assert_eq!(call_recur_tile!(double_until_at_least_ten, 2), 16);
-        assert_eq!(call_recur_seq!(add_sequence_until_goal, 0, 3), (3, 3));
+        assert_eq!(
+            call_recur_tile!(fallible_double_until_at_least_ten, 2).expect("recursive tile"),
+            16
+        );
+        assert_eq!(
+            call_recur_seq!(fallible_add_sequence_until_goal, 0, 3).expect("recursive sequence"),
+            3
+        );
 
         assert_eq!(super::stop_tile_invocation_counting(), Some(11));
         assert_eq!(super::stop_tile_invocation_counting(), None);
@@ -603,8 +530,8 @@ mod tests {
     fn tile_invocation_counter_counts_fallible_failed_step() {
         super::start_tile_invocation_counting();
 
-        let error = call_recur_tile_result!(fallible_step_that_fails, 0)
-            .expect_err("recursive tile should fail");
+        let error =
+            call_recur_tile!(fallible_step_that_fails, 0).expect_err("recursive tile should fail");
 
         assert!(error.to_string().contains("step failed"));
         assert_eq!(super::stop_tile_invocation_counting(), Some(3));
@@ -614,7 +541,7 @@ mod tests {
     fn tile_invocation_counter_counts_fallible_failed_sequence_step() {
         super::start_tile_invocation_counting();
 
-        let error = call_recur_seq_result!(fallible_sequence_step_that_fails, 0)
+        let error = call_recur_seq!(fallible_sequence_step_that_fails, 0)
             .expect_err("recursive sequence should fail");
 
         assert!(error.to_string().contains("sequence step failed"));

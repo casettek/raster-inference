@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::raster_authoring::prelude::{
-    auth_read, call_recur_tile_result, call_seq, call_tile, sequence, tile,
+    auth_read, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
 use crate::shared::det_num::scale_act;
 use crate::shared::raster_prefill_ple::{
@@ -368,7 +368,7 @@ pub fn project_sequence_with_source(
         projection_rows,
         projection_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         project_next_ple_sequence_rows,
         state,
         ple_source,
@@ -394,7 +394,7 @@ pub fn run_refs_with_store(
         ple_source,
         projection_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(compute_next_prefill_ple_layer, state, ple_source, store)?;
+    let state = call_recur_tile!(compute_next_prefill_ple_layer, state, ple_source, store)?;
     call_tile!(finalize_prefill_ple_input_refs, state)
 }
 
@@ -529,7 +529,7 @@ fn build_scaled_token_embedding_sequence_ref(
         scale,
         row_width
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         append_next_scaled_token_embedding_row,
         state,
         ple_source,
@@ -581,7 +581,7 @@ fn project_ple_sequence_with_source_ref(
         projection_rows,
         projection_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         project_next_ple_sequence_rows,
         state,
         ple_source,
@@ -644,7 +644,7 @@ fn compute_sequence_scale_ref(
         scalar,
         1
     )?;
-    let state = call_recur_tile_result!(compute_next_sequence_unary_ref, state, store)?;
+    let state = call_recur_tile!(compute_next_sequence_unary_ref, state, store)?;
     call_tile!(finalize_sequence_unary_ref_state, state, store)
 }
 
@@ -665,7 +665,7 @@ fn compute_sequence_rms_norm_ref(
         eps,
         1
     )?;
-    let state = call_recur_tile_result!(compute_next_sequence_unary_ref, state, store)?;
+    let state = call_recur_tile!(compute_next_sequence_unary_ref, state, store)?;
     call_tile!(finalize_sequence_unary_ref_state, state, store)
 }
 
@@ -711,7 +711,7 @@ fn compute_sequence_add_ref(
         output_id,
         1
     )?;
-    let state = call_recur_tile_result!(compute_next_sequence_binary_ref, state, store)?;
+    let state = call_recur_tile!(compute_next_sequence_binary_ref, state, store)?;
     call_tile!(finalize_sequence_binary_ref_state, state, store)
 }
 

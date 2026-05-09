@@ -3,7 +3,7 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 
 use crate::raster_authoring::prelude::{
-    call_recur_seq_result, call_recur_tile_result, call_tile, sequence, tile,
+    call_recur_seq, call_recur_tile, call_tile, sequence, tile,
 };
 use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::gemma_tokenizer::{
@@ -219,7 +219,6 @@ pub fn split_tokenize_prompt(
     })
 }
 
-#[tile]
 pub fn init_artifact_store() {
     ArtifactIo::reset_store();
 }
@@ -260,7 +259,7 @@ pub fn prepare_raster_prompt_input_roots(
     bpe_pairs_per_tile: usize,
     bpe_pieces_per_tile: usize,
 ) -> Result<RasterPromptInputRoots> {
-    ArtifactIo::reset_store();
+    init_artifact_store();
 
     let prompt_bytes_ref = store_byte_artifact(
         "prompt-bytes",
@@ -507,13 +506,13 @@ pub fn merge_bpe_tokenize_prompt(
 ) -> Result<(bool, GemmaBpeState)> {
     let scan_state = call_tile!(init_bpe_merge_scan, &state)?;
     let scan_state =
-        call_recur_tile_result!(scan_bpe_merge_candidates, scan_state, tokenizer_source_root)?;
+        call_recur_tile!(scan_bpe_merge_candidates, scan_state, tokenizer_source_root)?;
     let Some(selection) = call_tile!(finalize_bpe_merge_scan, scan_state, tokenizer_source_root)?
     else {
         return Ok((true, state));
     };
     let apply_state = call_tile!(init_apply_bpe_merge, &state, selection)?;
-    let apply_state = call_recur_tile_result!(apply_bpe_merge_chunk, apply_state)?;
+    let apply_state = call_recur_tile!(apply_bpe_merge_chunk, apply_state)?;
     let state = call_tile!(finalize_apply_bpe_merge, apply_state)?;
     Ok((false, state))
 }
@@ -613,7 +612,7 @@ pub fn tokenize_prompt_with_controls(
     bpe_pairs_per_tile: usize,
     bpe_pieces_per_tile: usize,
 ) -> Result<RasterTokenizationResult> {
-    ArtifactIo::reset_store();
+    init_artifact_store();
     let input = init_tokenize_prompt(prompt_ref, add_special_tokens)?;
     let normalized = normalize_tokenize_prompt(&input, tokenizer_ref)?;
     let pre_tokenized = split_tokenize_prompt(normalized, tokenizer_ref)?;
@@ -632,14 +631,14 @@ pub fn tokenize_bpe_state(
     state: GemmaBpeState,
     tokenizer_source_root: String,
 ) -> Result<RasterTokenizationResult> {
-    let state = call_recur_seq_result!(
+    let state = call_recur_seq!(
         merge_bpe_tokenize_prompt,
         state,
         tokenizer_source_root.as_str()
     )?;
     let output = call_tile!(finalize_bpe_tokenize_prompt, state)?;
     let token_id_state = call_tile!(init_token_id_finalization, output)?;
-    let token_id_state = call_recur_tile_result!(
+    let token_id_state = call_recur_tile!(
         finalize_next_token_ids,
         token_id_state,
         tokenizer_source_root.as_str()
@@ -683,20 +682,6 @@ pub fn run(
     request: &InferenceRequest,
     model: &ModelSpec,
     tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<RasterPromptPreparationResult> {
-    run_with_tokenizer_controls(
-        request,
-        model,
-        tokenizer,
-        DEFAULT_BPE_PAIRS_PER_TILE,
-        DEFAULT_BPE_PIECES_PER_TILE,
-    )
-}
-
-pub fn run_with_tokenizer_controls(
-    request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &AuthenticatedGemmaTokenizer,
     bpe_pairs_per_tile: usize,
     bpe_pieces_per_tile: usize,
 ) -> Result<RasterPromptPreparationResult> {
@@ -707,21 +692,19 @@ pub fn run_with_tokenizer_controls(
         bpe_pairs_per_tile,
         bpe_pieces_per_tile,
     )?;
-    run_from_input_roots(input_roots)
+    main(input_roots)
 }
 
 #[sequence]
-pub fn run_from_input_roots(
-    input_roots: RasterPromptInputRoots,
-) -> Result<RasterPromptPreparationResult> {
-    let bpe_state = call_recur_seq_result!(
+pub fn main(input_roots: RasterPromptInputRoots) -> Result<RasterPromptPreparationResult> {
+    let bpe_state = call_recur_seq!(
         merge_bpe_tokenize_prompt,
         input_roots.bpe_state,
         input_roots.tokenizer_source_root.as_str()
     )?;
     let output = call_tile!(finalize_bpe_tokenize_prompt, bpe_state)?;
     let token_id_state = call_tile!(init_token_id_finalization, output)?;
-    let token_id_state = call_recur_tile_result!(
+    let token_id_state = call_recur_tile!(
         finalize_next_token_ids,
         token_id_state,
         input_roots.tokenizer_source_root.as_str()
@@ -751,8 +734,7 @@ mod tests {
     use super::{
         build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes,
         finalize_next_token_ids, finalize_tokenize_prompt, init_token_id_finalization,
-        init_tokenize_prompt, render_prompt, run_with_tokenizer_controls, tokenize_prompt,
-        tokenize_prompt_with_controls,
+        init_tokenize_prompt, render_prompt, run, tokenize_prompt, tokenize_prompt_with_controls,
     };
     use crate::shared::gemma_tokenizer::{
         AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeOutput,
@@ -919,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn run_with_tokenizer_controls_returns_root_backed_prompt_state() {
+    fn run_returns_root_backed_prompt_state() {
         let request = crate::shared::input::InferenceRequest {
             prompt_bytes: b"ab".to_vec(),
             text_decoding_policy: TextDecodingPolicy::Utf8,
@@ -938,7 +920,7 @@ mod tests {
             unk_token: None,
         };
 
-        let result = run_with_tokenizer_controls(&request, &model, &test_tokenizer_source(), 1, 1)
+        let result = run(&request, &model, &test_tokenizer_source(), 1, 1)
             .expect("raster prompt refs should build");
         let token_ids = materialize_token_ids(
             &result.state.prompt_token_ids_root,

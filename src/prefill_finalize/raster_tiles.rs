@@ -1,8 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::raster_authoring::prelude::{
-    auth_read, call_recur_tile_result, call_tile, sequence, tile,
-};
+use crate::raster_authoring::prelude::{auth_read, call_recur_tile, call_tile, sequence, tile};
 use crate::shared::det_num::{softcap_act, Act};
 use crate::shared::raster_prefill_finalize::{
     AuthenticatedGemmaPrefillFinalizeSource, GemmaPrefillFinalizeMetadataRequest,
@@ -253,7 +251,7 @@ pub fn run_refs_with_store(
         finalize_source,
         projection_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(project_next_prefill_logit, state, finalize_source, store)?;
+    let state = call_recur_tile!(project_next_prefill_logit, state, finalize_source, store)?;
     call_tile!(
         finalize_prefill_result_from_refs,
         store,
@@ -286,7 +284,7 @@ pub fn run(
         finalize_source,
         projection_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         project_next_prefill_logit,
         state,
         finalize_source,

@@ -98,10 +98,10 @@ pub fn step(mut state: State, source: &AuthenticatedSource) -> Result<(bool, Sta
 }
 ```
 
-Invoke fallible recursive tiles with `call_recur_tile_result!`:
+Invoke fallible recursive tiles with `call_recur_tile!`:
 
 ```rust
-let state = call_recur_tile_result!(step, state, source)?;
+let state = call_recur_tile!(step, state, source)?;
 ```
 
 Prompt preparation uses this for BPE merging. The native tokenizer repeatedly chooses the best merge candidate until no merge remains; the raster version makes one logical merge iteration a recursive sequence over compact refs, cursors, and bounded scan/apply states.
@@ -156,7 +156,7 @@ For prompt preparation, `TokenizePromptInput`, `GemmaNormalizedText`, `GemmaPreT
 - Mark orchestration units with `#[sequence]`.
 - Call tiles with `call_tile!`.
 - Call nested sequences with `call_seq!`.
-- Call recursive tiles with `call_recur_tile!` or `call_recur_tile_result!`.
+- Call recursive tiles with `call_recur_tile!`.
 - Keep sequence bodies mostly linear. Branching is acceptable when it reflects routine semantics, but large branches should usually become separate tiles or sequences.
 - Do not use a sequence as a place to smuggle dynamic loops around the recursive authoring model.
 

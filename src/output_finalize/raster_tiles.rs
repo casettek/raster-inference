@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::raster_authoring::prelude::{
-    auth_read, call_recur_tile_result, call_seq, call_tile, sequence, tile,
+    auth_read, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
 use crate::shared::{
     gemma_tokenizer::{
@@ -359,7 +359,7 @@ pub fn detokenize_output_tokens_ref_with_byte_flush_bytes_per_tile(
         store,
         byte_flush_bytes_per_tile
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         decode_next_output_token,
         state,
         token_source,

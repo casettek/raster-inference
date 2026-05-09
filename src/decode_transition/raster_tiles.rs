@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::raster_authoring::prelude::{
-    auth_read, call_recur_seq_result, call_recur_tile_result, call_seq, call_tile, sequence, tile,
+    auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
 use crate::shared::det_num::{
     acc_add_sat, add_sat, attention_score as det_attention_score, attention_softmax_exp_term,
@@ -590,7 +590,7 @@ pub fn run(
         source,
         raster_sizing
     )?;
-    let state = call_recur_seq_result!(compute_next_decode_layer, state, source, &mut store)?;
+    let state = call_recur_seq!(compute_next_decode_layer, state, source, &mut store)?;
     let layer_output = call_tile!(finalize_decode_layer_state, &store, state)?;
     let normalized = call_tile!(
         normalize_decode_final_position,
@@ -605,7 +605,7 @@ pub fn run(
         raster_sizing.projection_rows_per_tile
     )?;
     let logits_state =
-        call_recur_tile_result!(project_next_decode_logit, logits_state, source, &mut store)?;
+        call_recur_tile!(project_next_decode_logit, logits_state, source, &mut store)?;
     call_tile!(
         finalize_decode_transition_result,
         &mut store,
@@ -1415,8 +1415,7 @@ fn project_row_with_decode_source(
         RasterTensorId::new(output_id)?,
         None
     )?;
-    let state =
-        call_recur_tile_result!(project_next_decode_projection_chunk, state, source, store)?;
+    let state = call_recur_tile!(project_next_decode_projection_chunk, state, source, store)?;
     call_tile!(finalize_decode_row_projection, store, state)
 }
 
@@ -1440,8 +1439,7 @@ fn project_row_with_ple_source(
         RasterTensorId::new(output_id)?,
         None
     )?;
-    let state =
-        call_recur_tile_result!(project_next_decode_projection_chunk, state, source, store)?;
+    let state = call_recur_tile!(project_next_decode_projection_chunk, state, source, store)?;
     call_tile!(finalize_decode_row_projection, store, state)
 }
 
@@ -1595,7 +1593,7 @@ fn compute_decode_attention_ref(
         attention_window,
         kv_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(compute_next_decode_attention_head, state, store)?;
+    let state = call_recur_tile!(compute_next_decode_attention_head, state, store)?;
     call_tile!(finalize_decode_attention_state_ref, store, state)
 }
 
@@ -2059,7 +2057,7 @@ fn append_decode_kv_cache_ref(
         cache_window,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(compute_next_decode_kv_cache_append_row, state, store)?;
+    let state = call_recur_tile!(compute_next_decode_kv_cache_append_row, state, store)?;
     call_tile!(finalize_decode_kv_cache_append_state, store, state)
 }
 

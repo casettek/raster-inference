@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::raster_authoring::prelude::{
-    auth_read, call_recur_seq_result, call_recur_tile_result, call_seq, call_tile, sequence, tile,
+    auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
 use crate::shared::raster_prefill_layer::{
     AuthenticatedGemmaPrefillLayerSource, GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind,
@@ -546,7 +546,7 @@ pub fn run_refs_with_store(
         ple_input_refs,
         raster_sizing
     )?;
-    let state = call_recur_seq_result!(
+    let state = call_recur_seq!(
         compute_next_prefill_layer_sequence,
         state,
         layer_source,
@@ -678,7 +678,7 @@ pub fn project_sequence_with_prefill_source(
         projection_rows,
         projection_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         project_next_prefill_sequence_rows,
         state,
         layer_source,
@@ -837,7 +837,7 @@ pub fn run_prefill_attention_rows(
         attention_window,
         kv_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(project_next_prefill_attention_row, state, &mut store)?;
+    let state = call_recur_tile!(project_next_prefill_attention_row, state, &mut store)?;
     call_tile!(finalize_prefill_attention_state, &mut store, state)
 }
 
@@ -960,8 +960,7 @@ pub fn run_prefill_sequence_rms_norm_with_rows_per_tile(
         eps,
         rows_per_tile
     )?;
-    let state =
-        call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
     call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
 }
 
@@ -984,8 +983,7 @@ pub fn run_prefill_sequence_gelu_with_rows_per_tile(
         input,
         rows_per_tile
     )?;
-    let state =
-        call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
     call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
 }
 
@@ -1011,8 +1009,7 @@ pub fn run_prefill_sequence_scale_with_rows_per_tile(
         scalar,
         rows_per_tile
     )?;
-    let state =
-        call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
     call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
 }
 
@@ -1104,7 +1101,7 @@ pub fn run_prefill_sequence_add_with_rows_per_tile(
         rhs,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         transform_next_prefill_sequence_binary_row,
         state,
         &mut store
@@ -1134,7 +1131,7 @@ pub fn run_prefill_sequence_mul_with_rows_per_tile(
         rhs,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         transform_next_prefill_sequence_binary_row,
         state,
         &mut store
@@ -1286,7 +1283,7 @@ pub fn run_prefill_head_rms_norm_with_rows_per_tile(
         eps,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_head_row, state, &mut store)?;
     call_tile!(finalize_prefill_head_state, state, &mut store)
 }
 
@@ -1312,7 +1309,7 @@ pub fn run_prefill_value_rms_norm_with_rows_per_tile(
         eps,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_head_row, state, &mut store)?;
     call_tile!(finalize_prefill_head_state, state, &mut store)
 }
 
@@ -1354,7 +1351,7 @@ pub fn run_prefill_rope_heads_with_rows_per_tile(
         position_offset,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_head_row, state, &mut store)?;
     call_tile!(finalize_prefill_head_state, state, &mut store)
 }
 
@@ -1417,7 +1414,7 @@ pub fn run_prefill_reshape_heads(
         num_heads,
         head_dim
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_reshape_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_reshape_row, state, &mut store)?;
     call_tile!(finalize_prefill_reshape_heads_state, state, &mut store)
 }
 
@@ -1468,7 +1465,7 @@ pub fn run_prefill_combine_heads(
 ) -> Result<RasterActivationSequence> {
     let mut store = call_tile!(init_prefill_attention_store);
     let state = call_tile!(init_prefill_combine_heads_state, &mut store, heads)?;
-    let state = call_recur_tile_result!(transform_next_prefill_combine_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_combine_row, state, &mut store)?;
     call_tile!(finalize_prefill_combine_heads_state, state, &mut store)
 }
 
@@ -1539,7 +1536,7 @@ pub fn run_prefill_kv_cache(
         values,
         sliding_window
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_kv_cache_row, state, &mut store)?;
+    let state = call_recur_tile!(transform_next_prefill_kv_cache_row, state, &mut store)?;
     call_tile!(finalize_prefill_kv_cache_state, state, &mut store)
 }
 
@@ -2166,7 +2163,7 @@ fn project_sequence_with_prefill_source_ref(
         projection_rows,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(
+    let state = call_recur_tile!(
         project_next_prefill_sequence_rows,
         state,
         layer_source,
@@ -2195,7 +2192,7 @@ fn compute_sequence_rms_norm_ref(
         eps,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, store)?;
     call_tile!(finalize_prefill_sequence_unary_state_ref, state, store)
 }
 
@@ -2213,7 +2210,7 @@ fn compute_sequence_gelu_ref(
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, store)?;
     call_tile!(finalize_prefill_sequence_unary_state_ref, state, store)
 }
 
@@ -2233,7 +2230,7 @@ fn compute_sequence_scale_ref(
         scalar,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_unary_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, store)?;
     call_tile!(finalize_prefill_sequence_unary_state_ref, state, store)
 }
 
@@ -2253,7 +2250,7 @@ fn compute_sequence_add_ref(
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_binary_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_sequence_binary_row, state, store)?;
     call_tile!(finalize_prefill_sequence_binary_state_ref, state, store)
 }
 
@@ -2273,7 +2270,7 @@ fn compute_sequence_mul_ref(
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_sequence_binary_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_sequence_binary_row, state, store)?;
     call_tile!(finalize_prefill_sequence_binary_state_ref, state, store)
 }
 
@@ -2293,7 +2290,7 @@ fn reshape_heads_ref(
         num_heads,
         head_dim
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_reshape_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_reshape_row, state, store)?;
     call_tile!(finalize_prefill_reshape_heads_state_ref, state, store)
 }
 
@@ -2315,7 +2312,7 @@ fn compute_head_rms_norm_ref(
         eps,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_head_row, state, store)?;
     call_tile!(finalize_prefill_head_state_ref, state, store)
 }
 
@@ -2335,7 +2332,7 @@ fn compute_value_rms_norm_ref(
         eps,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_head_row, state, store)?;
     call_tile!(finalize_prefill_head_state_ref, state, store)
 }
 
@@ -2361,7 +2358,7 @@ fn compute_rope_ref(
         position_offset,
         rows_per_tile
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_head_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_head_row, state, store)?;
     call_tile!(finalize_prefill_head_state_ref, state, store)
 }
 
@@ -2382,7 +2379,7 @@ fn build_kv_cache_ref(
         RasterTensorId::new(format!("{id_prefix}.values"))?,
         sliding_window
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_kv_cache_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_kv_cache_row, state, store)?;
     call_tile!(finalize_prefill_kv_cache_state_ref, state, store)
 }
 
@@ -2408,7 +2405,7 @@ fn compute_attention_ref(
         attention_window,
         kv_rows_per_tile
     )?;
-    let state = call_recur_tile_result!(project_next_prefill_attention_row, state, store)?;
+    let state = call_recur_tile!(project_next_prefill_attention_row, state, store)?;
     call_tile!(finalize_prefill_attention_state_ref, store, state)
 }
 
@@ -2424,7 +2421,7 @@ fn combine_heads_ref(
         heads_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?
     )?;
-    let state = call_recur_tile_result!(transform_next_prefill_combine_row, state, store)?;
+    let state = call_recur_tile!(transform_next_prefill_combine_row, state, store)?;
     call_tile!(finalize_prefill_combine_heads_state_ref, state, store)
 }
 

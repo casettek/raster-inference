@@ -1,8 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::raster_authoring::prelude::{
-    auth_read, call_recur_tile_result, call_tile, sequence, tile,
-};
+use crate::raster_authoring::prelude::{auth_read, call_recur_tile, call_tile, sequence, tile};
 use crate::shared::{
     det_num::{argmax_first, Act},
     output::OutputDecodeStopReason,
@@ -153,7 +151,7 @@ pub fn run(
     }
 
     let state = call_tile!(init_select_next_token, logits_source)?;
-    let state = call_recur_tile_result!(scan_next_token_logit, state, logits_source)?;
+    let state = call_recur_tile!(scan_next_token_logit, state, logits_source)?;
     let next_token = call_tile!(finalize_selected_token, state)?;
     let full_token_ids = call_tile!(append_token, full_token_ids, next_token);
     let generated_token_ids = call_tile!(append_token, generated_token_ids, next_token);

@@ -127,7 +127,7 @@ Stop treating an entire prefill layer as one heavy tile.
 
 Introduce fallible recursive sequence support if needed.
 
-Today `compute_next_prefill_layer` is invoked through `call_recur_tile_result!`. If it becomes a recursive sequence returning `Result<(bool, State)>`, the raster authoring layer likely needs a `call_recur_seq_result!` macro that mirrors `call_recur_tile_result!`.
+Today `compute_next_prefill_layer` is invoked through `call_recur_tile!`. If it becomes a recursive sequence returning `Result<(bool, State)>`, the raster authoring layer likely needs a `call_recur_seq!` macro that mirrors `call_recur_tile!`.
 
 This macro should:
 
@@ -144,7 +144,7 @@ Replace the current coarse layer tile with an orchestration sequence:
 ```text
 run
   init_prefill_layer_state tile
-  call_recur_seq_result compute_next_prefill_layer_sequence
+  call_recur_seq compute_next_prefill_layer_sequence
   finalize_prefill_layer_state tile
 ```
 
@@ -174,7 +174,7 @@ run_prefill_layer_sequence
 
 ### Tests To Include
 
-- `call_recur_seq_result!` runs until done and propagates errors.
+- `call_recur_seq!` runs until done and propagates errors.
 - Tile invocation counting is unchanged for recursive sequences: sequence loops do not count, but nested tile calls do.
 - Existing raster prefill layer parity tests still pass.
 - Terminal checkpoint output still includes `raster_tile_invocations`.
