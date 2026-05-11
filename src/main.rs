@@ -35,7 +35,9 @@ fn run() -> anyhow::Result<()> {
     }
     let chat_template = load_chat_template(&cli_args.template_path)?;
     let tokenizer = load_tokenizer_from_path(&cli_args.tokenizer_path)?;
-    let raster_tokenizer_source = if cli_args.raster_tiles {
+    let raster_tokenizer_source = if cli_args.raster_tiles
+        || cli_args.execution_mode == InferenceExecutionMode::Deterministic
+    {
         Some(AuthenticatedGemmaTokenizer::new(
             load_gemma_tokenizer_spec_from_path(&cli_args.tokenizer_path)?,
         ))

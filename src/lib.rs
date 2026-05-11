@@ -342,6 +342,49 @@ pub fn run_inference_with_controls(
                 }
 
                 let prompt_preparation = run_prompt_prepare(request, model, tokenizer)?;
+                if request.execution_mode == InferenceExecutionMode::Deterministic {
+                    trace::trace_checkpoint_lazy_result("prompt.prepare", || {
+                        let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
+                            "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
+                        )?;
+                        let prompt_checkpoint =
+                            prompt_prepare::format_native_prompt_as_raster_checkpoint(
+                                request,
+                                model,
+                                tokenizer_source,
+                                &prompt_preparation,
+                            )?;
+                        Ok(json!({
+                            "prompt_bytes_root": prompt_checkpoint.prompt_bytes_root,
+                            "prompt_text_root": prompt_checkpoint.prompt_text_root,
+                            "rendered_prompt_root": prompt_checkpoint.rendered_prompt_root,
+                            "normalized_prompt_root": prompt_checkpoint.normalized_prompt_root,
+                            "prompt_token_count": prompt_checkpoint.prompt_token_count,
+                            "prompt_token_ids_root": prompt_checkpoint.prompt_token_ids_root,
+                            "sampling": request.sampling.clone(),
+                        }))
+                    })?;
+                    if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
+                        let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
+                            "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
+                        )?;
+                        let prompt_checkpoint =
+                            prompt_prepare::format_native_prompt_as_raster_checkpoint(
+                                request,
+                                model,
+                                tokenizer_source,
+                                &prompt_preparation,
+                            )?;
+                        return Ok(InferenceRunOutcome::RasterPromptPrepared(
+                            RasterPromptPreparedState {
+                                terminal_checkpoint_id,
+                                prompt_preparation: prompt_checkpoint,
+                                sampling: request.sampling.clone(),
+                                raster_tile_invocations: None,
+                            },
+                        ));
+                    }
+                }
                 let token_embeddings = if let Some(embedding_table) =
                     transformer_model.embedding_table.as_ref()
                 {
@@ -368,18 +411,20 @@ pub fn run_inference_with_controls(
                         .det_activations_sha256
                         .clone(),
                 };
-                trace::trace_checkpoint(
-                    "prompt.prepare",
-                    &json!({
-                        "prompt_text": prompt_preparation.prompt_text.clone(),
-                        "prompt_token_ids": prompt_preparation.prompt_token_ids.clone(),
-                        "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
-                        "embedded_prompt_activations": token_embeddings.activations.clone(),
-                        "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
-                        "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
-                        "sampling": request.sampling.clone(),
-                    }),
-                );
+                if request.execution_mode != InferenceExecutionMode::Deterministic {
+                    trace::trace_checkpoint(
+                        "prompt.prepare",
+                        &json!({
+                            "prompt_text": prompt_preparation.prompt_text.clone(),
+                            "prompt_token_ids": prompt_preparation.prompt_token_ids.clone(),
+                            "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
+                            "embedded_prompt_activations": token_embeddings.activations.clone(),
+                            "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
+                            "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
+                            "sampling": request.sampling.clone(),
+                        }),
+                    );
+                }
                 if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                     return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
                         terminal_checkpoint_id,
@@ -787,6 +832,63 @@ mod tests {
             }
             InferenceRunOutcome::Completed(_) => panic!("expected paused inference"),
             InferenceRunOutcome::RasterPromptPrepared(_) => panic!("expected paused inference"),
+        }
+    }
+
+    #[test]
+    fn deterministic_cpu_prompt_prepare_checkpoint_matches_raster_shape() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let tokenizer_source = test_gemma_tokenizer_source();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: Some("prompt.prepare".to_string()),
+                raster_tiles: false,
+                raster_decode_only: false,
+                raster_tokenizer_source: Some(tokenizer_source.clone()),
+                raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
+                raster_output_byte_flush_bytes_per_tile: None,
+            },
+        )
+        .expect("deterministic inference should stop after prompt prepare");
+        let expected = crate::prompt_prepare::run_raster(&request, &model, &tokenizer_source)
+            .expect("raster prompt prepare should run");
+
+        match paused {
+            InferenceRunOutcome::RasterPromptPrepared(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
+                assert_eq!(state.prompt_preparation, expected.state);
+                assert_eq!(state.sampling, request.sampling);
+                assert_eq!(state.raster_tile_invocations, None);
+            }
+            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::Paused(_) => {
+                panic!("expected deterministic CPU prompt boundary")
+            }
         }
     }
 
