@@ -100,22 +100,30 @@ fn trace_prefill_prepare_aux_checkpoint(
 ) {
     crate::trace::trace_checkpoint(
         "prefill.prepare_aux",
-        &json!({
-            "prompt_token_ids": prompt_token_ids,
-            "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
-            "embedded_prompt_activations": token_embeddings.activations.clone(),
-            "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
-            "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
-            "per_layer_prefill_inputs": ple_inputs.map(|inputs| inputs.per_layer_inputs.clone()),
-            "per_layer_prefill_input_sha256s": ple_inputs.map(|inputs| {
-                inputs
-                    .per_layer_inputs
-                    .iter()
-                    .map(|input| input.as_ref().map(crate::trace::sha256_hex))
-                    .collect::<Vec<_>>()
-            }),
-        }),
+        &prefill_prepare_aux_checkpoint_payload(prompt_token_ids, token_embeddings, ple_inputs),
     );
+}
+
+fn prefill_prepare_aux_checkpoint_payload(
+    prompt_token_ids: &[u32],
+    token_embeddings: &ActivationSequence,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+) -> serde_json::Value {
+    json!({
+        "prompt_token_ids": prompt_token_ids,
+        "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
+        "embedded_prompt_activations": token_embeddings.activations.clone(),
+        "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
+        "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
+        "per_layer_prefill_inputs": ple_inputs.map(|inputs| inputs.per_layer_inputs.clone()),
+        "per_layer_prefill_input_sha256s": ple_inputs.map(|inputs| {
+            inputs
+                .per_layer_inputs
+                .iter()
+                .map(|input| input.as_ref().map(crate::trace::sha256_hex))
+                .collect::<Vec<_>>()
+        }),
+    })
 }
 
 fn trace_prefill_prepare_aux_raster_checkpoint(
@@ -125,21 +133,11 @@ fn trace_prefill_prepare_aux_raster_checkpoint(
 ) -> Result<()> {
     crate::trace::trace_checkpoint_lazy_result("prefill.prepare_aux", || {
         let ple_inputs = raster_tiles::materialize_prefill_ple_input_refs(ple_input_refs)?;
-        Ok(json!({
-            "prompt_token_ids": prompt_token_ids,
-            "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
-            "embedded_prompt_activations": token_embeddings.activations.clone(),
-            "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
-            "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
-            "per_layer_prefill_inputs": ple_inputs.as_ref().map(|inputs| inputs.per_layer_inputs.clone()),
-            "per_layer_prefill_input_sha256s": ple_inputs.as_ref().map(|inputs| {
-                inputs
-                    .per_layer_inputs
-                    .iter()
-                    .map(|input| input.as_ref().map(crate::trace::sha256_hex))
-                    .collect::<Vec<_>>()
-            }),
-        }))
+        Ok(prefill_prepare_aux_checkpoint_payload(
+            prompt_token_ids,
+            token_embeddings,
+            ple_inputs.as_ref(),
+        ))
     })?;
     Ok(())
 }

@@ -6,6 +6,11 @@ use serde_json::json;
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
+use crate::shared::artifact_io::ArtifactIo;
+use crate::shared::raster_artifact_store::{
+    activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
+    RasterArtifactId, RasterArtifactMetadata,
+};
 use crate::shared::raster_prefill_layer::{
     AuthenticatedGemmaPrefillLayerSource, GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind,
     GemmaPrefillLayerMetadata, GemmaPrefillLayerMetadataRequest, GemmaPrefillLayerNormKind,
@@ -142,7 +147,7 @@ pub fn init_prefill_layer_state(
                     ple_input_refs.token_count()
                 );
             }
-            ple_input_refs.per_layer_inputs().to_vec()
+            import_ple_input_artifact_refs(store, ple_input_refs)?
         }
         None => vec![None; metadata.layer_count],
     };
@@ -2652,7 +2657,7 @@ fn register_prefill_layer_cache(
 }
 
 fn import_materialized_ple_inputs(
-    store: &mut AuthenticatedRasterTensorStore,
+    _store: &mut AuthenticatedRasterTensorStore,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<Option<RasterPrefillPleInputRefs>> {
@@ -2680,10 +2685,7 @@ fn import_materialized_ple_inputs(
                         None => token_count = Some(input_len),
                         _ => {}
                     }
-                    store.insert_activation_sequence(
-                        RasterTensorId::new(format!("prefill.layer.per_layer_input.{layer_idx}"))?,
-                        input,
-                    )
+                    insert_ple_input_artifact(layer_idx, input)
                 })
                 .transpose()
         })
@@ -2699,6 +2701,74 @@ fn import_materialized_ple_inputs(
         token_count.ok_or_else(|| anyhow!("materialized PLE inputs contained no layer rows"))?,
         per_layer_inputs,
     )?))
+}
+
+fn import_ple_input_artifact_refs(
+    store: &mut AuthenticatedRasterTensorStore,
+    ple_input_refs: &RasterPrefillPleInputRefs,
+) -> Result<Vec<Option<RasterActivationSequenceRef>>> {
+    ple_input_refs
+        .per_layer_inputs()
+        .iter()
+        .enumerate()
+        .map(|(layer_idx, input_ref)| {
+            input_ref
+                .as_ref()
+                .map(|input_ref| {
+                    let input = materialize_activation_sequence_artifact(input_ref)?;
+                    store.insert_activation_sequence(
+                        RasterTensorId::new(format!(
+                            "prefill.layer.per_layer_input.{layer_idx}.{}",
+                            input_ref.root()
+                        ))?,
+                        input,
+                    )
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+fn insert_ple_input_artifact(
+    layer_idx: usize,
+    input: RasterActivationSequence,
+) -> Result<RasterActivationSequenceArtifactRef> {
+    let width = input.width()?;
+    let leaves = input
+        .rows()
+        .iter()
+        .map(activation_row_leaf)
+        .collect::<Vec<_>>();
+    let artifact_ref = ArtifactIo::insert_artifact(
+        RasterArtifactId::new(format!(
+            "prefill.layer.materialized_ple.{layer_idx}.{}",
+            crate::trace::sha256_hex(&input)
+        ))?,
+        RasterArtifactMetadata::activation_rows(input.len(), width)?,
+        leaves,
+    )?;
+    RasterActivationSequenceArtifactRef::new(artifact_ref)
+}
+
+fn materialize_activation_sequence_artifact(
+    input_ref: &RasterActivationSequenceArtifactRef,
+) -> Result<RasterActivationSequence> {
+    let rows = (0..input_ref.row_count())
+        .map(|row_idx| {
+            let read = ArtifactIo::read_leaf(input_ref.artifact_ref(), row_idx)?;
+            ArtifactIo::verify_artifact_read(input_ref.artifact_ref(), &read)?;
+            let row = decode_activation_row_leaf(read.payload())?;
+            if row.width() != input_ref.width() {
+                bail!(
+                    "PLE input artifact row {row_idx} has width {}, expected {}",
+                    row.width(),
+                    input_ref.width()
+                );
+            }
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RasterActivationSequence::from_rows(rows))
 }
 
 fn materialize_prefill_activation_sequence_from_store(
@@ -2783,7 +2853,7 @@ fn layer_caches_from_raster(caches: &[RasterKvCache]) -> Vec<LayerKvCache> {
 #[cfg(test)]
 mod tests {
     use super::{
-        finalize_prefill_attention_state, init_prefill_attention_state,
+        finalize_prefill_attention_state, init_prefill_attention_state, insert_ple_input_artifact,
         project_next_prefill_attention_row, run_materialized_compat, run_prefill_attention_rows,
         run_prefill_combine_heads, run_prefill_head_rms_norm, run_prefill_kv_cache,
         run_prefill_reshape_heads, run_prefill_rope_heads, run_prefill_sequence_add,
@@ -2791,12 +2861,12 @@ mod tests {
         run_prefill_sequence_scale, run_prefill_value_rms_norm,
     };
     use crate::prefill_layer::deterministic_tiles;
+    use crate::shared::artifact_io::ArtifactIo;
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
     use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
     use crate::shared::raster_row_store::{
         AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterTensorId,
-        RasterTensorKind, RasterTensorRef, RasterTensorShape,
     };
     use crate::shared::raster_transformer_kernels::{
         add_sequences, apply_rope_to_heads, build_raster_kv_cache,
@@ -3528,15 +3598,11 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = store
-            .insert_activation_sequence(
-                RasterTensorId::new("bridge.ple.0").expect("id"),
-                RasterActivationSequence::from_acts(vec![vec![
-                    Act::from_num(0.5),
-                    Act::from_num(0.25),
-                ]]),
-            )
-            .expect("insert PLE ref");
+        let ple_sequence = RasterActivationSequence::from_acts(vec![vec![
+            Act::from_num(0.5),
+            Act::from_num(0.25),
+        ]]);
+        let ple_ref = insert_ple_input_artifact(0, ple_sequence.clone()).expect("insert PLE ref");
         let ple_refs =
             RasterPrefillPleInputRefs::new("prefill-layer", 1, 1, vec![Some(ple_ref.clone())])
                 .expect("PLE refs");
@@ -3550,15 +3616,12 @@ mod tests {
         )
         .expect("state");
 
-        assert_eq!(state.per_layer_inputs, vec![Some(ple_ref)]);
+        let imported_ref = state.per_layer_inputs[0].as_ref().expect("PLE ref");
         assert_eq!(
-            state.per_layer_inputs[0]
-                .as_ref()
-                .expect("PLE ref")
-                .tensor_ref()
-                .id()
-                .source_name(),
-            "bridge.ple.0"
+            store
+                .materialize_sequence(imported_ref)
+                .expect("materialize"),
+            ple_sequence
         );
     }
 
@@ -3585,14 +3648,15 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let mut store = AuthenticatedRasterTensorStore::new();
-        let raw_ref = RasterTensorRef::new(
-            RasterTensorId::new("missing.ple.0").expect("id"),
-            RasterTensorKind::ActivationSequence,
-            RasterTensorShape::sequence(1, 2).expect("shape"),
-            "missing-commitment",
+        let ple_ref = insert_ple_input_artifact(
+            0,
+            RasterActivationSequence::from_acts(vec![vec![
+                Act::from_num(0.5),
+                Act::from_num(0.25),
+            ]]),
         )
-        .expect("raw ref");
-        let ple_ref = RasterActivationSequenceRef::new(raw_ref).expect("typed ref");
+        .expect("insert PLE ref");
+        ArtifactIo::reset_store();
         let ple_refs = RasterPrefillPleInputRefs::new("prefill-layer", 1, 1, vec![Some(ple_ref)])
             .expect("PLE refs");
 
@@ -3615,15 +3679,14 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = store
-            .insert_activation_sequence(
-                RasterTensorId::new("bridge.ple.0").expect("id"),
-                RasterActivationSequence::from_acts(vec![vec![
-                    Act::from_num(0.5),
-                    Act::from_num(0.25),
-                ]]),
-            )
-            .expect("insert PLE ref");
+        let ple_ref = insert_ple_input_artifact(
+            0,
+            RasterActivationSequence::from_acts(vec![vec![
+                Act::from_num(0.5),
+                Act::from_num(0.25),
+            ]]),
+        )
+        .expect("insert PLE ref");
         let ple_refs = RasterPrefillPleInputRefs::new("other-source", 1, 1, vec![Some(ple_ref)])
             .expect("PLE refs");
 
@@ -3648,15 +3711,14 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = store
-            .insert_activation_sequence(
-                RasterTensorId::new("bridge.ple.0").expect("id"),
-                RasterActivationSequence::from_acts(vec![vec![
-                    Act::from_num(0.5),
-                    Act::from_num(0.25),
-                ]]),
-            )
-            .expect("insert PLE ref");
+        let ple_ref = insert_ple_input_artifact(
+            0,
+            RasterActivationSequence::from_acts(vec![vec![
+                Act::from_num(0.5),
+                Act::from_num(0.25),
+            ]]),
+        )
+        .expect("insert PLE ref");
         let ple_refs =
             RasterPrefillPleInputRefs::new("prefill-layer", 2, 1, vec![Some(ple_ref), None])
                 .expect("PLE refs");
@@ -3680,15 +3742,14 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = store
-            .insert_activation_sequence(
-                RasterTensorId::new("bridge.ple.0").expect("id"),
-                RasterActivationSequence::from_acts(vec![vec![
-                    Act::from_num(0.5),
-                    Act::from_num(0.25),
-                ]]),
-            )
-            .expect("insert PLE ref");
+        let ple_ref = insert_ple_input_artifact(
+            0,
+            RasterActivationSequence::from_acts(vec![vec![
+                Act::from_num(0.5),
+                Act::from_num(0.25),
+            ]]),
+        )
+        .expect("insert PLE ref");
         let ple_refs = RasterPrefillPleInputRefs::new("prefill-layer", 1, 2, vec![Some(ple_ref)])
             .expect("PLE refs");
 
@@ -3711,15 +3772,14 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = store
-            .insert_activation_sequence(
-                RasterTensorId::new("bridge.ple.0").expect("id"),
-                RasterActivationSequence::from_acts(vec![
-                    vec![Act::from_num(0.5), Act::from_num(0.25)],
-                    vec![Act::from_num(1.0), Act::from_num(-0.25)],
-                ]),
-            )
-            .expect("insert PLE ref");
+        let ple_ref = insert_ple_input_artifact(
+            0,
+            RasterActivationSequence::from_acts(vec![
+                vec![Act::from_num(0.5), Act::from_num(0.25)],
+                vec![Act::from_num(1.0), Act::from_num(-0.25)],
+            ]),
+        )
+        .expect("insert PLE ref");
         let ple_refs = RasterPrefillPleInputRefs::new("prefill-layer", 1, 1, vec![Some(ple_ref)])
             .expect("PLE refs");
 

@@ -3,32 +3,26 @@ use anyhow::{anyhow, bail, Result};
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::shared::det_num::{scale_act, Acc, Act, Wgt};
+use crate::shared::det_num::{add_sat, rms_norm as det_rms_norm, scale_act, Acc, Act, Wgt};
+use crate::shared::raster_artifact_store::{RasterActivationSequenceArtifactRef, RasterArtifactId};
 use crate::shared::raster_prefill_ple::{
     AuthenticatedGemmaPleSource, GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest,
     GemmaPleModelProjectionRowRequest, GemmaPleProjectionNormWeightsRequest,
     GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest, RasterPrefillPleInputRefs,
 };
-use crate::shared::raster_row_store::{
-    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterTensorBuilderRef,
-    RasterTensorId,
-};
+use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::shared::raster_transformer_kernels::{
-    validate_projection_rows_per_tile, validate_sequence_rows_per_tile, RasterActivationRow,
-    RasterActivationSequence, RasterSequenceBinaryState, RasterSequenceProjectionState,
-    RasterSequenceUnaryState,
+    project_row_with_weights, validate_projection_rows_per_tile, validate_sequence_rows_per_tile,
+    RasterActivationRow, RasterActivationSequence,
 };
 use crate::shared::transformer::{ActivationSequence, Gemma4PrefillPleInputs};
 use crate::RasterSizingControls;
 
 use super::raster_utils::{
-    append_projection_chunk, append_sequence_row, compute_next_binary_row, compute_next_unary_row,
-    finalize_binary_row_state_ref, finalize_projection_state, finalize_projection_state_ref,
-    finalize_sequence_builder, finalize_unary_row_state_ref, init_add_row_state_from_refs,
-    init_projection_state, init_projection_state_from_ref, init_rms_norm_row_state_from_ref,
-    init_scale_row_state_from_ref, insert_activation_sequence, internal_sequence_from_raster,
-    materialize_sequence, raster_activation_sequence_from_embedding, read_prefill_token_id,
-    reset_tensor_store, start_sequence_builder, store_prefill_token_ids_artifact,
+    append_sequence_row_by_builder_root, finalize_sequence_builder_by_root,
+    insert_activation_sequence, internal_sequence_from_raster, materialize_sequence,
+    raster_activation_sequence_from_embedding, read_activation_row_from_ref, read_prefill_token_id,
+    reset_artifact_store, start_sequence_builder, store_prefill_token_ids_artifact,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -36,10 +30,10 @@ pub struct PrefillPleRasterState {
     source_id: String,
     token_ids_artifact_root: String,
     token_count: usize,
-    input_activations_ref: Option<RasterActivationSequenceRef>,
+    input_activations_ref: Option<RasterActivationSequenceArtifactRef>,
     next_layer_idx: usize,
     layer_count: usize,
-    per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
+    per_layer_inputs: Vec<Option<RasterActivationSequenceArtifactRef>>,
     has_ple_global: bool,
     raster_sizing: RasterSizingControls,
 }
@@ -49,7 +43,7 @@ pub struct RasterPrefillPleInputRoots {
     source_id: String,
     token_ids_artifact_root: String,
     token_count: usize,
-    input_activations_ref: Option<RasterActivationSequenceRef>,
+    input_activations_ref: Option<RasterActivationSequenceArtifactRef>,
     layer_count: usize,
     has_ple_global: bool,
     raster_sizing: RasterSizingControls,
@@ -76,7 +70,7 @@ pub struct PrefillPleTokenEmbeddingState {
     next_token_idx: usize,
     token_count: usize,
     row_width: usize,
-    output_builder_ref: RasterTensorBuilderRef,
+    output_builder_root: String,
 }
 
 impl PrefillPleTokenEmbeddingState {
@@ -85,8 +79,76 @@ impl PrefillPleTokenEmbeddingState {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PrefillPleSequenceProjectionState {
+    input_ref: RasterActivationSequenceArtifactRef,
+    output_builder_root: String,
+    current_row_bits: Vec<i32>,
+    next_token_idx: usize,
+    next_projection_row_idx: usize,
+    token_count: usize,
+    input_width: usize,
+    projection_rows: usize,
+    rows_per_tile: usize,
+}
+
+impl PrefillPleSequenceProjectionState {
+    fn is_complete(&self) -> bool {
+        self.next_token_idx >= self.token_count
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum PrefillPleSequenceUnaryOp {
+    RmsNorm {
+        norm_weight_bits: Vec<i32>,
+        eps_bits: i64,
+    },
+    Scale {
+        scalar_bits: i32,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PrefillPleSequenceUnaryState {
+    input_ref: RasterActivationSequenceArtifactRef,
+    output_builder_root: String,
+    op: PrefillPleSequenceUnaryOp,
+    next_row_idx: usize,
+    row_count: usize,
+    width: usize,
+    rows_per_tile: usize,
+}
+
+impl PrefillPleSequenceUnaryState {
+    fn is_complete(&self) -> bool {
+        self.next_row_idx >= self.row_count
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PrefillPleSequenceBinaryState {
+    lhs_ref: RasterActivationSequenceArtifactRef,
+    rhs_ref: RasterActivationSequenceArtifactRef,
+    output_builder_root: String,
+    next_row_idx: usize,
+    row_count: usize,
+    width: usize,
+    rows_per_tile: usize,
+}
+
+impl PrefillPleSequenceBinaryState {
+    fn is_complete(&self) -> bool {
+        self.next_row_idx >= self.row_count
+    }
+}
+
+pub fn init_prefill_ple_artifact_store() {
+    reset_artifact_store();
+}
+
 pub fn init_prefill_ple_tensor_store() {
-    reset_tensor_store();
+    init_prefill_ple_artifact_store();
 }
 
 pub fn tensor_store_snapshot() -> AuthenticatedRasterTensorStore {
@@ -155,7 +217,7 @@ pub fn prepare_raster_prefill_ple_input_roots(
         );
     }
     let input_activations_ref = insert_activation_sequence(
-        RasterTensorId::new("prefill.prepare_aux.input.initial")?,
+        RasterArtifactId::new("prefill.prepare_aux.input.initial")?,
         input_activations,
     )?;
 
@@ -298,11 +360,11 @@ pub fn compute_next_prefill_ple_layer_sequence(
 fn run_prefill_ple_layer_sequence_ref(
     token_ids_artifact_root: &str,
     token_count: usize,
-    input_activations_ref: RasterActivationSequenceRef,
+    input_activations_ref: RasterActivationSequenceArtifactRef,
     ple_source: &AuthenticatedGemmaPleSource,
     context: &PrefillPleLayerContext,
     raster_sizing: RasterSizingControls,
-) -> Result<RasterActivationSequenceRef> {
+) -> Result<RasterActivationSequenceArtifactRef> {
     let layer_idx = context.layer_idx;
     let embedding_scale = Act::from_bits(context.embedding_scale_bits.ok_or_else(|| {
         anyhow!("Gemma PLE layer {layer_idx} is missing embedding scale metadata")
@@ -346,19 +408,19 @@ fn run_prefill_ple_layer_sequence_ref(
         layer_idx,
         projection_rows,
         raster_sizing.projection_rows_per_tile,
-        RasterTensorId::new(format!("prefill.prepare_aux.projected.{layer_idx}"))?
+        RasterArtifactId::new(format!("prefill.prepare_aux.projected.{layer_idx}"))?
     )?;
     let projected_ref = call_seq!(
         compute_sequence_scale_ref,
         projected_ref,
-        RasterTensorId::new(format!("prefill.prepare_aux.projected.scaled.{layer_idx}"))?,
+        RasterArtifactId::new(format!("prefill.prepare_aux.projected.scaled.{layer_idx}"))?,
         Some(projection_scalar),
         raster_sizing.sequence_rows_per_tile
     )?;
     let projected_ref = call_seq!(
         compute_sequence_rms_norm_ref,
         projected_ref,
-        RasterTensorId::new(format!("prefill.prepare_aux.projected.normed.{layer_idx}"))?,
+        RasterArtifactId::new(format!("prefill.prepare_aux.projected.normed.{layer_idx}"))?,
         Some(norm_weights.as_slice()),
         Some(rms_norm_eps),
         raster_sizing.sequence_rows_per_tile
@@ -367,13 +429,13 @@ fn run_prefill_ple_layer_sequence_ref(
         compute_sequence_add_ref,
         embedded_ref,
         projected_ref,
-        RasterTensorId::new(format!("prefill.prepare_aux.combined.{layer_idx}"))?,
+        RasterArtifactId::new(format!("prefill.prepare_aux.combined.{layer_idx}"))?,
         raster_sizing.sequence_rows_per_tile
     )?;
     call_seq!(
         compute_sequence_scale_ref,
         combined_ref,
-        RasterTensorId::new(format!("prefill.prepare_aux.per_layer_input.{layer_idx}"))?,
+        RasterArtifactId::new(format!("prefill.prepare_aux.per_layer_input.{layer_idx}"))?,
         Some(input_scale),
         raster_sizing.sequence_rows_per_tile
     )
@@ -383,7 +445,7 @@ fn run_prefill_ple_layer_sequence_ref(
 pub fn update_prefill_ple_state_refs(
     mut state: PrefillPleRasterState,
     layer_idx: usize,
-    per_layer_input: Option<RasterActivationSequenceRef>,
+    per_layer_input: Option<RasterActivationSequenceArtifactRef>,
 ) -> Result<(bool, PrefillPleRasterState)> {
     if layer_idx != state.next_layer_idx {
         bail!(
@@ -459,52 +521,93 @@ pub fn init_ple_sequence_projection(
     input: &RasterActivationSequence,
     projection_rows: usize,
     projection_rows_per_tile: usize,
-) -> Result<RasterSequenceProjectionState> {
-    init_projection_state(input, projection_rows, projection_rows_per_tile)
+) -> Result<PrefillPleSequenceProjectionState> {
+    let input_ref = insert_activation_sequence(
+        RasterArtifactId::new(format!(
+            "sequence.projection.input.{}",
+            crate::trace::sha256_hex(input)
+        ))?,
+        input.clone(),
+    )?;
+    init_ple_sequence_projection_from_ref(
+        input_ref,
+        RasterArtifactId::new(format!(
+            "sequence.projection.output.{}",
+            crate::trace::sha256_hex(input)
+        ))?,
+        projection_rows,
+        projection_rows_per_tile,
+    )
 }
 
 #[tile(kind = recursive)]
 pub fn project_next_ple_sequence_rows(
-    mut state: RasterSequenceProjectionState,
+    mut state: PrefillPleSequenceProjectionState,
     ple_source: &AuthenticatedGemmaPleSource,
     layer_idx: usize,
-) -> Result<(bool, RasterSequenceProjectionState)> {
+) -> Result<(bool, PrefillPleSequenceProjectionState)> {
     if state.is_complete() {
         return Ok((true, state));
     }
 
     let end = state
-        .next_projection_row_idx()
-        .saturating_add(state.rows_per_tile())
-        .min(state.projection_rows());
-    let start_projection_row_idx = state.next_projection_row_idx();
-    let start_token_idx = state.next_token_idx();
-    let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
-    for row_idx in state.next_projection_row_idx()..end {
+        .next_projection_row_idx
+        .saturating_add(state.rows_per_tile)
+        .min(state.projection_rows);
+    let start_projection_row_idx = state.next_projection_row_idx;
+    let start_token_idx = state.next_token_idx;
+    let mut rows = Vec::with_capacity(end - state.next_projection_row_idx);
+    for row_idx in state.next_projection_row_idx..end {
         rows.push(auth_read!(
             ple_source,
             GemmaPleModelProjectionRowRequest { layer_idx, row_idx },
         )?);
     }
-    append_projection_chunk(&mut state, &rows)?;
+    let input_row = read_activation_row_from_ref(&state.input_ref, state.next_token_idx)?;
+    let output_bits = rows
+        .iter()
+        .map(|projection_row| {
+            project_row_with_weights(&input_row, projection_row)
+                .map(|projected| projected.to_bits())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    state.current_row_bits.extend(output_bits);
+    state.next_projection_row_idx = end;
+    if state.next_projection_row_idx == state.projection_rows {
+        if state.current_row_bits.len() != state.projection_rows {
+            bail!(
+                "raster projection output row has width {}, expected {}",
+                state.current_row_bits.len(),
+                state.projection_rows
+            );
+        }
+        state.output_builder_root = append_sequence_row_by_builder_root(
+            &state.output_builder_root,
+            state.next_token_idx,
+            RasterActivationRow::from_act_bits(std::mem::take(&mut state.current_row_bits)),
+        )?;
+        state.next_token_idx += 1;
+        state.next_projection_row_idx = 0;
+    }
     crate::trace::trace_event(format!(
         "progress prefill.prepare_aux.projection layer={} token={}/{} projection_rows={}..{} of {} input_width={}",
         layer_idx,
         start_token_idx + 1,
-        state.token_count(),
+        state.token_count,
         start_projection_row_idx,
         end,
-        state.projection_rows(),
-        state.input_width()
+        state.projection_rows,
+        state.input_width
     ));
     Ok((false, state))
 }
 
 #[tile]
 pub fn finalize_ple_sequence_projection(
-    state: RasterSequenceProjectionState,
+    state: PrefillPleSequenceProjectionState,
 ) -> Result<RasterActivationSequence> {
-    finalize_projection_state(state)
+    let output_ref = finalize_ple_sequence_projection_ref(state)?;
+    materialize_sequence(&output_ref)
 }
 
 #[sequence]
@@ -578,7 +681,7 @@ fn init_scaled_token_embedding_sequence_ref(
         bail!("transformer PLE token embedding sequence requires at least one token");
     }
     let output_builder_ref = start_sequence_builder(
-        RasterTensorId::new(format!("prefill.prepare_aux.embedded.{layer_idx}"))?,
+        RasterArtifactId::new(format!("prefill.prepare_aux.embedded.{layer_idx}"))?,
         token_count,
         row_width,
     )?;
@@ -589,7 +692,7 @@ fn init_scaled_token_embedding_sequence_ref(
         next_token_idx: 0,
         token_count,
         row_width,
-        output_builder_ref,
+        output_builder_root: output_builder_ref.running_root().to_string(),
     })
 }
 
@@ -621,8 +724,8 @@ fn append_next_scaled_token_embedding_row(
             state.row_width
         );
     }
-    append_sequence_row(
-        &mut state.output_builder_ref,
+    state.output_builder_root = append_sequence_row_by_builder_root(
+        &state.output_builder_root,
         state.next_token_idx,
         RasterActivationRow::from_acts(
             row.into_iter()
@@ -642,7 +745,7 @@ fn append_next_scaled_token_embedding_row(
 #[tile]
 fn finalize_scaled_token_embedding_sequence_ref(
     state: PrefillPleTokenEmbeddingState,
-) -> Result<RasterActivationSequenceRef> {
+) -> Result<RasterActivationSequenceArtifactRef> {
     if !state.is_complete() {
         bail!(
             "PLE token embedding finalized at token {}, expected {}",
@@ -650,7 +753,7 @@ fn finalize_scaled_token_embedding_sequence_ref(
             state.token_count
         );
     }
-    finalize_sequence_builder(state.output_builder_ref)
+    finalize_sequence_builder_by_root(&state.output_builder_root)
 }
 
 #[sequence]
@@ -661,7 +764,7 @@ fn build_scaled_token_embedding_sequence_ref(
     ple_source: &AuthenticatedGemmaPleSource,
     scale: crate::shared::det_num::Act,
     row_width: usize,
-) -> Result<RasterActivationSequenceRef> {
+) -> Result<RasterActivationSequenceArtifactRef> {
     let state = call_tile!(
         init_scaled_token_embedding_sequence_ref,
         token_ids_artifact_root,
@@ -676,35 +779,61 @@ fn build_scaled_token_embedding_sequence_ref(
 
 #[tile]
 fn init_ple_sequence_projection_from_ref(
-    input_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
+    input_ref: RasterActivationSequenceArtifactRef,
+    output_id: RasterArtifactId,
     projection_rows: usize,
     projection_rows_per_tile: usize,
-) -> Result<RasterSequenceProjectionState> {
-    init_projection_state_from_ref(
+) -> Result<PrefillPleSequenceProjectionState> {
+    if projection_rows == 0 {
+        bail!("deterministic linear projection requires at least one projection row");
+    }
+    validate_projection_rows_per_tile(projection_rows_per_tile)?;
+    let token_count = input_ref.row_count();
+    let input_width = input_ref.width();
+    let output_builder = start_sequence_builder(output_id, token_count, projection_rows)?;
+    Ok(PrefillPleSequenceProjectionState {
         input_ref,
-        output_id,
+        output_builder_root: output_builder.running_root().to_string(),
+        current_row_bits: Vec::new(),
+        next_token_idx: 0,
+        next_projection_row_idx: 0,
+        token_count,
+        input_width,
         projection_rows,
-        projection_rows_per_tile,
-    )
+        rows_per_tile: projection_rows_per_tile,
+    })
 }
 
 #[tile]
 fn finalize_ple_sequence_projection_ref(
-    state: RasterSequenceProjectionState,
-) -> Result<RasterActivationSequenceRef> {
-    finalize_projection_state_ref(state)
+    state: PrefillPleSequenceProjectionState,
+) -> Result<RasterActivationSequenceArtifactRef> {
+    if state.next_token_idx != state.token_count || state.next_projection_row_idx != 0 {
+        bail!(
+            "raster projection completed token {}, projection row {}, expected {} complete token rows",
+            state.next_token_idx,
+            state.next_projection_row_idx,
+            state.token_count
+        );
+    }
+    if !state.current_row_bits.is_empty() {
+        bail!(
+            "raster projection finalized with partial row width {}",
+            state.current_row_bits.len()
+        );
+    }
+    finalize_sequence_builder_by_root(&state.output_builder_root)
 }
 
 #[sequence]
 fn project_ple_sequence_with_source_ref(
-    input_ref: RasterActivationSequenceRef,
+    input_ref: RasterActivationSequenceArtifactRef,
     ple_source: &AuthenticatedGemmaPleSource,
     layer_idx: usize,
     projection_rows: usize,
     projection_rows_per_tile: usize,
-    output_id: RasterTensorId,
-) -> Result<RasterActivationSequenceRef> {
+    output_id: RasterArtifactId,
+) -> Result<RasterActivationSequenceArtifactRef> {
     let state = call_tile!(
         init_ple_sequence_projection_from_ref,
         input_ref,
@@ -718,39 +847,87 @@ fn project_ple_sequence_with_source_ref(
 
 #[tile]
 fn init_sequence_scale_ref_state(
-    input_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
+    input_ref: RasterActivationSequenceArtifactRef,
+    output_id: RasterArtifactId,
     scalar: Option<crate::shared::det_num::Act>,
     rows_per_tile: usize,
-) -> Result<RasterSequenceUnaryState> {
-    init_scale_row_state_from_ref(input_ref, output_id, scalar, rows_per_tile)
+) -> Result<PrefillPleSequenceUnaryState> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let scalar = scalar
+        .ok_or_else(|| anyhow!("deterministic sequence scaling requires canonical Act scalar"))?;
+    let row_count = input_ref.row_count();
+    let width = input_ref.width();
+    let output_builder = start_sequence_builder(output_id, row_count, width)?;
+    Ok(PrefillPleSequenceUnaryState {
+        input_ref,
+        output_builder_root: output_builder.running_root().to_string(),
+        op: PrefillPleSequenceUnaryOp::Scale {
+            scalar_bits: scalar.to_bits(),
+        },
+        next_row_idx: 0,
+        row_count,
+        width,
+        rows_per_tile,
+    })
 }
 
 #[tile]
 fn init_sequence_rms_norm_ref_state(
-    input_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
+    input_ref: RasterActivationSequenceArtifactRef,
+    output_id: RasterArtifactId,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
     rows_per_tile: usize,
-) -> Result<RasterSequenceUnaryState> {
-    init_rms_norm_row_state_from_ref(input_ref, output_id, norm_weights, eps, rows_per_tile)
+) -> Result<PrefillPleSequenceUnaryState> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let norm_weights = norm_weights
+        .ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical norm weights"))?;
+    if norm_weights.len() != input_ref.width() {
+        bail!(
+            "RMSNorm weight length {} does not match sequence width {}",
+            norm_weights.len(),
+            input_ref.width()
+        );
+    }
+    let eps = eps.ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical epsilon"))?;
+    let row_count = input_ref.row_count();
+    let width = input_ref.width();
+    let output_builder = start_sequence_builder(output_id, row_count, width)?;
+    Ok(PrefillPleSequenceUnaryState {
+        input_ref,
+        output_builder_root: output_builder.running_root().to_string(),
+        op: PrefillPleSequenceUnaryOp::RmsNorm {
+            norm_weight_bits: norm_weights.iter().map(|weight| weight.to_bits()).collect(),
+            eps_bits: eps.to_bits(),
+        },
+        next_row_idx: 0,
+        row_count,
+        width,
+        rows_per_tile,
+    })
 }
 
 #[tile]
 fn finalize_sequence_unary_ref_state(
-    state: RasterSequenceUnaryState,
-) -> Result<RasterActivationSequenceRef> {
-    finalize_unary_row_state_ref(state)
+    state: PrefillPleSequenceUnaryState,
+) -> Result<RasterActivationSequenceArtifactRef> {
+    if !state.is_complete() {
+        bail!(
+            "sequence unary state completed {} rows, expected {}",
+            state.next_row_idx,
+            state.row_count
+        );
+    }
+    finalize_sequence_builder_by_root(&state.output_builder_root)
 }
 
 #[sequence]
 fn compute_sequence_scale_ref(
-    input_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
+    input_ref: RasterActivationSequenceArtifactRef,
+    output_id: RasterArtifactId,
     scalar: Option<crate::shared::det_num::Act>,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
+) -> Result<RasterActivationSequenceArtifactRef> {
     let state = call_tile!(
         init_sequence_scale_ref_state,
         input_ref,
@@ -764,12 +941,12 @@ fn compute_sequence_scale_ref(
 
 #[sequence]
 fn compute_sequence_rms_norm_ref(
-    input_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
+    input_ref: RasterActivationSequenceArtifactRef,
+    output_id: RasterArtifactId,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
+) -> Result<RasterActivationSequenceArtifactRef> {
     let state = call_tile!(
         init_sequence_rms_norm_ref_state,
         input_ref,
@@ -784,35 +961,107 @@ fn compute_sequence_rms_norm_ref(
 
 #[tile(kind = recursive)]
 fn compute_next_sequence_unary_ref(
-    state: RasterSequenceUnaryState,
-) -> Result<(bool, RasterSequenceUnaryState)> {
-    compute_next_unary_row(state)
+    mut state: PrefillPleSequenceUnaryState,
+) -> Result<(bool, PrefillPleSequenceUnaryState)> {
+    if state.is_complete() {
+        return Ok((true, state));
+    }
+    let end = state
+        .next_row_idx
+        .saturating_add(state.rows_per_tile)
+        .min(state.row_count);
+    while state.next_row_idx < end {
+        let row = read_activation_row_from_ref(&state.input_ref, state.next_row_idx)?;
+        let output_row = match &state.op {
+            PrefillPleSequenceUnaryOp::RmsNorm {
+                norm_weight_bits,
+                eps_bits,
+            } => {
+                let norm_weights = norm_weight_bits
+                    .iter()
+                    .copied()
+                    .map(Wgt::from_bits)
+                    .collect::<Vec<_>>();
+                RasterActivationRow::from_acts(det_rms_norm(
+                    &row.acts(),
+                    &norm_weights,
+                    Acc::from_bits(*eps_bits),
+                ))
+            }
+            PrefillPleSequenceUnaryOp::Scale { scalar_bits } => RasterActivationRow::from_acts(
+                row.acts()
+                    .into_iter()
+                    .map(|value| scale_act(value, Act::from_bits(*scalar_bits)))
+                    .collect(),
+            ),
+        };
+        state.output_builder_root = append_sequence_row_by_builder_root(
+            &state.output_builder_root,
+            state.next_row_idx,
+            output_row,
+        )?;
+        state.next_row_idx += 1;
+    }
+    Ok((false, state))
 }
 
 #[tile]
 fn init_sequence_add_ref_state(
-    lhs_ref: RasterActivationSequenceRef,
-    rhs_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
+    lhs_ref: RasterActivationSequenceArtifactRef,
+    rhs_ref: RasterActivationSequenceArtifactRef,
+    output_id: RasterArtifactId,
     rows_per_tile: usize,
-) -> Result<RasterSequenceBinaryState> {
-    init_add_row_state_from_refs(lhs_ref, rhs_ref, output_id, rows_per_tile)
+) -> Result<PrefillPleSequenceBinaryState> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    if lhs_ref.row_count() != rhs_ref.row_count() {
+        bail!(
+            "sequence length mismatch: {} vs {}",
+            lhs_ref.row_count(),
+            rhs_ref.row_count()
+        );
+    }
+    if lhs_ref.width() != rhs_ref.width() {
+        bail!(
+            "right sequence row 0 has width {}, expected {}",
+            rhs_ref.width(),
+            lhs_ref.width()
+        );
+    }
+    let row_count = lhs_ref.row_count();
+    let width = lhs_ref.width();
+    let output_builder = start_sequence_builder(output_id, row_count, width)?;
+    Ok(PrefillPleSequenceBinaryState {
+        lhs_ref,
+        rhs_ref,
+        output_builder_root: output_builder.running_root().to_string(),
+        next_row_idx: 0,
+        row_count,
+        width,
+        rows_per_tile,
+    })
 }
 
 #[tile]
 fn finalize_sequence_binary_ref_state(
-    state: RasterSequenceBinaryState,
-) -> Result<RasterActivationSequenceRef> {
-    finalize_binary_row_state_ref(state)
+    state: PrefillPleSequenceBinaryState,
+) -> Result<RasterActivationSequenceArtifactRef> {
+    if !state.is_complete() {
+        bail!(
+            "sequence binary state completed {} rows, expected {}",
+            state.next_row_idx,
+            state.row_count
+        );
+    }
+    finalize_sequence_builder_by_root(&state.output_builder_root)
 }
 
 #[sequence]
 fn compute_sequence_add_ref(
-    lhs_ref: RasterActivationSequenceRef,
-    rhs_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
+    lhs_ref: RasterActivationSequenceArtifactRef,
+    rhs_ref: RasterActivationSequenceArtifactRef,
+    output_id: RasterArtifactId,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
+) -> Result<RasterActivationSequenceArtifactRef> {
     let state = call_tile!(
         init_sequence_add_ref_state,
         lhs_ref,
@@ -826,9 +1075,34 @@ fn compute_sequence_add_ref(
 
 #[tile(kind = recursive)]
 fn compute_next_sequence_binary_ref(
-    state: RasterSequenceBinaryState,
-) -> Result<(bool, RasterSequenceBinaryState)> {
-    compute_next_binary_row(state)
+    mut state: PrefillPleSequenceBinaryState,
+) -> Result<(bool, PrefillPleSequenceBinaryState)> {
+    if state.is_complete() {
+        return Ok((true, state));
+    }
+    let end = state
+        .next_row_idx
+        .saturating_add(state.rows_per_tile)
+        .min(state.row_count);
+    while state.next_row_idx < end {
+        let lhs_row = read_activation_row_from_ref(&state.lhs_ref, state.next_row_idx)?;
+        let rhs_row = read_activation_row_from_ref(&state.rhs_ref, state.next_row_idx)?;
+        let output_row = RasterActivationRow::from_acts(
+            lhs_row
+                .acts()
+                .into_iter()
+                .zip(rhs_row.acts())
+                .map(|(lhs_value, rhs_value)| add_sat(lhs_value, rhs_value))
+                .collect(),
+        );
+        state.output_builder_root = append_sequence_row_by_builder_root(
+            &state.output_builder_root,
+            state.next_row_idx,
+            output_row,
+        )?;
+        state.next_row_idx += 1;
+    }
+    Ok((false, state))
 }
 
 #[cfg(test)]
@@ -1522,10 +1796,13 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
+        static FIXTURE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique_counter = FIXTURE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "raster-prefill-ple-{}-{}-{}.detwgt",
+            "raster-prefill-ple-{}-{}-{}-{}.detwgt",
             std::process::id(),
             unique_suffix,
+            unique_counter,
             crate::trace::sha256_hex(&format!("{:?}{:?}", token_embeddings, model_projections))
         ));
         let mut bytes = Vec::new();

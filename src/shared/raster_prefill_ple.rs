@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::shared::artifact_io::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
-use crate::shared::raster_row_store::RasterActivationSequenceRef;
+use crate::shared::raster_artifact_store::RasterActivationSequenceArtifactRef;
 use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
 use crate::shared::transformer::{
     Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
@@ -48,7 +48,7 @@ pub struct RasterPrefillPleInputRefs {
     source_id: String,
     layer_count: usize,
     token_count: usize,
-    per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
+    per_layer_inputs: Vec<Option<RasterActivationSequenceArtifactRef>>,
 }
 
 impl RasterPrefillPleInputRefs {
@@ -56,7 +56,7 @@ impl RasterPrefillPleInputRefs {
         source_id: impl Into<String>,
         layer_count: usize,
         token_count: usize,
-        per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
+        per_layer_inputs: Vec<Option<RasterActivationSequenceArtifactRef>>,
     ) -> Result<Self> {
         let source_id = validate_identifier(source_id.into())?;
         if layer_count == 0 {
@@ -91,11 +91,14 @@ impl RasterPrefillPleInputRefs {
         self.token_count
     }
 
-    pub fn per_layer_inputs(&self) -> &[Option<RasterActivationSequenceRef>] {
+    pub fn per_layer_inputs(&self) -> &[Option<RasterActivationSequenceArtifactRef>] {
         &self.per_layer_inputs
     }
 
-    pub fn clone_layer_ref(&self, layer_idx: usize) -> Result<Option<RasterActivationSequenceRef>> {
+    pub fn clone_layer_ref(
+        &self,
+        layer_idx: usize,
+    ) -> Result<Option<RasterActivationSequenceArtifactRef>> {
         self.per_layer_inputs
             .get(layer_idx)
             .cloned()

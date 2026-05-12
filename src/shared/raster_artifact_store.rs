@@ -342,6 +342,48 @@ impl RasterTokenIdSequenceRef {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+pub struct RasterActivationSequenceArtifactRef {
+    artifact_ref: RasterArtifactRef,
+}
+
+impl RasterActivationSequenceArtifactRef {
+    pub fn new(artifact_ref: RasterArtifactRef) -> Result<Self> {
+        artifact_ref
+            .metadata()
+            .ensure_kind(ACTIVATION_ROW_ARTIFACT_KIND)?;
+        artifact_ref.metadata().ensure_finalized()?;
+        artifact_ref
+            .metadata()
+            .shape_value(SHAPE_WIDTH)
+            .ok_or_else(|| anyhow!("raster activation artifact metadata missing width"))?;
+        Ok(Self { artifact_ref })
+    }
+
+    pub fn artifact_ref(&self) -> &RasterArtifactRef {
+        &self.artifact_ref
+    }
+
+    pub fn id(&self) -> &RasterArtifactId {
+        self.artifact_ref.id()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.artifact_ref.metadata().leaf_count()
+    }
+
+    pub fn width(&self) -> usize {
+        self.artifact_ref
+            .metadata()
+            .shape_value(SHAPE_WIDTH)
+            .expect("activation sequence artifact refs validate width metadata")
+    }
+
+    pub fn root(&self) -> &str {
+        self.artifact_ref.root()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StoredArtifact {
     metadata: RasterArtifactMetadata,
@@ -735,6 +777,38 @@ pub fn activation_row_leaf(row: &RasterActivationRow) -> Vec<u8> {
         payload.extend_from_slice(&bits.to_le_bytes());
     }
     payload
+}
+
+pub fn decode_activation_row_leaf(payload: &[u8]) -> Result<RasterActivationRow> {
+    if payload.len() < 8 {
+        bail!("activation row leaf payload is too short");
+    }
+    let width = u64::from_le_bytes(
+        payload[0..8]
+            .try_into()
+            .expect("slice length checked above"),
+    ) as usize;
+    let bits = &payload[8..];
+    let expected_len = width
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| anyhow!("activation row leaf width is too large"))?;
+    if bits.len() != expected_len {
+        bail!(
+            "activation row leaf payload has {} value bytes, expected {expected_len}",
+            bits.len()
+        );
+    }
+    let act_bits = bits
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|chunk| {
+            i32::from_le_bytes(
+                chunk
+                    .try_into()
+                    .expect("chunks_exact yields four-byte chunks"),
+            )
+        })
+        .collect();
+    Ok(RasterActivationRow::from_act_bits(act_bits))
 }
 
 fn artifact_ref(id: RasterArtifactId, state: &ArtifactBuilderState) -> RasterArtifactRef {

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokenizers::Tokenizer;
 
+use crate::shared::artifact_io::ArtifactIo;
+use crate::shared::raster_artifact_store::RasterTokenIdSequenceRef;
+
 pub mod checkpoints;
 pub mod decode_select_token;
 pub mod decode_transition;
@@ -304,7 +307,7 @@ pub fn run_inference_with_controls(
 
             let result = (|| {
                 trace::phase_started(PhaseId::InputEmbedding);
-                if use_raster_prefill {
+                let prompt_preparation = if use_raster_prefill {
                     let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
                         "raster tile inference requires an authenticated Gemma tokenizer",
                     )?;
@@ -331,60 +334,71 @@ pub fn run_inference_with_controls(
                             "sampling": request.sampling.clone(),
                         }),
                     );
-                    return Ok(InferenceRunOutcome::RasterPromptPrepared(
-                        RasterPromptPreparedState {
-                            terminal_checkpoint_id: "prompt.prepare".to_string(),
-                            prompt_preparation: raster_prompt_preparation.state,
-                            sampling: request.sampling.clone(),
-                            raster_tile_invocations: None,
-                        },
-                    ));
-                }
-
-                let prompt_preparation = run_prompt_prepare(request, model, tokenizer)?;
-                if request.execution_mode == InferenceExecutionMode::Deterministic {
-                    trace::trace_checkpoint_lazy_result("prompt.prepare", || {
-                        let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
-                            "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
-                        )?;
-                        let prompt_checkpoint =
-                            prompt_prepare::format_native_prompt_as_raster_checkpoint(
-                                request,
-                                model,
-                                tokenizer_source,
-                                &prompt_preparation,
-                            )?;
-                        Ok(json!({
-                            "prompt_bytes_root": prompt_checkpoint.prompt_bytes_root,
-                            "prompt_text_root": prompt_checkpoint.prompt_text_root,
-                            "rendered_prompt_root": prompt_checkpoint.rendered_prompt_root,
-                            "normalized_prompt_root": prompt_checkpoint.normalized_prompt_root,
-                            "prompt_token_count": prompt_checkpoint.prompt_token_count,
-                            "prompt_token_ids_root": prompt_checkpoint.prompt_token_ids_root,
-                            "sampling": request.sampling.clone(),
-                        }))
-                    })?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
-                        let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
-                            "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
-                        )?;
-                        let prompt_checkpoint =
-                            prompt_prepare::format_native_prompt_as_raster_checkpoint(
-                                request,
-                                model,
-                                tokenizer_source,
-                                &prompt_preparation,
-                            )?;
                         return Ok(InferenceRunOutcome::RasterPromptPrepared(
                             RasterPromptPreparedState {
                                 terminal_checkpoint_id,
-                                prompt_preparation: prompt_checkpoint,
+                                prompt_preparation: raster_prompt_preparation.state,
                                 sampling: request.sampling.clone(),
                                 raster_tile_invocations: None,
                             },
                         ));
                     }
-                }
+                    prompt_preparation_from_raster_prompt(
+                        request,
+                        &raster_prompt_preparation.state,
+                    )?
+                } else {
+                    let prompt_preparation = run_prompt_prepare(request, model, tokenizer)?;
+                    if request.execution_mode == InferenceExecutionMode::Deterministic {
+                        trace::trace_checkpoint_lazy_result("prompt.prepare", || {
+                            let tokenizer_source =
+                                controls.raster_tokenizer_source.as_ref().context(
+                                    "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
+                                )?;
+                            let prompt_checkpoint =
+                                prompt_prepare::format_native_prompt_as_raster_checkpoint(
+                                    request,
+                                    model,
+                                    tokenizer_source,
+                                    &prompt_preparation,
+                                )?;
+                            Ok(json!({
+                                "prompt_bytes_root": prompt_checkpoint.prompt_bytes_root,
+                                "prompt_text_root": prompt_checkpoint.prompt_text_root,
+                                "rendered_prompt_root": prompt_checkpoint.rendered_prompt_root,
+                                "normalized_prompt_root": prompt_checkpoint.normalized_prompt_root,
+                                "prompt_token_count": prompt_checkpoint.prompt_token_count,
+                                "prompt_token_ids_root": prompt_checkpoint.prompt_token_ids_root,
+                                "sampling": request.sampling.clone(),
+                            }))
+                        })?;
+                        if let Some(terminal_checkpoint_id) =
+                            reached_terminal_checkpoint_id(controls)
+                        {
+                            let tokenizer_source =
+                                controls.raster_tokenizer_source.as_ref().context(
+                                    "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
+                                )?;
+                            let prompt_checkpoint =
+                                prompt_prepare::format_native_prompt_as_raster_checkpoint(
+                                    request,
+                                    model,
+                                    tokenizer_source,
+                                    &prompt_preparation,
+                                )?;
+                            return Ok(InferenceRunOutcome::RasterPromptPrepared(
+                                RasterPromptPreparedState {
+                                    terminal_checkpoint_id,
+                                    prompt_preparation: prompt_checkpoint,
+                                    sampling: request.sampling.clone(),
+                                    raster_tile_invocations: None,
+                                },
+                            ));
+                        }
+                    }
+                    prompt_preparation
+                };
                 let token_embeddings = if let Some(embedding_table) =
                     transformer_model.embedding_table.as_ref()
                 {
@@ -660,6 +674,55 @@ fn reached_terminal_checkpoint_id(controls: &InferenceControls) -> Option<String
     trace::reached_terminal_checkpoint_id()
 }
 
+fn prompt_preparation_from_raster_prompt(
+    request: &InferenceRequest,
+    raster_prompt: &RasterPromptPreparationState,
+) -> Result<PromptPreparationState> {
+    let prompt_text = prompt_prepare::tiles::decode_prompt_bytes(
+        &request.prompt_bytes,
+        request.text_decoding_policy,
+    )?;
+    let prompt_token_ids = materialize_raster_prompt_token_ids(
+        &raster_prompt.prompt_token_ids_root,
+        raster_prompt.prompt_token_count,
+    )?;
+    let prompt_token_ids_sha256 =
+        prompt_prepare::tiles::build_prompt_commitment(&prompt_token_ids)?;
+
+    Ok(PromptPreparationState {
+        prompt_text,
+        prompt_token_ids,
+        prompt_token_ids_sha256,
+    })
+}
+
+fn materialize_raster_prompt_token_ids(
+    token_ids_root: &str,
+    token_count: usize,
+) -> Result<Vec<u32>> {
+    let token_ids_ref =
+        RasterTokenIdSequenceRef::new(ArtifactIo::artifact_ref_for_root(token_ids_root)?)?;
+    if token_ids_ref.token_count() != token_count {
+        anyhow::bail!(
+            "raster prompt token count mismatch: root has {}, checkpoint expected {}",
+            token_ids_ref.token_count(),
+            token_count
+        );
+    }
+
+    (0..token_count)
+        .map(|token_idx| {
+            let read = ArtifactIo::read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
+            ArtifactIo::verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
+            let payload = read.payload();
+            let bytes: [u8; 4] = payload
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("token-id leaf payload must be exactly four bytes"))?;
+            Ok(u32::from_le_bytes(bytes))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -930,16 +993,24 @@ mod tests {
                 raster_output_byte_flush_bytes_per_tile: None,
             },
         )
-        .expect("raster inference should stop after prompt prepare");
+        .expect("raster inference should stop after prefill prepare aux");
 
         match paused {
-            InferenceRunOutcome::RasterPromptPrepared(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
-                assert_eq!(state.prompt_preparation.prompt_token_count, 1);
-                assert!(!state.prompt_preparation.prompt_token_ids_root.is_empty());
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prefill.prepare_aux");
+                assert_eq!(
+                    state.input_embedding.prompt_preparation.prompt_token_ids,
+                    vec![1]
+                );
+                assert!(state.transformer_state_transition.is_none());
+                assert!(state.output_decode.is_none());
+                assert!(
+                    state.raster_tile_invocations.unwrap_or(0) > 0,
+                    "raster prefill checkpoint should include tile invocation count"
+                );
             }
-            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::Paused(_) => {
-                panic!("expected raster prompt boundary")
+            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
+                panic!("expected paused raster inference")
             }
         }
     }
@@ -983,15 +1054,16 @@ mod tests {
                 raster_output_byte_flush_bytes_per_tile: None,
             },
         )
-        .expect("raster inference should stop after prompt prepare");
+        .expect("raster inference should stop after prefill layer");
 
         match paused {
-            InferenceRunOutcome::RasterPromptPrepared(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
-                assert_eq!(state.prompt_preparation.prompt_token_count, 1);
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prefill.layer");
+                assert!(state.transformer_state_transition.is_none());
+                assert!(state.output_decode.is_none());
             }
-            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::Paused(_) => {
-                panic!("expected raster prompt boundary")
+            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
+                panic!("expected paused raster inference")
             }
         }
     }
@@ -1090,18 +1162,20 @@ mod tests {
                 raster_output_byte_flush_bytes_per_tile: None,
             },
         )
-        .expect("raster inference should stop after prompt prepare");
+        .expect("raster inference should stop after prefill finalize");
 
         match paused {
-            InferenceRunOutcome::RasterPromptPrepared(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "prefill.finalize");
                 assert!(
                     state.raster_tile_invocations.unwrap_or(0) > 0,
-                    "raster prompt boundary should include tile invocation count"
+                    "raster prefill should include tile invocation count"
                 );
+                assert!(state.transformer_state_transition.is_some());
+                assert!(state.output_decode.is_none());
             }
-            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::Paused(_) => {
-                panic!("expected raster prompt boundary")
+            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
+                panic!("expected paused raster inference")
             }
         }
     }
@@ -1211,15 +1285,23 @@ mod tests {
                 raster_output_byte_flush_bytes_per_tile: None,
             },
         )
-        .expect("raster inference should stop after prompt prepare");
+        .expect("raster inference should complete");
 
         match outcome {
-            InferenceRunOutcome::RasterPromptPrepared(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
-                assert_eq!(state.prompt_preparation.prompt_token_count, 1);
+            InferenceRunOutcome::Completed(state) => {
+                assert_eq!(state.output_decode.generated_token_ids, vec![0, 0]);
+                assert_eq!(
+                    state.output_decode.generated_text,
+                    "raster-helloraster-hello"
+                );
+                assert_eq!(state.output_decode.generated_token_count, 2);
+                assert!(
+                    state.raster_tile_invocations.expect("tile count") > 0,
+                    "full raster inference should count raster tiles"
+                );
             }
-            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::Paused(_) => {
-                panic!("expected raster prompt boundary")
+            InferenceRunOutcome::Paused(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
+                panic!("expected completed raster inference")
             }
         }
     }
@@ -1333,15 +1415,18 @@ mod tests {
                 raster_output_byte_flush_bytes_per_tile: None,
             },
         )
-        .expect("raster inference should stop after prompt prepare");
+        .expect("raster inference should complete");
 
         let InferenceRunOutcome::Completed(native) = native else {
             panic!("expected native inference to complete");
         };
-        let InferenceRunOutcome::RasterPromptPrepared(raster) = raster else {
-            panic!("expected raster prompt boundary");
+        let InferenceRunOutcome::Completed(raster) = raster else {
+            panic!("expected completed raster inference");
         };
-        assert_eq!(raster.prompt_preparation.prompt_token_count, 1);
+        assert_eq!(
+            raster.output_decode.generated_token_ids,
+            native.output_decode.generated_token_ids
+        );
         assert!(raster.raster_tile_invocations.expect("tile count") > 0);
     }
 
@@ -1384,14 +1469,17 @@ mod tests {
                 raster_output_byte_flush_bytes_per_tile: None,
             },
         )
-        .expect("raster inference should stop after prompt prepare");
+        .expect("raster inference should pause after output finalize");
 
         match paused {
-            InferenceRunOutcome::RasterPromptPrepared(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "output.finalize");
+                assert!(state.transformer_state_transition.is_some());
+                let output_decode = state.output_decode.expect("output phase should be present");
+                assert_eq!(output_decode.generated_token_count, 1);
             }
-            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::Paused(_) => {
-                panic!("expected raster prompt boundary")
+            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
+                panic!("expected paused raster inference")
             }
         }
     }
