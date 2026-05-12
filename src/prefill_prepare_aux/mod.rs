@@ -11,6 +11,7 @@ use crate::RasterSizingControls;
 
 pub mod raster_tiles;
 mod raster_utils;
+pub mod tiles;
 
 pub fn run(
     prompt_token_ids: &[u32],
@@ -18,21 +19,7 @@ pub fn run(
     token_embeddings: &ActivationSequence,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
-    let ple_inputs = model
-        .ple_global
-        .as_ref()
-        .map(|ple_global| {
-            crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
-                prompt_token_ids,
-                token_embeddings.clone_internal(),
-                &model.layers,
-                ple_global,
-                model.rms_norm_eps,
-                model.rms_norm_eps_det,
-                execution_mode,
-            )
-        })
-        .transpose()?;
+    let ple_inputs = tiles::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     trace_prefill_prepare_aux_checkpoint(prompt_token_ids, token_embeddings, ple_inputs.as_ref());
     Ok(ple_inputs)
 }
@@ -49,7 +36,7 @@ pub fn run_raster(
         token_embeddings,
         raster_sizing_with_projection_rows(projection_rows_per_tile),
     )?;
-    let ple_inputs = raster_tiles::materialize_prefill_ple_input_refs(ple_input_refs.as_ref())?;
+    let ple_inputs = materialize_prefill_ple_input_refs(ple_input_refs.as_ref())?;
     Ok(ple_inputs)
 }
 
@@ -90,7 +77,31 @@ pub fn run_raster_refs(
 }
 
 pub fn raster_tensor_store_snapshot() -> AuthenticatedRasterTensorStore {
-    raster_tiles::tensor_store_snapshot()
+    raster_utils::tensor_store_snapshot()
+}
+
+pub fn materialize_prefill_ple_input_refs(
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+) -> Result<Option<Gemma4PrefillPleInputs>> {
+    let Some(ple_input_refs) = ple_input_refs else {
+        return Ok(None);
+    };
+
+    Ok(Some(Gemma4PrefillPleInputs::from_internal(
+        ple_input_refs
+            .per_layer_inputs()
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map(|input_ref| {
+                        raster_utils::materialize_sequence(input_ref)
+                            .map(raster_utils::internal_sequence_from_raster)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?,
+    )))
 }
 
 fn trace_prefill_prepare_aux_checkpoint(
@@ -132,7 +143,7 @@ fn trace_prefill_prepare_aux_raster_checkpoint(
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
 ) -> Result<()> {
     crate::trace::trace_checkpoint_lazy_result("prefill.prepare_aux", || {
-        let ple_inputs = raster_tiles::materialize_prefill_ple_input_refs(ple_input_refs)?;
+        let ple_inputs = materialize_prefill_ple_input_refs(ple_input_refs)?;
         Ok(prefill_prepare_aux_checkpoint_payload(
             prompt_token_ids,
             token_embeddings,

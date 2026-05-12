@@ -10,19 +10,18 @@ use crate::shared::raster_prefill_ple::{
     GemmaPleModelProjectionRowRequest, GemmaPleProjectionNormWeightsRequest,
     GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest, RasterPrefillPleInputRefs,
 };
-use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::shared::raster_transformer_kernels::{
     project_row_with_weights, validate_projection_rows_per_tile, validate_sequence_rows_per_tile,
-    RasterActivationRow, RasterActivationSequence,
+    RasterActivationRow,
 };
-use crate::shared::transformer::{ActivationSequence, Gemma4PrefillPleInputs};
+use crate::shared::transformer::ActivationSequence;
 use crate::RasterSizingControls;
 
 use super::raster_utils::{
     append_sequence_row_by_builder_root, finalize_sequence_builder_by_root,
-    insert_activation_sequence, internal_sequence_from_raster, materialize_sequence,
-    raster_activation_sequence_from_embedding, read_activation_row_from_ref, read_prefill_token_id,
-    reset_artifact_store, start_sequence_builder, store_prefill_token_ids_artifact,
+    insert_activation_sequence, raster_activation_sequence_from_embedding,
+    read_activation_row_from_ref, read_prefill_token_id, reset_artifact_store,
+    start_sequence_builder, store_prefill_token_ids_artifact,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -143,25 +142,13 @@ impl PrefillPleSequenceBinaryState {
     }
 }
 
-pub fn init_prefill_ple_artifact_store() {
-    reset_artifact_store();
-}
-
-pub fn init_prefill_ple_tensor_store() {
-    init_prefill_ple_artifact_store();
-}
-
-pub fn tensor_store_snapshot() -> AuthenticatedRasterTensorStore {
-    super::raster_utils::tensor_store_snapshot()
-}
-
 pub fn prepare_raster_prefill_ple_input_roots(
     token_ids: &[u32],
     input_activations: &ActivationSequence,
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<RasterPrefillPleInputRoots> {
-    init_prefill_ple_tensor_store();
+    reset_artifact_store();
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
     validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
     let token_ids_ref = store_prefill_token_ids_artifact(token_ids)?;
@@ -481,65 +468,6 @@ pub fn finalize_prefill_ple_input_refs(
     )?))
 }
 
-#[tile]
-pub fn materialize_prefill_ple_input_refs(
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-) -> Result<Option<Gemma4PrefillPleInputs>> {
-    let Some(ple_input_refs) = ple_input_refs else {
-        return Ok(None);
-    };
-
-    // Public compatibility boundary. Recursive prepare-aux work stores only
-    // refs/cursors; materialization happens here only to preserve the existing
-    // `Gemma4PrefillPleInputs` return shape outside zkVM replay.
-    Ok(Some(Gemma4PrefillPleInputs::from_internal(
-        ple_input_refs
-            .per_layer_inputs()
-            .iter()
-            .map(|input| {
-                input
-                    .as_ref()
-                    .map(|input_ref| {
-                        materialize_sequence(&input_ref).map(internal_sequence_from_raster)
-                    })
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>>>()?,
-    )))
-}
-
-#[tile]
-pub fn finalize_prefill_ple_inputs(
-    state: PrefillPleRasterState,
-) -> Result<Option<Gemma4PrefillPleInputs>> {
-    let refs = finalize_prefill_ple_input_refs(state)?;
-    materialize_prefill_ple_input_refs(refs.as_ref())
-}
-
-#[tile]
-pub fn init_ple_sequence_projection(
-    input: &RasterActivationSequence,
-    projection_rows: usize,
-    projection_rows_per_tile: usize,
-) -> Result<PrefillPleSequenceProjectionState> {
-    let input_ref = insert_activation_sequence(
-        RasterArtifactId::new(format!(
-            "sequence.projection.input.{}",
-            crate::trace::sha256_hex(input)
-        ))?,
-        input.clone(),
-    )?;
-    init_ple_sequence_projection_from_ref(
-        input_ref,
-        RasterArtifactId::new(format!(
-            "sequence.projection.output.{}",
-            crate::trace::sha256_hex(input)
-        ))?,
-        projection_rows,
-        projection_rows_per_tile,
-    )
-}
-
 #[tile(kind = recursive)]
 pub fn project_next_ple_sequence_rows(
     mut state: PrefillPleSequenceProjectionState,
@@ -602,32 +530,6 @@ pub fn project_next_ple_sequence_rows(
     Ok((false, state))
 }
 
-#[tile]
-pub fn finalize_ple_sequence_projection(
-    state: PrefillPleSequenceProjectionState,
-) -> Result<RasterActivationSequence> {
-    let output_ref = finalize_ple_sequence_projection_ref(state)?;
-    materialize_sequence(&output_ref)
-}
-
-#[sequence]
-pub fn project_sequence_with_source(
-    input: &RasterActivationSequence,
-    ple_source: &AuthenticatedGemmaPleSource,
-    layer_idx: usize,
-    projection_rows: usize,
-    projection_rows_per_tile: usize,
-) -> Result<RasterActivationSequence> {
-    let state = call_tile!(
-        init_ple_sequence_projection,
-        input,
-        projection_rows,
-        projection_rows_per_tile
-    )?;
-    let state = call_recur_tile!(project_next_ple_sequence_rows, state, ple_source, layer_idx)?;
-    call_tile!(finalize_ple_sequence_projection, state)
-}
-
 pub fn run(
     token_ids: &[u32],
     input_activations: &ActivationSequence,
@@ -651,22 +553,6 @@ pub fn main(
     let state = call_tile!(init_prefill_ple_state, input_roots)?;
     let state = call_recur_seq!(compute_next_prefill_ple_layer_sequence, state, ple_source)?;
     call_tile!(finalize_prefill_ple_input_refs, state)
-}
-
-fn raster_sizing_with_projection_rows(projection_rows_per_tile: usize) -> RasterSizingControls {
-    RasterSizingControls {
-        projection_rows_per_tile,
-        attention_kv_rows_per_tile:
-            crate::InferenceControls::DEFAULT_RASTER_ATTENTION_KV_ROWS_PER_TILE,
-        sequence_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE,
-        head_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_HEAD_ROWS_PER_TILE,
-        tokenizer_bpe_pairs_per_tile:
-            crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
-        tokenizer_bpe_pieces_per_tile:
-            crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE,
-        output_byte_flush_bytes_per_tile:
-            crate::InferenceControls::DEFAULT_RASTER_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
-    }
 }
 
 #[tile]
@@ -1136,7 +1022,7 @@ mod tests {
     #[test]
     fn scaled_token_embedding_rows_advance_one_recursive_step_at_a_time() {
         let fixture = PleFixture::single_layer().expect("fixture should build");
-        init_prefill_ple_tensor_store();
+        reset_artifact_store();
         let token_ids_ref = store_prefill_token_ids_artifact(&[0, 1]).expect("token ids ref");
         let state = init_scaled_token_embedding_sequence_ref(
             token_ids_ref.root(),
@@ -1167,9 +1053,8 @@ mod tests {
 
         let sequence_ref = finalize_scaled_token_embedding_sequence_ref(state)
             .expect("finalize embedded sequence");
-        let sequence = materialize_sequence(&sequence_ref).expect("materialize embedded sequence");
-        assert_eq!(sequence.len(), 2);
-        assert_eq!(sequence.width().expect("width"), 2);
+        assert_eq!(sequence_ref.row_count(), 2);
+        assert_eq!(sequence_ref.width(), 2);
     }
 
     #[test]
@@ -1305,16 +1190,7 @@ mod tests {
         let raster = run_materialized(&token_ids, &input, &fixture.source, 2)
             .expect("raster PLE should run")
             .expect("raster PLE inputs");
-        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
-            &token_ids,
-            input.clone_internal(),
-            &fixture.layers,
-            &fixture.native_ple_global,
-            0.0,
-            Some(f32_to_acc(0.0)),
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("native PLE should run");
+        let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
 
         assert_eq!(raster.per_layer_inputs, native.per_layer_inputs);
     }
@@ -1389,19 +1265,13 @@ mod tests {
         assert!(encoded.contains("prefill.prepare_aux.per_layer_input.0"));
         assert!(!encoded.contains("act_bits"));
 
-        let finalized = finalize_prefill_ple_inputs(state)
+        let refs = finalize_prefill_ple_input_refs(state)
             .expect("finalize")
+            .expect("PLE refs");
+        let finalized = crate::prefill_prepare_aux::materialize_prefill_ple_input_refs(Some(&refs))
+            .expect("materialize refs")
             .expect("PLE inputs");
-        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
-            &token_ids,
-            input.clone_internal(),
-            &fixture.layers,
-            &fixture.native_ple_global,
-            0.0,
-            Some(f32_to_acc(0.0)),
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("native PLE should run");
+        let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
         assert_eq!(finalized.per_layer_inputs, native.per_layer_inputs);
     }
 
@@ -1427,19 +1297,11 @@ mod tests {
         assert!(encoded.contains("per_layer_inputs"));
         assert!(!encoded.contains("act_bits"));
 
-        let materialized = materialize_prefill_ple_input_refs(Some(&refs))
-            .expect("materialize refs")
-            .expect("PLE inputs");
-        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
-            &token_ids,
-            input.clone_internal(),
-            &fixture.layers,
-            &fixture.native_ple_global,
-            0.0,
-            Some(f32_to_acc(0.0)),
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("native PLE should run");
+        let materialized =
+            crate::prefill_prepare_aux::materialize_prefill_ple_input_refs(Some(&refs))
+                .expect("materialize refs")
+                .expect("PLE inputs");
+        let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
         assert_eq!(materialized.per_layer_inputs, native.per_layer_inputs);
     }
 
@@ -1720,16 +1582,7 @@ mod tests {
         let raster = run_materialized(token_ids, input, &fixture.source, 1)
             .expect("raster PLE should run")
             .expect("raster PLE inputs");
-        let native = crate::shared::transformer_kernels::compute_prefill_ple_inputs_internal(
-            token_ids,
-            input.clone_internal(),
-            &fixture.layers,
-            &fixture.native_ple_global,
-            0.0,
-            Some(f32_to_acc(0.0)),
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("native PLE should run");
+        let native = native_prefill_ple_inputs(fixture, token_ids, input);
         (raster, native)
     }
 
@@ -1754,7 +1607,40 @@ mod tests {
         raster_sizing: RasterSizingControls,
     ) -> Result<Option<Gemma4PrefillPleInputs>> {
         let refs = run(token_ids, input, source, raster_sizing)?;
-        materialize_prefill_ple_input_refs(refs.as_ref())
+        crate::prefill_prepare_aux::materialize_prefill_ple_input_refs(refs.as_ref())
+    }
+
+    fn native_prefill_ple_inputs(
+        fixture: &PleFixture,
+        token_ids: &[u32],
+        input: &ActivationSequence,
+    ) -> Gemma4PrefillPleInputs {
+        crate::prefill_prepare_aux::tiles::compute_prefill_ple_inputs_internal(
+            token_ids,
+            input.clone_internal(),
+            &fixture.layers,
+            &fixture.native_ple_global,
+            0.0,
+            Some(f32_to_acc(0.0)),
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("native PLE should run")
+    }
+
+    fn raster_sizing_with_projection_rows(projection_rows_per_tile: usize) -> RasterSizingControls {
+        RasterSizingControls {
+            projection_rows_per_tile,
+            attention_kv_rows_per_tile:
+                crate::InferenceControls::DEFAULT_RASTER_ATTENTION_KV_ROWS_PER_TILE,
+            sequence_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE,
+            head_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_HEAD_ROWS_PER_TILE,
+            tokenizer_bpe_pairs_per_tile:
+                crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
+            tokenizer_bpe_pieces_per_tile:
+                crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE,
+            output_byte_flush_bytes_per_tile:
+                crate::InferenceControls::DEFAULT_RASTER_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+        }
     }
 
     fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {
