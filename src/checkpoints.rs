@@ -45,6 +45,7 @@ impl FromStr for PhaseId {
 #[serde(rename_all = "snake_case")]
 pub enum RoutineId {
     PromptPrepare,
+    InputEmbedding,
     PrefillPrepareAux,
     PrefillLayer,
     PrefillFinalize,
@@ -64,6 +65,10 @@ pub fn classify_checkpoint(checkpoint_name: &str) -> Option<CheckpointTaxonomy> 
         "prompt.prepare" => Some(CheckpointTaxonomy {
             phase_id: PhaseId::InputEmbedding,
             routine_id: RoutineId::PromptPrepare,
+        }),
+        "input.embedding" => Some(CheckpointTaxonomy {
+            phase_id: PhaseId::InputEmbedding,
+            routine_id: RoutineId::InputEmbedding,
         }),
         "prefill.prepare_aux" => Some(CheckpointTaxonomy {
             phase_id: PhaseId::TransformerStateTransition,
@@ -112,6 +117,17 @@ mod tests {
             Some(CheckpointTaxonomy {
                 phase_id: PhaseId::TransformerStateTransition,
                 routine_id: RoutineId::PrefillLayer,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_input_embedding_checkpoint() {
+        assert_eq!(
+            classify_checkpoint("input.embedding"),
+            Some(CheckpointTaxonomy {
+                phase_id: PhaseId::InputEmbedding,
+                routine_id: RoutineId::InputEmbedding,
             })
         );
     }

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 
+use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
@@ -213,6 +214,71 @@ pub fn prepare_raster_prefill_ple_input_roots(
         token_ids_artifact_root: token_ids_ref.root().to_string(),
         token_count: token_ids_ref.token_count(),
         input_activations_ref: Some(input_activations_ref),
+        layer_count: metadata.layer_count,
+        has_ple_global: true,
+        raster_sizing,
+    })
+}
+
+pub fn prepare_raster_prefill_ple_input_roots_from_embedding_refs(
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_source: &AuthenticatedGemmaPleSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<RasterPrefillPleInputRoots> {
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
+    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
+    if !metadata.has_ple_global {
+        return Ok(RasterPrefillPleInputRoots {
+            source_id: metadata.source_id,
+            token_ids_artifact_root: input_embedding_refs.prompt_token_ids_root.clone(),
+            token_count: input_embedding_refs.prompt_token_count,
+            input_activations_ref: None,
+            layer_count: metadata.layer_count,
+            has_ple_global: false,
+            raster_sizing,
+        });
+    }
+
+    if metadata.layer_count == 0 {
+        bail!("transformer PLE computation requires at least one layer");
+    }
+    if metadata.token_embedding_layer_count != metadata.layer_count {
+        bail!(
+            "transformer PLE token embedding slice count mismatch: {} vs {}",
+            metadata.token_embedding_layer_count,
+            metadata.layer_count
+        );
+    }
+    if metadata.model_projection_layer_count != metadata.layer_count {
+        bail!(
+            "transformer PLE model projection slice count mismatch: {} vs {}",
+            metadata.model_projection_layer_count,
+            metadata.layer_count
+        );
+    }
+    if input_embedding_refs.prompt_token_count
+        != input_embedding_refs
+            .embedded_prompt_activations_ref
+            .row_count()
+    {
+        bail!("transformer PLE computation requires token ids and activations to have matching lengths");
+    }
+
+    let first_layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx: 0 })?;
+    if input_embedding_refs.embedded_prompt_activations_ref.width() != first_layer.hidden_width {
+        bail!(
+            "input activations row 0 has width {}, expected {}",
+            input_embedding_refs.embedded_prompt_activations_ref.width(),
+            first_layer.hidden_width
+        );
+    }
+
+    Ok(RasterPrefillPleInputRoots {
+        source_id: metadata.source_id,
+        token_ids_artifact_root: input_embedding_refs.prompt_token_ids_root.clone(),
+        token_count: input_embedding_refs.prompt_token_count,
+        input_activations_ref: Some(input_embedding_refs.embedded_prompt_activations_ref.clone()),
         layer_count: metadata.layer_count,
         has_ple_global: true,
         raster_sizing,
@@ -539,6 +605,19 @@ pub fn run(
     let input_roots = prepare_raster_prefill_ple_input_roots(
         token_ids,
         input_activations,
+        ple_source,
+        raster_sizing,
+    )?;
+    main(input_roots, ple_source)
+}
+
+pub fn run_with_input_embedding_refs(
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_source: &AuthenticatedGemmaPleSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<Option<RasterPrefillPleInputRefs>> {
+    let input_roots = prepare_raster_prefill_ple_input_roots_from_embedding_refs(
+        input_embedding_refs,
         ple_source,
         raster_sizing,
     )?;
@@ -1072,6 +1151,57 @@ mod tests {
         let output = run_materialized(&[0], &input, &source, 1).expect("raster PLE should run");
 
         assert!(output.is_none());
+    }
+
+    #[test]
+    fn prefill_prepare_aux_roots_can_be_built_from_input_embedding_refs() {
+        reset_artifact_store();
+        let token_ids_ref = store_prefill_token_ids_artifact(&[0, 1]).expect("token ids ref");
+        let activations_ref = insert_activation_sequence(
+            RasterArtifactId::new("input.embedding.test.embedded").expect("artifact id"),
+            crate::shared::raster_transformer_kernels::RasterActivationSequence::from_acts(vec![
+                vec![Act::from_num(1.0), Act::from_num(0.0)],
+                vec![Act::from_num(0.0), Act::from_num(1.0)],
+            ]),
+        )
+        .expect("activation ref");
+        let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
+            source_id: "embedding-fixture".to_string(),
+            embedding_source_root: "embedding-source-root".to_string(),
+            prompt_token_ids_root: token_ids_ref.root().to_string(),
+            prompt_token_count: token_ids_ref.token_count(),
+            embedded_prompt_activations_ref: activations_ref.clone(),
+        };
+        let ple_source = AuthenticatedGemmaPleSource::from_canonical_parts(
+            "ple-fixture",
+            vec![GemmaPleLayerConfig {
+                has_ple: true,
+                hidden_width: 2,
+            }],
+            vec![vec![
+                vec![Act::from_num(1.0), Act::from_num(0.0)],
+                vec![Act::from_num(0.0), Act::from_num(1.0)],
+            ]],
+            vec![vec![
+                vec![Wgt::from_num(1.0), Wgt::from_num(0.0)],
+                vec![Wgt::from_num(0.0), Wgt::from_num(1.0)],
+            ]],
+            vec![Wgt::from_num(1.0), Wgt::from_num(1.0)],
+            test_scalars(),
+        )
+        .expect("PLE source");
+
+        let roots = prepare_raster_prefill_ple_input_roots_from_embedding_refs(
+            &input_embedding_refs,
+            &ple_source,
+            raster_sizing_with_projection_rows(1),
+        )
+        .expect("input roots");
+
+        assert_eq!(roots.token_ids_artifact_root, token_ids_ref.root());
+        assert_eq!(roots.token_count, token_ids_ref.token_count());
+        assert_eq!(roots.input_activations_ref, Some(activations_ref));
+        assert!(roots.has_ple_global);
     }
 
     #[test]

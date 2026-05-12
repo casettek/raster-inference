@@ -5,10 +5,12 @@ use tokenizers::Tokenizer;
 
 use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::raster_artifact_store::RasterTokenIdSequenceRef;
+use crate::shared::raster_input_embedding::AuthenticatedGemmaInputEmbeddingSource;
 
 pub mod checkpoints;
 pub mod decode_select_token;
 pub mod decode_transition;
+pub mod input_embedding;
 pub mod io;
 pub mod output_finalize;
 mod pipeline;
@@ -24,6 +26,7 @@ pub use checkpoints::{classify_checkpoint, CheckpointTaxonomy, PhaseId, RoutineI
 pub use decode_select_token::run as run_decode_select_token;
 pub use decode_transition::tiles::run_text_layers_decode_step;
 pub use decode_transition::{finalize as finalize_decode_transition, run as run_decode_transition};
+pub use input_embedding::run as run_input_embedding;
 pub use io::{
     load_chat_template, load_embedding_table_from_gemma_model_path, load_embedding_table_from_path,
     load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
@@ -304,9 +307,21 @@ pub fn run_inference_with_controls(
             if use_raster_decode {
                 crate::raster_authoring::start_tile_invocation_counting();
             }
+            let deterministic_prompt_checkpoint = |prompt_preparation: &PromptPreparationState| {
+                let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
+                    "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
+                )?;
+                prompt_prepare::format_native_prompt_as_raster_checkpoint(
+                    request,
+                    model,
+                    tokenizer_source,
+                    prompt_preparation,
+                )
+            };
 
             let result = (|| {
                 trace::phase_started(PhaseId::InputEmbedding);
+                let mut raster_prompt_preparation_for_embedding = None;
                 let prompt_preparation = if use_raster_prefill {
                     let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
                         "raster tile inference requires an authenticated Gemma tokenizer",
@@ -344,49 +359,34 @@ pub fn run_inference_with_controls(
                             },
                         ));
                     }
+                    raster_prompt_preparation_for_embedding =
+                        Some(raster_prompt_preparation.state.clone());
                     prompt_preparation_from_raster_prompt(
                         request,
                         &raster_prompt_preparation.state,
                     )?
                 } else {
                     let prompt_preparation = run_prompt_prepare(request, model, tokenizer)?;
-                    if request.execution_mode == InferenceExecutionMode::Deterministic {
-                        trace::trace_checkpoint_lazy_result("prompt.prepare", || {
-                            let tokenizer_source =
-                                controls.raster_tokenizer_source.as_ref().context(
-                                    "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
-                                )?;
-                            let prompt_checkpoint =
-                                prompt_prepare::format_native_prompt_as_raster_checkpoint(
-                                    request,
-                                    model,
-                                    tokenizer_source,
-                                    &prompt_preparation,
-                                )?;
-                            Ok(json!({
-                                "prompt_bytes_root": prompt_checkpoint.prompt_bytes_root,
-                                "prompt_text_root": prompt_checkpoint.prompt_text_root,
-                                "rendered_prompt_root": prompt_checkpoint.rendered_prompt_root,
-                                "normalized_prompt_root": prompt_checkpoint.normalized_prompt_root,
+                    if request.execution_mode == InferenceExecutionMode::Deterministic
+                        && controls.raster_tokenizer_source.is_some()
+                    {
+                        let prompt_checkpoint =
+                            deterministic_prompt_checkpoint(&prompt_preparation)?;
+                        trace::trace_checkpoint(
+                            "prompt.prepare",
+                            &json!({
+                                "prompt_bytes_root": prompt_checkpoint.prompt_bytes_root.clone(),
+                                "prompt_text_root": prompt_checkpoint.prompt_text_root.clone(),
+                                "rendered_prompt_root": prompt_checkpoint.rendered_prompt_root.clone(),
+                                "normalized_prompt_root": prompt_checkpoint.normalized_prompt_root.clone(),
                                 "prompt_token_count": prompt_checkpoint.prompt_token_count,
-                                "prompt_token_ids_root": prompt_checkpoint.prompt_token_ids_root,
+                                "prompt_token_ids_root": prompt_checkpoint.prompt_token_ids_root.clone(),
                                 "sampling": request.sampling.clone(),
-                            }))
-                        })?;
+                            }),
+                        );
                         if let Some(terminal_checkpoint_id) =
                             reached_terminal_checkpoint_id(controls)
                         {
-                            let tokenizer_source =
-                                controls.raster_tokenizer_source.as_ref().context(
-                                    "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
-                                )?;
-                            let prompt_checkpoint =
-                                prompt_prepare::format_native_prompt_as_raster_checkpoint(
-                                    request,
-                                    model,
-                                    tokenizer_source,
-                                    &prompt_preparation,
-                                )?;
                             return Ok(InferenceRunOutcome::RasterPromptPrepared(
                                 RasterPromptPreparedState {
                                     terminal_checkpoint_id,
@@ -396,27 +396,49 @@ pub fn run_inference_with_controls(
                                 },
                             ));
                         }
+                        raster_prompt_preparation_for_embedding = Some(prompt_checkpoint);
                     }
                     prompt_preparation
                 };
-                let token_embeddings = if let Some(embedding_table) =
-                    transformer_model.embedding_table.as_ref()
-                {
-                    embed_input_tokens_with_mode(
-                        &prompt_preparation.prompt_token_ids,
-                        embedding_table,
-                        request.execution_mode,
-                    )?
-                } else if let Some(embedding_source) = transformer_model.embedding_source.as_ref() {
-                    io::embed_input_tokens_from_gemma_source_with_mode(
-                        &prompt_preparation.prompt_token_ids,
-                        embedding_source,
-                        request.execution_mode,
-                    )?
+                let (token_embeddings, raster_input_embedding_refs) = if use_raster_prefill {
+                    let raster_prompt_preparation = raster_prompt_preparation_for_embedding
+                        .as_ref()
+                        .expect("raster prompt preparation should exist for raster prefill");
+                    let embedding_source = AuthenticatedGemmaInputEmbeddingSource::from_model(
+                        model.model_id.clone(),
+                        transformer_model,
+                    )?;
+                    let input_embedding_refs = input_embedding::run_raster_refs(
+                        raster_prompt_preparation,
+                        &embedding_source,
+                    )?;
+                    let token_embeddings =
+                        input_embedding::materialize_input_embedding_refs(&input_embedding_refs)?;
+                    (token_embeddings, Some(input_embedding_refs))
                 } else {
-                    anyhow::bail!(
-                    "transformer state model is missing both embedding_table and embedding_source"
-                )
+                    let token_embeddings = input_embedding::run(
+                        &prompt_preparation.prompt_token_ids,
+                        transformer_model,
+                        request.execution_mode,
+                    )?;
+                    let input_embedding_refs = raster_prompt_preparation_for_embedding
+                        .as_ref()
+                        .map(|raster_prompt_preparation| {
+                            let embedding_source =
+                                AuthenticatedGemmaInputEmbeddingSource::from_model(
+                                    model.model_id.clone(),
+                                    transformer_model,
+                                )?;
+                            let embedding_source_ref = embedding_source.committed_source_ref()?;
+                            input_embedding::format_native_input_embedding_as_raster_checkpoint(
+                                model.model_id.clone(),
+                                embedding_source_ref.root().to_string(),
+                                raster_prompt_preparation,
+                                &token_embeddings,
+                            )
+                        })
+                        .transpose()?;
+                    (token_embeddings, input_embedding_refs)
                 };
                 let input_embedding = InputEmbeddingState {
                     prompt_preparation: prompt_preparation.clone(),
@@ -439,6 +461,11 @@ pub fn run_inference_with_controls(
                         }),
                     );
                 }
+                input_embedding::trace_input_embedding_checkpoint(
+                    &prompt_preparation.prompt_token_ids,
+                    &token_embeddings,
+                    raster_input_embedding_refs.as_ref(),
+                );
                 if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                     return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
                         terminal_checkpoint_id,
@@ -459,8 +486,12 @@ pub fn run_inference_with_controls(
                             model.model_id.clone(),
                             transformer_model,
                         )?;
-                    let ple_input_refs = prefill_prepare_aux::run_raster_refs(
+                    let input_embedding_refs = raster_input_embedding_refs
+                        .as_ref()
+                        .expect("raster prefill requires raster input embedding refs");
+                    let ple_input_refs = prefill_prepare_aux::run_raster_refs_from_input_embedding(
                         &prompt_preparation.prompt_token_ids,
+                        input_embedding_refs,
                         &ple_source,
                         &token_embeddings,
                         raster_sizing,
@@ -950,6 +981,67 @@ mod tests {
             }
             InferenceRunOutcome::Completed(_) | InferenceRunOutcome::Paused(_) => {
                 panic!("expected deterministic CPU prompt boundary")
+            }
+        }
+    }
+
+    #[test]
+    fn run_inference_with_controls_raster_tiles_can_pause_after_input_embedding() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(2),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let paused = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: false,
+                terminal_checkpoint: Some("input.embedding".to_string()),
+                raster_tiles: true,
+                raster_decode_only: false,
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_projection_rows_per_tile: None,
+                raster_attention_kv_rows_per_tile: None,
+                raster_sequence_rows_per_tile: None,
+                raster_head_rows_per_tile: None,
+                raster_tokenizer_bpe_pairs_per_tile: None,
+                raster_tokenizer_bpe_pieces_per_tile: None,
+                raster_output_byte_flush_bytes_per_tile: None,
+            },
+        )
+        .expect("raster inference should stop after input embedding");
+
+        match paused {
+            InferenceRunOutcome::Paused(state) => {
+                assert_eq!(state.terminal_checkpoint_id, "input.embedding");
+                assert_eq!(
+                    state.input_embedding.prompt_preparation.prompt_token_ids,
+                    vec![1]
+                );
+                assert!(state
+                    .input_embedding
+                    .det_embedded_prompt_activations_sha256
+                    .is_some());
+                assert!(state.transformer_state_transition.is_none());
+                assert!(state.output_decode.is_none());
+            }
+            InferenceRunOutcome::Completed(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
+                panic!("expected paused inference")
             }
         }
     }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::raster_prefill_ple::{AuthenticatedGemmaPleSource, RasterPrefillPleInputRefs};
 use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
@@ -65,6 +66,26 @@ pub fn run_raster_refs(
     let ple_input_refs = raster_tiles::run(
         prompt_token_ids,
         token_embeddings,
+        ple_source,
+        raster_sizing,
+    )?;
+    trace_prefill_prepare_aux_raster_checkpoint(
+        prompt_token_ids,
+        token_embeddings,
+        ple_input_refs.as_ref(),
+    )?;
+    Ok(ple_input_refs)
+}
+
+pub fn run_raster_refs_from_input_embedding(
+    prompt_token_ids: &[u32],
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_source: &AuthenticatedGemmaPleSource,
+    token_embeddings: &ActivationSequence,
+    raster_sizing: RasterSizingControls,
+) -> Result<Option<RasterPrefillPleInputRefs>> {
+    let ple_input_refs = raster_tiles::run_with_input_embedding_refs(
+        input_embedding_refs,
         ple_source,
         raster_sizing,
     )?;
