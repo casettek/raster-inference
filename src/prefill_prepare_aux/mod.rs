@@ -7,8 +7,10 @@ use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel,
 };
+use crate::RasterSizingControls;
 
 pub mod raster_tiles;
+mod raster_utils;
 
 pub fn run(
     prompt_token_ids: &[u32],
@@ -41,40 +43,54 @@ pub fn run_raster(
     token_embeddings: &ActivationSequence,
     projection_rows_per_tile: usize,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
-    let mut store = raster_tiles::init_prefill_ple_store();
-    let ple_input_refs = run_raster_refs_with_store(
+    let ple_input_refs = run_raster_refs(
         prompt_token_ids,
         ple_source,
         token_embeddings,
-        projection_rows_per_tile,
-        &mut store,
+        raster_sizing_with_projection_rows(projection_rows_per_tile),
     )?;
-    let ple_inputs =
-        raster_tiles::materialize_prefill_ple_input_refs(&store, ple_input_refs.as_ref())?;
+    let ple_inputs = raster_tiles::materialize_prefill_ple_input_refs(ple_input_refs.as_ref())?;
     Ok(ple_inputs)
 }
 
-pub fn run_raster_refs_with_store(
+fn raster_sizing_with_projection_rows(projection_rows_per_tile: usize) -> RasterSizingControls {
+    RasterSizingControls {
+        projection_rows_per_tile,
+        attention_kv_rows_per_tile:
+            crate::InferenceControls::DEFAULT_RASTER_ATTENTION_KV_ROWS_PER_TILE,
+        sequence_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE,
+        head_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_HEAD_ROWS_PER_TILE,
+        tokenizer_bpe_pairs_per_tile:
+            crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
+        tokenizer_bpe_pieces_per_tile:
+            crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE,
+        output_byte_flush_bytes_per_tile:
+            crate::InferenceControls::DEFAULT_RASTER_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+    }
+}
+
+pub fn run_raster_refs(
     prompt_token_ids: &[u32],
     ple_source: &AuthenticatedGemmaPleSource,
     token_embeddings: &ActivationSequence,
-    projection_rows_per_tile: usize,
-    store: &mut AuthenticatedRasterTensorStore,
+    raster_sizing: RasterSizingControls,
 ) -> Result<Option<RasterPrefillPleInputRefs>> {
-    let ple_input_refs = raster_tiles::run_refs_with_store(
-        store,
+    let ple_input_refs = raster_tiles::run(
         prompt_token_ids,
         token_embeddings,
         ple_source,
-        projection_rows_per_tile,
+        raster_sizing,
     )?;
     trace_prefill_prepare_aux_raster_checkpoint(
         prompt_token_ids,
         token_embeddings,
-        store,
         ple_input_refs.as_ref(),
     )?;
     Ok(ple_input_refs)
+}
+
+pub fn raster_tensor_store_snapshot() -> AuthenticatedRasterTensorStore {
+    raster_tiles::tensor_store_snapshot()
 }
 
 fn trace_prefill_prepare_aux_checkpoint(
@@ -105,11 +121,10 @@ fn trace_prefill_prepare_aux_checkpoint(
 fn trace_prefill_prepare_aux_raster_checkpoint(
     prompt_token_ids: &[u32],
     token_embeddings: &ActivationSequence,
-    store: &AuthenticatedRasterTensorStore,
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
 ) -> Result<()> {
     crate::trace::trace_checkpoint_lazy_result("prefill.prepare_aux", || {
-        let ple_inputs = raster_tiles::materialize_prefill_ple_input_refs(store, ple_input_refs)?;
+        let ple_inputs = raster_tiles::materialize_prefill_ple_input_refs(ple_input_refs)?;
         Ok(json!({
             "prompt_token_ids": prompt_token_ids,
             "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),

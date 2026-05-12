@@ -1,15 +1,19 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::gemma_tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::input::{
     InferenceRequest, ModelSpec, PromptPreparationState, RasterPromptPreparationState,
 };
-use crate::shared::raster_artifact_store::{RasterArtifactMetadata, RasterTokenIdSequenceRef};
 use crate::trace::{trace_event, trace_scope};
 
-use self::raster_utils::{artifact_id, store_byte_artifact, store_text_artifact, token_id_leaf};
+use self::raster_utils::{
+    init_artifact_store, init_tokenize_prompt, insert_token_id_artifact, normalize_tokenize_prompt,
+    prepare_raster_prompt_input_roots, store_byte_artifact, store_text_artifact,
+    NORMALIZED_PROMPT_ARTIFACT_DOMAIN, NORMALIZED_PROMPT_ARTIFACT_KIND,
+    PROMPT_BYTES_ARTIFACT_DOMAIN, PROMPT_BYTES_ARTIFACT_KIND, PROMPT_TEXT_ARTIFACT_DOMAIN,
+    PROMPT_TEXT_ARTIFACT_KIND, RENDERED_PROMPT_ARTIFACT_DOMAIN, RENDERED_PROMPT_ARTIFACT_KIND,
+};
 use self::tiles::{
     build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes, render_prompt,
     tokenize_prompt,
@@ -18,16 +22,6 @@ use self::tiles::{
 pub mod raster_tiles;
 mod raster_utils;
 pub mod tiles;
-
-const PROMPT_BYTES_ARTIFACT_KIND: &str = "prompt_bytes";
-const PROMPT_TEXT_ARTIFACT_KIND: &str = "prompt_text";
-const RENDERED_PROMPT_ARTIFACT_KIND: &str = "rendered_prompt";
-const NORMALIZED_PROMPT_ARTIFACT_KIND: &str = "normalized_prompt";
-
-const PROMPT_BYTES_ARTIFACT_DOMAIN: &str = "raster-artifact-prompt-bytes-merkle-v1";
-const PROMPT_TEXT_ARTIFACT_DOMAIN: &str = "raster-artifact-prompt-text-merkle-v1";
-const RENDERED_PROMPT_ARTIFACT_DOMAIN: &str = "raster-artifact-rendered-prompt-merkle-v1";
-const NORMALIZED_PROMPT_ARTIFACT_DOMAIN: &str = "raster-artifact-normalized-prompt-merkle-v1";
 
 pub fn run(
     request: &InferenceRequest,
@@ -60,7 +54,7 @@ pub fn format_native_prompt_as_raster_checkpoint(
     tokenizer: &AuthenticatedGemmaTokenizer,
     prompt_preparation: &PromptPreparationState,
 ) -> Result<RasterPromptPreparationState> {
-    raster_tiles::init_artifact_store();
+    init_artifact_store();
 
     let prompt_bytes_ref = store_byte_artifact(
         "prompt-bytes",
@@ -85,24 +79,16 @@ pub fn format_native_prompt_as_raster_checkpoint(
         RENDERED_PROMPT_ARTIFACT_DOMAIN,
         &rendered_prompt,
     )?;
-    let input = raster_tiles::init_tokenize_prompt(&rendered_prompt, request.add_special_tokens)?;
-    let normalized = raster_tiles::normalize_tokenize_prompt(&input, tokenizer)?;
+    let input = init_tokenize_prompt(&rendered_prompt, request.add_special_tokens)?;
+    let normalized = normalize_tokenize_prompt(&input, tokenizer)?;
     let normalized_prompt_ref = store_text_artifact(
         "normalized-prompt",
         NORMALIZED_PROMPT_ARTIFACT_KIND,
         NORMALIZED_PROMPT_ARTIFACT_DOMAIN,
         &normalized.text,
     )?;
-    let token_id_leaves = prompt_preparation
-        .prompt_token_ids
-        .iter()
-        .map(|token_id| token_id_leaf(*token_id))
-        .collect::<Vec<_>>();
-    let token_ids_ref = RasterTokenIdSequenceRef::new(ArtifactIo::insert_artifact(
-        artifact_id("prompt-token-ids")?,
-        RasterArtifactMetadata::token_ids(prompt_preparation.prompt_token_ids.len()),
-        token_id_leaves,
-    )?)?;
+    let token_ids_ref =
+        insert_token_id_artifact("prompt-token-ids", &prompt_preparation.prompt_token_ids)?;
 
     Ok(RasterPromptPreparationState {
         prompt_bytes_root: prompt_bytes_ref.root().to_string(),
@@ -119,7 +105,7 @@ pub fn run_raster(
     model: &ModelSpec,
     tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<raster_tiles::RasterPromptPreparationResult> {
-    raster_tiles::run(
+    run_raster_with_tokenizer_controls(
         request,
         model,
         tokenizer,
@@ -135,11 +121,12 @@ pub fn run_raster_with_tokenizer_controls(
     bpe_pairs_per_tile: usize,
     bpe_pieces_per_tile: usize,
 ) -> Result<raster_tiles::RasterPromptPreparationResult> {
-    raster_tiles::run(
+    let input_roots = prepare_raster_prompt_input_roots(
         request,
         model,
         tokenizer,
         bpe_pairs_per_tile,
         bpe_pieces_per_tile,
-    )
+    )?;
+    raster_tiles::main(input_roots)
 }

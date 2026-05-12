@@ -438,8 +438,6 @@ pub fn run_inference_with_controls(
 
                 trace::phase_started(PhaseId::TransformerStateTransition);
                 let prefill = if use_raster_prefill {
-                    let mut raster_prefill_store =
-                        crate::shared::raster_row_store::AuthenticatedRasterTensorStore::new();
                     let raster_sizing =
                         raster_sizing_controls.expect("raster sizing controls should be validated");
                     let ple_source =
@@ -447,12 +445,11 @@ pub fn run_inference_with_controls(
                             model.model_id.clone(),
                             transformer_model,
                         )?;
-                    let ple_input_refs = prefill_prepare_aux::run_raster_refs_with_store(
+                    let ple_input_refs = prefill_prepare_aux::run_raster_refs(
                         &prompt_preparation.prompt_token_ids,
                         &ple_source,
                         &token_embeddings,
-                        raster_sizing.projection_rows_per_tile,
-                        &mut raster_prefill_store,
+                        raster_sizing,
                     )?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                         trace::phase_paused(PhaseId::TransformerStateTransition);
@@ -464,6 +461,8 @@ pub fn run_inference_with_controls(
                             raster_tile_invocations: None,
                         }));
                     }
+                    let mut raster_prefill_store =
+                        prefill_prepare_aux::raster_tensor_store_snapshot();
                     let layer_source =
                     crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
                         model.model_id.clone(),

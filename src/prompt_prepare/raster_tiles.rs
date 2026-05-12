@@ -1,57 +1,24 @@
 use anyhow::{bail, Context, Result};
-use minijinja::{context, Environment};
-use sha2::{Digest, Sha256};
 
 use crate::raster_authoring::prelude::{
     call_recur_seq, call_recur_tile, call_tile, sequence, tile,
 };
 use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::gemma_tokenizer::{
-    AuthenticatedGemmaTokenizer, GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest, GemmaBpeOutput,
-    GemmaBpeState, GemmaNormalizedText, GemmaPreTokenizedText, GemmaTokenIdRequest,
-    GemmaTokenizerMetadataRequest,
+    GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest, GemmaBpeOutput, GemmaBpeState,
+    GemmaTokenIdRequest,
 };
-use crate::shared::input::{
-    Gemma4Prompt, InferenceRequest, MessageRole, ModelSpec, RasterPromptPreparationState,
-    TextDecodingPolicy, TextMessage,
-};
+use crate::shared::input::RasterPromptPreparationState;
 use crate::shared::raster_artifact_store::{
     RasterArtifactMetadata, RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
 };
 
 use super::raster_utils::{
-    artifact_id, bpe_piece_leaf, ensure_tokenizer_controls, initial_bpe_pieces, read_bpe_pair,
-    read_bpe_piece, split_merged_with_previous, store_byte_artifact, store_text_artifact,
-    token_id_leaf,
+    artifact_id, bpe_piece_leaf, read_bpe_pair, read_bpe_piece, token_id_leaf,
 };
 
 pub const DEFAULT_BPE_PAIRS_PER_TILE: usize = 64;
 pub const DEFAULT_BPE_PIECES_PER_TILE: usize = 64;
-
-const PROMPT_BYTES_ARTIFACT_KIND: &str = "prompt_bytes";
-const PROMPT_TEXT_ARTIFACT_KIND: &str = "prompt_text";
-const RENDERED_PROMPT_ARTIFACT_KIND: &str = "rendered_prompt";
-const NORMALIZED_PROMPT_ARTIFACT_KIND: &str = "normalized_prompt";
-
-const PROMPT_BYTES_ARTIFACT_DOMAIN: &str = "raster-artifact-prompt-bytes-merkle-v1";
-const PROMPT_TEXT_ARTIFACT_DOMAIN: &str = "raster-artifact-prompt-text-merkle-v1";
-const RENDERED_PROMPT_ARTIFACT_DOMAIN: &str = "raster-artifact-rendered-prompt-merkle-v1";
-const NORMALIZED_PROMPT_ARTIFACT_DOMAIN: &str = "raster-artifact-normalized-prompt-merkle-v1";
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct TemplateMessage {
-    role: String,
-    content: String,
-}
-
-impl From<&TextMessage> for TemplateMessage {
-    fn from(message_ref: &TextMessage) -> Self {
-        Self {
-            role: message_ref.role.as_template_role().to_string(),
-            content: message_ref.content.clone(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TokenizePromptInput {
@@ -125,188 +92,6 @@ pub struct GemmaTokenIdFinalizeState {
     pub token_ids_builder_root: String,
     pub next_piece_idx: usize,
     pub pieces_per_tile: usize,
-}
-
-pub fn decode_prompt_bytes(prompt_bytes_ref: &[u8], policy: TextDecodingPolicy) -> Result<String> {
-    match policy {
-        TextDecodingPolicy::Utf8 => String::from_utf8(prompt_bytes_ref.to_vec())
-            .context("failed to decode prompt bytes as utf-8"),
-    }
-}
-
-pub fn build_gemma4_messages(
-    prompt_text_ref: &str,
-    add_generation_prompt: bool,
-) -> Result<Gemma4Prompt> {
-    if prompt_text_ref.is_empty() {
-        bail!("input embedding requires a non-empty prompt");
-    }
-
-    Ok(Gemma4Prompt {
-        messages: vec![TextMessage {
-            role: MessageRole::User,
-            content: prompt_text_ref.to_string(),
-        }],
-        add_generation_prompt,
-    })
-}
-
-pub fn render_prompt(prompt_ref: &Gemma4Prompt, model_ref: &ModelSpec) -> Result<String> {
-    let mut environment = Environment::new();
-    environment
-        .add_template("chat", &model_ref.chat_template)
-        .context("failed to register chat template")?;
-
-    let template = environment
-        .get_template("chat")
-        .context("failed to load chat template")?;
-    let messages = prompt_ref
-        .messages
-        .iter()
-        .map(TemplateMessage::from)
-        .collect::<Vec<_>>();
-
-    template
-        .render(context! {
-            messages => messages,
-            add_generation_prompt => prompt_ref.add_generation_prompt,
-            bos_token => model_ref.bos_token.clone(),
-            eos_token => model_ref.eos_token.clone(),
-            unk_token => model_ref.unk_token.clone(),
-        })
-        .context("failed to render chat template")
-}
-
-pub fn init_tokenize_prompt(
-    prompt_ref: &str,
-    add_special_tokens: bool,
-) -> Result<TokenizePromptInput> {
-    Ok(TokenizePromptInput {
-        rendered_prompt: prompt_ref.to_string(),
-        add_special_tokens,
-    })
-}
-
-pub fn normalize_tokenize_prompt(
-    input_ref: &TokenizePromptInput,
-    tokenizer_ref: &AuthenticatedGemmaTokenizer,
-) -> Result<GemmaNormalizedText> {
-    let metadata = ArtifactIo::auth_read(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
-
-    Ok(GemmaNormalizedText {
-        text: input_ref
-            .rendered_prompt
-            .replace(' ', &metadata.space_replacement),
-        add_special_tokens: input_ref.add_special_tokens,
-    })
-}
-
-pub fn split_tokenize_prompt(
-    normalized: GemmaNormalizedText,
-    tokenizer_ref: &AuthenticatedGemmaTokenizer,
-) -> Result<GemmaPreTokenizedText> {
-    let metadata = ArtifactIo::auth_read(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
-    if metadata.split_pattern != " " {
-        bail!(
-            "Gemma tokenizer split pattern {} is not supported",
-            metadata.split_pattern
-        );
-    }
-
-    Ok(GemmaPreTokenizedText {
-        segments: split_merged_with_previous(&normalized.text, &metadata.split_pattern),
-        add_special_tokens: normalized.add_special_tokens,
-    })
-}
-
-pub fn init_artifact_store() {
-    ArtifactIo::reset_store();
-}
-
-pub fn init_bpe_tokenize_prompt(
-    pre_tokenized: GemmaPreTokenizedText,
-    tokenizer_ref: &AuthenticatedGemmaTokenizer,
-    bpe_pairs_per_tile: usize,
-    bpe_pieces_per_tile: usize,
-) -> Result<GemmaBpeState> {
-    ensure_tokenizer_controls(bpe_pairs_per_tile, bpe_pieces_per_tile)?;
-    let metadata = ArtifactIo::auth_read(tokenizer_ref, GemmaTokenizerMetadataRequest)?;
-    let mut pieces = Vec::new();
-    for segment in pre_tokenized.segments {
-        pieces.extend(initial_bpe_pieces(&segment, tokenizer_ref, &metadata)?);
-    }
-
-    let mut pieces_builder = ArtifactIo::start_builder(
-        artifact_id("bpe-pieces-0")?,
-        RasterArtifactMetadata::open_bpe_pieces(),
-    )?;
-    for (piece_idx, piece) in pieces.iter().enumerate() {
-        ArtifactIo::append_leaf(&mut pieces_builder, piece_idx, bpe_piece_leaf(piece))?;
-    }
-    let pieces_ref = RasterBpePieceSequenceRef::new(ArtifactIo::finalize_builder(pieces_builder)?)?;
-    Ok(GemmaBpeState::new(
-        pieces_ref,
-        pre_tokenized.add_special_tokens,
-        bpe_pairs_per_tile,
-        bpe_pieces_per_tile,
-    ))
-}
-
-pub fn prepare_raster_prompt_input_roots(
-    request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &AuthenticatedGemmaTokenizer,
-    bpe_pairs_per_tile: usize,
-    bpe_pieces_per_tile: usize,
-) -> Result<RasterPromptInputRoots> {
-    init_artifact_store();
-
-    let prompt_bytes_ref = store_byte_artifact(
-        "prompt-bytes",
-        PROMPT_BYTES_ARTIFACT_KIND,
-        PROMPT_BYTES_ARTIFACT_DOMAIN,
-        &request.prompt_bytes,
-    )?;
-    let prompt_text = decode_prompt_bytes(&request.prompt_bytes, request.text_decoding_policy)?;
-    let prompt_text_ref = store_text_artifact(
-        "prompt-text",
-        PROMPT_TEXT_ARTIFACT_KIND,
-        PROMPT_TEXT_ARTIFACT_DOMAIN,
-        &prompt_text,
-    )?;
-    let gemma4_prompt = build_gemma4_messages(&prompt_text, request.add_generation_prompt)?;
-    let rendered_prompt = render_prompt(&gemma4_prompt, model)?;
-    let rendered_prompt_ref = store_text_artifact(
-        "rendered-prompt",
-        RENDERED_PROMPT_ARTIFACT_KIND,
-        RENDERED_PROMPT_ARTIFACT_DOMAIN,
-        &rendered_prompt,
-    )?;
-    let input = init_tokenize_prompt(&rendered_prompt, request.add_special_tokens)?;
-    let normalized = normalize_tokenize_prompt(&input, tokenizer)?;
-    let normalized_prompt_ref = store_text_artifact(
-        "normalized-prompt",
-        NORMALIZED_PROMPT_ARTIFACT_KIND,
-        NORMALIZED_PROMPT_ARTIFACT_DOMAIN,
-        &normalized.text,
-    )?;
-    let pre_tokenized = split_tokenize_prompt(normalized, tokenizer)?;
-    let bpe_state = init_bpe_tokenize_prompt(
-        pre_tokenized,
-        tokenizer,
-        bpe_pairs_per_tile,
-        bpe_pieces_per_tile,
-    )?;
-    let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
-
-    Ok(RasterPromptInputRoots {
-        prompt_bytes_root: prompt_bytes_ref.root().to_string(),
-        prompt_text_root: prompt_text_ref.root().to_string(),
-        rendered_prompt_root: rendered_prompt_ref.root().to_string(),
-        normalized_prompt_root: normalized_prompt_ref.root().to_string(),
-        tokenizer_source_root,
-        bpe_state,
-    })
 }
 
 #[tile]
@@ -591,41 +376,6 @@ pub fn finalize_tokenize_prompt(
     })
 }
 
-pub fn tokenize_prompt(
-    prompt_ref: &str,
-    tokenizer_ref: &AuthenticatedGemmaTokenizer,
-    add_special_tokens: bool,
-) -> Result<RasterTokenizationResult> {
-    tokenize_prompt_with_controls(
-        prompt_ref,
-        tokenizer_ref,
-        add_special_tokens,
-        DEFAULT_BPE_PAIRS_PER_TILE,
-        DEFAULT_BPE_PIECES_PER_TILE,
-    )
-}
-
-pub fn tokenize_prompt_with_controls(
-    prompt_ref: &str,
-    tokenizer_ref: &AuthenticatedGemmaTokenizer,
-    add_special_tokens: bool,
-    bpe_pairs_per_tile: usize,
-    bpe_pieces_per_tile: usize,
-) -> Result<RasterTokenizationResult> {
-    init_artifact_store();
-    let input = init_tokenize_prompt(prompt_ref, add_special_tokens)?;
-    let normalized = normalize_tokenize_prompt(&input, tokenizer_ref)?;
-    let pre_tokenized = split_tokenize_prompt(normalized, tokenizer_ref)?;
-    let state = init_bpe_tokenize_prompt(
-        pre_tokenized,
-        tokenizer_ref,
-        bpe_pairs_per_tile,
-        bpe_pieces_per_tile,
-    )?;
-    let tokenizer_source_root = tokenizer_ref.committed_source_ref()?.root().to_string();
-    tokenize_bpe_state(state, tokenizer_source_root)
-}
-
 #[sequence]
 pub fn tokenize_bpe_state(
     state: GemmaBpeState,
@@ -644,14 +394,6 @@ pub fn tokenize_bpe_state(
         tokenizer_source_root.as_str()
     )?;
     call_tile!(finalize_tokenize_prompt, token_id_state)
-}
-
-pub fn build_prompt_commitment(prompt_token_ids_ref: &[u32]) -> Result<String> {
-    let payload = serde_json::to_vec(prompt_token_ids_ref)
-        .context("failed to serialize input-embedding prompt token ids")?;
-
-    let digest = Sha256::digest(payload);
-    Ok(format!("{digest:x}"))
 }
 
 #[tile]
@@ -676,23 +418,6 @@ pub fn finalize_raster_prompt_preparation(
         prompt_token_ids_root,
         prompt_token_count,
     })
-}
-
-pub fn run(
-    request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &AuthenticatedGemmaTokenizer,
-    bpe_pairs_per_tile: usize,
-    bpe_pieces_per_tile: usize,
-) -> Result<RasterPromptPreparationResult> {
-    let input_roots = prepare_raster_prompt_input_roots(
-        request,
-        model,
-        tokenizer,
-        bpe_pairs_per_tile,
-        bpe_pieces_per_tile,
-    )?;
-    main(input_roots)
 }
 
 #[sequence]
@@ -731,10 +456,16 @@ pub fn main(input_roots: RasterPromptInputRoots) -> Result<RasterPromptPreparati
 mod tests {
     use anyhow::{Context, Result};
 
+    use super::super::raster_utils::{
+        bpe_piece_leaf, init_artifact_store, init_bpe_tokenize_prompt, init_tokenize_prompt,
+        prepare_raster_prompt_input_roots, read_bpe_piece, tokenize_prompt,
+        tokenize_prompt_with_controls,
+    };
+    use super::super::tiles::{
+        build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes, render_prompt,
+    };
     use super::{
-        build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes,
-        finalize_next_token_ids, finalize_tokenize_prompt, init_token_id_finalization,
-        init_tokenize_prompt, render_prompt, run, tokenize_prompt, tokenize_prompt_with_controls,
+        finalize_next_token_ids, finalize_tokenize_prompt, init_token_id_finalization, main,
     };
     use crate::shared::gemma_tokenizer::{
         AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeOutput,
@@ -804,7 +535,7 @@ mod tests {
             .expect("tokenizer source should commit")
             .root()
             .to_string();
-        super::init_artifact_store();
+        init_artifact_store();
         let pieces_ref =
             insert_bpe_piece_sequence_for_test("pieces", vec!["a".to_string(), "ab".to_string()])
                 .expect("pieces should insert");
@@ -848,8 +579,8 @@ mod tests {
     #[test]
     fn init_bpe_tokenize_prompt_returns_compact_ref_state() {
         let tokenizer = test_tokenizer_source();
-        super::init_artifact_store();
-        let state = super::init_bpe_tokenize_prompt(
+        init_artifact_store();
+        let state = init_bpe_tokenize_prompt(
             GemmaPreTokenizedText {
                 segments: vec!["ab".to_string()],
                 add_special_tokens: false,
@@ -920,8 +651,10 @@ mod tests {
             unk_token: None,
         };
 
-        let result = run(&request, &model, &test_tokenizer_source(), 1, 1)
-            .expect("raster prompt refs should build");
+        let input_roots =
+            prepare_raster_prompt_input_roots(&request, &model, &test_tokenizer_source(), 1, 1)
+                .expect("raster prompt roots should build");
+        let result = main(input_roots).expect("raster prompt refs should build");
         let token_ids = materialize_token_ids(
             &result.state.prompt_token_ids_root,
             result.state.prompt_token_count,
@@ -955,18 +688,14 @@ mod tests {
             raster_artifact_store::RasterArtifactMetadata::bpe_pieces(pieces.len()),
         )?;
         for (piece_idx, piece) in pieces.iter().enumerate() {
-            raster_artifact_store::append_leaf(
-                &mut builder,
-                piece_idx,
-                super::bpe_piece_leaf(piece),
-            )?;
+            raster_artifact_store::append_leaf(&mut builder, piece_idx, bpe_piece_leaf(piece))?;
         }
         RasterBpePieceSequenceRef::new(raster_artifact_store::finalize_builder(builder)?)
     }
 
     fn materialize_bpe_pieces(pieces_root: &str, piece_count: usize) -> Result<Vec<String>> {
         (0..piece_count)
-            .map(|piece_idx| super::read_bpe_piece(pieces_root, piece_idx))
+            .map(|piece_idx| read_bpe_piece(pieces_root, piece_idx))
             .collect()
     }
 
