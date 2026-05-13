@@ -6,6 +6,7 @@ use tokenizers::Tokenizer;
 use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::raster_artifact_store::RasterTokenIdSequenceRef;
 use crate::shared::raster_input_embedding::AuthenticatedGemmaInputEmbeddingSource;
+use crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource;
 
 pub mod checkpoints;
 pub mod decode_select_token;
@@ -481,19 +482,16 @@ pub fn run_inference_with_controls(
                 let prefill = if use_raster_prefill {
                     let raster_sizing =
                         raster_sizing_controls.expect("raster sizing controls should be validated");
-                    let ple_source =
-                        crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource::from_model(
-                            model.model_id.clone(),
-                            transformer_model,
-                        )?;
+                    let ple_source = AuthenticatedGemmaPleSource::from_model(
+                        model.model_id.clone(),
+                        transformer_model,
+                    )?;
                     let input_embedding_refs = raster_input_embedding_refs
                         .as_ref()
                         .expect("raster prefill requires raster input embedding refs");
                     let ple_input_refs = prefill_prepare_aux::run_raster_refs_from_input_embedding(
-                        &prompt_preparation.prompt_token_ids,
                         input_embedding_refs,
                         &ple_source,
-                        &token_embeddings,
                         raster_sizing,
                     )?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
@@ -544,12 +542,28 @@ pub fn run_inference_with_controls(
                         raster_sizing.projection_rows_per_tile,
                     )?
                 } else {
-                    let ple_inputs = run_prefill_prepare_aux(
-                        &prompt_preparation.prompt_token_ids,
-                        transformer_model,
-                        &token_embeddings,
-                        request.execution_mode,
-                    )?;
+                    let ple_inputs =
+                        if let Some(input_embedding_refs) = raster_input_embedding_refs.as_ref() {
+                            let ple_source = AuthenticatedGemmaPleSource::from_model(
+                                model.model_id.clone(),
+                                transformer_model,
+                            )?;
+                            prefill_prepare_aux::run_with_input_embedding_checkpoint(
+                                &prompt_preparation.prompt_token_ids,
+                                transformer_model,
+                                &token_embeddings,
+                                request.execution_mode,
+                                input_embedding_refs,
+                                &ple_source,
+                            )?
+                        } else {
+                            run_prefill_prepare_aux(
+                                &prompt_preparation.prompt_token_ids,
+                                transformer_model,
+                                &token_embeddings,
+                                request.execution_mode,
+                            )?
+                        };
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                         trace::phase_paused(PhaseId::TransformerStateTransition);
                         return Ok(InferenceRunOutcome::Paused(PausedInferenceState {

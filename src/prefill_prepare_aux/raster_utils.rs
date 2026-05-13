@@ -159,9 +159,14 @@ fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
 pub(super) fn raster_activation_sequence_from_embedding(
     input_activations: &ActivationSequence,
 ) -> Result<RasterActivationSequence> {
-    let internal = input_activations.clone_internal();
-    let det_rows = internal.det_values().ok_or_else(|| {
-        anyhow!("deterministic raster PLE input requires canonical embedded prompt activations")
+    raster_activation_sequence_from_internal(&input_activations.clone_internal())
+}
+
+pub(super) fn raster_activation_sequence_from_internal(
+    input_activations: &InternalActivationSequence,
+) -> Result<RasterActivationSequence> {
+    let det_rows = input_activations.det_values().ok_or_else(|| {
+        anyhow!("deterministic raster activation sequence requires canonical activations")
     })?;
     Ok(RasterActivationSequence::from_acts(det_rows.to_vec()))
 }

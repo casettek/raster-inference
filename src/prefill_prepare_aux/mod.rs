@@ -2,8 +2,12 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
+use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::input::InferenceExecutionMode;
-use crate::shared::raster_prefill_ple::{AuthenticatedGemmaPleSource, RasterPrefillPleInputRefs};
+use crate::shared::raster_artifact_store::RasterArtifactId;
+use crate::shared::raster_prefill_ple::{
+    AuthenticatedGemmaPleSource, GemmaPleMetadataRequest, RasterPrefillPleInputRefs,
+};
 use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel,
@@ -22,6 +26,27 @@ pub fn run(
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let ple_inputs = tiles::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     trace_prefill_prepare_aux_checkpoint(prompt_token_ids, token_embeddings, ple_inputs.as_ref());
+    Ok(ple_inputs)
+}
+
+pub fn run_with_input_embedding_checkpoint(
+    prompt_token_ids: &[u32],
+    model: &Gemma4TransformerModel,
+    token_embeddings: &ActivationSequence,
+    execution_mode: InferenceExecutionMode,
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<Option<Gemma4PrefillPleInputs>> {
+    let ple_inputs = tiles::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
+    let ple_input_refs = format_native_prefill_prepare_aux_as_raster_checkpoint(
+        input_embedding_refs,
+        ple_source,
+        ple_inputs.as_ref(),
+    )?;
+    trace_prefill_prepare_aux_raster_checkpoint_from_input_embedding(
+        input_embedding_refs,
+        ple_input_refs.as_ref(),
+    );
     Ok(ple_inputs)
 }
 
@@ -78,10 +103,8 @@ pub fn run_raster_refs(
 }
 
 pub fn run_raster_refs_from_input_embedding(
-    prompt_token_ids: &[u32],
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
-    token_embeddings: &ActivationSequence,
     raster_sizing: RasterSizingControls,
 ) -> Result<Option<RasterPrefillPleInputRefs>> {
     let ple_input_refs = raster_tiles::run_with_input_embedding_refs(
@@ -89,12 +112,49 @@ pub fn run_raster_refs_from_input_embedding(
         ple_source,
         raster_sizing,
     )?;
-    trace_prefill_prepare_aux_raster_checkpoint(
-        prompt_token_ids,
-        token_embeddings,
+    trace_prefill_prepare_aux_raster_checkpoint_from_input_embedding(
+        input_embedding_refs,
         ple_input_refs.as_ref(),
-    )?;
+    );
     Ok(ple_input_refs)
+}
+
+pub fn format_native_prefill_prepare_aux_as_raster_checkpoint(
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_source: &AuthenticatedGemmaPleSource,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+) -> Result<Option<RasterPrefillPleInputRefs>> {
+    let metadata = ArtifactIo::auth_read(ple_source, GemmaPleMetadataRequest)?;
+    let Some(ple_inputs) = ple_inputs else {
+        return Ok(None);
+    };
+
+    let per_layer_inputs = ple_inputs
+        .internal_per_layer_inputs
+        .iter()
+        .enumerate()
+        .map(|(layer_idx, input)| {
+            input
+                .as_ref()
+                .map(|input| {
+                    let sequence = raster_utils::raster_activation_sequence_from_internal(input)?;
+                    raster_utils::insert_activation_sequence(
+                        RasterArtifactId::new(format!(
+                            "prefill.prepare_aux.per_layer_input.{layer_idx}"
+                        ))?,
+                        sequence,
+                    )
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Some(RasterPrefillPleInputRefs::new(
+        metadata.source_id,
+        metadata.layer_count,
+        input_embedding_refs.prompt_token_count,
+        per_layer_inputs,
+    )?))
 }
 
 pub fn raster_tensor_store_snapshot() -> AuthenticatedRasterTensorStore {
@@ -172,4 +232,54 @@ fn trace_prefill_prepare_aux_raster_checkpoint(
         ))
     })?;
     Ok(())
+}
+
+fn trace_prefill_prepare_aux_raster_checkpoint_from_input_embedding(
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+) {
+    crate::trace::trace_checkpoint(
+        "prefill.prepare_aux",
+        &prefill_prepare_aux_raster_checkpoint_payload(input_embedding_refs, ple_input_refs),
+    );
+}
+
+fn prefill_prepare_aux_raster_checkpoint_payload(
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+) -> serde_json::Value {
+    let per_layer_prefill_input_refs = ple_input_refs.map(|refs| {
+        refs.per_layer_inputs()
+            .iter()
+            .map(|input_ref| {
+                input_ref.as_ref().map(|input_ref| {
+                    json!({
+                        "root": input_ref.root(),
+                        "row_count": input_ref.row_count(),
+                        "width": input_ref.width(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+
+    json!({
+        "input_embedding": {
+            "source_id": input_embedding_refs.source_id.as_str(),
+            "embedding_source_root": input_embedding_refs.embedding_source_root.as_str(),
+            "prompt_token_ids_root": input_embedding_refs.prompt_token_ids_root.as_str(),
+            "prompt_token_count": input_embedding_refs.prompt_token_count,
+            "embedded_prompt_activations_root": input_embedding_refs.embedded_prompt_activations_ref.root(),
+            "embedded_prompt_activation_row_count": input_embedding_refs.embedded_prompt_activations_ref.row_count(),
+            "embedded_prompt_activation_width": input_embedding_refs.embedded_prompt_activations_ref.width(),
+        },
+        "ple": ple_input_refs.map(|refs| {
+            json!({
+                "source_id": refs.source_id(),
+                "layer_count": refs.layer_count(),
+                "token_count": refs.token_count(),
+                "per_layer_prefill_input_refs": per_layer_prefill_input_refs,
+            })
+        }),
+    })
 }
