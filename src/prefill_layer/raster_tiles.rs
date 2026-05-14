@@ -3,14 +3,11 @@ use std::collections::VecDeque;
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
+use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::raster_artifact_store::{
-    activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
-    RasterArtifactId, RasterArtifactMetadata,
-};
+use crate::shared::raster_artifact_store::RasterActivationSequenceArtifactRef;
 use crate::shared::raster_prefill_layer::{
     AuthenticatedGemmaPrefillLayerSource, GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind,
     GemmaPrefillLayerMetadata, GemmaPrefillLayerMetadataRequest, GemmaPrefillLayerNormKind,
@@ -19,8 +16,9 @@ use crate::shared::raster_prefill_layer::{
 };
 use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
 use crate::shared::raster_row_store::{
-    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
-    RasterKvCacheRef, RasterSequenceRowRequest, RasterTensorId,
+    insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
+    RasterActivationSequenceRef, RasterAttentionHeadsRef, RasterKvCacheRef,
+    RasterSequenceRowRequest, RasterTensorId,
 };
 use crate::shared::raster_transformer_kernels::{
     append_projection_chunk_to_state, compute_next_attention_row, compute_next_combine_heads_row,
@@ -92,10 +90,55 @@ pub struct PrefillLayerContext {
     per_layer_input: Option<RasterActivationSequenceRef>,
 }
 
-#[tile]
 pub fn init_prefill_layer_state(
     store: &mut AuthenticatedRasterTensorStore,
     input_activations: &ActivationSequence,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    raster_sizing: RasterSizingControls,
+) -> Result<PrefillLayerRasterState> {
+    let input_activations = raster_activation_sequence_from_activation(input_activations)?;
+    let input_activations_ref = insert_activation_sequence_artifact_ref(
+        "prefill.layer.current.initial.compat",
+        input_activations,
+    )?;
+    init_prefill_layer_state_from_activation_ref(
+        store,
+        input_activations_ref,
+        layer_source,
+        ple_input_refs,
+        raster_sizing,
+    )
+}
+
+#[tile]
+pub fn init_prefill_layer_state_from_input_embedding_refs(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    raster_sizing: RasterSizingControls,
+) -> Result<PrefillLayerRasterState> {
+    if input_embedding_refs.prompt_token_count
+        != input_embedding_refs
+            .embedded_prompt_activations_ref
+            .row_count()
+    {
+        bail!("prefill layer requires input embedding token count and activation rows to match");
+    }
+    init_prefill_layer_state_from_activation_ref(
+        store,
+        input_embedding_refs.embedded_prompt_activations_ref.clone(),
+        layer_source,
+        ple_input_refs,
+        raster_sizing,
+    )
+}
+
+#[tile]
+fn init_prefill_layer_state_from_activation_ref(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_activations_ref: RasterActivationSequenceArtifactRef,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
     raster_sizing: RasterSizingControls,
@@ -115,14 +158,27 @@ pub fn init_prefill_layer_state(
         bail!("transformer prefill requires at least one layer");
     }
 
-    let current_activations = raster_activation_sequence_from_activation(input_activations)?;
-    if current_activations.is_empty() {
+    if input_activations_ref.row_count() == 0 {
         bail!("transformer layer execution requires at least one activation row");
     }
-    let token_count = current_activations.len();
-    let current_activations_ref = store.insert_activation_sequence(
-        RasterTensorId::new("prefill.layer.current.initial")?,
-        current_activations,
+    let first_layer = auth_read!(
+        layer_source,
+        GemmaPrefillLayerMetadataRequest { layer_idx: 0 }
+    )?;
+    if input_activations_ref.width() != first_layer.hidden_size {
+        bail!(
+            "transformer layer input width {}, expected {}",
+            input_activations_ref.width(),
+            first_layer.hidden_size
+        );
+    }
+    let token_count = input_activations_ref.row_count();
+    let current_activations_ref = store.register_activation_sequence_artifact(
+        RasterTensorId::new(format!(
+            "prefill.layer.current.initial.{}",
+            input_activations_ref.root()
+        ))?,
+        input_activations_ref,
     )?;
 
     let per_layer_inputs = match ple_input_refs {
@@ -147,7 +203,7 @@ pub fn init_prefill_layer_state(
                     ple_input_refs.token_count()
                 );
             }
-            import_ple_input_artifact_refs(store, ple_input_refs)?
+            register_ple_input_artifact_refs(store, ple_input_refs)?
         }
         None => vec![None; metadata.layer_count],
     };
@@ -454,7 +510,6 @@ pub fn finalize_prefill_layer_refs(
     })
 }
 
-#[tile]
 pub fn materialize_prefill_layer_output_refs(
     store: &AuthenticatedRasterTensorStore,
     refs: &PrefillLayerOutputRefs,
@@ -485,7 +540,6 @@ pub fn materialize_prefill_layer_output_refs(
     ))
 }
 
-#[tile]
 pub fn finalize_prefill_layer_state(
     store: &AuthenticatedRasterTensorStore,
     state: PrefillLayerRasterState,
@@ -499,7 +553,6 @@ pub fn init_prefill_layer_store() -> AuthenticatedRasterTensorStore {
     AuthenticatedRasterTensorStore::new()
 }
 
-#[tile]
 pub fn materialize_prefill_activation_sequence(
     store: &AuthenticatedRasterTensorStore,
     sequence_ref: &RasterActivationSequenceRef,
@@ -507,7 +560,6 @@ pub fn materialize_prefill_activation_sequence(
     materialize_prefill_activation_sequence_from_store(store, sequence_ref)
 }
 
-#[tile]
 pub fn materialize_prefill_layer_cache(
     store: &AuthenticatedRasterTensorStore,
     cache: &PrefillLayerCacheSlot,
@@ -535,7 +587,6 @@ pub fn run_materialized_compat(
     )
 }
 
-#[sequence]
 pub fn run_refs_with_store(
     store: &mut AuthenticatedRasterTensorStore,
     input_activations: &ActivationSequence,
@@ -543,10 +594,32 @@ pub fn run_refs_with_store(
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
     raster_sizing: RasterSizingControls,
 ) -> Result<PrefillLayerOutputRefs> {
-    let state = call_tile!(
-        init_prefill_layer_state,
-        store,
+    let input_activations = raster_activation_sequence_from_activation(input_activations)?;
+    let input_activations_ref = insert_activation_sequence_artifact_ref(
+        "prefill.layer.current.initial.compat",
         input_activations,
+    )?;
+    run_refs_from_activation_ref_with_store(
+        store,
+        input_activations_ref,
+        layer_source,
+        ple_input_refs,
+        raster_sizing,
+    )
+}
+
+#[sequence]
+pub fn run_refs_from_input_embedding_with_store(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    raster_sizing: RasterSizingControls,
+) -> Result<PrefillLayerOutputRefs> {
+    let state = call_tile!(
+        init_prefill_layer_state_from_input_embedding_refs,
+        store,
+        input_embedding_refs,
         layer_source,
         ple_input_refs,
         raster_sizing
@@ -561,6 +634,30 @@ pub fn run_refs_with_store(
 }
 
 #[sequence]
+fn run_refs_from_activation_ref_with_store(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_activations_ref: RasterActivationSequenceArtifactRef,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    raster_sizing: RasterSizingControls,
+) -> Result<PrefillLayerOutputRefs> {
+    let state = call_tile!(
+        init_prefill_layer_state_from_activation_ref,
+        store,
+        input_activations_ref,
+        layer_source,
+        ple_input_refs,
+        raster_sizing
+    )?;
+    let state = call_recur_seq!(
+        compute_next_prefill_layer_sequence,
+        state,
+        layer_source,
+        store
+    )?;
+    call_tile!(finalize_prefill_layer_refs, state)
+}
+
 pub fn run_with_store(
     store: &mut AuthenticatedRasterTensorStore,
     input_activations: &ActivationSequence,
@@ -568,15 +665,14 @@ pub fn run_with_store(
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    let refs = call_seq!(
-        run_refs_with_store,
+    let refs = run_refs_with_store(
         store,
         input_activations,
         layer_source,
         ple_input_refs,
-        raster_sizing
+        raster_sizing,
     )?;
-    call_tile!(materialize_prefill_layer_output_refs, store, &refs)
+    materialize_prefill_layer_output_refs(store, &refs)
 }
 
 #[tile]
@@ -2703,7 +2799,7 @@ fn import_materialized_ple_inputs(
     )?))
 }
 
-fn import_ple_input_artifact_refs(
+fn register_ple_input_artifact_refs(
     store: &mut AuthenticatedRasterTensorStore,
     ple_input_refs: &RasterPrefillPleInputRefs,
 ) -> Result<Vec<Option<RasterActivationSequenceRef>>> {
@@ -2715,13 +2811,12 @@ fn import_ple_input_artifact_refs(
             input_ref
                 .as_ref()
                 .map(|input_ref| {
-                    let input = materialize_activation_sequence_artifact(input_ref)?;
-                    store.insert_activation_sequence(
+                    store.register_activation_sequence_artifact(
                         RasterTensorId::new(format!(
                             "prefill.layer.per_layer_input.{layer_idx}.{}",
                             input_ref.root()
                         ))?,
-                        input,
+                        input_ref.clone(),
                     )
                 })
                 .transpose()
@@ -2733,42 +2828,10 @@ fn insert_ple_input_artifact(
     layer_idx: usize,
     input: RasterActivationSequence,
 ) -> Result<RasterActivationSequenceArtifactRef> {
-    let width = input.width()?;
-    let leaves = input
-        .rows()
-        .iter()
-        .map(activation_row_leaf)
-        .collect::<Vec<_>>();
-    let artifact_ref = ArtifactIo::insert_artifact(
-        RasterArtifactId::new(format!(
-            "prefill.layer.materialized_ple.{layer_idx}.{}",
-            crate::trace::sha256_hex(&input)
-        ))?,
-        RasterArtifactMetadata::activation_rows(input.len(), width)?,
-        leaves,
-    )?;
-    RasterActivationSequenceArtifactRef::new(artifact_ref)
-}
-
-fn materialize_activation_sequence_artifact(
-    input_ref: &RasterActivationSequenceArtifactRef,
-) -> Result<RasterActivationSequence> {
-    let rows = (0..input_ref.row_count())
-        .map(|row_idx| {
-            let read = ArtifactIo::read_leaf(input_ref.artifact_ref(), row_idx)?;
-            ArtifactIo::verify_artifact_read(input_ref.artifact_ref(), &read)?;
-            let row = decode_activation_row_leaf(read.payload())?;
-            if row.width() != input_ref.width() {
-                bail!(
-                    "PLE input artifact row {row_idx} has width {}, expected {}",
-                    row.width(),
-                    input_ref.width()
-                );
-            }
-            Ok(row)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(RasterActivationSequence::from_rows(rows))
+    insert_activation_sequence_artifact_ref(
+        &format!("prefill.layer.materialized_ple.{layer_idx}"),
+        input,
+    )
 }
 
 fn materialize_prefill_activation_sequence_from_store(
@@ -2860,13 +2923,15 @@ mod tests {
         run_prefill_sequence_gelu, run_prefill_sequence_mul, run_prefill_sequence_rms_norm,
         run_prefill_sequence_scale, run_prefill_value_rms_norm,
     };
+    use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
     use crate::prefill_layer::deterministic_tiles;
     use crate::shared::artifact_io::ArtifactIo;
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
     use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
     use crate::shared::raster_row_store::{
-        AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterTensorId,
+        insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
+        RasterActivationSequenceRef, RasterTensorId,
     };
     use crate::shared::raster_transformer_kernels::{
         add_sequences, apply_rope_to_heads, build_raster_kv_cache,
@@ -2911,9 +2976,10 @@ mod tests {
     }
 
     #[test]
-    fn authored_prefill_layer_surfaces_do_not_accept_materialized_ple_inputs() {
+    fn authored_prefill_layer_surfaces_do_not_accept_materialized_stage_inputs() {
         let source = include_str!("raster_tiles.rs");
         let materialized_ple_type = concat!("Gemma4", "PrefillPleInputs");
+        let materialized_activation_arg = concat!("&", "ActivationSequence");
         let lines = source.lines().collect::<Vec<_>>();
         let mut index = 0;
 
@@ -2933,6 +2999,10 @@ mod tests {
                 assert!(
                     !signature.contains(materialized_ple_type),
                     "authored raster tile/sequence must not accept materialized PLE inputs: {signature}"
+                );
+                assert!(
+                    !signature.contains(materialized_activation_arg),
+                    "authored raster tile/sequence must not accept materialized activation inputs: {signature}"
                 );
             }
             index += 1;
@@ -3041,6 +3111,51 @@ mod tests {
         );
         assert_eq!(materialized.1, deterministic.1);
         assert_eq!(refs.layer_caches.len(), deterministic.1.len());
+    }
+
+    #[test]
+    fn prefill_layer_consumes_input_embedding_refs_without_activation_materialization() {
+        let (_path, model) = no_ple_model();
+        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+            .expect("source should build");
+        let input_rows = vec![
+            vec![Act::from_num(1.0), Act::from_num(0.0)],
+            vec![Act::from_num(0.0), Act::from_num(1.0)],
+        ];
+        let input = RasterActivationSequence::from_acts(input_rows.clone());
+        let input_ref =
+            insert_activation_sequence_artifact_ref("prefill.layer.test.input_embedding", input)
+                .expect("input embedding ref");
+        let input_embedding_refs = RasterInputEmbeddingRefs {
+            source_id: "embedding-fixture".to_string(),
+            embedding_source_root: "embedding-root".to_string(),
+            prompt_token_ids_root: "token-root".to_string(),
+            prompt_token_count: input_ref.row_count(),
+            embedded_prompt_activations_ref: input_ref,
+        };
+        let mut store = AuthenticatedRasterTensorStore::new();
+
+        let refs = super::run_refs_from_input_embedding_with_store(
+            &mut store,
+            &input_embedding_refs,
+            &source,
+            None,
+            raster_sizing(1),
+        )
+        .expect("ref-backed layer should run");
+        assert_eq!(store.materialization_counts(), (0, 0));
+
+        let materialized = super::materialize_prefill_layer_output_refs(&store, &refs)
+            .expect("materialize ref-backed layer output");
+        let deterministic = deterministic_tiles::run_internal(
+            InternalActivationSequence::from_det_values(input_rows),
+            &model,
+            None,
+        )
+        .expect("deterministic prefill layer should run");
+
+        assert_eq!(materialized.0.activations, deterministic.0.activations);
+        assert_eq!(materialized.1, deterministic.1);
     }
 
     #[test]

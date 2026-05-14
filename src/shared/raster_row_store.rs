@@ -5,7 +5,12 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 
-use crate::shared::artifact_io::AuthRead;
+use crate::shared::artifact_io::{ArtifactIo, AuthRead};
+use crate::shared::merkle::merkle_root;
+use crate::shared::raster_artifact_store::{
+    activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
+    RasterArtifactId, RasterArtifactMetadata, ACTIVATION_ROW_ARTIFACT_DOMAIN,
+};
 use crate::shared::raster_transformer_kernels::{
     RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
 };
@@ -426,7 +431,7 @@ impl RasterKvCacheBuilderRef {
 
 #[derive(Debug, Clone)]
 enum StoredTensor {
-    Sequence(RasterActivationSequence),
+    SequenceArtifact(RasterActivationSequenceArtifactRef),
     Heads(RasterAttentionHeadSequence),
     KvKeys(Vec<Vec<RasterActivationRow>>),
     KvValues(Vec<Vec<RasterActivationRow>>),
@@ -480,15 +485,23 @@ impl AuthenticatedRasterTensorStore {
         id: RasterTensorId,
         sequence: RasterActivationSequence,
     ) -> Result<RasterActivationSequenceRef> {
-        let shape = sequence_shape(&sequence)?;
-        let commitment = build_intermediate_sequence_commitment(&sequence);
+        let artifact_ref = insert_activation_sequence_artifact_ref(id.source_name(), sequence)?;
+        self.register_activation_sequence_artifact(id, artifact_ref)
+    }
+
+    pub fn register_activation_sequence_artifact(
+        &mut self,
+        id: RasterTensorId,
+        artifact_ref: RasterActivationSequenceArtifactRef,
+    ) -> Result<RasterActivationSequenceRef> {
+        let shape = RasterTensorShape::sequence(artifact_ref.row_count(), artifact_ref.width())?;
         let reference = RasterTensorRef::new(
             id.clone(),
             RasterTensorKind::ActivationSequence,
             shape,
-            commitment,
+            artifact_ref.root(),
         )?;
-        self.insert_tensor(id, StoredTensor::Sequence(sequence))?;
+        self.insert_tensor(id, StoredTensor::SequenceArtifact(artifact_ref))?;
         RasterActivationSequenceRef::new(reference)
     }
 
@@ -892,14 +905,11 @@ impl AuthenticatedRasterTensorStore {
         self.materialize_sequence_count
             .set(self.materialize_sequence_count.get() + 1);
         let sequence = match self.tensor(tensor_ref.tensor_ref())? {
-            StoredTensor::Sequence(sequence) => sequence.clone(),
+            StoredTensor::SequenceArtifact(artifact_ref) => {
+                materialize_activation_sequence_artifact(artifact_ref)?
+            }
             _ => bail!("raster activation sequence ref points to non-sequence tensor"),
         };
-        ensure_commitment(
-            tensor_ref.tensor_ref().det_commitment(),
-            &build_intermediate_sequence_commitment(&sequence),
-            "activation sequence",
-        )?;
         Ok(sequence)
     }
 
@@ -1120,23 +1130,21 @@ impl RasterRowSource for AuthenticatedRasterTensorStore {
                 row_count
             );
         }
-        let sequence = match self.tensor(request.tensor_ref.tensor_ref())? {
-            StoredTensor::Sequence(sequence) => sequence,
+        match self.tensor(request.tensor_ref.tensor_ref())? {
+            StoredTensor::SequenceArtifact(artifact_ref) => {
+                let row = read_activation_artifact_row(artifact_ref, request.row_idx)?;
+                if row.width() != width {
+                    bail!(
+                        "sequence row {} has width {}, expected {}",
+                        request.row_idx,
+                        row.width(),
+                        width
+                    );
+                }
+                return Ok(row);
+            }
             _ => bail!("raster activation sequence ref points to non-sequence tensor"),
-        };
-        let row = sequence
-            .rows()
-            .get(request.row_idx)
-            .ok_or_else(|| anyhow!("sequence row {} is missing", request.row_idx))?;
-        if row.width() != width {
-            bail!(
-                "sequence row {} has width {}, expected {}",
-                request.row_idx,
-                row.width(),
-                width
-            );
         }
-        Ok(row.clone())
     }
 
     fn read_head_row(&self, request: RasterHeadRowRequest) -> Result<RasterActivationRow> {
@@ -1299,8 +1307,58 @@ fn ensure_kind_matches_shape(kind: RasterTensorKind, shape: &RasterTensorShape) 
     }
 }
 
-fn sequence_shape(sequence: &RasterActivationSequence) -> Result<RasterTensorShape> {
-    RasterTensorShape::sequence(sequence.len(), sequence.width()?)
+pub fn insert_activation_sequence_artifact_ref(
+    source_name: &str,
+    sequence: RasterActivationSequence,
+) -> Result<RasterActivationSequenceArtifactRef> {
+    let width = sequence.width()?;
+    let leaves = sequence
+        .rows()
+        .iter()
+        .map(activation_row_leaf)
+        .collect::<Vec<_>>();
+    let root = merkle_root(ACTIVATION_ROW_ARTIFACT_DOMAIN.as_bytes(), &leaves);
+    if let Ok(artifact_ref) = ArtifactIo::artifact_ref_for_root(&root) {
+        return RasterActivationSequenceArtifactRef::new(artifact_ref);
+    }
+    let artifact_ref = ArtifactIo::insert_artifact(
+        RasterArtifactId::new(format!("{source_name}.{root}"))?,
+        RasterArtifactMetadata::activation_rows(sequence.len(), width)?,
+        leaves,
+    )?;
+    RasterActivationSequenceArtifactRef::new(artifact_ref)
+}
+
+fn materialize_activation_sequence_artifact(
+    artifact_ref: &RasterActivationSequenceArtifactRef,
+) -> Result<RasterActivationSequence> {
+    let rows = (0..artifact_ref.row_count())
+        .map(|row_idx| read_activation_artifact_row(artifact_ref, row_idx))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RasterActivationSequence::from_rows(rows))
+}
+
+fn read_activation_artifact_row(
+    artifact_ref: &RasterActivationSequenceArtifactRef,
+    row_idx: usize,
+) -> Result<RasterActivationRow> {
+    if row_idx >= artifact_ref.row_count() {
+        bail!(
+            "activation artifact row index {row_idx} is out of range for {} rows",
+            artifact_ref.row_count()
+        );
+    }
+    let read = ArtifactIo::read_leaf(artifact_ref.artifact_ref(), row_idx)?;
+    ArtifactIo::verify_artifact_read(artifact_ref.artifact_ref(), &read)?;
+    let row = decode_activation_row_leaf(read.payload())?;
+    if row.width() != artifact_ref.width() {
+        bail!(
+            "activation artifact row {row_idx} has width {}, expected {}",
+            row.width(),
+            artifact_ref.width()
+        );
+    }
+    Ok(row)
 }
 
 fn heads_shape(heads: &RasterAttentionHeadSequence) -> Result<RasterTensorShape> {
@@ -1326,15 +1384,16 @@ fn kv_cache_shape(cache: &RasterKvCache) -> Result<RasterTensorShape> {
 
 fn validate_stored_tensor(tensor_ref: &RasterTensorRef, tensor: &StoredTensor) -> Result<()> {
     match (tensor_ref.kind, tensor) {
-        (RasterTensorKind::ActivationSequence, StoredTensor::Sequence(sequence)) => {
-            let shape = sequence_shape(sequence)?;
+        (RasterTensorKind::ActivationSequence, StoredTensor::SequenceArtifact(artifact_ref)) => {
+            let shape =
+                RasterTensorShape::sequence(artifact_ref.row_count(), artifact_ref.width())?;
             if &shape != tensor_ref.shape() {
-                bail!("stored activation sequence shape mismatch");
+                bail!("stored activation artifact shape mismatch");
             }
             ensure_commitment(
                 tensor_ref.det_commitment(),
-                &build_intermediate_sequence_commitment(sequence),
-                "activation sequence",
+                artifact_ref.root(),
+                "activation artifact",
             )
         }
         (RasterTensorKind::AttentionHeads, StoredTensor::Heads(heads)) => {
@@ -2087,12 +2146,17 @@ mod tests {
         let seq_ref = store
             .insert_activation_sequence(tensor_id("seq"), sequence_fixture())
             .expect("insert seq");
-        store.tensors.insert(
-            tensor_id("seq"),
-            StoredTensor::Sequence(RasterActivationSequence::from_acts(vec![
+        let corrupt_ref = insert_activation_sequence_artifact_ref(
+            "seq.corrupt",
+            RasterActivationSequence::from_acts(vec![
                 vec![Act::from_num(9.0), Act::from_num(9.0)],
                 vec![Act::from_num(8.0), Act::from_num(8.0)],
-            ])),
+            ]),
+        )
+        .expect("corrupt artifact");
+        store.tensors.insert(
+            tensor_id("seq"),
+            StoredTensor::SequenceArtifact(corrupt_ref),
         );
 
         let error = store

@@ -511,13 +511,14 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let layer_refs = prefill_layer::run_raster_refs_with_store(
-                        &mut raster_prefill_store,
-                        &token_embeddings,
-                        &layer_source,
-                        ple_input_refs.as_ref(),
-                        raster_sizing,
-                    )?;
+                    let layer_refs =
+                        prefill_layer::run_raster_refs_from_input_embedding_with_store(
+                            &mut raster_prefill_store,
+                            input_embedding_refs,
+                            &layer_source,
+                            ple_input_refs.as_ref(),
+                            raster_sizing,
+                        )?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                         trace::phase_paused(PhaseId::TransformerStateTransition);
                         return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
@@ -786,13 +787,33 @@ mod tests {
     };
     use crate::shared::det_num::{f32_to_acc, Act, Wgt};
     use crate::shared::gemma_tokenizer::GemmaAddedToken;
+    use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
+    use crate::shared::raster_row_store::{
+        insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
+    };
+    use crate::shared::raster_transformer_kernels::RasterActivationSequence;
     use crate::shared::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4LayerMatrixSource, GemmaEmbeddingTensorSource,
+        InternalActivationSequence,
     };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     };
+
+    fn trace_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn checkpoint_commitments(payload: &serde_json::Value, checkpoint: &str) -> Vec<String> {
+        payload
+            .as_array()
+            .expect("checkpoint payload should be an array")
+            .iter()
+            .filter_map(|entry| entry.get(checkpoint)?.as_str().map(ToString::to_string))
+            .collect()
+    }
 
     #[test]
     fn run_inference_generates_greedy_text_for_max_new_tokens() {
@@ -997,6 +1018,76 @@ mod tests {
                 panic!("expected deterministic CPU prompt boundary")
             }
         }
+    }
+
+    #[test]
+    fn deterministic_cpu_prefill_layer_checkpoint_commitment_matches_raster() {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let input_rows = vec![
+            vec![
+                Act::from_num(1.0),
+                Act::from_num(0.0),
+                Act::from_num(0.0),
+                Act::from_num(0.0),
+            ],
+            vec![
+                Act::from_num(0.0),
+                Act::from_num(1.0),
+                Act::from_num(0.0),
+                Act::from_num(0.0),
+            ],
+        ];
+
+        let deterministic_payload = crate::trace::with_checkpointing_enabled(true, || {
+            crate::trace::start_inference_trace(&json!({ "test": "deterministic-prefill-layer" }));
+            crate::prefill_layer::run_with_mode_internal(
+                InternalActivationSequence::from_det_values(input_rows.clone()),
+                &transformer_fixture.model,
+                None,
+                InferenceExecutionMode::Deterministic,
+            )
+            .expect("deterministic prefill layer should run");
+            crate::trace::checkpoint_payload_for_tests()
+        });
+
+        let input_ref = insert_activation_sequence_artifact_ref(
+            "test.prefill.layer.input_embedding",
+            RasterActivationSequence::from_acts(input_rows),
+        )
+        .expect("input embedding activation ref");
+        let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
+            source_id: "embedding-fixture".to_string(),
+            embedding_source_root: "embedding-root".to_string(),
+            prompt_token_ids_root: "token-root".to_string(),
+            prompt_token_count: input_ref.row_count(),
+            embedded_prompt_activations_ref: input_ref,
+        };
+        let layer_source = AuthenticatedGemmaPrefillLayerSource::from_model(
+            "prefill-layer",
+            &transformer_fixture.model,
+        )
+        .expect("prefill layer source");
+        let raster_payload = crate::trace::with_checkpointing_enabled(true, || {
+            crate::trace::start_inference_trace(&json!({ "test": "raster-prefill-layer" }));
+            let mut store = AuthenticatedRasterTensorStore::new();
+            crate::prefill_layer::raster_tiles::run_refs_from_input_embedding_with_store(
+                &mut store,
+                &input_embedding_refs,
+                &layer_source,
+                None,
+                InferenceControls::default()
+                    .raster_sizing_controls()
+                    .expect("default sizing"),
+            )
+            .expect("raster prefill layer should run");
+            crate::trace::checkpoint_payload_for_tests()
+        });
+
+        assert_eq!(
+            checkpoint_commitments(&deterministic_payload, "prefill.layer"),
+            checkpoint_commitments(&raster_payload, "prefill.layer")
+        );
     }
 
     #[test]

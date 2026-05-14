@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
 use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
@@ -83,6 +84,22 @@ pub fn run_raster_refs_with_store(
     raster_tiles::run_refs_with_store(
         store,
         input_activations,
+        layer_source,
+        ple_input_refs,
+        raster_sizing,
+    )
+}
+
+pub fn run_raster_refs_from_input_embedding_with_store(
+    store: &mut AuthenticatedRasterTensorStore,
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    raster_sizing: RasterSizingControls,
+) -> Result<raster_tiles::PrefillLayerOutputRefs> {
+    raster_tiles::run_refs_from_input_embedding_with_store(
+        store,
+        input_embedding_refs,
         layer_source,
         ple_input_refs,
         raster_sizing,

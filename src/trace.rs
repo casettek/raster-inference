@@ -277,6 +277,16 @@ pub fn abort_inference_trace(error: &anyhow::Error) {
     emit_checkpoint_bundle(&payload, collector.completed_trace_path.as_deref());
 }
 
+#[cfg(test)]
+pub(crate) fn checkpoint_payload_for_tests() -> Value {
+    let checkpoints = trace_collector()
+        .lock()
+        .expect("trace collector mutex should not be poisoned")
+        .checkpoints
+        .clone();
+    Value::Array(checkpoints)
+}
+
 pub fn serialize_layer_caches(
     layer_caches: &[crate::shared::transformer::LayerKvCache],
 ) -> Vec<SerializableLayerKvCache> {
