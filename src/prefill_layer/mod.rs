@@ -13,6 +13,7 @@ use crate::RasterSizingControls;
 
 pub mod deterministic_tiles;
 pub mod raster_tiles;
+mod raster_utils;
 pub mod tiles;
 
 pub fn run(
@@ -97,7 +98,7 @@ pub fn run_raster_refs_from_input_embedding_with_store(
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
     raster_sizing: RasterSizingControls,
 ) -> Result<raster_tiles::PrefillLayerOutputRefs> {
-    raster_tiles::run_refs_from_input_embedding_with_store(
+    raster_tiles::main(
         store,
         input_embedding_refs,
         layer_source,
