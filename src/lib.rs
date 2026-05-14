@@ -323,6 +323,7 @@ pub fn run_inference_with_controls(
             let result = (|| {
                 trace::phase_started(PhaseId::InputEmbedding);
                 let mut raster_prompt_preparation_for_embedding = None;
+                let mut raster_prompt_preparation_roots_for_embedding = None;
                 let prompt_preparation = if use_raster_prefill {
                     let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
                         "raster tile inference requires an authenticated Gemma tokenizer",
@@ -360,6 +361,8 @@ pub fn run_inference_with_controls(
                             },
                         ));
                     }
+                    raster_prompt_preparation_roots_for_embedding =
+                        Some(raster_prompt_preparation.artifact_store_roots.clone());
                     raster_prompt_preparation_for_embedding =
                         Some(raster_prompt_preparation.state.clone());
                     prompt_preparation_from_raster_prompt(
@@ -397,6 +400,8 @@ pub fn run_inference_with_controls(
                                 },
                             ));
                         }
+                        raster_prompt_preparation_roots_for_embedding =
+                            Some(ArtifactIo::export_store_roots());
                         raster_prompt_preparation_for_embedding = Some(prompt_checkpoint);
                     }
                     prompt_preparation
@@ -405,11 +410,18 @@ pub fn run_inference_with_controls(
                     let raster_prompt_preparation = raster_prompt_preparation_for_embedding
                         .as_ref()
                         .expect("raster prompt preparation should exist for raster prefill");
+                    let raster_prompt_preparation_roots =
+                        raster_prompt_preparation_roots_for_embedding
+                            .clone()
+                            .expect(
+                                "raster prompt preparation roots should exist for raster prefill",
+                            );
                     let embedding_source = AuthenticatedGemmaInputEmbeddingSource::from_model(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let input_embedding_refs = input_embedding::run_raster_refs(
+                    let input_embedding_refs = input_embedding::run_raster_refs_with_roots(
+                        raster_prompt_preparation_roots,
                         raster_prompt_preparation,
                         &embedding_source,
                     )?;
@@ -1057,6 +1069,7 @@ mod tests {
         )
         .expect("input embedding activation ref");
         let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
+            artifact_store_roots: crate::shared::artifact_io::ArtifactIo::export_store_roots(),
             source_id: "embedding-fixture".to_string(),
             embedding_source_root: "embedding-root".to_string(),
             prompt_token_ids_root: "token-root".to_string(),

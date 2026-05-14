@@ -4,8 +4,8 @@ use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::merkle::merkle_root;
 use crate::shared::raster_artifact_store::{
     activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
-    RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterTokenIdSequenceRef,
-    TOKEN_ID_ARTIFACT_DOMAIN,
+    RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
+    RasterTokenIdSequenceRef, TOKEN_ID_ARTIFACT_DOMAIN,
 };
 use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::shared::raster_transformer_kernels::{RasterActivationRow, RasterActivationSequence};
@@ -37,29 +37,72 @@ pub(super) fn insert_activation_sequence(
     RasterActivationSequenceArtifactRef::new(artifact_ref)
 }
 
-pub(super) fn start_sequence_builder(
+pub(super) fn insert_activation_sequence_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    id: RasterArtifactId,
+    sequence: RasterActivationSequence,
+) -> Result<(
+    RasterArtifactStoreRoots,
+    RasterActivationSequenceArtifactRef,
+)> {
+    let width = sequence.width()?;
+    let leaves = sequence
+        .rows()
+        .iter()
+        .map(activation_row_leaf)
+        .collect::<Vec<_>>();
+    let (roots, artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        roots,
+        id,
+        RasterArtifactMetadata::activation_rows(sequence.len(), width)?,
+        leaves,
+    )?;
+    Ok((
+        roots,
+        RasterActivationSequenceArtifactRef::new(artifact_ref)?,
+    ))
+}
+
+pub(super) fn start_sequence_builder_with_roots(
+    roots: &RasterArtifactStoreRoots,
     id: RasterArtifactId,
     row_count: usize,
     width: usize,
-) -> Result<RasterArtifactBuilderRef> {
-    ArtifactIo::start_builder(
+) -> Result<(RasterArtifactStoreRoots, RasterArtifactBuilderRef)> {
+    ArtifactIo::start_builder_with_roots(
+        roots,
         id,
         RasterArtifactMetadata::activation_rows(row_count, width)?,
     )
 }
 
-pub(super) fn append_sequence_row_by_builder_root(
+pub(super) fn append_sequence_row_by_builder_root_with_roots(
+    roots: &RasterArtifactStoreRoots,
     builder_root: &str,
     row_idx: usize,
     row: RasterActivationRow,
-) -> Result<String> {
-    ArtifactIo::append_leaf_by_builder_root(builder_root, row_idx, activation_row_leaf(&row))
+) -> Result<(RasterArtifactStoreRoots, String)> {
+    ArtifactIo::append_leaf_by_builder_root_with_roots(
+        roots,
+        builder_root,
+        row_idx,
+        activation_row_leaf(&row),
+    )
 }
 
-pub(super) fn finalize_sequence_builder_by_root(
+pub(super) fn finalize_sequence_builder_by_root_with_roots(
+    roots: &RasterArtifactStoreRoots,
     builder_root: &str,
-) -> Result<RasterActivationSequenceArtifactRef> {
-    RasterActivationSequenceArtifactRef::new(ArtifactIo::finalize_builder_by_root(builder_root)?)
+) -> Result<(
+    RasterArtifactStoreRoots,
+    RasterActivationSequenceArtifactRef,
+)> {
+    let (roots, artifact_ref) =
+        ArtifactIo::finalize_builder_by_root_with_roots(roots, builder_root)?;
+    Ok((
+        roots,
+        RasterActivationSequenceArtifactRef::new(artifact_ref)?,
+    ))
 }
 
 pub(super) fn materialize_sequence(
@@ -115,6 +158,30 @@ pub(super) fn store_prefill_token_ids_artifact(
     RasterTokenIdSequenceRef::new(artifact_ref)
 }
 
+pub(super) fn store_prefill_token_ids_artifact_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    token_ids: &[u32],
+) -> Result<(RasterArtifactStoreRoots, RasterTokenIdSequenceRef)> {
+    let leaves = token_ids
+        .iter()
+        .copied()
+        .map(token_id_leaf)
+        .collect::<Vec<_>>();
+    let token_ids_artifact_root = merkle_root(TOKEN_ID_ARTIFACT_DOMAIN.as_bytes(), &leaves);
+    if let Ok(artifact_ref) = ArtifactIo::artifact_ref_for_root(&token_ids_artifact_root) {
+        roots.artifact_entry_for_root(&token_ids_artifact_root)?;
+        return Ok((roots.clone(), RasterTokenIdSequenceRef::new(artifact_ref)?));
+    }
+
+    let (roots, artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        roots,
+        prefill_token_ids_artifact_id(token_ids)?,
+        RasterArtifactMetadata::token_ids(token_ids.len()),
+        leaves,
+    )?;
+    Ok((roots, RasterTokenIdSequenceRef::new(artifact_ref)?))
+}
+
 fn prefill_token_ids_artifact_id(token_ids: &[u32]) -> Result<RasterArtifactId> {
     RasterArtifactId::new(format!(
         "prefill.prepare_aux.token_ids.{}",
@@ -123,10 +190,12 @@ fn prefill_token_ids_artifact_id(token_ids: &[u32]) -> Result<RasterArtifactId> 
 }
 
 pub(super) fn read_prefill_token_id(
+    roots: &RasterArtifactStoreRoots,
     token_ids_artifact_root: &str,
     token_count: usize,
     token_idx: usize,
 ) -> Result<u32> {
+    roots.artifact_entry_for_root(token_ids_artifact_root)?;
     let token_ids_ref =
         RasterTokenIdSequenceRef::new(ArtifactIo::artifact_ref_for_root(token_ids_artifact_root)?)?;
     if token_ids_ref.token_count() != token_count {

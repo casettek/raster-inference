@@ -1,7 +1,9 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::input::{InferenceExecutionMode, RasterPromptPreparationState};
+use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::raster_input_embedding::AuthenticatedGemmaInputEmbeddingSource;
 use crate::shared::transformer::{ActivationSequence, Gemma4TransformerModel};
 
@@ -21,8 +23,21 @@ pub fn run_raster_refs(
     prompt_preparation: &RasterPromptPreparationState,
     embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
 ) -> Result<raster_tiles::RasterInputEmbeddingRefs> {
+    run_raster_refs_with_roots(
+        ArtifactIo::export_store_roots(),
+        prompt_preparation,
+        embedding_source,
+    )
+}
+
+pub fn run_raster_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    prompt_preparation: &RasterPromptPreparationState,
+    embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
+) -> Result<raster_tiles::RasterInputEmbeddingRefs> {
     let embedding_source_ref = embedding_source.committed_source_ref()?;
     run_raster_refs_for_roots(
+        artifact_store_roots,
         prompt_preparation.prompt_token_ids_root.clone(),
         prompt_preparation.prompt_token_count,
         embedding_source_ref.root().to_string(),
@@ -30,15 +45,19 @@ pub fn run_raster_refs(
 }
 
 pub fn run_raster_refs_for_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
     prompt_token_ids_root: String,
     prompt_token_count: usize,
     embedding_source_root: String,
 ) -> Result<raster_tiles::RasterInputEmbeddingRefs> {
-    raster_tiles::main(raster_tiles::RasterInputEmbeddingInputRoots {
-        prompt_token_ids_root,
-        prompt_token_count,
-        embedding_source_root,
-    })
+    raster_tiles::main(
+        artifact_store_roots,
+        raster_tiles::RasterInputEmbeddingInputRoots {
+            prompt_token_ids_root,
+            prompt_token_count,
+            embedding_source_root,
+        },
+    )
 }
 
 pub fn materialize_input_embedding_refs(
@@ -72,6 +91,7 @@ pub fn format_native_input_embedding_as_raster_checkpoint(
     )?;
 
     Ok(raster_tiles::RasterInputEmbeddingRefs {
+        artifact_store_roots: ArtifactIo::export_store_roots(),
         source_id: source_id.into(),
         embedding_source_root: embedding_source_root.into(),
         prompt_token_ids_root: prompt_preparation.prompt_token_ids_root.clone(),

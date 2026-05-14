@@ -129,6 +129,7 @@ pub fn format_native_prefill_prepare_aux_as_raster_checkpoint(
         return Ok(None);
     };
 
+    let mut artifact_store_roots = input_embedding_refs.artifact_store_roots.clone();
     let per_layer_inputs = ple_inputs
         .internal_per_layer_inputs
         .iter()
@@ -138,18 +139,23 @@ pub fn format_native_prefill_prepare_aux_as_raster_checkpoint(
                 .as_ref()
                 .map(|input| {
                     let sequence = raster_utils::raster_activation_sequence_from_internal(input)?;
-                    raster_utils::insert_activation_sequence(
-                        RasterArtifactId::new(format!(
-                            "prefill.prepare_aux.per_layer_input.{layer_idx}"
-                        ))?,
-                        sequence,
-                    )
+                    let (next_roots, input_ref) =
+                        raster_utils::insert_activation_sequence_with_roots(
+                            &artifact_store_roots,
+                            RasterArtifactId::new(format!(
+                                "prefill.prepare_aux.per_layer_input.{layer_idx}"
+                            ))?,
+                            sequence,
+                        )?;
+                    artifact_store_roots = next_roots;
+                    Ok(input_ref)
                 })
                 .transpose()
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(Some(RasterPrefillPleInputRefs::new(
+    Ok(Some(RasterPrefillPleInputRefs::new_with_roots(
+        artifact_store_roots,
         metadata.source_id,
         metadata.layer_count,
         input_embedding_refs.prompt_token_count,

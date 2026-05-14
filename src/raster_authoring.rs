@@ -112,6 +112,12 @@ macro_rules! call_seq {
 
 #[macro_export]
 macro_rules! call_recur_tile {
+    ($tile:ident, ($state_a:expr, $state_b:expr) $(,)?) => {
+        $crate::__raster_authoring_run_recur_tile_result_pair!($tile, $state_a, $state_b)
+    };
+    ($tile:ident, ($state_a:expr, $state_b:expr), $($context:expr),+ $(,)?) => {
+        $crate::__raster_authoring_run_recur_tile_result_pair!($tile, $state_a, $state_b, $($context),+)
+    };
     ($tile:ident, $state:expr $(,)?) => {
         $crate::__raster_authoring_run_recur_tile_result!($tile, $state)
     };
@@ -122,6 +128,12 @@ macro_rules! call_recur_tile {
 
 #[macro_export]
 macro_rules! call_recur_seq {
+    ($sequence:ident, ($state_a:expr, $state_b:expr) $(,)?) => {
+        $crate::__raster_authoring_run_recur_sequence_result_pair!($sequence, $state_a, $state_b)
+    };
+    ($sequence:ident, ($state_a:expr, $state_b:expr), $($context:expr),+ $(,)?) => {
+        $crate::__raster_authoring_run_recur_sequence_result_pair!($sequence, $state_a, $state_b, $($context),+)
+    };
     ($sequence:ident, $state:expr $(,)?) => {
         $crate::__raster_authoring_run_recur_sequence_result!($sequence, $state)
     };
@@ -241,6 +253,42 @@ macro_rules! __raster_authoring_run_recur_tile_result {
 }
 
 #[macro_export]
+macro_rules! __raster_authoring_run_recur_tile_result_pair {
+    ($tile:ident, $state_a:expr, $state_b:expr $(,)?) => {{
+        let mut state_a = $state_a;
+        let mut state_b = $state_b;
+        loop {
+            $crate::raster_authoring::record_tile_invocation();
+            let (done, next_state_a, next_state_b) = match $tile(state_a, state_b) {
+                Ok(next) => next,
+                Err(error) => break Err(error),
+            };
+            if done {
+                break Ok((next_state_a, next_state_b));
+            }
+            state_a = next_state_a;
+            state_b = next_state_b;
+        }
+    }};
+    ($tile:ident, $state_a:expr, $state_b:expr, $($context:expr),+ $(,)?) => {{
+        let mut state_a = $state_a;
+        let mut state_b = $state_b;
+        loop {
+            $crate::raster_authoring::record_tile_invocation();
+            let (done, next_state_a, next_state_b) = match $tile(state_a, state_b, $($context),+) {
+                Ok(next) => next,
+                Err(error) => break Err(error),
+            };
+            if done {
+                break Ok((next_state_a, next_state_b));
+            }
+            state_a = next_state_a;
+            state_b = next_state_b;
+        }
+    }};
+}
+
+#[macro_export]
 macro_rules! __raster_authoring_run_recur_sequence {
     ($sequence:ident, $state:expr $(,)?) => {{
         let mut state = $state;
@@ -330,6 +378,42 @@ macro_rules! __raster_authoring_run_recur_sequence_result {
                 break Ok(next_state);
             }
             state = next_state;
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! __raster_authoring_run_recur_sequence_result_pair {
+    ($sequence:ident, $state_a:expr, $state_b:expr $(,)?) => {{
+        let mut state_a = $state_a;
+        let mut state_b = $state_b;
+        loop {
+            $crate::raster_authoring::record_tile_invocation();
+            let (done, next_state_a, next_state_b) = match $sequence(state_a, state_b) {
+                Ok(next) => next,
+                Err(error) => break Err(error),
+            };
+            if done {
+                break Ok((next_state_a, next_state_b));
+            }
+            state_a = next_state_a;
+            state_b = next_state_b;
+        }
+    }};
+    ($sequence:ident, $state_a:expr, $state_b:expr, $($context:expr),+ $(,)?) => {{
+        let mut state_a = $state_a;
+        let mut state_b = $state_b;
+        loop {
+            $crate::raster_authoring::record_tile_invocation();
+            let (done, next_state_a, next_state_b) = match $sequence(state_a, state_b, $($context),+) {
+                Ok(next) => next,
+                Err(error) => break Err(error),
+            };
+            if done {
+                break Ok((next_state_a, next_state_b));
+            }
+            state_a = next_state_a;
+            state_b = next_state_b;
         }
     }};
 }

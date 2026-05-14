@@ -2,7 +2,9 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::shared::artifact_io::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
-use crate::shared::raster_artifact_store::RasterActivationSequenceArtifactRef;
+use crate::shared::raster_artifact_store::{
+    RasterActivationSequenceArtifactRef, RasterArtifactStoreRoots,
+};
 use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
 use crate::shared::transformer::{
     Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
@@ -45,6 +47,7 @@ pub struct GemmaPleMetadata {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterPrefillPleInputRefs {
+    artifact_store_roots: RasterArtifactStoreRoots,
     source_id: String,
     layer_count: usize,
     token_count: usize,
@@ -53,6 +56,22 @@ pub struct RasterPrefillPleInputRefs {
 
 impl RasterPrefillPleInputRefs {
     pub fn new(
+        source_id: impl Into<String>,
+        layer_count: usize,
+        token_count: usize,
+        per_layer_inputs: Vec<Option<RasterActivationSequenceArtifactRef>>,
+    ) -> Result<Self> {
+        Self::new_with_roots(
+            RasterArtifactStoreRoots::default(),
+            source_id,
+            layer_count,
+            token_count,
+            per_layer_inputs,
+        )
+    }
+
+    pub fn new_with_roots(
+        artifact_store_roots: RasterArtifactStoreRoots,
         source_id: impl Into<String>,
         layer_count: usize,
         token_count: usize,
@@ -72,6 +91,7 @@ impl RasterPrefillPleInputRefs {
             );
         }
         Ok(Self {
+            artifact_store_roots,
             source_id,
             layer_count,
             token_count,
@@ -81,6 +101,10 @@ impl RasterPrefillPleInputRefs {
 
     pub fn source_id(&self) -> &str {
         &self.source_id
+    }
+
+    pub fn artifact_store_roots(&self) -> &RasterArtifactStoreRoots {
+        &self.artifact_store_roots
     }
 
     pub fn layer_count(&self) -> usize {
