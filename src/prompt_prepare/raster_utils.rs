@@ -12,13 +12,21 @@ use crate::shared::raster_artifact_store::{
     RasterArtifactId, RasterArtifactMetadata, RasterArtifactRef, RasterBpePieceSequenceRef,
 };
 
-use super::raster_tiles::{RasterPromptInputRoots, RasterTokenizationResult, TokenizePromptInput};
+use super::raster_tiles::{
+    RasterPromptInputRoots, RasterPromptPreparedInputs, RasterTokenizationResult,
+    TokenizePromptInput,
+};
 use super::tiles::{build_gemma4_messages, decode_prompt_bytes, render_prompt};
 
 pub(super) const PROMPT_BYTES_ARTIFACT_KIND: &str = "prompt_bytes";
 pub(super) const PROMPT_TEXT_ARTIFACT_KIND: &str = "prompt_text";
 pub(super) const RENDERED_PROMPT_ARTIFACT_KIND: &str = "rendered_prompt";
 pub(super) const NORMALIZED_PROMPT_ARTIFACT_KIND: &str = "normalized_prompt";
+pub(super) const PROMPT_BYTES_ARTIFACT_NAME: &str = "prompt-bytes";
+pub(super) const PROMPT_TEXT_ARTIFACT_NAME: &str = "prompt-text";
+pub(super) const RENDERED_PROMPT_ARTIFACT_NAME: &str = "rendered-prompt";
+pub(super) const NORMALIZED_PROMPT_ARTIFACT_NAME: &str = "normalized-prompt";
+pub(super) const PROMPT_TOKEN_IDS_ARTIFACT_NAME: &str = "prompt-token-ids";
 
 pub(super) const PROMPT_BYTES_ARTIFACT_DOMAIN: &str = "raster-artifact-prompt-bytes-merkle-v1";
 pub(super) const PROMPT_TEXT_ARTIFACT_DOMAIN: &str = "raster-artifact-prompt-text-merkle-v1";
@@ -96,34 +104,34 @@ pub(super) fn prepare_raster_prompt_input_roots(
     tokenizer: &AuthenticatedGemmaTokenizer,
     bpe_pairs_per_tile: usize,
     bpe_pieces_per_tile: usize,
-) -> Result<RasterPromptInputRoots> {
+) -> Result<RasterPromptPreparedInputs> {
     init_artifact_store();
 
-    let prompt_bytes_ref = store_byte_artifact(
-        "prompt-bytes",
+    store_byte_artifact(
+        PROMPT_BYTES_ARTIFACT_NAME,
         PROMPT_BYTES_ARTIFACT_KIND,
         PROMPT_BYTES_ARTIFACT_DOMAIN,
         &request.prompt_bytes,
     )?;
     let prompt_text = decode_prompt_bytes(&request.prompt_bytes, request.text_decoding_policy)?;
-    let prompt_text_ref = store_text_artifact(
-        "prompt-text",
+    store_text_artifact(
+        PROMPT_TEXT_ARTIFACT_NAME,
         PROMPT_TEXT_ARTIFACT_KIND,
         PROMPT_TEXT_ARTIFACT_DOMAIN,
         &prompt_text,
     )?;
     let gemma4_prompt = build_gemma4_messages(&prompt_text, request.add_generation_prompt)?;
     let rendered_prompt = render_prompt(&gemma4_prompt, model)?;
-    let rendered_prompt_ref = store_text_artifact(
-        "rendered-prompt",
+    store_text_artifact(
+        RENDERED_PROMPT_ARTIFACT_NAME,
         RENDERED_PROMPT_ARTIFACT_KIND,
         RENDERED_PROMPT_ARTIFACT_DOMAIN,
         &rendered_prompt,
     )?;
     let input = init_tokenize_prompt(&rendered_prompt, request.add_special_tokens)?;
     let normalized = normalize_tokenize_prompt(&input, tokenizer)?;
-    let normalized_prompt_ref = store_text_artifact(
-        "normalized-prompt",
+    store_text_artifact(
+        NORMALIZED_PROMPT_ARTIFACT_NAME,
         NORMALIZED_PROMPT_ARTIFACT_KIND,
         NORMALIZED_PROMPT_ARTIFACT_DOMAIN,
         &normalized.text,
@@ -137,13 +145,14 @@ pub(super) fn prepare_raster_prompt_input_roots(
     )?;
     let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
 
-    Ok(RasterPromptInputRoots {
-        prompt_bytes_root: prompt_bytes_ref.root().to_string(),
-        prompt_text_root: prompt_text_ref.root().to_string(),
-        rendered_prompt_root: rendered_prompt_ref.root().to_string(),
-        normalized_prompt_root: normalized_prompt_ref.root().to_string(),
+    let input_roots = RasterPromptInputRoots {
         tokenizer_source_root,
         bpe_state,
+    };
+
+    Ok(RasterPromptPreparedInputs {
+        artifact_store_roots: ArtifactIo::export_store_roots(),
+        input_roots,
     })
 }
 
@@ -250,7 +259,12 @@ pub(super) fn tokenize_prompt_with_controls(
         bpe_pieces_per_tile,
     )?;
     let tokenizer_source_root = tokenizer_ref.committed_source_ref()?.root().to_string();
-    super::raster_tiles::tokenize_bpe_state(state, tokenizer_source_root)
+    let (_artifact_store_roots, tokenization) = super::raster_tiles::tokenize_bpe_state(
+        ArtifactIo::export_store_roots(),
+        state,
+        tokenizer_source_root,
+    )?;
+    Ok(tokenization)
 }
 
 pub(super) fn insert_token_id_artifact(

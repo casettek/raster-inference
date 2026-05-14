@@ -155,7 +155,6 @@ pub struct GemmaPreTokenizedText {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeState {
-    pub pieces_root: String,
     pub piece_count: usize,
     pub add_special_tokens: bool,
     pub iteration: u64,
@@ -165,8 +164,8 @@ pub struct GemmaBpeState {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeOutput {
-    pub pieces_root: String,
     pub piece_count: usize,
+    pub iteration: u64,
     pub add_special_tokens: bool,
     pub bpe_pieces_per_tile: usize,
 }
@@ -650,9 +649,7 @@ impl GemmaBpeState {
         bpe_pieces_per_tile: usize,
     ) -> Self {
         let piece_count = pieces_ref.piece_count();
-        let pieces_root = pieces_ref.root().to_string();
         Self {
-            pieces_root,
             piece_count,
             add_special_tokens,
             iteration: 0,
@@ -663,8 +660,8 @@ impl GemmaBpeState {
 
     pub fn into_output(self) -> GemmaBpeOutput {
         GemmaBpeOutput {
-            pieces_root: self.pieces_root,
             piece_count: self.piece_count,
+            iteration: self.iteration,
             add_special_tokens: self.add_special_tokens,
             bpe_pieces_per_tile: self.bpe_pieces_per_tile,
         }

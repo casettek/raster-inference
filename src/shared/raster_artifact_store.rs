@@ -259,6 +259,132 @@ impl RasterArtifactBuilderRef {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub struct RasterArtifactStoreRoots {
+    pub artifacts: Vec<RasterArtifactRootEntry>,
+    pub builders: Vec<RasterArtifactBuilderRootEntry>,
+}
+
+impl RasterArtifactStoreRoots {
+    pub fn artifact_root_for_source_name(&self, source_name: &str) -> Result<&str> {
+        Ok(self.artifact_entry_for_source_name(source_name)?.root())
+    }
+
+    pub fn artifact_entry_for_root(&self, root: &str) -> Result<&RasterArtifactRootEntry> {
+        let mut matches = self.artifacts.iter().filter(|entry| entry.root() == root);
+        let Some(entry) = matches.next() else {
+            bail!("raster artifact root {root} is not present in the store roots snapshot");
+        };
+        if matches.next().is_some() {
+            bail!("raster artifact root {root} matches multiple snapshot artifacts");
+        }
+        Ok(entry)
+    }
+
+    pub fn artifact_entry_for_source_name(
+        &self,
+        source_name: &str,
+    ) -> Result<&RasterArtifactRootEntry> {
+        let mut matches = self
+            .artifacts
+            .iter()
+            .filter(|entry| entry.id().source_name() == source_name);
+        let Some(entry) = matches.next() else {
+            bail!("raster artifact id {source_name} is not present in the store roots snapshot");
+        };
+        if matches.next().is_some() {
+            bail!("raster artifact id {source_name} matches multiple snapshot artifacts");
+        }
+        Ok(entry)
+    }
+
+    pub fn builder_root_for_source_name(&self, source_name: &str) -> Result<&str> {
+        Ok(self
+            .builder_entry_for_source_name(source_name)?
+            .running_root())
+    }
+
+    pub fn builder_entry_for_root(&self, root: &str) -> Result<&RasterArtifactBuilderRootEntry> {
+        let mut matches = self
+            .builders
+            .iter()
+            .filter(|entry| entry.running_root() == root);
+        let Some(entry) = matches.next() else {
+            bail!("raster artifact builder root {root} is not present in the store roots snapshot");
+        };
+        if matches.next().is_some() {
+            bail!("raster artifact builder root {root} matches multiple snapshot builders");
+        }
+        Ok(entry)
+    }
+
+    pub fn builder_entry_for_source_name(
+        &self,
+        source_name: &str,
+    ) -> Result<&RasterArtifactBuilderRootEntry> {
+        let mut matches = self
+            .builders
+            .iter()
+            .filter(|entry| entry.id().source_name() == source_name);
+        let Some(entry) = matches.next() else {
+            bail!(
+                "raster artifact builder id {source_name} is not present in the store roots snapshot"
+            );
+        };
+        if matches.next().is_some() {
+            bail!("raster artifact builder id {source_name} matches multiple snapshot builders");
+        }
+        Ok(entry)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterArtifactRootEntry {
+    id: RasterArtifactId,
+    metadata: RasterArtifactMetadata,
+    root: String,
+}
+
+impl RasterArtifactRootEntry {
+    pub fn id(&self) -> &RasterArtifactId {
+        &self.id
+    }
+
+    pub fn metadata(&self) -> &RasterArtifactMetadata {
+        &self.metadata
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterArtifactBuilderRootEntry {
+    id: RasterArtifactId,
+    metadata: RasterArtifactMetadata,
+    leaves_written: usize,
+    running_root: String,
+}
+
+impl RasterArtifactBuilderRootEntry {
+    pub fn id(&self) -> &RasterArtifactId {
+        &self.id
+    }
+
+    pub fn metadata(&self) -> &RasterArtifactMetadata {
+        &self.metadata
+    }
+
+    pub fn leaves_written(&self) -> usize {
+        self.leaves_written
+    }
+
+    pub fn running_root(&self) -> &str {
+        &self.running_root
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterArtifactRead {
     leaf_idx: usize,
@@ -412,6 +538,36 @@ impl RasterArtifactStore {
         Self::default()
     }
 
+    pub fn roots_snapshot(&self) -> RasterArtifactStoreRoots {
+        let mut artifacts = self
+            .artifacts
+            .iter()
+            .map(|(id, artifact)| RasterArtifactRootEntry {
+                id: id.clone(),
+                metadata: artifact.metadata.clone(),
+                root: artifact_root(&artifact.metadata, &artifact.leaves),
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| left.id.source_name().cmp(right.id.source_name()));
+
+        let mut builders = self
+            .builders
+            .iter()
+            .map(|(id, builder)| RasterArtifactBuilderRootEntry {
+                id: id.clone(),
+                metadata: builder.metadata.clone(),
+                leaves_written: builder.leaves.len(),
+                running_root: artifact_root(&builder.metadata, &builder.leaves),
+            })
+            .collect::<Vec<_>>();
+        builders.sort_by(|left, right| left.id.source_name().cmp(right.id.source_name()));
+
+        RasterArtifactStoreRoots {
+            artifacts,
+            builders,
+        }
+    }
+
     pub fn start_builder(
         &mut self,
         id: RasterArtifactId,
@@ -506,6 +662,18 @@ impl RasterArtifactStore {
         Ok(builder_ref.running_root().to_string())
     }
 
+    pub fn append_leaf_by_builder_root_with_roots(
+        &mut self,
+        roots: &RasterArtifactStoreRoots,
+        builder_root: &str,
+        leaf_idx: usize,
+        payload: Vec<u8>,
+    ) -> Result<(RasterArtifactStoreRoots, String)> {
+        self.ensure_builder_root_in_snapshot(roots, builder_root)?;
+        let running_root = self.append_leaf_by_builder_root(builder_root, leaf_idx, payload)?;
+        Ok((self.roots_snapshot(), running_root))
+    }
+
     pub fn append_activation_row(
         &mut self,
         builder_ref: &mut RasterArtifactBuilderRef,
@@ -569,6 +737,49 @@ impl RasterArtifactStore {
             },
         );
         Ok(artifact_ref)
+    }
+
+    pub fn start_builder_with_roots(
+        &mut self,
+        roots: &RasterArtifactStoreRoots,
+        id: RasterArtifactId,
+        metadata: RasterArtifactMetadata,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactBuilderRef)> {
+        self.ensure_roots_snapshot_matches(roots)?;
+        let builder_ref = self.start_builder(id, metadata)?;
+        Ok((self.roots_snapshot(), builder_ref))
+    }
+
+    pub fn insert_artifact_with_roots(
+        &mut self,
+        roots: &RasterArtifactStoreRoots,
+        id: RasterArtifactId,
+        metadata: RasterArtifactMetadata,
+        leaves: Vec<Vec<u8>>,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+        self.ensure_roots_snapshot_matches(roots)?;
+        let artifact_ref = self.insert_artifact(id, metadata, leaves)?;
+        Ok((self.roots_snapshot(), artifact_ref))
+    }
+
+    pub fn finalize_builder_with_roots(
+        &mut self,
+        roots: &RasterArtifactStoreRoots,
+        builder_ref: RasterArtifactBuilderRef,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+        self.ensure_builder_root_in_snapshot(roots, builder_ref.running_root())?;
+        let artifact_ref = self.finalize_builder(builder_ref)?;
+        Ok((self.roots_snapshot(), artifact_ref))
+    }
+
+    pub fn finalize_builder_by_root_with_roots(
+        &mut self,
+        roots: &RasterArtifactStoreRoots,
+        builder_root: &str,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+        self.ensure_builder_root_in_snapshot(roots, builder_root)?;
+        let artifact_ref = self.finalize_builder_by_root(builder_root)?;
+        Ok((self.roots_snapshot(), artifact_ref))
     }
 
     pub fn read_leaf(
@@ -643,6 +854,29 @@ impl RasterArtifactStore {
         Ok(())
     }
 
+    fn ensure_builder_root_in_snapshot(
+        &self,
+        roots: &RasterArtifactStoreRoots,
+        builder_root: &str,
+    ) -> Result<()> {
+        let entry = roots.builder_entry_for_root(builder_root)?;
+        let builder_ref = self.builder_ref_for_root(builder_root)?;
+        if entry.id() != builder_ref.id()
+            || entry.metadata() != builder_ref.metadata()
+            || entry.leaves_written() != builder_ref.leaves_written()
+        {
+            bail!("raster artifact builder root {builder_root} snapshot metadata mismatch");
+        }
+        Ok(())
+    }
+
+    fn ensure_roots_snapshot_matches(&self, roots: &RasterArtifactStoreRoots) -> Result<()> {
+        if self.roots_snapshot() != *roots {
+            bail!("raster artifact store roots snapshot does not match the current store state");
+        }
+        Ok(())
+    }
+
     fn builder_mut(
         &mut self,
         builder_ref: &RasterArtifactBuilderRef,
@@ -703,11 +937,23 @@ pub fn artifact_store_snapshot() -> RasterArtifactStore {
     ARTIFACT_STORE.with(|store_ref| store_ref.borrow().clone())
 }
 
+pub fn artifact_store_roots_snapshot() -> RasterArtifactStoreRoots {
+    ARTIFACT_STORE.with(|store_ref| store_ref.borrow().roots_snapshot())
+}
+
 pub fn start_builder(
     id: RasterArtifactId,
     metadata: RasterArtifactMetadata,
 ) -> Result<RasterArtifactBuilderRef> {
     with_artifact_store(|store| store.start_builder(id, metadata))
+}
+
+pub fn start_builder_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    id: RasterArtifactId,
+    metadata: RasterArtifactMetadata,
+) -> Result<(RasterArtifactStoreRoots, RasterArtifactBuilderRef)> {
+    with_artifact_store(|store| store.start_builder_with_roots(roots, id, metadata))
 }
 
 pub fn insert_artifact(
@@ -716,6 +962,15 @@ pub fn insert_artifact(
     leaves: Vec<Vec<u8>>,
 ) -> Result<RasterArtifactRef> {
     with_artifact_store(|store| store.insert_artifact(id, metadata, leaves))
+}
+
+pub fn insert_artifact_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    id: RasterArtifactId,
+    metadata: RasterArtifactMetadata,
+    leaves: Vec<Vec<u8>>,
+) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+    with_artifact_store(|store| store.insert_artifact_with_roots(roots, id, metadata, leaves))
 }
 
 pub fn append_leaf(
@@ -734,12 +989,37 @@ pub fn append_leaf_by_builder_root(
     with_artifact_store(|store| store.append_leaf_by_builder_root(builder_root, leaf_idx, payload))
 }
 
+pub fn append_leaf_by_builder_root_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    builder_root: &str,
+    leaf_idx: usize,
+    payload: Vec<u8>,
+) -> Result<(RasterArtifactStoreRoots, String)> {
+    with_artifact_store(|store| {
+        store.append_leaf_by_builder_root_with_roots(roots, builder_root, leaf_idx, payload)
+    })
+}
+
 pub fn finalize_builder(builder_ref: RasterArtifactBuilderRef) -> Result<RasterArtifactRef> {
     with_artifact_store(|store| store.finalize_builder(builder_ref))
 }
 
+pub fn finalize_builder_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    builder_ref: RasterArtifactBuilderRef,
+) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+    with_artifact_store(|store| store.finalize_builder_with_roots(roots, builder_ref))
+}
+
 pub fn finalize_builder_by_root(builder_root: &str) -> Result<RasterArtifactRef> {
     with_artifact_store(|store| store.finalize_builder_by_root(builder_root))
+}
+
+pub fn finalize_builder_by_root_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    builder_root: &str,
+) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+    with_artifact_store(|store| store.finalize_builder_by_root_with_roots(roots, builder_root))
 }
 
 pub fn read_leaf(artifact_ref: &RasterArtifactRef, leaf_idx: usize) -> Result<RasterArtifactRead> {
@@ -1050,6 +1330,80 @@ mod tests {
             materialize_token_ids(&store, &token_ref).expect("token ids"),
             vec![17, 23]
         );
+    }
+
+    #[test]
+    fn roots_snapshot_tracks_builder_updates_and_finalization() {
+        let mut store = RasterArtifactStore::new();
+        let roots = store.roots_snapshot();
+        let (roots, builder) = store
+            .start_builder_with_roots(
+                &roots,
+                artifact_id("tokens"),
+                RasterArtifactMetadata::token_ids(2),
+            )
+            .expect("builder should start with roots");
+        assert_eq!(roots.artifacts.len(), 0);
+        assert_eq!(roots.builders.len(), 1);
+        assert_eq!(roots.builders[0].running_root(), builder.running_root());
+
+        let (roots, builder_root) = store
+            .append_leaf_by_builder_root_with_roots(
+                &roots,
+                builder.running_root(),
+                0,
+                token_id_leaf(17),
+            )
+            .expect("first append should update roots");
+        assert_eq!(roots.builders.len(), 1);
+        assert_eq!(roots.builders[0].running_root(), builder_root);
+        assert_eq!(roots.builders[0].leaves_written(), 1);
+
+        let (roots, builder_root) = store
+            .append_leaf_by_builder_root_with_roots(&roots, &builder_root, 1, token_id_leaf(23))
+            .expect("second append should update roots");
+        let (roots, token_ref) = store
+            .finalize_builder_by_root_with_roots(&roots, &builder_root)
+            .expect("finalization should update roots");
+
+        assert_eq!(roots.builders.len(), 0);
+        assert_eq!(roots.artifacts.len(), 1);
+        assert_eq!(roots.artifacts[0].root(), token_ref.root());
+        assert!(roots.artifact_entry_for_root(token_ref.root()).is_ok());
+    }
+
+    #[test]
+    fn roots_aware_append_rejects_stale_builder_snapshot() {
+        let mut store = RasterArtifactStore::new();
+        let roots = store.roots_snapshot();
+        let (roots, builder) = store
+            .start_builder_with_roots(
+                &roots,
+                artifact_id("tokens"),
+                RasterArtifactMetadata::token_ids(2),
+            )
+            .expect("builder should start with roots");
+        let stale_roots = roots.clone();
+
+        let (roots, builder_root) = store
+            .append_leaf_by_builder_root_with_roots(
+                &roots,
+                builder.running_root(),
+                0,
+                token_id_leaf(17),
+            )
+            .expect("first append should update roots");
+        let error = store
+            .append_leaf_by_builder_root_with_roots(
+                &stale_roots,
+                &builder_root,
+                1,
+                token_id_leaf(23),
+            )
+            .expect_err("stale snapshot should be rejected");
+
+        assert!(error.to_string().contains("snapshot"));
+        assert_eq!(roots.builders[0].leaves_written(), 1);
     }
 
     #[test]

@@ -121,12 +121,15 @@ pub fn run_raster_with_tokenizer_controls(
     bpe_pairs_per_tile: usize,
     bpe_pieces_per_tile: usize,
 ) -> Result<raster_tiles::RasterPromptPreparationResult> {
-    let input_roots = prepare_raster_prompt_input_roots(
+    let prepared_inputs = prepare_raster_prompt_input_roots(
         request,
         model,
         tokenizer,
         bpe_pairs_per_tile,
         bpe_pieces_per_tile,
     )?;
-    raster_tiles::main(input_roots)
+    raster_tiles::main(
+        prepared_inputs.artifact_store_roots,
+        prepared_inputs.input_roots,
+    )
 }

@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::shared::raster_artifact_store::{
     self, RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactRead,
-    RasterArtifactRef,
+    RasterArtifactRef, RasterArtifactStoreRoots,
 };
 
 pub trait AuthRead<Request> {
@@ -29,11 +29,23 @@ impl ArtifactIo {
         raster_artifact_store::reset_artifact_store();
     }
 
+    pub fn export_store_roots() -> RasterArtifactStoreRoots {
+        raster_artifact_store::artifact_store_roots_snapshot()
+    }
+
     pub fn start_builder(
         id: RasterArtifactId,
         metadata: RasterArtifactMetadata,
     ) -> Result<RasterArtifactBuilderRef> {
         raster_artifact_store::start_builder(id, metadata)
+    }
+
+    pub fn start_builder_with_roots(
+        roots: &RasterArtifactStoreRoots,
+        id: RasterArtifactId,
+        metadata: RasterArtifactMetadata,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactBuilderRef)> {
+        raster_artifact_store::start_builder_with_roots(roots, id, metadata)
     }
 
     pub fn insert_artifact(
@@ -42,6 +54,15 @@ impl ArtifactIo {
         leaves: Vec<Vec<u8>>,
     ) -> Result<RasterArtifactRef> {
         raster_artifact_store::insert_artifact(id, metadata, leaves)
+    }
+
+    pub fn insert_artifact_with_roots(
+        roots: &RasterArtifactStoreRoots,
+        id: RasterArtifactId,
+        metadata: RasterArtifactMetadata,
+        leaves: Vec<Vec<u8>>,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+        raster_artifact_store::insert_artifact_with_roots(roots, id, metadata, leaves)
     }
 
     pub fn append_leaf(
@@ -60,12 +81,40 @@ impl ArtifactIo {
         raster_artifact_store::append_leaf_by_builder_root(builder_root, leaf_idx, payload)
     }
 
+    pub fn append_leaf_by_builder_root_with_roots(
+        roots: &RasterArtifactStoreRoots,
+        builder_root: &str,
+        leaf_idx: usize,
+        payload: Vec<u8>,
+    ) -> Result<(RasterArtifactStoreRoots, String)> {
+        raster_artifact_store::append_leaf_by_builder_root_with_roots(
+            roots,
+            builder_root,
+            leaf_idx,
+            payload,
+        )
+    }
+
     pub fn finalize_builder_by_root(builder_root: &str) -> Result<RasterArtifactRef> {
         raster_artifact_store::finalize_builder_by_root(builder_root)
     }
 
+    pub fn finalize_builder_by_root_with_roots(
+        roots: &RasterArtifactStoreRoots,
+        builder_root: &str,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+        raster_artifact_store::finalize_builder_by_root_with_roots(roots, builder_root)
+    }
+
     pub fn finalize_builder(builder_ref: RasterArtifactBuilderRef) -> Result<RasterArtifactRef> {
         raster_artifact_store::finalize_builder(builder_ref)
+    }
+
+    pub fn finalize_builder_with_roots(
+        roots: &RasterArtifactStoreRoots,
+        builder_ref: RasterArtifactBuilderRef,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+        raster_artifact_store::finalize_builder_with_roots(roots, builder_ref)
     }
 
     pub fn read_leaf(
