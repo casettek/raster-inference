@@ -674,6 +674,29 @@ impl RasterArtifactStore {
         Ok((self.roots_snapshot(), running_root))
     }
 
+    pub fn append_leaf_by_builder_source_name_with_roots(
+        &mut self,
+        roots: &RasterArtifactStoreRoots,
+        source_name: &str,
+        leaf_idx: usize,
+        payload: Vec<u8>,
+    ) -> Result<(RasterArtifactStoreRoots, String)> {
+        let entry = roots.builder_entry_for_source_name(source_name)?;
+        let mut builder_ref = self.builder_ref_for_source_name(source_name)?;
+        if entry.id() != builder_ref.id()
+            || entry.metadata() != builder_ref.metadata()
+            || entry.leaves_written() != builder_ref.leaves_written()
+            || entry.running_root() != builder_ref.running_root()
+        {
+            bail!("raster artifact builder {source_name} snapshot metadata mismatch");
+        }
+        self.append_leaf(&mut builder_ref, leaf_idx, payload)?;
+        Ok((
+            self.roots_snapshot(),
+            builder_ref.running_root().to_string(),
+        ))
+    }
+
     pub fn append_activation_row(
         &mut self,
         builder_ref: &mut RasterArtifactBuilderRef,
@@ -782,6 +805,24 @@ impl RasterArtifactStore {
         Ok((self.roots_snapshot(), artifact_ref))
     }
 
+    pub fn finalize_builder_by_source_name_with_roots(
+        &mut self,
+        roots: &RasterArtifactStoreRoots,
+        source_name: &str,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+        let entry = roots.builder_entry_for_source_name(source_name)?;
+        let builder_ref = self.builder_ref_for_source_name(source_name)?;
+        if entry.id() != builder_ref.id()
+            || entry.metadata() != builder_ref.metadata()
+            || entry.leaves_written() != builder_ref.leaves_written()
+            || entry.running_root() != builder_ref.running_root()
+        {
+            bail!("raster artifact builder {source_name} snapshot metadata mismatch");
+        }
+        let artifact_ref = self.finalize_builder(builder_ref)?;
+        Ok((self.roots_snapshot(), artifact_ref))
+    }
+
     pub fn read_leaf(
         &self,
         artifact_ref: &RasterArtifactRef,
@@ -825,6 +866,21 @@ impl RasterArtifactStore {
         })
     }
 
+    pub fn artifact_ref_for_root_any(&self, root: &str) -> Result<RasterArtifactRef> {
+        let Some((id, artifact)) = self
+            .artifacts
+            .iter()
+            .find(|(_, artifact)| artifact_root(&artifact.metadata, &artifact.leaves) == root)
+        else {
+            bail!("raster artifact root {root} is not registered");
+        };
+        Ok(RasterArtifactRef {
+            id: id.clone(),
+            metadata: artifact.metadata.clone(),
+            root: root.to_string(),
+        })
+    }
+
     fn builder_ref_for_root(&self, root: &str) -> Result<RasterArtifactBuilderRef> {
         let mut matches = self.builders.iter().filter_map(|(id, state)| {
             let running_root = artifact_root(&state.metadata, &state.leaves);
@@ -842,6 +898,15 @@ impl RasterArtifactStore {
             leaves_written: state.leaves.len(),
             running_root,
         })
+    }
+
+    fn builder_ref_for_source_name(&self, source_name: &str) -> Result<RasterArtifactBuilderRef> {
+        let id = RasterArtifactId::new(source_name)?;
+        let state = self
+            .builders
+            .get(&id)
+            .ok_or_else(|| anyhow!("raster artifact builder {source_name} is not registered"))?;
+        Ok(artifact_builder_ref(id, state))
     }
 
     fn ensure_id_available(&self, id: &RasterArtifactId) -> Result<()> {
@@ -1000,6 +1065,17 @@ pub fn append_leaf_by_builder_root_with_roots(
     })
 }
 
+pub fn append_leaf_by_builder_source_name_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name: &str,
+    leaf_idx: usize,
+    payload: Vec<u8>,
+) -> Result<(RasterArtifactStoreRoots, String)> {
+    with_artifact_store(|store| {
+        store.append_leaf_by_builder_source_name_with_roots(roots, source_name, leaf_idx, payload)
+    })
+}
+
 pub fn finalize_builder(builder_ref: RasterArtifactBuilderRef) -> Result<RasterArtifactRef> {
     with_artifact_store(|store| store.finalize_builder(builder_ref))
 }
@@ -1022,12 +1098,25 @@ pub fn finalize_builder_by_root_with_roots(
     with_artifact_store(|store| store.finalize_builder_by_root_with_roots(roots, builder_root))
 }
 
+pub fn finalize_builder_by_source_name_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name: &str,
+) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+    with_artifact_store(|store| {
+        store.finalize_builder_by_source_name_with_roots(roots, source_name)
+    })
+}
+
 pub fn read_leaf(artifact_ref: &RasterArtifactRef, leaf_idx: usize) -> Result<RasterArtifactRead> {
     read_artifact_store(|store| store.read_leaf(artifact_ref, leaf_idx))
 }
 
 pub fn artifact_ref_for_root(root: &str) -> Result<RasterArtifactRef> {
     read_artifact_store(|store| store.artifact_ref_for_root(root))
+}
+
+pub fn artifact_ref_for_root_any(root: &str) -> Result<RasterArtifactRef> {
+    read_artifact_store(|store| store.artifact_ref_for_root_any(root))
 }
 
 pub fn verify_artifact_read(

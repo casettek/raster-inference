@@ -214,10 +214,7 @@ pub fn finalize_prefill_result_from_refs(
         layer_caches,
     };
     let (final_hidden_states, layer_caches) =
-        crate::prefill_layer::raster_tiles::materialize_prefill_layer_output_refs(
-            store,
-            &layer_refs,
-        )?;
+        crate::prefill_layer::materialize_prefill_layer_output_refs(store, &layer_refs)?;
     finalize_prefill_result_materialized_compat(
         store,
         state,

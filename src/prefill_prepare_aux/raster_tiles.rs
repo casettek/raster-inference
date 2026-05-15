@@ -10,9 +10,9 @@ use crate::shared::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
 };
 use crate::shared::raster_prefill_ple::{
-    AuthenticatedGemmaPleSource, GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest,
-    GemmaPleModelProjectionRowRequest, GemmaPleProjectionNormWeightsRequest,
-    GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest, RasterPrefillPleInputRefs,
+    store_prefill_ple_input_manifest_with_roots, AuthenticatedGemmaPleSource,
+    GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest, GemmaPleModelProjectionRowRequest,
+    GemmaPleProjectionNormWeightsRequest, GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
 };
 use crate::shared::raster_transformer_kernels::{
     project_row_with_weights, validate_projection_rows_per_tile, validate_sequence_rows_per_tile,
@@ -597,7 +597,7 @@ pub fn update_prefill_ple_state_refs(
 pub fn finalize_prefill_ple_input_refs(
     artifact_store_roots: RasterArtifactStoreRoots,
     state: PrefillPleRasterState,
-) -> Result<(RasterArtifactStoreRoots, Option<RasterPrefillPleInputRefs>)> {
+) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
     if !state.has_ple_global {
         return Ok((artifact_store_roots, None));
     }
@@ -609,16 +609,14 @@ pub fn finalize_prefill_ple_input_refs(
         );
     }
 
-    Ok((
-        artifact_store_roots.clone(),
-        Some(RasterPrefillPleInputRefs::new_with_roots(
-            artifact_store_roots,
-            state.source_id,
-            state.layer_count,
-            state.token_count,
-            state.per_layer_inputs,
-        )?),
-    ))
+    let (artifact_store_roots, manifest_root) = store_prefill_ple_input_manifest_with_roots(
+        &artifact_store_roots,
+        state.source_id,
+        state.layer_count,
+        state.token_count,
+        &state.per_layer_inputs,
+    )?;
+    Ok((artifact_store_roots, Some(manifest_root)))
 }
 
 #[tile(kind = recursive)]
@@ -698,7 +696,7 @@ pub fn run(
     input_activations: &ActivationSequence,
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
-) -> Result<Option<RasterPrefillPleInputRefs>> {
+) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
     let (artifact_store_roots, input_roots) = prepare_raster_prefill_ple_input_roots(
         token_ids,
         input_activations,
@@ -712,7 +710,7 @@ pub fn run_with_input_embedding_refs(
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
-) -> Result<Option<RasterPrefillPleInputRefs>> {
+) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
     let (artifact_store_roots, input_roots) =
         prepare_raster_prefill_ple_input_roots_from_embedding_refs(
             input_embedding_refs,
@@ -727,7 +725,7 @@ pub fn main(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterPrefillPleInputRoots,
     ple_source: &AuthenticatedGemmaPleSource,
-) -> Result<Option<RasterPrefillPleInputRefs>> {
+) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
     let (artifact_store_roots, state) =
         call_tile!(init_prefill_ple_state, artifact_store_roots, input_roots)?;
     let (artifact_store_roots, state) = call_recur_seq!(
@@ -735,9 +733,9 @@ pub fn main(
         (artifact_store_roots, state),
         ple_source
     )?;
-    let (_artifact_store_roots, refs) =
+    let (artifact_store_roots, manifest_root) =
         call_tile!(finalize_prefill_ple_input_refs, artifact_store_roots, state)?;
-    Ok(refs)
+    Ok((artifact_store_roots, manifest_root))
 }
 
 #[tile]
@@ -1669,9 +1667,14 @@ mod tests {
         assert!(encoded.contains("prefill.prepare_aux.per_layer_input.0"));
         assert!(!encoded.contains("act_bits"));
 
-        let (_artifact_store_roots, refs) =
+        let (artifact_store_roots, refs) =
             finalize_prefill_ple_input_refs(artifact_store_roots, state).expect("finalize");
-        let refs = refs.expect("PLE refs");
+        let refs = crate::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
+            artifact_store_roots,
+            refs.as_deref(),
+        )
+        .expect("read manifest")
+        .expect("PLE refs");
         let finalized = crate::prefill_prepare_aux::materialize_prefill_ple_input_refs(Some(&refs))
             .expect("materialize refs")
             .expect("PLE inputs");
@@ -1687,13 +1690,18 @@ mod tests {
             vec![Act::from_num(1.0), Act::from_num(0.5)],
             vec![Act::from_num(-1.0), Act::from_num(2.0)],
         ]);
-        let refs = run(
+        let (artifact_store_roots, manifest_root) = run(
             &token_ids,
             &input,
             &fixture.source,
             raster_sizing_with_projection_rows(1),
         )
-        .expect("raster PLE refs should run")
+        .expect("raster PLE refs should run");
+        let refs = crate::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
+            artifact_store_roots,
+            manifest_root.as_deref(),
+        )
+        .expect("read manifest")
         .expect("PLE refs");
 
         let encoded = serde_json::to_string(&refs).expect("serialize refs");
@@ -2012,7 +2020,11 @@ mod tests {
         source: &AuthenticatedGemmaPleSource,
         raster_sizing: RasterSizingControls,
     ) -> Result<Option<Gemma4PrefillPleInputs>> {
-        let refs = run(token_ids, input, source, raster_sizing)?;
+        let (artifact_store_roots, manifest_root) = run(token_ids, input, source, raster_sizing)?;
+        let refs = crate::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
+            artifact_store_roots,
+            manifest_root.as_deref(),
+        )?;
         crate::prefill_prepare_aux::materialize_prefill_ple_input_refs(refs.as_ref())
     }
 

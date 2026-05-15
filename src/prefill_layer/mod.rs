@@ -2,14 +2,19 @@ use anyhow::Result;
 
 use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
 use crate::shared::input::InferenceExecutionMode;
+use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
-use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
 use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence,
     LayerKvCache,
 };
 use crate::RasterSizingControls;
+
+use self::raster_utils::{
+    layer_cache_from_raster, materialize_prefill_activation_sequence_from_store,
+    materialize_prefill_layer_cache_from_store, raster_sequence_acts,
+};
 
 pub mod deterministic_tiles;
 pub mod raster_tiles;
@@ -43,66 +48,51 @@ pub fn run_with_mode(
     )
 }
 
-pub fn run_raster(
-    input_activations: &ActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_inputs: Option<&Gemma4PrefillPleInputs>,
-    raster_sizing: RasterSizingControls,
+pub fn materialize_prefill_layer_output_refs(
+    store: &AuthenticatedRasterTensorStore,
+    refs: &raster_tiles::PrefillLayerOutputRefs,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    // Compatibility entry point for callers that still hold materialized PLE
-    // inputs. The proof-shaped raster path should use `run_raster_with_store`.
-    raster_tiles::run_materialized_compat(
-        input_activations,
-        layer_source,
-        ple_inputs,
-        raster_sizing,
-    )
+    // Public/dev compatibility boundary. The proof-shaped prefill path carries
+    // `PrefillLayerOutputRefs` forward and materializes only for public results
+    // and checkpoint payloads.
+    let current_activations =
+        materialize_prefill_activation_sequence_from_store(store, &refs.final_hidden_states_ref)?;
+    let det_activations = raster_sequence_acts(&current_activations);
+    let values = current_activations.to_f32_values();
+    let mut activation_sequence = ActivationSequence::from_internal(
+        InternalActivationSequence::from_det_values(det_activations.clone()),
+        crate::shared::transformer_kernels::build_activation_commitment(&values),
+    );
+    activation_sequence.det_activations_sha256 =
+        Some(crate::shared::transformer_kernels::build_det_activation_commitment(&det_activations));
+
+    Ok((
+        activation_sequence,
+        refs.layer_caches
+            .iter()
+            .map(|cache| {
+                materialize_prefill_layer_cache_from_store(store, cache)
+                    .map(layer_cache_from_raster)
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
-pub fn run_raster_with_store(
-    store: &mut AuthenticatedRasterTensorStore,
-    input_activations: &ActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-    raster_sizing: RasterSizingControls,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    raster_tiles::run_with_store(
-        store,
-        input_activations,
-        layer_source,
-        ple_input_refs,
-        raster_sizing,
-    )
-}
-
-pub fn run_raster_refs_with_store(
-    store: &mut AuthenticatedRasterTensorStore,
-    input_activations: &ActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-    raster_sizing: RasterSizingControls,
-) -> Result<raster_tiles::PrefillLayerOutputRefs> {
-    raster_tiles::run_refs_with_store(
-        store,
-        input_activations,
-        layer_source,
-        ple_input_refs,
-        raster_sizing,
-    )
-}
-
-pub fn run_raster_refs_from_input_embedding_with_store(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn run_raster_refs_from_input_embedding(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
-) -> Result<raster_tiles::PrefillLayerOutputRefs> {
+) -> Result<(
+    RasterArtifactStoreRoots,
+    raster_tiles::PrefillLayerOutputRefs,
+)> {
     raster_tiles::main(
-        store,
+        artifact_store_roots,
         input_embedding_refs,
         layer_source,
-        ple_input_refs,
+        ple_input_manifest_root,
         raster_sizing,
     )
 }

@@ -2,21 +2,12 @@ use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::raster_authoring::prelude::auth_read;
-use crate::shared::raster_artifact_store::RasterActivationSequenceArtifactRef;
-use crate::shared::raster_prefill_layer::{
-    AuthenticatedGemmaPrefillLayerSource, GemmaPrefillLayerMetadata,
-    GemmaPrefillLayerSourceMetadataRequest,
-};
-use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
+use crate::shared::raster_prefill_layer::GemmaPrefillLayerMetadata;
 use crate::shared::raster_row_store::{
-    insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
-    RasterActivationSequenceRef, RasterAttentionHeadsRef, RasterTensorId,
+    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
 };
 use crate::shared::raster_transformer_kernels::{RasterActivationSequence, RasterKvCache};
-use crate::shared::transformer::{
-    ActivationSequence, Gemma4PrefillPleInputs, InternalActivationSequence, LayerKvCache,
-};
+use crate::shared::transformer::LayerKvCache;
 
 use super::raster_tiles::PrefillLayerCacheSlot;
 
@@ -98,107 +89,6 @@ pub(super) fn resolve_prefill_donor_cache_index(
         .transpose()
 }
 
-#[cfg(test)]
-pub(super) fn register_prefill_layer_cache(
-    store: &mut AuthenticatedRasterTensorStore,
-    layer_idx: usize,
-    cache: RasterKvCache,
-) -> Result<PrefillLayerCacheSlot> {
-    if cache.current_len() == 0 {
-        return Ok(PrefillLayerCacheSlot::Empty {
-            num_kv_heads: cache.head_count(),
-        });
-    }
-
-    Ok(PrefillLayerCacheSlot::Ref(store.insert_kv_cache(
-        RasterTensorId::new(format!("prefill.layer.cache.{layer_idx}.keys"))?,
-        RasterTensorId::new(format!("prefill.layer.cache.{layer_idx}.values"))?,
-        cache,
-    )?))
-}
-
-pub(super) fn import_materialized_ple_inputs(
-    _store: &mut AuthenticatedRasterTensorStore,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_inputs: Option<&Gemma4PrefillPleInputs>,
-) -> Result<Option<RasterPrefillPleInputRefs>> {
-    // Host/dev compatibility bridge only. This deliberately lives outside any
-    // authored tile or sequence so proof-shaped code cannot accidentally ingest
-    // all PLE layer inputs as one materialized argument.
-    let Some(ple_inputs) = ple_inputs else {
-        return Ok(None);
-    };
-    let metadata = auth_read!(layer_source, GemmaPrefillLayerSourceMetadataRequest)?;
-    let mut token_count = None;
-    let per_layer_inputs = (0..metadata.layer_count)
-        .map(|layer_idx| {
-            let input = ple_inputs
-                .clone_layer_internal(layer_idx)
-                .map(|input| raster_activation_sequence_from_internal(&input))
-                .transpose()?;
-            input
-                .map(|input| {
-                    let input_len = input.len();
-                    match token_count {
-                        Some(expected) if expected != input_len => bail!(
-                            "materialized PLE input layer {layer_idx} contains {input_len} tokens, expected {expected}"
-                        ),
-                        None => token_count = Some(input_len),
-                        _ => {}
-                    }
-                    insert_ple_input_artifact(layer_idx, input)
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    if per_layer_inputs.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-
-    Ok(Some(RasterPrefillPleInputRefs::new(
-        metadata.source_id,
-        metadata.layer_count,
-        token_count.ok_or_else(|| anyhow!("materialized PLE inputs contained no layer rows"))?,
-        per_layer_inputs,
-    )?))
-}
-
-pub(super) fn register_ple_input_artifact_refs(
-    store: &mut AuthenticatedRasterTensorStore,
-    ple_input_refs: &RasterPrefillPleInputRefs,
-) -> Result<Vec<Option<RasterActivationSequenceRef>>> {
-    ple_input_refs
-        .per_layer_inputs()
-        .iter()
-        .enumerate()
-        .map(|(layer_idx, input_ref)| {
-            input_ref
-                .as_ref()
-                .map(|input_ref| {
-                    store.register_activation_sequence_artifact(
-                        RasterTensorId::new(format!(
-                            "prefill.layer.per_layer_input.{layer_idx}.{}",
-                            input_ref.root()
-                        ))?,
-                        input_ref.clone(),
-                    )
-                })
-                .transpose()
-        })
-        .collect()
-}
-
-pub(super) fn insert_ple_input_artifact(
-    layer_idx: usize,
-    input: RasterActivationSequence,
-) -> Result<RasterActivationSequenceArtifactRef> {
-    insert_activation_sequence_artifact_ref(
-        &format!("prefill.layer.materialized_ple.{layer_idx}"),
-        input,
-    )
-}
-
 pub(super) fn materialize_prefill_activation_sequence_from_store(
     store: &AuthenticatedRasterTensorStore,
     sequence_ref: &RasterActivationSequenceRef,
@@ -228,21 +118,6 @@ pub(super) fn materialize_prefill_layer_caches(
         .iter()
         .map(|cache| materialize_prefill_layer_cache_from_store(store, cache))
         .collect()
-}
-
-pub(super) fn raster_activation_sequence_from_activation(
-    input_activations: &ActivationSequence,
-) -> Result<RasterActivationSequence> {
-    raster_activation_sequence_from_internal(&input_activations.clone_internal())
-}
-
-pub(super) fn raster_activation_sequence_from_internal(
-    input_activations: &InternalActivationSequence,
-) -> Result<RasterActivationSequence> {
-    let det_rows = input_activations.det_values().ok_or_else(|| {
-        anyhow!("deterministic raster prefill layer input requires canonical activations")
-    })?;
-    Ok(RasterActivationSequence::from_acts(det_rows.to_vec()))
 }
 
 pub(super) fn raster_sequence_acts(

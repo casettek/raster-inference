@@ -9,7 +9,8 @@ use crate::shared::artifact_io::{ArtifactIo, AuthRead};
 use crate::shared::merkle::merkle_root;
 use crate::shared::raster_artifact_store::{
     activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
-    RasterArtifactId, RasterArtifactMetadata, ACTIVATION_ROW_ARTIFACT_DOMAIN,
+    RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
+    ACTIVATION_ROW_ARTIFACT_DOMAIN,
 };
 use crate::shared::raster_transformer_kernels::{
     RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
@@ -461,6 +462,7 @@ struct BuilderState {
 pub struct AuthenticatedRasterTensorStore {
     tensors: HashMap<RasterTensorId, StoredTensor>,
     builders: HashMap<RasterTensorId, BuilderState>,
+    allow_artifact_fallback: bool,
     #[cfg(test)]
     materialize_sequence_count: Cell<usize>,
     #[cfg(test)]
@@ -470,6 +472,13 @@ pub struct AuthenticatedRasterTensorStore {
 impl AuthenticatedRasterTensorStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn artifact_backed() -> Self {
+        Self {
+            allow_artifact_fallback: true,
+            ..Self::default()
+        }
     }
 
     #[cfg(test)]
@@ -511,12 +520,13 @@ impl AuthenticatedRasterTensorStore {
         heads: RasterAttentionHeadSequence,
     ) -> Result<RasterAttentionHeadsRef> {
         let shape = heads_shape(&heads)?;
-        let commitment = build_intermediate_heads_commitment(&heads);
+        let artifact_ref =
+            insert_flat_rows_artifact_ref(id.source_name(), flatten_nested_rows(heads.heads()))?;
         let reference = RasterTensorRef::new(
             id.clone(),
             RasterTensorKind::AttentionHeads,
             shape,
-            commitment,
+            artifact_ref.root(),
         )?;
         self.insert_tensor(id, StoredTensor::Heads(heads))?;
         RasterAttentionHeadsRef::new(reference)
@@ -529,17 +539,25 @@ impl AuthenticatedRasterTensorStore {
         cache: RasterKvCache,
     ) -> Result<RasterKvCacheRef> {
         let shape = kv_cache_shape(&cache)?;
+        let keys_artifact_ref = insert_flat_rows_artifact_ref(
+            keys_id.source_name(),
+            flatten_nested_rows(cache.keys()),
+        )?;
+        let values_artifact_ref = insert_flat_rows_artifact_ref(
+            values_id.source_name(),
+            flatten_nested_rows(cache.values()),
+        )?;
         let keys_ref = RasterTensorRef::new(
             keys_id.clone(),
             RasterTensorKind::KvCacheKeys,
             shape.clone(),
-            build_nested_rows_commitment(b"raster-intermediate-kv-keys-v1", cache.keys()),
+            keys_artifact_ref.root(),
         )?;
         let values_ref = RasterTensorRef::new(
             values_id.clone(),
             RasterTensorKind::KvCacheValues,
             shape,
-            build_nested_rows_commitment(b"raster-intermediate-kv-values-v1", cache.values()),
+            values_artifact_ref.root(),
         )?;
         let cache_ref = RasterKvCacheRef::new(
             keys_ref.clone(),
@@ -904,11 +922,24 @@ impl AuthenticatedRasterTensorStore {
         #[cfg(test)]
         self.materialize_sequence_count
             .set(self.materialize_sequence_count.get() + 1);
-        let sequence = match self.tensor(tensor_ref.tensor_ref())? {
-            StoredTensor::SequenceArtifact(artifact_ref) => {
-                materialize_activation_sequence_artifact(artifact_ref)?
+        let sequence = match self.tensors.get(tensor_ref.tensor_ref().id()) {
+            Some(tensor) => {
+                validate_stored_tensor(tensor_ref.tensor_ref(), tensor)?;
+                match tensor {
+                    StoredTensor::SequenceArtifact(artifact_ref) => {
+                        materialize_activation_sequence_artifact(artifact_ref)?
+                    }
+                    _ => bail!("raster activation sequence ref points to non-sequence tensor"),
+                }
             }
-            _ => bail!("raster activation sequence ref points to non-sequence tensor"),
+            None if self.allow_artifact_fallback => {
+                let artifact_ref = artifact_ref_for_tensor_ref(tensor_ref.tensor_ref())?;
+                materialize_activation_sequence_artifact(&artifact_ref)?
+            }
+            None => bail!(
+                "raster tensor ref {} is not registered",
+                tensor_ref.tensor_ref().id().source_name()
+            ),
         };
         Ok(sequence)
     }
@@ -917,15 +948,20 @@ impl AuthenticatedRasterTensorStore {
         &self,
         tensor_ref: &RasterAttentionHeadsRef,
     ) -> Result<RasterAttentionHeadSequence> {
-        let heads = match self.tensor(tensor_ref.tensor_ref())? {
-            StoredTensor::Heads(heads) => heads.clone(),
-            _ => bail!("raster attention heads ref points to non-head tensor"),
+        let heads = match self.tensors.get(tensor_ref.tensor_ref().id()) {
+            Some(tensor) => {
+                validate_stored_tensor(tensor_ref.tensor_ref(), tensor)?;
+                match tensor {
+                    StoredTensor::Heads(heads) => heads.clone(),
+                    _ => bail!("raster attention heads ref points to non-head tensor"),
+                }
+            }
+            None if self.allow_artifact_fallback => materialize_heads_artifact(tensor_ref)?,
+            None => bail!(
+                "raster tensor ref {} is not registered",
+                tensor_ref.tensor_ref().id().source_name()
+            ),
         };
-        ensure_commitment(
-            tensor_ref.tensor_ref().det_commitment(),
-            &build_intermediate_heads_commitment(&heads),
-            "attention heads",
-        )?;
         Ok(heads)
     }
 
@@ -933,20 +969,37 @@ impl AuthenticatedRasterTensorStore {
         #[cfg(test)]
         self.materialize_kv_cache_count
             .set(self.materialize_kv_cache_count.get() + 1);
-        let keys = match self.tensor(cache_ref.keys())? {
-            StoredTensor::KvKeys(keys) => keys.clone(),
-            _ => bail!("raster KV cache keys ref points to non-key tensor"),
+        let keys = match self.tensors.get(cache_ref.keys().id()) {
+            Some(tensor) => {
+                validate_stored_tensor(cache_ref.keys(), tensor)?;
+                match tensor {
+                    StoredTensor::KvKeys(keys) => keys.clone(),
+                    _ => bail!("raster KV cache keys ref points to non-key tensor"),
+                }
+            }
+            None if self.allow_artifact_fallback => materialize_kv_artifact_rows(cache_ref.keys())?,
+            None => bail!(
+                "raster tensor ref {} is not registered",
+                cache_ref.keys().id().source_name()
+            ),
         };
-        let values = match self.tensor(cache_ref.values())? {
-            StoredTensor::KvValues(values) => values.clone(),
-            _ => bail!("raster KV cache values ref points to non-value tensor"),
+        let values = match self.tensors.get(cache_ref.values().id()) {
+            Some(tensor) => {
+                validate_stored_tensor(cache_ref.values(), tensor)?;
+                match tensor {
+                    StoredTensor::KvValues(values) => values.clone(),
+                    _ => bail!("raster KV cache values ref points to non-value tensor"),
+                }
+            }
+            None if self.allow_artifact_fallback => {
+                materialize_kv_artifact_rows(cache_ref.values())?
+            }
+            None => bail!(
+                "raster tensor ref {} is not registered",
+                cache_ref.values().id().source_name()
+            ),
         };
         let cache = RasterKvCache::from_heads(keys, values)?;
-        ensure_commitment(
-            cache_ref.det_commitment(),
-            &build_intermediate_kv_cache_commitment(&cache),
-            "KV cache",
-        )?;
         Ok(cache)
     }
 
@@ -1040,17 +1093,6 @@ impl AuthenticatedRasterTensorStore {
         Ok(builder_ref)
     }
 
-    fn tensor(&self, tensor_ref: &RasterTensorRef) -> Result<&StoredTensor> {
-        let tensor = self.tensors.get(tensor_ref.id()).ok_or_else(|| {
-            anyhow!(
-                "raster tensor ref {} is not registered",
-                tensor_ref.id().source_name()
-            )
-        })?;
-        validate_stored_tensor(tensor_ref, tensor)?;
-        Ok(tensor)
-    }
-
     fn builder_mut(&mut self, builder_ref: &RasterTensorBuilderRef) -> Result<&mut BuilderState> {
         let builder = self.builders.get_mut(builder_ref.id()).ok_or_else(|| {
             anyhow!(
@@ -1116,6 +1158,300 @@ impl AuthenticatedRasterTensorStore {
     }
 }
 
+pub fn activation_sequence_ref_from_artifact(
+    id: RasterTensorId,
+    artifact_ref: RasterActivationSequenceArtifactRef,
+) -> Result<RasterActivationSequenceRef> {
+    let shape = RasterTensorShape::sequence(artifact_ref.row_count(), artifact_ref.width())?;
+    RasterActivationSequenceRef::new(RasterTensorRef::new(
+        id,
+        RasterTensorKind::ActivationSequence,
+        shape,
+        artifact_ref.root(),
+    )?)
+}
+
+pub fn attention_heads_ref_from_artifact(
+    id: RasterTensorId,
+    artifact_ref: RasterActivationSequenceArtifactRef,
+    head_count: usize,
+    sequence_len: usize,
+    head_dim: usize,
+) -> Result<RasterAttentionHeadsRef> {
+    if artifact_ref.row_count() != head_count * sequence_len {
+        bail!(
+            "raster heads artifact has {} rows, expected {}",
+            artifact_ref.row_count(),
+            head_count * sequence_len
+        );
+    }
+    if artifact_ref.width() != head_dim {
+        bail!(
+            "raster heads artifact width {}, expected {head_dim}",
+            artifact_ref.width()
+        );
+    }
+    RasterAttentionHeadsRef::new(RasterTensorRef::new(
+        id,
+        RasterTensorKind::AttentionHeads,
+        RasterTensorShape::heads(head_count, sequence_len, head_dim)?,
+        artifact_ref.root(),
+    )?)
+}
+
+pub fn kv_cache_ref_from_artifacts(
+    keys_id: RasterTensorId,
+    values_id: RasterTensorId,
+    keys_artifact_ref: RasterActivationSequenceArtifactRef,
+    values_artifact_ref: RasterActivationSequenceArtifactRef,
+    head_count: usize,
+    current_len: usize,
+    head_dim: usize,
+) -> Result<RasterKvCacheRef> {
+    let expected_rows = head_count * current_len;
+    if keys_artifact_ref.row_count() != expected_rows {
+        bail!(
+            "raster KV keys artifact has {} rows, expected {expected_rows}",
+            keys_artifact_ref.row_count()
+        );
+    }
+    if values_artifact_ref.row_count() != expected_rows {
+        bail!(
+            "raster KV values artifact has {} rows, expected {expected_rows}",
+            values_artifact_ref.row_count()
+        );
+    }
+    if keys_artifact_ref.width() != head_dim {
+        bail!(
+            "raster KV keys artifact width {}, expected {head_dim}",
+            keys_artifact_ref.width()
+        );
+    }
+    if values_artifact_ref.width() != head_dim {
+        bail!(
+            "raster KV values artifact width {}, expected {head_dim}",
+            values_artifact_ref.width()
+        );
+    }
+
+    let shape = RasterTensorShape::kv_cache(head_count, current_len, head_dim)?;
+    let keys_ref = RasterTensorRef::new(
+        keys_id,
+        RasterTensorKind::KvCacheKeys,
+        shape.clone(),
+        keys_artifact_ref.root(),
+    )?;
+    let values_ref = RasterTensorRef::new(
+        values_id,
+        RasterTensorKind::KvCacheValues,
+        shape,
+        values_artifact_ref.root(),
+    )?;
+    RasterKvCacheRef::new(
+        keys_ref,
+        values_ref,
+        build_intermediate_kv_cache_roots_commitment(
+            keys_artifact_ref.root(),
+            values_artifact_ref.root(),
+        ),
+    )
+}
+
+pub fn start_sequence_builder_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    id: RasterArtifactId,
+    row_count: usize,
+    width: usize,
+) -> Result<RasterArtifactStoreRoots> {
+    let (roots, _builder) = ArtifactIo::start_builder_with_roots(
+        roots,
+        id,
+        RasterArtifactMetadata::activation_rows(row_count, width)?,
+    )?;
+    Ok(roots)
+}
+
+pub fn append_sequence_row_by_source_name_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name: &str,
+    row_idx: usize,
+    row: RasterActivationRow,
+) -> Result<RasterArtifactStoreRoots> {
+    let (roots, _builder_root) = ArtifactIo::append_leaf_by_builder_source_name_with_roots(
+        roots,
+        source_name,
+        row_idx,
+        activation_row_leaf(&row),
+    )?;
+    Ok(roots)
+}
+
+pub fn finalize_sequence_builder_by_source_name_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name: &str,
+    id: RasterTensorId,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (roots, artifact_ref) =
+        ArtifactIo::finalize_builder_by_source_name_with_roots(roots, source_name)?;
+    let sequence_ref = activation_sequence_ref_from_artifact(
+        id,
+        RasterActivationSequenceArtifactRef::new(artifact_ref)?,
+    )?;
+    Ok((roots, sequence_ref))
+}
+
+pub fn finalize_heads_builder_by_source_name_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name: &str,
+    id: RasterTensorId,
+    head_count: usize,
+    sequence_len: usize,
+    head_dim: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let (roots, artifact_ref) =
+        ArtifactIo::finalize_builder_by_source_name_with_roots(roots, source_name)?;
+    let heads_ref = attention_heads_ref_from_artifact(
+        id,
+        RasterActivationSequenceArtifactRef::new(artifact_ref)?,
+        head_count,
+        sequence_len,
+        head_dim,
+    )?;
+    Ok((roots, heads_ref))
+}
+
+pub fn finalize_kv_cache_builders_by_source_name_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    keys_source_name: &str,
+    values_source_name: &str,
+    keys_id: RasterTensorId,
+    values_id: RasterTensorId,
+    head_count: usize,
+    current_len: usize,
+    head_dim: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterKvCacheRef)> {
+    let (roots, keys_artifact_ref) =
+        ArtifactIo::finalize_builder_by_source_name_with_roots(roots, keys_source_name)?;
+    let (roots, values_artifact_ref) =
+        ArtifactIo::finalize_builder_by_source_name_with_roots(&roots, values_source_name)?;
+    let cache_ref = kv_cache_ref_from_artifacts(
+        keys_id,
+        values_id,
+        RasterActivationSequenceArtifactRef::new(keys_artifact_ref)?,
+        RasterActivationSequenceArtifactRef::new(values_artifact_ref)?,
+        head_count,
+        current_len,
+        head_dim,
+    )?;
+    Ok((roots, cache_ref))
+}
+
+pub fn append_head_row_by_source_name_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name: &str,
+    head_idx: usize,
+    token_idx: usize,
+    sequence_len: usize,
+    row: RasterActivationRow,
+) -> Result<RasterArtifactStoreRoots> {
+    append_sequence_row_by_source_name_with_roots(
+        roots,
+        source_name,
+        head_idx * sequence_len + token_idx,
+        row,
+    )
+}
+
+pub fn read_sequence_row_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    request: RasterSequenceRowRequest,
+) -> Result<RasterActivationRow> {
+    let (row_count, width) = request
+        .tensor_ref
+        .tensor_ref()
+        .shape()
+        .sequence_metadata()?;
+    if request.row_idx >= row_count {
+        bail!(
+            "sequence row {} is out of range for {} rows",
+            request.row_idx,
+            row_count
+        );
+    }
+    ensure_artifact_root_present(roots, request.tensor_ref.tensor_ref().det_commitment())?;
+    read_activation_artifact_row_by_tensor_ref(
+        request.tensor_ref.tensor_ref(),
+        request.row_idx,
+        width,
+    )
+}
+
+pub fn read_head_row_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    request: RasterHeadRowRequest,
+) -> Result<RasterActivationRow> {
+    let (head_count, sequence_len, head_dim) =
+        request.tensor_ref.tensor_ref().shape().heads_metadata()?;
+    if request.head_idx >= head_count {
+        bail!(
+            "head row request head {} is out of range for {} heads",
+            request.head_idx,
+            head_count
+        );
+    }
+    if request.token_idx >= sequence_len {
+        bail!(
+            "head row request token {} is out of range for {} rows",
+            request.token_idx,
+            sequence_len
+        );
+    }
+    ensure_artifact_root_present(roots, request.tensor_ref.tensor_ref().det_commitment())?;
+    read_activation_artifact_row_by_tensor_ref(
+        request.tensor_ref.tensor_ref(),
+        request.head_idx * sequence_len + request.token_idx,
+        head_dim,
+    )
+}
+
+pub fn read_kv_row_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    request: RasterKvRowRequest,
+) -> Result<RasterActivationRow> {
+    let (head_count, current_len, head_dim) = request.cache_ref.shape().kv_cache_metadata()?;
+    if request.head_idx >= head_count {
+        bail!(
+            "KV row request head {} is out of range for {} heads",
+            request.head_idx,
+            head_count
+        );
+    }
+    if request.token_idx >= current_len {
+        bail!(
+            "KV row request token {} is out of range for {} rows",
+            request.token_idx,
+            current_len
+        );
+    }
+    let tensor_ref = match request.row_kind {
+        RasterKvRowKind::Key => request.cache_ref.keys(),
+        RasterKvRowKind::Value => request.cache_ref.values(),
+    };
+    ensure_artifact_root_present(roots, tensor_ref.det_commitment())?;
+    read_activation_artifact_row_by_tensor_ref(
+        tensor_ref,
+        request.head_idx * current_len + request.token_idx,
+        head_dim,
+    )
+}
+
+fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) -> Result<()> {
+    if roots.artifacts.iter().any(|entry| entry.root() == root) {
+        return Ok(());
+    }
+    bail!("raster artifact root {root} is not present in the store roots snapshot")
+}
+
 impl RasterRowSource for AuthenticatedRasterTensorStore {
     fn read_sequence_row(&self, request: RasterSequenceRowRequest) -> Result<RasterActivationRow> {
         let (row_count, width) = request
@@ -1130,8 +1466,12 @@ impl RasterRowSource for AuthenticatedRasterTensorStore {
                 row_count
             );
         }
-        match self.tensor(request.tensor_ref.tensor_ref())? {
-            StoredTensor::SequenceArtifact(artifact_ref) => {
+        match self.tensors.get(request.tensor_ref.tensor_ref().id()) {
+            Some(tensor) => {
+                validate_stored_tensor(request.tensor_ref.tensor_ref(), tensor)?;
+                let StoredTensor::SequenceArtifact(artifact_ref) = tensor else {
+                    bail!("raster activation sequence ref points to non-sequence tensor");
+                };
                 let row = read_activation_artifact_row(artifact_ref, request.row_idx)?;
                 if row.width() != width {
                     bail!(
@@ -1143,7 +1483,15 @@ impl RasterRowSource for AuthenticatedRasterTensorStore {
                 }
                 return Ok(row);
             }
-            _ => bail!("raster activation sequence ref points to non-sequence tensor"),
+            None if self.allow_artifact_fallback => read_activation_artifact_row_by_tensor_ref(
+                request.tensor_ref.tensor_ref(),
+                request.row_idx,
+                width,
+            ),
+            None => bail!(
+                "raster tensor ref {} is not registered",
+                request.tensor_ref.tensor_ref().id().source_name()
+            ),
         }
     }
 
@@ -1164,21 +1512,35 @@ impl RasterRowSource for AuthenticatedRasterTensorStore {
                 sequence_len
             );
         }
-        let heads = match self.tensor(request.tensor_ref.tensor_ref())? {
-            StoredTensor::Heads(heads) => heads,
-            _ => bail!("raster attention heads ref points to non-head tensor"),
+        let row = match self.tensors.get(request.tensor_ref.tensor_ref().id()) {
+            Some(tensor) => {
+                validate_stored_tensor(request.tensor_ref.tensor_ref(), tensor)?;
+                let StoredTensor::Heads(heads) = tensor else {
+                    bail!("raster attention heads ref points to non-head tensor");
+                };
+                heads
+                    .heads()
+                    .get(request.head_idx)
+                    .and_then(|head| head.get(request.token_idx))
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "head row ({}, {}) is missing",
+                            request.head_idx,
+                            request.token_idx
+                        )
+                    })?
+            }
+            None if self.allow_artifact_fallback => read_activation_artifact_row_by_tensor_ref(
+                request.tensor_ref.tensor_ref(),
+                request.head_idx * sequence_len + request.token_idx,
+                head_dim,
+            )?,
+            None => bail!(
+                "raster tensor ref {} is not registered",
+                request.tensor_ref.tensor_ref().id().source_name()
+            ),
         };
-        let row = heads
-            .heads()
-            .get(request.head_idx)
-            .and_then(|head| head.get(request.token_idx))
-            .ok_or_else(|| {
-                anyhow!(
-                    "head row ({}, {}) is missing",
-                    request.head_idx,
-                    request.token_idx
-                )
-            })?;
         if row.width() != head_dim {
             bail!(
                 "head row ({}, {}) has width {}, expected {}",
@@ -1188,7 +1550,7 @@ impl RasterRowSource for AuthenticatedRasterTensorStore {
                 head_dim
             );
         }
-        Ok(row.clone())
+        Ok(row)
     }
 
     fn read_kv_row(&self, request: RasterKvRowRequest) -> Result<RasterActivationRow> {
@@ -1207,34 +1569,40 @@ impl RasterRowSource for AuthenticatedRasterTensorStore {
                 current_len
             );
         }
-        let key_rows = match self.tensor(request.cache_ref.keys())? {
-            StoredTensor::KvKeys(rows) => rows,
-            _ => bail!("raster KV cache keys ref points to non-key tensor"),
+        let tensor_ref = match request.row_kind {
+            RasterKvRowKind::Key => request.cache_ref.keys(),
+            RasterKvRowKind::Value => request.cache_ref.values(),
         };
-        let value_rows = match self.tensor(request.cache_ref.values())? {
-            StoredTensor::KvValues(rows) => rows,
-            _ => bail!("raster KV cache values ref points to non-value tensor"),
+        let row = match self.tensors.get(tensor_ref.id()) {
+            Some(tensor) => {
+                validate_stored_tensor(tensor_ref, tensor)?;
+                let rows = match (request.row_kind, tensor) {
+                    (RasterKvRowKind::Key, StoredTensor::KvKeys(rows))
+                    | (RasterKvRowKind::Value, StoredTensor::KvValues(rows)) => rows,
+                    _ => bail!("raster KV cache ref points to incompatible tensor"),
+                };
+                rows.get(request.head_idx)
+                    .and_then(|head| head.get(request.token_idx))
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "KV row {:?} ({}, {}) is missing",
+                            request.row_kind,
+                            request.head_idx,
+                            request.token_idx
+                        )
+                    })?
+            }
+            None if self.allow_artifact_fallback => read_activation_artifact_row_by_tensor_ref(
+                tensor_ref,
+                request.head_idx * current_len + request.token_idx,
+                head_dim,
+            )?,
+            None => bail!(
+                "raster tensor ref {} is not registered",
+                tensor_ref.id().source_name()
+            ),
         };
-        ensure_commitment(
-            request.cache_ref.det_commitment(),
-            &build_intermediate_kv_cache_rows_commitment(key_rows, value_rows),
-            "KV cache",
-        )?;
-        let rows = match request.row_kind {
-            RasterKvRowKind::Key => key_rows,
-            RasterKvRowKind::Value => value_rows,
-        };
-        let row = rows
-            .get(request.head_idx)
-            .and_then(|head| head.get(request.token_idx))
-            .ok_or_else(|| {
-                anyhow!(
-                    "KV row {:?} ({}, {}) is missing",
-                    request.row_kind,
-                    request.head_idx,
-                    request.token_idx
-                )
-            })?;
         if row.width() != head_dim {
             bail!(
                 "KV row {:?} ({}, {}) has width {}, expected {}",
@@ -1245,7 +1613,7 @@ impl RasterRowSource for AuthenticatedRasterTensorStore {
                 head_dim
             );
         }
-        Ok(row.clone())
+        Ok(row)
     }
 }
 
@@ -1285,6 +1653,113 @@ pub fn build_intermediate_kv_cache_commitment(cache: &RasterKvCache) -> String {
     build_intermediate_kv_cache_rows_commitment(cache.keys(), cache.values())
 }
 
+pub fn build_intermediate_kv_cache_roots_commitment(keys_root: &str, values_root: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"raster-intermediate-kv-cache-roots-v1");
+    hasher.update((keys_root.len() as u64).to_le_bytes());
+    hasher.update(keys_root.as_bytes());
+    hasher.update((values_root.len() as u64).to_le_bytes());
+    hasher.update(values_root.as_bytes());
+    hex_digest(hasher.finalize())
+}
+
+fn insert_flat_rows_artifact_ref(
+    source_name: &str,
+    rows: Vec<RasterActivationRow>,
+) -> Result<RasterActivationSequenceArtifactRef> {
+    let width = rows.first().map(RasterActivationRow::width).unwrap_or(0);
+    let leaves = rows.iter().map(activation_row_leaf).collect::<Vec<_>>();
+    let root = merkle_root(ACTIVATION_ROW_ARTIFACT_DOMAIN.as_bytes(), &leaves);
+    if let Ok(artifact_ref) = ArtifactIo::artifact_ref_for_root_any(&root) {
+        return RasterActivationSequenceArtifactRef::new(artifact_ref);
+    }
+    let artifact_ref = ArtifactIo::insert_artifact(
+        RasterArtifactId::new(format!("{source_name}.{root}"))?,
+        RasterArtifactMetadata::activation_rows(rows.len(), width)?,
+        leaves,
+    )?;
+    RasterActivationSequenceArtifactRef::new(artifact_ref)
+}
+
+fn flat_rows_artifact_root(rows: &[RasterActivationRow]) -> Result<String> {
+    if rows.is_empty() {
+        bail!("raster row artifact requires at least one row");
+    }
+    let leaves = rows.iter().map(activation_row_leaf).collect::<Vec<_>>();
+    Ok(merkle_root(
+        ACTIVATION_ROW_ARTIFACT_DOMAIN.as_bytes(),
+        &leaves,
+    ))
+}
+
+fn flatten_nested_rows(rows: &[Vec<RasterActivationRow>]) -> Vec<RasterActivationRow> {
+    rows.iter()
+        .flat_map(|nested_rows| nested_rows.iter().cloned())
+        .collect()
+}
+
+fn artifact_ref_for_tensor_ref(
+    tensor_ref: &RasterTensorRef,
+) -> Result<RasterActivationSequenceArtifactRef> {
+    RasterActivationSequenceArtifactRef::new(ArtifactIo::artifact_ref_for_root_any(
+        tensor_ref.det_commitment(),
+    )?)
+}
+
+fn read_activation_artifact_row_by_tensor_ref(
+    tensor_ref: &RasterTensorRef,
+    row_idx: usize,
+    expected_width: usize,
+) -> Result<RasterActivationRow> {
+    let artifact_ref = artifact_ref_for_tensor_ref(tensor_ref)?;
+    let row = read_activation_artifact_row(&artifact_ref, row_idx)?;
+    if row.width() != expected_width {
+        bail!(
+            "activation artifact row {row_idx} has width {}, expected {expected_width}",
+            row.width()
+        );
+    }
+    Ok(row)
+}
+
+fn materialize_heads_artifact(
+    heads_ref: &RasterAttentionHeadsRef,
+) -> Result<RasterAttentionHeadSequence> {
+    let (head_count, sequence_len, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    let mut heads = Vec::with_capacity(head_count);
+    for head_idx in 0..head_count {
+        let mut rows = Vec::with_capacity(sequence_len);
+        for token_idx in 0..sequence_len {
+            rows.push(read_activation_artifact_row_by_tensor_ref(
+                heads_ref.tensor_ref(),
+                head_idx * sequence_len + token_idx,
+                head_dim,
+            )?);
+        }
+        heads.push(rows);
+    }
+    Ok(RasterAttentionHeadSequence::from_heads(heads))
+}
+
+fn materialize_kv_artifact_rows(
+    tensor_ref: &RasterTensorRef,
+) -> Result<Vec<Vec<RasterActivationRow>>> {
+    let (head_count, current_len, head_dim) = tensor_ref.shape().kv_cache_metadata()?;
+    let mut heads = Vec::with_capacity(head_count);
+    for head_idx in 0..head_count {
+        let mut rows = Vec::with_capacity(current_len);
+        for token_idx in 0..current_len {
+            rows.push(read_activation_artifact_row_by_tensor_ref(
+                tensor_ref,
+                head_idx * current_len + token_idx,
+                head_dim,
+            )?);
+        }
+        heads.push(rows);
+    }
+    Ok(heads)
+}
+
 fn build_intermediate_kv_cache_rows_commitment(
     keys: &[Vec<RasterActivationRow>],
     values: &[Vec<RasterActivationRow>],
@@ -1318,7 +1793,7 @@ pub fn insert_activation_sequence_artifact_ref(
         .map(activation_row_leaf)
         .collect::<Vec<_>>();
     let root = merkle_root(ACTIVATION_ROW_ARTIFACT_DOMAIN.as_bytes(), &leaves);
-    if let Ok(artifact_ref) = ArtifactIo::artifact_ref_for_root(&root) {
+    if let Ok(artifact_ref) = ArtifactIo::artifact_ref_for_root_any(&root) {
         return RasterActivationSequenceArtifactRef::new(artifact_ref);
     }
     let artifact_ref = ArtifactIo::insert_artifact(
@@ -1403,7 +1878,7 @@ fn validate_stored_tensor(tensor_ref: &RasterTensorRef, tensor: &StoredTensor) -
             }
             ensure_commitment(
                 tensor_ref.det_commitment(),
-                &build_intermediate_heads_commitment(heads),
+                &flat_rows_artifact_root(&flatten_nested_rows(heads.heads()))?,
                 "attention heads",
             )
         }
@@ -1412,14 +1887,7 @@ fn validate_stored_tensor(tensor_ref: &RasterTensorRef, tensor: &StoredTensor) -
             validate_kv_rows_shape(rows, tensor_ref.shape())?;
             ensure_commitment(
                 tensor_ref.det_commitment(),
-                &build_nested_rows_commitment(
-                    match tensor_ref.kind {
-                        RasterTensorKind::KvCacheKeys => b"raster-intermediate-kv-keys-v1",
-                        RasterTensorKind::KvCacheValues => b"raster-intermediate-kv-values-v1",
-                        _ => unreachable!("matched above"),
-                    },
-                    rows,
-                ),
+                &flat_rows_artifact_root(&flatten_nested_rows(rows))?,
                 "KV cache rows",
             )
         }

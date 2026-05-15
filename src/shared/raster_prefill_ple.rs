@@ -1,9 +1,10 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::artifact_io::AuthRead;
+use crate::shared::artifact_io::{ArtifactIo, AuthRead};
 use crate::shared::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_artifact_store::{
-    RasterActivationSequenceArtifactRef, RasterArtifactStoreRoots,
+    RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
+    RasterArtifactStoreRoots,
 };
 use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
 use crate::shared::transformer::{
@@ -52,6 +53,154 @@ pub struct RasterPrefillPleInputRefs {
     layer_count: usize,
     token_count: usize,
     per_layer_inputs: Vec<Option<RasterActivationSequenceArtifactRef>>,
+}
+
+const PREFILL_PLE_INPUT_MANIFEST_KIND: &str = "prefill_ple_input_manifest";
+const PREFILL_PLE_INPUT_MANIFEST_DOMAIN: &str = "raster-prefill-ple-input-manifest-v1";
+const PREFILL_PLE_INPUT_MANIFEST_SOURCE_NAME: &str = "prefill.prepare_aux.ple_input_manifest";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterPrefillPleInputManifest {
+    source_id: String,
+    layer_count: usize,
+    token_count: usize,
+    per_layer_input_roots: Vec<Option<String>>,
+}
+
+impl RasterPrefillPleInputManifest {
+    pub fn new(
+        source_id: impl Into<String>,
+        layer_count: usize,
+        token_count: usize,
+        per_layer_input_roots: Vec<Option<String>>,
+    ) -> Result<Self> {
+        let source_id = validate_identifier(source_id.into())?;
+        if layer_count == 0 {
+            bail!("raster PLE input manifest requires at least one layer");
+        }
+        if token_count == 0 {
+            bail!("raster PLE input manifest requires at least one token");
+        }
+        if per_layer_input_roots.len() != layer_count {
+            bail!(
+                "raster PLE input manifest received {} layers, expected {layer_count}",
+                per_layer_input_roots.len()
+            );
+        }
+        Ok(Self {
+            source_id,
+            layer_count,
+            token_count,
+            per_layer_input_roots,
+        })
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    pub fn per_layer_input_roots(&self) -> &[Option<String>] {
+        &self.per_layer_input_roots
+    }
+
+    pub fn into_prefill_ple_input_refs(
+        self,
+        artifact_store_roots: RasterArtifactStoreRoots,
+    ) -> Result<RasterPrefillPleInputRefs> {
+        let per_layer_inputs = self
+            .per_layer_input_roots
+            .into_iter()
+            .map(|root| {
+                root.map(|root| {
+                    ensure_artifact_root_present(&artifact_store_roots, &root)?;
+                    RasterActivationSequenceArtifactRef::new(ArtifactIo::artifact_ref_for_root_any(
+                        &root,
+                    )?)
+                })
+                .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        RasterPrefillPleInputRefs::new_with_roots(
+            artifact_store_roots,
+            self.source_id,
+            self.layer_count,
+            self.token_count,
+            per_layer_inputs,
+        )
+    }
+}
+
+pub fn store_prefill_ple_input_manifest_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_id: impl Into<String>,
+    layer_count: usize,
+    token_count: usize,
+    per_layer_inputs: &[Option<RasterActivationSequenceArtifactRef>],
+) -> Result<(RasterArtifactStoreRoots, String)> {
+    let manifest = RasterPrefillPleInputManifest::new(
+        source_id,
+        layer_count,
+        token_count,
+        per_layer_inputs
+            .iter()
+            .map(|input| input.as_ref().map(|input| input.root().to_string()))
+            .collect(),
+    )?;
+    let payload = serde_json::to_vec(&manifest)?;
+    let (roots, artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        roots,
+        RasterArtifactId::new(PREFILL_PLE_INPUT_MANIFEST_SOURCE_NAME)?,
+        RasterArtifactMetadata::new(
+            PREFILL_PLE_INPUT_MANIFEST_KIND,
+            PREFILL_PLE_INPUT_MANIFEST_DOMAIN,
+            1,
+            Vec::new(),
+        )?,
+        vec![payload],
+    )?;
+    Ok((roots, artifact_ref.root().to_string()))
+}
+
+pub fn read_prefill_ple_input_manifest_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    manifest_root: &str,
+) -> Result<RasterPrefillPleInputManifest> {
+    ensure_artifact_root_present(roots, manifest_root)?;
+    let artifact_ref = ArtifactIo::artifact_ref_for_root_any(manifest_root)?;
+    if artifact_ref.metadata().kind() != PREFILL_PLE_INPUT_MANIFEST_KIND {
+        bail!(
+            "raster PLE input manifest kind mismatch: {}",
+            artifact_ref.metadata().kind()
+        );
+    }
+    if artifact_ref.metadata().domain() != PREFILL_PLE_INPUT_MANIFEST_DOMAIN {
+        bail!(
+            "raster PLE input manifest domain mismatch: {}",
+            artifact_ref.metadata().domain()
+        );
+    }
+    if artifact_ref.metadata().leaf_count() != 1 {
+        bail!("raster PLE input manifest must have exactly one leaf");
+    }
+    let read = ArtifactIo::read_leaf(&artifact_ref, 0)?;
+    ArtifactIo::verify_artifact_read(&artifact_ref, &read)?;
+    Ok(serde_json::from_slice(read.payload())?)
+}
+
+fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) -> Result<()> {
+    if roots.artifacts.iter().any(|entry| entry.root() == root) {
+        return Ok(());
+    }
+    bail!("raster artifact root {root} is not present in the store roots snapshot")
 }
 
 impl RasterPrefillPleInputRefs {

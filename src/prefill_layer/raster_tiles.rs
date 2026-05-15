@@ -2,60 +2,49 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use super::raster_utils::{
-    import_materialized_ple_inputs, layer_cache_from_raster, layer_caches_from_raster,
-    materialize_prefill_activation_sequence_from_store, materialize_prefill_layer_cache_from_store,
-    materialize_prefill_layer_caches, raster_activation_sequence_from_activation,
-    raster_sequence_acts, register_ple_input_artifact_refs, resolve_prefill_donor_cache_index,
+    layer_caches_from_raster, materialize_prefill_activation_sequence_from_store,
+    materialize_prefill_layer_caches, raster_sequence_acts, resolve_prefill_donor_cache_index,
     retained_prefill_kv_cache_len, validate_prefill_layer_ple_input_ref,
 };
 use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::shared::raster_artifact_store::RasterActivationSequenceArtifactRef;
+use crate::shared::raster_artifact_store::{
+    RasterActivationSequenceArtifactRef, RasterArtifactStoreRoots,
+};
 use crate::shared::raster_prefill_layer::{
     AuthenticatedGemmaPrefillLayerSource, GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind,
     GemmaPrefillLayerMetadata, GemmaPrefillLayerMetadataRequest, GemmaPrefillLayerNormKind,
     GemmaPrefillLayerNormWeightsRequest, GemmaPrefillLayerScalars, GemmaPrefillLayerScalarsRequest,
     GemmaPrefillLayerSourceMetadataRequest,
 };
-use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
+use crate::shared::raster_prefill_ple::read_prefill_ple_input_manifest_from_roots;
 use crate::shared::raster_row_store::{
-    insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
-    RasterActivationSequenceRef, RasterAttentionHeadsRef, RasterKvCacheRef,
-    RasterSequenceRowRequest, RasterTensorId,
+    activation_sequence_ref_from_artifact, read_sequence_row_from_roots,
+    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
+    RasterKvCacheRef, RasterSequenceRowRequest, RasterTensorId,
 };
 use crate::shared::raster_transformer_kernels::{
-    append_projection_chunk_to_state, compute_next_attention_row, compute_next_combine_heads_row,
-    compute_next_head_unary_row, compute_next_kv_cache_row, compute_next_reshape_heads_row,
-    compute_next_sequence_binary_row, compute_next_sequence_unary_row,
-    finalize_attention_row_state, finalize_attention_row_state_ref, finalize_combine_heads_state,
-    finalize_combine_heads_state_ref, finalize_head_unary_row_state,
-    finalize_head_unary_row_state_ref, finalize_kv_cache_build_state,
-    finalize_kv_cache_build_state_ref, finalize_reshape_heads_state,
-    finalize_reshape_heads_state_ref, finalize_sequence_binary_row_state,
-    finalize_sequence_binary_row_state_ref, finalize_sequence_projection_state,
-    finalize_sequence_projection_state_ref, finalize_sequence_unary_row_state,
-    finalize_sequence_unary_row_state_ref, init_attention_row_state,
-    init_attention_row_state_from_refs, init_combine_heads_state,
-    init_combine_heads_state_from_ref, init_head_rms_norm_row_state,
-    init_head_rms_norm_row_state_from_ref, init_kv_cache_build_state,
-    init_kv_cache_build_state_from_refs, init_reshape_heads_state,
-    init_reshape_heads_state_from_ref, init_rope_row_state, init_rope_row_state_from_ref,
-    init_sequence_add_row_state, init_sequence_add_row_state_from_refs,
-    init_sequence_gelu_row_state, init_sequence_gelu_row_state_from_ref,
-    init_sequence_mul_row_state, init_sequence_mul_row_state_from_refs,
-    init_sequence_projection_state, init_sequence_projection_state_from_ref,
-    init_sequence_rms_norm_row_state, init_sequence_rms_norm_row_state_from_ref,
-    init_sequence_scale_row_state, init_sequence_scale_row_state_from_ref,
-    init_value_rms_norm_row_state, init_value_rms_norm_row_state_from_ref,
-    validate_projection_rows_per_tile, RasterActivationSequence, RasterAttentionHeadSequence,
-    RasterAttentionRowState, RasterCombineHeadsState, RasterHeadUnaryState, RasterKvCache,
-    RasterKvCacheBuildState, RasterReshapeHeadsState, RasterSequenceBinaryState,
-    RasterSequenceProjectionState, RasterSequenceUnaryState,
-};
-use crate::shared::transformer::{
-    ActivationSequence, Gemma4PrefillPleInputs, InternalActivationSequence, LayerKvCache,
+    append_projection_chunk_to_artifact_state, compute_next_attention_artifact_row,
+    compute_next_combine_heads_artifact_row, compute_next_head_unary_artifact_row,
+    compute_next_kv_cache_artifact_row, compute_next_reshape_heads_artifact_row,
+    compute_next_sequence_binary_artifact_row, compute_next_sequence_unary_artifact_row,
+    finalize_attention_artifact_row_state_ref, finalize_combine_heads_artifact_state_ref,
+    finalize_head_unary_artifact_state_ref, finalize_kv_cache_build_artifact_state_ref,
+    finalize_reshape_heads_artifact_state_ref, finalize_sequence_binary_artifact_state_ref,
+    finalize_sequence_projection_artifact_state_ref, finalize_sequence_unary_artifact_state_ref,
+    init_attention_artifact_row_state_from_refs, init_combine_heads_artifact_state_from_ref,
+    init_head_rms_norm_artifact_state_from_ref, init_kv_cache_build_artifact_state_from_refs,
+    init_reshape_heads_artifact_state_from_ref, init_rope_artifact_state_from_ref,
+    init_sequence_add_artifact_state_from_refs, init_sequence_gelu_artifact_state_from_ref,
+    init_sequence_mul_artifact_state_from_refs, init_sequence_projection_artifact_state_from_ref,
+    init_sequence_rms_norm_artifact_state_from_ref, init_sequence_scale_artifact_state_from_ref,
+    init_value_rms_norm_artifact_state_from_ref, validate_projection_rows_per_tile,
+    RasterAttentionArtifactRowState, RasterCombineHeadsArtifactState, RasterHeadUnaryArtifactState,
+    RasterKvCacheBuildArtifactState, RasterReshapeHeadsArtifactState,
+    RasterSequenceBinaryArtifactState, RasterSequenceProjectionArtifactState,
+    RasterSequenceUnaryArtifactState,
 };
 use crate::trace::{trace_event, trace_scope};
 use crate::RasterSizingControls;
@@ -95,35 +84,14 @@ pub struct PrefillLayerContext {
     per_layer_input: Option<RasterActivationSequenceRef>,
 }
 
-pub fn init_prefill_layer_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    input_activations: &ActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-    raster_sizing: RasterSizingControls,
-) -> Result<PrefillLayerRasterState> {
-    let input_activations = raster_activation_sequence_from_activation(input_activations)?;
-    let input_activations_ref = insert_activation_sequence_artifact_ref(
-        "prefill.layer.current.initial.compat",
-        input_activations,
-    )?;
-    init_prefill_layer_state_from_activation_ref(
-        store,
-        input_activations_ref,
-        layer_source,
-        ple_input_refs,
-        raster_sizing,
-    )
-}
-
 #[tile]
-pub fn init_prefill_layer_state_from_input_embedding_refs(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_layer_state_from_input_embedding_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
-) -> Result<PrefillLayerRasterState> {
+) -> Result<(RasterArtifactStoreRoots, PrefillLayerRasterState)> {
     if input_embedding_refs.prompt_token_count
         != input_embedding_refs
             .embedded_prompt_activations_ref
@@ -131,23 +99,23 @@ pub fn init_prefill_layer_state_from_input_embedding_refs(
     {
         bail!("prefill layer requires input embedding token count and activation rows to match");
     }
-    init_prefill_layer_state_from_activation_ref(
-        store,
+    init_prefill_layer_state_from_activation_ref_with_roots(
+        artifact_store_roots,
         input_embedding_refs.embedded_prompt_activations_ref.clone(),
         layer_source,
-        ple_input_refs,
+        ple_input_manifest_root,
         raster_sizing,
     )
 }
 
 #[tile]
-fn init_prefill_layer_state_from_activation_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub(crate) fn init_prefill_layer_state_from_activation_ref_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_activations_ref: RasterActivationSequenceArtifactRef,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
-) -> Result<PrefillLayerRasterState> {
+) -> Result<(RasterArtifactStoreRoots, PrefillLayerRasterState)> {
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
     crate::shared::raster_transformer_kernels::validate_attention_kv_rows_per_tile(
         raster_sizing.attention_kv_rows_per_tile,
@@ -158,6 +126,7 @@ fn init_prefill_layer_state_from_activation_ref(
     crate::shared::raster_transformer_kernels::validate_head_rows_per_tile(
         raster_sizing.head_rows_per_tile,
     )?;
+    ensure_artifact_root_present(&artifact_store_roots, input_activations_ref.root())?;
     let metadata = auth_read!(layer_source, GemmaPrefillLayerSourceMetadataRequest)?;
     if metadata.layer_count == 0 {
         bail!("transformer prefill requires at least one layer");
@@ -178,7 +147,7 @@ fn init_prefill_layer_state_from_activation_ref(
         );
     }
     let token_count = input_activations_ref.row_count();
-    let current_activations_ref = store.register_activation_sequence_artifact(
+    let current_activations_ref = activation_sequence_ref_from_artifact(
         RasterTensorId::new(format!(
             "prefill.layer.current.initial.{}",
             input_activations_ref.root()
@@ -186,7 +155,13 @@ fn init_prefill_layer_state_from_activation_ref(
         input_activations_ref,
     )?;
 
-    let per_layer_inputs = match ple_input_refs {
+    let ple_input_refs = ple_input_manifest_root
+        .map(|root| {
+            read_prefill_ple_input_manifest_from_roots(&artifact_store_roots, root)?
+                .into_prefill_ple_input_refs(artifact_store_roots.clone())
+        })
+        .transpose()?;
+    let per_layer_inputs = match ple_input_refs.as_ref() {
         Some(ple_input_refs) => {
             if ple_input_refs.source_id() != metadata.source_id {
                 bail!(
@@ -208,24 +183,46 @@ fn init_prefill_layer_state_from_activation_ref(
                     ple_input_refs.token_count()
                 );
             }
-            register_ple_input_artifact_refs(store, ple_input_refs)?
+            ple_input_refs
+                .per_layer_inputs()
+                .iter()
+                .enumerate()
+                .map(|(layer_idx, input_ref)| {
+                    input_ref
+                        .as_ref()
+                        .map(|input_ref| {
+                            ensure_artifact_root_present(&artifact_store_roots, input_ref.root())?;
+                            activation_sequence_ref_from_artifact(
+                                RasterTensorId::new(format!(
+                                    "prefill.layer.per_layer_input.{layer_idx}.{}",
+                                    input_ref.root()
+                                ))?,
+                                input_ref.clone(),
+                            )
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
         }
         None => vec![None; metadata.layer_count],
     };
 
-    Ok(PrefillLayerRasterState {
-        current_activations_ref,
-        next_layer_idx: 0,
-        layer_count: metadata.layer_count,
-        layer_caches: Vec::with_capacity(metadata.layer_count),
-        per_layer_inputs,
-        completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
-        completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
-        projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
-        attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
-        sequence_rows_per_tile: raster_sizing.sequence_rows_per_tile,
-        head_rows_per_tile: raster_sizing.head_rows_per_tile,
-    })
+    Ok((
+        artifact_store_roots,
+        PrefillLayerRasterState {
+            current_activations_ref,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            layer_caches: Vec::with_capacity(metadata.layer_count),
+            per_layer_inputs,
+            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+            projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
+            attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
+            sequence_rows_per_tile: raster_sizing.sequence_rows_per_tile,
+            head_rows_per_tile: raster_sizing.head_rows_per_tile,
+        },
+    ))
 }
 
 #[tile]
@@ -270,23 +267,23 @@ pub fn prepare_next_prefill_layer_context(
 }
 
 #[sequence(kind = recursive)]
-pub fn compute_next_prefill_layer_sequence(
+pub fn compute_next_prefill_layer_sequence_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
     state: PrefillLayerRasterState,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, PrefillLayerRasterState)> {
+) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
     if state.next_layer_idx >= state.layer_count {
-        return Ok((true, state));
+        return Ok((true, artifact_store_roots, state));
     }
 
     let context = call_tile!(prepare_next_prefill_layer_context, &state, layer_source)?;
     if let Some(per_layer_input) = context.per_layer_input.as_ref() {
-        auth_read!(
-            store,
+        read_sequence_row_from_roots(
+            &artifact_store_roots,
             RasterSequenceRowRequest {
                 tensor_ref: per_layer_input.clone(),
                 row_idx: 0,
-            }
+            },
         )?;
     }
     let (token_count, _) = state
@@ -311,9 +308,9 @@ pub fn compute_next_prefill_layer_sequence(
         context.layer.has_ple,
         context.layer.kv_shared_layer_index
     ));
-    let (layer_output_ref, layer_cache) = call_seq!(
-        run_prefill_layer_sequence_ref,
-        store,
+    let (artifact_store_roots, layer_output_ref, layer_cache) = call_seq!(
+        run_prefill_layer_sequence_artifact_ref,
+        artifact_store_roots,
         state.current_activations_ref.clone(),
         layer_source,
         &context.layer,
@@ -326,8 +323,8 @@ pub fn compute_next_prefill_layer_sequence(
     )?;
 
     call_tile!(
-        update_prefill_layer_state_refs,
-        store,
+        update_prefill_layer_state_refs_with_roots,
+        artifact_store_roots,
         state,
         context.layer_idx,
         layer_output_ref,
@@ -336,13 +333,13 @@ pub fn compute_next_prefill_layer_sequence(
 }
 
 #[tile]
-pub fn update_prefill_layer_state_refs(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn update_prefill_layer_state_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
     mut state: PrefillLayerRasterState,
     layer_idx: usize,
     layer_output_ref: RasterActivationSequenceRef,
     layer_cache: PrefillLayerCacheSlot,
-) -> Result<(bool, PrefillLayerRasterState)> {
+) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
     if layer_idx != state.next_layer_idx {
         bail!(
             "cannot update prefill layer {layer_idx} while next layer is {}",
@@ -353,19 +350,26 @@ pub fn update_prefill_layer_state_refs(
     state.current_activations_ref = layer_output_ref;
     state.layer_caches.push(layer_cache);
 
-    let completed_layer_output = trace_prefill_layer_checkpoint(store, &state, layer_idx)?;
+    let completed_layer_output = trace_prefill_layer_checkpoint_with_roots(&state, layer_idx)?;
     if let Some((sha256, det_sha256)) = completed_layer_output {
         state.completed_layer_output_sha256s.push(sha256);
         state.completed_layer_output_det_sha256s.push(det_sha256);
     }
 
-    if trace_prefill_layer_token_checkpoints(store, &state, layer_idx)? {
+    if trace_prefill_layer_token_checkpoints_with_roots(&artifact_store_roots, &state, layer_idx)? {
         state.next_layer_idx += 1;
         state.layer_count = state.next_layer_idx;
-        return Ok((true, state));
+        return Ok((true, artifact_store_roots, state));
     }
     state.next_layer_idx += 1;
-    Ok((false, state))
+    Ok((false, artifact_store_roots, state))
+}
+
+fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) -> Result<()> {
+    if roots.artifacts.iter().any(|entry| entry.root() == root) {
+        return Ok(());
+    }
+    bail!("raster artifact root {root} is not present in the store roots snapshot")
 }
 
 fn trace_prefill_layer_checkpoint(
@@ -414,8 +418,16 @@ fn trace_prefill_layer_checkpoint(
     Ok(completed_layer_output)
 }
 
-fn trace_prefill_layer_token_checkpoints(
-    store: &AuthenticatedRasterTensorStore,
+fn trace_prefill_layer_checkpoint_with_roots(
+    state: &PrefillLayerRasterState,
+    layer_idx: usize,
+) -> Result<Option<(String, Option<String>)>> {
+    let store = AuthenticatedRasterTensorStore::artifact_backed();
+    trace_prefill_layer_checkpoint(&store, state, layer_idx)
+}
+
+fn trace_prefill_layer_token_checkpoints_with_roots(
+    artifact_store_roots: &RasterArtifactStoreRoots,
     state: &PrefillLayerRasterState,
     layer_idx: usize,
 ) -> Result<bool> {
@@ -427,12 +439,12 @@ fn trace_prefill_layer_token_checkpoints(
     for token_idx in 0..token_count {
         let checkpoint_name = format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}");
         if crate::trace::trace_checkpoint_lazy_result(&checkpoint_name, || {
-            let token_row = auth_read!(
-                store,
+            let token_row = read_sequence_row_from_roots(
+                artifact_store_roots,
                 RasterSequenceRowRequest {
                     tensor_ref: state.current_activations_ref.clone(),
                     row_idx: token_idx,
-                }
+                },
             )?;
             let token_activation = token_row.to_f32_values();
             let det_token_activation = token_row.acts();
@@ -469,207 +481,48 @@ pub fn finalize_prefill_layer_refs(
     })
 }
 
-pub fn materialize_prefill_layer_output_refs(
-    store: &AuthenticatedRasterTensorStore,
-    refs: &PrefillLayerOutputRefs,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    // Public/dev compatibility boundary. The proof-shaped prefill path carries
-    // `PrefillLayerOutputRefs` forward and materializes only for public results
-    // and checkpoint payloads.
-    let current_activations =
-        materialize_prefill_activation_sequence_from_store(store, &refs.final_hidden_states_ref)?;
-    let det_activations = raster_sequence_acts(&current_activations);
-    let values = current_activations.to_f32_values();
-    let mut activation_sequence = ActivationSequence::from_internal(
-        InternalActivationSequence::from_det_values(det_activations.clone()),
-        crate::shared::transformer_kernels::build_activation_commitment(&values),
-    );
-    activation_sequence.det_activations_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_activation_commitment(&det_activations));
-
-    Ok((
-        activation_sequence,
-        refs.layer_caches
-            .iter()
-            .map(|cache| {
-                materialize_prefill_layer_cache_from_store(store, cache)
-                    .map(layer_cache_from_raster)
-            })
-            .collect::<Result<Vec<_>>>()?,
-    ))
-}
-
-pub fn finalize_prefill_layer_state(
-    store: &AuthenticatedRasterTensorStore,
-    state: PrefillLayerRasterState,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    let refs = finalize_prefill_layer_refs(state)?;
-    materialize_prefill_layer_output_refs(store, &refs)
-}
-
-#[tile]
-pub fn init_prefill_layer_store() -> AuthenticatedRasterTensorStore {
-    AuthenticatedRasterTensorStore::new()
-}
-
-pub fn materialize_prefill_activation_sequence(
-    store: &AuthenticatedRasterTensorStore,
-    sequence_ref: &RasterActivationSequenceRef,
-) -> Result<RasterActivationSequence> {
-    materialize_prefill_activation_sequence_from_store(store, sequence_ref)
-}
-
-pub fn materialize_prefill_layer_cache(
-    store: &AuthenticatedRasterTensorStore,
-    cache: &PrefillLayerCacheSlot,
-) -> Result<RasterKvCache> {
-    materialize_prefill_layer_cache_from_store(store, cache)
-}
-
-pub fn run_materialized_compat(
-    input_activations: &ActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_inputs: Option<&Gemma4PrefillPleInputs>,
-    raster_sizing: RasterSizingControls,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    // Compatibility adapter for dev/tests that still hold materialized
-    // `Gemma4PrefillPleInputs`. ZkVM-shaped raster replay should enter through
-    // `run_with_store` with refs already written by prepare-aux.
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let ple_input_refs = import_materialized_ple_inputs(&mut store, layer_source, ple_inputs)?;
-    run_with_store(
-        &mut store,
-        input_activations,
-        layer_source,
-        ple_input_refs.as_ref(),
-        raster_sizing,
-    )
-}
-
-pub fn run_refs_with_store(
-    store: &mut AuthenticatedRasterTensorStore,
-    input_activations: &ActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-    raster_sizing: RasterSizingControls,
-) -> Result<PrefillLayerOutputRefs> {
-    let input_activations = raster_activation_sequence_from_activation(input_activations)?;
-    let input_activations_ref = insert_activation_sequence_artifact_ref(
-        "prefill.layer.current.initial.compat",
-        input_activations,
-    )?;
-    run_refs_from_activation_ref_with_store(
-        store,
-        input_activations_ref,
-        layer_source,
-        ple_input_refs,
-        raster_sizing,
-    )
-}
-
 #[sequence]
 pub fn main(
-    store: &mut AuthenticatedRasterTensorStore,
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+    ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
-) -> Result<PrefillLayerOutputRefs> {
-    let state = call_tile!(
-        init_prefill_layer_state_from_input_embedding_refs,
-        store,
+) -> Result<(RasterArtifactStoreRoots, PrefillLayerOutputRefs)> {
+    ensure_artifact_root_present(
+        &artifact_store_roots,
+        input_embedding_refs.embedded_prompt_activations_ref.root(),
+    )?;
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_layer_state_from_input_embedding_refs_with_roots,
+        artifact_store_roots,
         input_embedding_refs,
         layer_source,
-        ple_input_refs,
+        ple_input_manifest_root,
         raster_sizing
     )?;
-    let state = call_recur_seq!(
-        compute_next_prefill_layer_sequence,
-        state,
-        layer_source,
-        store
+    let (artifact_store_roots, state) = call_recur_seq!(
+        compute_next_prefill_layer_sequence_with_roots,
+        (artifact_store_roots, state),
+        layer_source
     )?;
-    call_tile!(finalize_prefill_layer_refs, state)
-}
-
-pub fn run_refs_from_input_embedding_with_store(
-    store: &mut AuthenticatedRasterTensorStore,
-    input_embedding_refs: &RasterInputEmbeddingRefs,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-    raster_sizing: RasterSizingControls,
-) -> Result<PrefillLayerOutputRefs> {
-    main(
-        store,
-        input_embedding_refs,
-        layer_source,
-        ple_input_refs,
-        raster_sizing,
-    )
-}
-
-#[sequence]
-fn run_refs_from_activation_ref_with_store(
-    store: &mut AuthenticatedRasterTensorStore,
-    input_activations_ref: RasterActivationSequenceArtifactRef,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-    raster_sizing: RasterSizingControls,
-) -> Result<PrefillLayerOutputRefs> {
-    let state = call_tile!(
-        init_prefill_layer_state_from_activation_ref,
-        store,
-        input_activations_ref,
-        layer_source,
-        ple_input_refs,
-        raster_sizing
-    )?;
-    let state = call_recur_seq!(
-        compute_next_prefill_layer_sequence,
-        state,
-        layer_source,
-        store
-    )?;
-    call_tile!(finalize_prefill_layer_refs, state)
-}
-
-pub fn run_with_store(
-    store: &mut AuthenticatedRasterTensorStore,
-    input_activations: &ActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-    raster_sizing: RasterSizingControls,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    let refs = run_refs_with_store(
-        store,
-        input_activations,
-        layer_source,
-        ple_input_refs,
-        raster_sizing,
-    )?;
-    materialize_prefill_layer_output_refs(store, &refs)
+    let refs = call_tile!(finalize_prefill_layer_refs, state)?;
+    Ok((artifact_store_roots, refs))
 }
 
 #[tile]
-pub fn init_prefill_sequence_projection(
-    store: &mut AuthenticatedRasterTensorStore,
-    input: &RasterActivationSequence,
-    projection_rows: usize,
-    projection_rows_per_tile: usize,
-) -> Result<RasterSequenceProjectionState> {
-    init_sequence_projection_state(store, input, projection_rows, projection_rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_sequence_projection_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_sequence_projection_artifact_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     output_id: RasterTensorId,
     projection_rows: usize,
     projection_rows_per_tile: usize,
-) -> Result<RasterSequenceProjectionState> {
-    init_sequence_projection_state_from_ref(
-        store,
+) -> Result<(
+    RasterArtifactStoreRoots,
+    RasterSequenceProjectionArtifactState,
+)> {
+    init_sequence_projection_artifact_state_from_ref(
+        artifact_store_roots,
         input_ref,
         output_id,
         projection_rows,
@@ -678,15 +531,19 @@ pub fn init_prefill_sequence_projection_from_ref(
 }
 
 #[tile(kind = recursive)]
-pub fn project_next_prefill_sequence_rows(
-    mut state: RasterSequenceProjectionState,
+pub fn project_next_prefill_sequence_artifact_rows(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceProjectionArtifactState,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer_idx: usize,
     matrix: GemmaPrefillLayerMatrixKind,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, RasterSequenceProjectionState)> {
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterSequenceProjectionArtifactState,
+)> {
     if state.is_complete() {
-        return Ok((true, state));
+        return Ok((true, artifact_store_roots, state));
     }
 
     let end = state
@@ -706,7 +563,8 @@ pub fn project_next_prefill_sequence_rows(
             },
         )?);
     }
-    append_projection_chunk_to_state(&mut state, store, &rows)?;
+    let (artifact_store_roots, state) =
+        append_projection_chunk_to_artifact_state(artifact_store_roots, state, &rows)?;
     trace_event(format!(
         "progress prefill.layer.projection layer={} matrix={:?} token={}/{} projection_rows={}..{} of {} input_width={}",
         layer_idx,
@@ -718,51 +576,15 @@ pub fn project_next_prefill_sequence_rows(
         state.projection_rows(),
         state.input_width()
     ));
-    Ok((false, state))
+    Ok((false, artifact_store_roots, state))
 }
 
 #[tile]
-pub fn finalize_prefill_sequence_projection(
-    state: RasterSequenceProjectionState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterActivationSequence> {
-    finalize_sequence_projection_state(state, store)
-}
-
-#[tile]
-pub fn finalize_prefill_sequence_projection_ref(
-    state: RasterSequenceProjectionState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterActivationSequenceRef> {
-    finalize_sequence_projection_state_ref(state, store)
-}
-
-#[sequence]
-pub fn project_sequence_with_prefill_source(
-    input: &RasterActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    layer_idx: usize,
-    matrix: GemmaPrefillLayerMatrixKind,
-    projection_rows: usize,
-    projection_rows_per_tile: usize,
-) -> Result<RasterActivationSequence> {
-    let mut store = call_tile!(init_prefill_layer_store);
-    let state = call_tile!(
-        init_prefill_sequence_projection,
-        &mut store,
-        input,
-        projection_rows,
-        projection_rows_per_tile
-    )?;
-    let state = call_recur_tile!(
-        project_next_prefill_sequence_rows,
-        state,
-        layer_source,
-        layer_idx,
-        matrix,
-        &mut store
-    )?;
-    call_tile!(finalize_prefill_sequence_projection, state, &mut store)
+pub fn finalize_prefill_sequence_projection_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceProjectionArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    finalize_sequence_projection_artifact_state_ref(artifact_store_roots, state)
 }
 
 #[tile]
@@ -786,27 +608,6 @@ pub fn read_prefill_layer_norm_weights(
 }
 
 #[tile]
-pub fn resolve_prefill_value_projection(
-    layer: &GemmaPrefillLayerMetadata,
-    key_projection: &RasterActivationSequence,
-    value_projection: Option<RasterActivationSequence>,
-) -> Result<RasterActivationSequence> {
-    if layer.has_v_proj {
-        value_projection
-            .ok_or_else(|| anyhow!("Gemma prefill layer metadata is missing v_proj shape"))
-    } else if layer.attention_k_eq_v {
-        Ok(key_projection.clone())
-    } else {
-        bail!("Gemma prefill layer is missing v_proj without attention_k_eq_v enabled");
-    }
-}
-
-#[tile]
-pub fn empty_prefill_layer_cache(num_kv_heads: usize) -> RasterKvCache {
-    RasterKvCache::empty(num_kv_heads)
-}
-
-#[tile]
 pub fn resolve_prefill_attention_window(
     layer: &GemmaPrefillLayerMetadata,
 ) -> Result<Option<usize>> {
@@ -821,34 +622,8 @@ pub fn resolve_prefill_attention_window(
 }
 
 #[tile]
-pub fn init_prefill_attention_store() -> AuthenticatedRasterTensorStore {
-    AuthenticatedRasterTensorStore::new()
-}
-
-#[tile]
-pub fn init_prefill_attention_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    queries: &RasterAttentionHeadSequence,
-    keys: &RasterAttentionHeadSequence,
-    values: &RasterAttentionHeadSequence,
-    donor_cache: Option<&RasterKvCache>,
-    attention_window: Option<usize>,
-    kv_rows_per_tile: usize,
-) -> Result<RasterAttentionRowState> {
-    init_attention_row_state(
-        store,
-        queries,
-        keys,
-        values,
-        donor_cache,
-        attention_window,
-        kv_rows_per_tile,
-    )
-}
-
-#[tile]
-pub fn init_prefill_attention_state_from_refs(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_attention_artifact_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
     query_ref: RasterAttentionHeadsRef,
     key_ref: RasterAttentionHeadsRef,
     value_ref: RasterAttentionHeadsRef,
@@ -856,9 +631,9 @@ pub fn init_prefill_attention_state_from_refs(
     output_id: RasterTensorId,
     attention_window: Option<usize>,
     kv_rows_per_tile: usize,
-) -> Result<RasterAttentionRowState> {
-    init_attention_row_state_from_refs(
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionArtifactRowState)> {
+    init_attention_artifact_row_state_from_refs(
+        artifact_store_roots,
         query_ref,
         key_ref,
         value_ref,
@@ -870,75 +645,36 @@ pub fn init_prefill_attention_state_from_refs(
 }
 
 #[tile(kind = recursive)]
-pub fn project_next_prefill_attention_row(
-    state: RasterAttentionRowState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, RasterAttentionRowState)> {
-    compute_next_attention_row(state, store)
+pub fn project_next_prefill_attention_artifact_row(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterAttentionArtifactRowState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterAttentionArtifactRowState,
+)> {
+    compute_next_attention_artifact_row(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_attention_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    state: RasterAttentionRowState,
-) -> Result<RasterAttentionHeadSequence> {
-    finalize_attention_row_state(state, store)
+pub fn finalize_prefill_attention_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterAttentionArtifactRowState,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    finalize_attention_artifact_row_state_ref(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_attention_state_ref(
-    store: &mut AuthenticatedRasterTensorStore,
-    state: RasterAttentionRowState,
-) -> Result<RasterAttentionHeadsRef> {
-    finalize_attention_row_state_ref(state, store)
-}
-
-#[sequence]
-pub fn run_prefill_attention_rows(
-    queries: &RasterAttentionHeadSequence,
-    keys: &RasterAttentionHeadSequence,
-    values: &RasterAttentionHeadSequence,
-    donor_cache: Option<&RasterKvCache>,
-    attention_window: Option<usize>,
-    kv_rows_per_tile: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_attention_state,
-        &mut store,
-        queries,
-        keys,
-        values,
-        donor_cache,
-        attention_window,
-        kv_rows_per_tile
-    )?;
-    let state = call_recur_tile!(project_next_prefill_attention_row, state, &mut store)?;
-    call_tile!(finalize_prefill_attention_state, &mut store, state)
-}
-
-#[tile]
-pub fn init_prefill_sequence_rms_norm_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    input: &RasterActivationSequence,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
-    rows_per_tile: usize,
-) -> Result<RasterSequenceUnaryState> {
-    init_sequence_rms_norm_row_state(store, input, norm_weights, eps, rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_sequence_rms_norm_state_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_sequence_rms_norm_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     output_id: RasterTensorId,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
     rows_per_tile: usize,
-) -> Result<RasterSequenceUnaryState> {
-    init_sequence_rms_norm_row_state_from_ref(
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
+    init_sequence_rms_norm_artifact_state_from_ref(
+        artifact_store_roots,
         input_ref,
         output_id,
         norm_weights,
@@ -948,295 +684,122 @@ pub fn init_prefill_sequence_rms_norm_state_from_ref(
 }
 
 #[tile]
-pub fn init_prefill_sequence_gelu_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    input: &RasterActivationSequence,
-    rows_per_tile: usize,
-) -> Result<RasterSequenceUnaryState> {
-    init_sequence_gelu_row_state(store, input, rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_sequence_gelu_state_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_sequence_gelu_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     output_id: RasterTensorId,
     rows_per_tile: usize,
-) -> Result<RasterSequenceUnaryState> {
-    init_sequence_gelu_row_state_from_ref(store, input_ref, output_id, rows_per_tile)
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
+    init_sequence_gelu_artifact_state_from_ref(
+        artifact_store_roots,
+        input_ref,
+        output_id,
+        rows_per_tile,
+    )
 }
 
 #[tile]
-pub fn init_prefill_sequence_scale_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    input: &RasterActivationSequence,
-    scalar: Option<crate::shared::det_num::Act>,
-    rows_per_tile: usize,
-) -> Result<RasterSequenceUnaryState> {
-    init_sequence_scale_row_state(store, input, scalar, rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_sequence_scale_state_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_sequence_scale_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     output_id: RasterTensorId,
     scalar: Option<crate::shared::det_num::Act>,
     rows_per_tile: usize,
-) -> Result<RasterSequenceUnaryState> {
-    init_sequence_scale_row_state_from_ref(store, input_ref, output_id, scalar, rows_per_tile)
-}
-
-#[tile(kind = recursive)]
-pub fn transform_next_prefill_sequence_unary_row(
-    state: RasterSequenceUnaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, RasterSequenceUnaryState)> {
-    compute_next_sequence_unary_row(state, store)
-}
-
-#[tile]
-pub fn finalize_prefill_sequence_unary_state(
-    state: RasterSequenceUnaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterActivationSequence> {
-    finalize_sequence_unary_row_state(state, store)
-}
-
-#[tile]
-pub fn finalize_prefill_sequence_unary_state_ref(
-    state: RasterSequenceUnaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterActivationSequenceRef> {
-    finalize_sequence_unary_row_state_ref(state, store)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_rms_norm(
-    input: &RasterActivationSequence,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
-) -> Result<RasterActivationSequence> {
-    run_prefill_sequence_rms_norm_with_rows_per_tile(input, norm_weights, eps, 1)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_rms_norm_with_rows_per_tile(
-    input: &RasterActivationSequence,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
-    rows_per_tile: usize,
-) -> Result<RasterActivationSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_sequence_rms_norm_state,
-        &mut store,
-        input,
-        norm_weights,
-        eps,
-        rows_per_tile
-    )?;
-    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
-    call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_gelu(
-    input: &RasterActivationSequence,
-) -> Result<RasterActivationSequence> {
-    run_prefill_sequence_gelu_with_rows_per_tile(input, 1)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_gelu_with_rows_per_tile(
-    input: &RasterActivationSequence,
-    rows_per_tile: usize,
-) -> Result<RasterActivationSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_sequence_gelu_state,
-        &mut store,
-        input,
-        rows_per_tile
-    )?;
-    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
-    call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_scale(
-    input: &RasterActivationSequence,
-    scalar: Option<crate::shared::det_num::Act>,
-) -> Result<RasterActivationSequence> {
-    run_prefill_sequence_scale_with_rows_per_tile(input, scalar, 1)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_scale_with_rows_per_tile(
-    input: &RasterActivationSequence,
-    scalar: Option<crate::shared::det_num::Act>,
-    rows_per_tile: usize,
-) -> Result<RasterActivationSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_sequence_scale_state,
-        &mut store,
-        input,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
+    init_sequence_scale_artifact_state_from_ref(
+        artifact_store_roots,
+        input_ref,
+        output_id,
         scalar,
-        rows_per_tile
-    )?;
-    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, &mut store)?;
-    call_tile!(finalize_prefill_sequence_unary_state, state, &mut store)
-}
-
-#[tile]
-pub fn init_prefill_sequence_add_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    lhs: &RasterActivationSequence,
-    rhs: &RasterActivationSequence,
-    rows_per_tile: usize,
-) -> Result<RasterSequenceBinaryState> {
-    init_sequence_add_row_state(store, lhs, rhs, rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_sequence_add_state_from_refs(
-    store: &mut AuthenticatedRasterTensorStore,
-    lhs_ref: RasterActivationSequenceRef,
-    rhs_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
-    rows_per_tile: usize,
-) -> Result<RasterSequenceBinaryState> {
-    init_sequence_add_row_state_from_refs(store, lhs_ref, rhs_ref, output_id, rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_sequence_mul_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    lhs: &RasterActivationSequence,
-    rhs: &RasterActivationSequence,
-    rows_per_tile: usize,
-) -> Result<RasterSequenceBinaryState> {
-    init_sequence_mul_row_state(store, lhs, rhs, rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_sequence_mul_state_from_refs(
-    store: &mut AuthenticatedRasterTensorStore,
-    lhs_ref: RasterActivationSequenceRef,
-    rhs_ref: RasterActivationSequenceRef,
-    output_id: RasterTensorId,
-    rows_per_tile: usize,
-) -> Result<RasterSequenceBinaryState> {
-    init_sequence_mul_row_state_from_refs(store, lhs_ref, rhs_ref, output_id, rows_per_tile)
+        rows_per_tile,
+    )
 }
 
 #[tile(kind = recursive)]
-pub fn transform_next_prefill_sequence_binary_row(
-    state: RasterSequenceBinaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, RasterSequenceBinaryState)> {
-    compute_next_sequence_binary_row(state, store)
+pub fn transform_next_prefill_sequence_unary_artifact_row(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceUnaryArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterSequenceUnaryArtifactState,
+)> {
+    compute_next_sequence_unary_artifact_row(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_sequence_binary_state(
-    state: RasterSequenceBinaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterActivationSequence> {
-    finalize_sequence_binary_row_state(state, store)
+pub fn finalize_prefill_sequence_unary_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceUnaryArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    finalize_sequence_unary_artifact_state_ref(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_sequence_binary_state_ref(
-    state: RasterSequenceBinaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterActivationSequenceRef> {
-    finalize_sequence_binary_row_state_ref(state, store)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_add(
-    lhs: &RasterActivationSequence,
-    rhs: &RasterActivationSequence,
-) -> Result<RasterActivationSequence> {
-    run_prefill_sequence_add_with_rows_per_tile(lhs, rhs, 1)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_add_with_rows_per_tile(
-    lhs: &RasterActivationSequence,
-    rhs: &RasterActivationSequence,
+pub fn init_prefill_sequence_add_artifact_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_sequence_add_state,
-        &mut store,
-        lhs,
-        rhs,
-        rows_per_tile
-    )?;
-    let state = call_recur_tile!(
-        transform_next_prefill_sequence_binary_row,
-        state,
-        &mut store
-    )?;
-    call_tile!(finalize_prefill_sequence_binary_state, state, &mut store)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_mul(
-    lhs: &RasterActivationSequence,
-    rhs: &RasterActivationSequence,
-) -> Result<RasterActivationSequence> {
-    run_prefill_sequence_mul_with_rows_per_tile(lhs, rhs, 1)
-}
-
-#[sequence]
-pub fn run_prefill_sequence_mul_with_rows_per_tile(
-    lhs: &RasterActivationSequence,
-    rhs: &RasterActivationSequence,
-    rows_per_tile: usize,
-) -> Result<RasterActivationSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_sequence_mul_state,
-        &mut store,
-        lhs,
-        rhs,
-        rows_per_tile
-    )?;
-    let state = call_recur_tile!(
-        transform_next_prefill_sequence_binary_row,
-        state,
-        &mut store
-    )?;
-    call_tile!(finalize_prefill_sequence_binary_state, state, &mut store)
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceBinaryArtifactState)> {
+    init_sequence_add_artifact_state_from_refs(
+        artifact_store_roots,
+        lhs_ref,
+        rhs_ref,
+        output_id,
+        rows_per_tile,
+    )
 }
 
 #[tile]
-pub fn init_prefill_head_rms_norm_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    heads: &RasterAttentionHeadSequence,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
+pub fn init_prefill_sequence_mul_artifact_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
     rows_per_tile: usize,
-) -> Result<RasterHeadUnaryState> {
-    init_head_rms_norm_row_state(store, heads, norm_weights, eps, rows_per_tile)
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceBinaryArtifactState)> {
+    init_sequence_mul_artifact_state_from_refs(
+        artifact_store_roots,
+        lhs_ref,
+        rhs_ref,
+        output_id,
+        rows_per_tile,
+    )
+}
+
+#[tile(kind = recursive)]
+pub fn transform_next_prefill_sequence_binary_artifact_row(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceBinaryArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterSequenceBinaryArtifactState,
+)> {
+    compute_next_sequence_binary_artifact_row(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn init_prefill_head_rms_norm_state_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn finalize_prefill_sequence_binary_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceBinaryArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    finalize_sequence_binary_artifact_state_ref(artifact_store_roots, state)
+}
+
+#[tile]
+pub fn init_prefill_head_rms_norm_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     output_id: RasterTensorId,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
     rows_per_tile: usize,
-) -> Result<RasterHeadUnaryState> {
-    init_head_rms_norm_row_state_from_ref(
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    init_head_rms_norm_artifact_state_from_ref(
+        artifact_store_roots,
         heads_ref,
         output_id,
         norm_weights,
@@ -1246,50 +809,25 @@ pub fn init_prefill_head_rms_norm_state_from_ref(
 }
 
 #[tile]
-pub fn init_prefill_value_rms_norm_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    heads: &RasterAttentionHeadSequence,
-    eps: Option<crate::shared::det_num::Acc>,
-    rows_per_tile: usize,
-) -> Result<RasterHeadUnaryState> {
-    init_value_rms_norm_row_state(store, heads, eps, rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_value_rms_norm_state_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_value_rms_norm_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     output_id: RasterTensorId,
     eps: Option<crate::shared::det_num::Acc>,
     rows_per_tile: usize,
-) -> Result<RasterHeadUnaryState> {
-    init_value_rms_norm_row_state_from_ref(store, heads_ref, output_id, eps, rows_per_tile)
-}
-
-#[tile]
-pub fn init_prefill_rope_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    heads: &RasterAttentionHeadSequence,
-    rotary_dim: usize,
-    freq_base_dim: usize,
-    base: Option<crate::shared::det_num::Acc>,
-    position_offset: usize,
-    rows_per_tile: usize,
-) -> Result<RasterHeadUnaryState> {
-    init_rope_row_state(
-        store,
-        heads,
-        rotary_dim,
-        freq_base_dim,
-        base,
-        position_offset,
+) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    init_value_rms_norm_artifact_state_from_ref(
+        artifact_store_roots,
+        heads_ref,
+        output_id,
+        eps,
         rows_per_tile,
     )
 }
 
 #[tile]
-pub fn init_prefill_rope_state_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_rope_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     output_id: RasterTensorId,
     rotary_dim: usize,
@@ -1297,9 +835,9 @@ pub fn init_prefill_rope_state_from_ref(
     base: Option<crate::shared::det_num::Acc>,
     position_offset: usize,
     rows_per_tile: usize,
-) -> Result<RasterHeadUnaryState> {
-    init_rope_row_state_from_ref(
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    init_rope_artifact_state_from_ref(
+        artifact_store_roots,
         heads_ref,
         output_id,
         rotary_dim,
@@ -1311,261 +849,98 @@ pub fn init_prefill_rope_state_from_ref(
 }
 
 #[tile(kind = recursive)]
-pub fn transform_next_prefill_head_row(
-    state: RasterHeadUnaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, RasterHeadUnaryState)> {
-    compute_next_head_unary_row(state, store)
+pub fn transform_next_prefill_head_artifact_row(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterHeadUnaryArtifactState,
+) -> Result<(bool, RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    compute_next_head_unary_artifact_row(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_head_state(
-    state: RasterHeadUnaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterAttentionHeadSequence> {
-    finalize_head_unary_row_state(state, store)
+pub fn finalize_prefill_head_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterHeadUnaryArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    finalize_head_unary_artifact_state_ref(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_head_state_ref(
-    state: RasterHeadUnaryState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterAttentionHeadsRef> {
-    finalize_head_unary_row_state_ref(state, store)
-}
-
-#[sequence]
-pub fn run_prefill_head_rms_norm(
-    heads: &RasterAttentionHeadSequence,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
-) -> Result<RasterAttentionHeadSequence> {
-    run_prefill_head_rms_norm_with_rows_per_tile(heads, norm_weights, eps, 1)
-}
-
-#[sequence]
-pub fn run_prefill_head_rms_norm_with_rows_per_tile(
-    heads: &RasterAttentionHeadSequence,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
-    rows_per_tile: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_head_rms_norm_state,
-        &mut store,
-        heads,
-        norm_weights,
-        eps,
-        rows_per_tile
-    )?;
-    let state = call_recur_tile!(transform_next_prefill_head_row, state, &mut store)?;
-    call_tile!(finalize_prefill_head_state, state, &mut store)
-}
-
-#[sequence]
-pub fn run_prefill_value_rms_norm(
-    heads: &RasterAttentionHeadSequence,
-    eps: Option<crate::shared::det_num::Acc>,
-) -> Result<RasterAttentionHeadSequence> {
-    run_prefill_value_rms_norm_with_rows_per_tile(heads, eps, 1)
-}
-
-#[sequence]
-pub fn run_prefill_value_rms_norm_with_rows_per_tile(
-    heads: &RasterAttentionHeadSequence,
-    eps: Option<crate::shared::det_num::Acc>,
-    rows_per_tile: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_value_rms_norm_state,
-        &mut store,
-        heads,
-        eps,
-        rows_per_tile
-    )?;
-    let state = call_recur_tile!(transform_next_prefill_head_row, state, &mut store)?;
-    call_tile!(finalize_prefill_head_state, state, &mut store)
-}
-
-#[sequence]
-pub fn run_prefill_rope_heads(
-    heads: &RasterAttentionHeadSequence,
-    rotary_dim: usize,
-    freq_base_dim: usize,
-    base: Option<crate::shared::det_num::Acc>,
-    position_offset: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    run_prefill_rope_heads_with_rows_per_tile(
-        heads,
-        rotary_dim,
-        freq_base_dim,
-        base,
-        position_offset,
-        1,
-    )
-}
-
-#[sequence]
-pub fn run_prefill_rope_heads_with_rows_per_tile(
-    heads: &RasterAttentionHeadSequence,
-    rotary_dim: usize,
-    freq_base_dim: usize,
-    base: Option<crate::shared::det_num::Acc>,
-    position_offset: usize,
-    rows_per_tile: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_rope_state,
-        &mut store,
-        heads,
-        rotary_dim,
-        freq_base_dim,
-        base,
-        position_offset,
-        rows_per_tile
-    )?;
-    let state = call_recur_tile!(transform_next_prefill_head_row, state, &mut store)?;
-    call_tile!(finalize_prefill_head_state, state, &mut store)
-}
-
-#[tile]
-pub fn init_prefill_reshape_heads_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    input: &RasterActivationSequence,
-    num_heads: usize,
-    head_dim: usize,
-) -> Result<RasterReshapeHeadsState> {
-    init_reshape_heads_state(store, input, num_heads, head_dim)
-}
-
-#[tile]
-pub fn init_prefill_reshape_heads_state_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_reshape_heads_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     output_id: RasterTensorId,
     num_heads: usize,
     head_dim: usize,
-) -> Result<RasterReshapeHeadsState> {
-    init_reshape_heads_state_from_ref(store, input_ref, output_id, num_heads, head_dim)
+) -> Result<(RasterArtifactStoreRoots, RasterReshapeHeadsArtifactState)> {
+    init_reshape_heads_artifact_state_from_ref(
+        artifact_store_roots,
+        input_ref,
+        output_id,
+        num_heads,
+        head_dim,
+    )
 }
 
 #[tile(kind = recursive)]
-pub fn transform_next_prefill_reshape_row(
-    state: RasterReshapeHeadsState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, RasterReshapeHeadsState)> {
-    compute_next_reshape_heads_row(state, store)
+pub fn transform_next_prefill_reshape_artifact_row(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterReshapeHeadsArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterReshapeHeadsArtifactState,
+)> {
+    compute_next_reshape_heads_artifact_row(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_reshape_heads_state(
-    state: RasterReshapeHeadsState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterAttentionHeadSequence> {
-    finalize_reshape_heads_state(state, store)
+pub fn finalize_prefill_reshape_heads_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterReshapeHeadsArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    finalize_reshape_heads_artifact_state_ref(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_reshape_heads_state_ref(
-    state: RasterReshapeHeadsState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterAttentionHeadsRef> {
-    finalize_reshape_heads_state_ref(state, store)
-}
-
-#[sequence]
-pub fn run_prefill_reshape_heads(
-    input: &RasterActivationSequence,
-    num_heads: usize,
-    head_dim: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_reshape_heads_state,
-        &mut store,
-        input,
-        num_heads,
-        head_dim
-    )?;
-    let state = call_recur_tile!(transform_next_prefill_reshape_row, state, &mut store)?;
-    call_tile!(finalize_prefill_reshape_heads_state, state, &mut store)
-}
-
-#[tile]
-pub fn init_prefill_combine_heads_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    heads: &RasterAttentionHeadSequence,
-) -> Result<RasterCombineHeadsState> {
-    init_combine_heads_state(store, heads)
-}
-
-#[tile]
-pub fn init_prefill_combine_heads_state_from_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_combine_heads_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     output_id: RasterTensorId,
-) -> Result<RasterCombineHeadsState> {
-    init_combine_heads_state_from_ref(store, heads_ref, output_id)
+) -> Result<(RasterArtifactStoreRoots, RasterCombineHeadsArtifactState)> {
+    init_combine_heads_artifact_state_from_ref(artifact_store_roots, heads_ref, output_id)
 }
 
 #[tile(kind = recursive)]
-pub fn transform_next_prefill_combine_row(
-    state: RasterCombineHeadsState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, RasterCombineHeadsState)> {
-    compute_next_combine_heads_row(state, store)
+pub fn transform_next_prefill_combine_artifact_row(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterCombineHeadsArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterCombineHeadsArtifactState,
+)> {
+    compute_next_combine_heads_artifact_row(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_combine_heads_state(
-    state: RasterCombineHeadsState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterActivationSequence> {
-    finalize_combine_heads_state(state, store)
+pub fn finalize_prefill_combine_heads_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterCombineHeadsArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    finalize_combine_heads_artifact_state_ref(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_combine_heads_state_ref(
-    state: RasterCombineHeadsState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterActivationSequenceRef> {
-    finalize_combine_heads_state_ref(state, store)
-}
-
-#[sequence]
-pub fn run_prefill_combine_heads(
-    heads: &RasterAttentionHeadSequence,
-) -> Result<RasterActivationSequence> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(init_prefill_combine_heads_state, &mut store, heads)?;
-    let state = call_recur_tile!(transform_next_prefill_combine_row, state, &mut store)?;
-    call_tile!(finalize_prefill_combine_heads_state, state, &mut store)
-}
-
-#[tile]
-pub fn init_prefill_kv_cache_state(
-    store: &mut AuthenticatedRasterTensorStore,
-    keys: &RasterAttentionHeadSequence,
-    values: &RasterAttentionHeadSequence,
-    sliding_window: Option<usize>,
-) -> Result<RasterKvCacheBuildState> {
-    init_kv_cache_build_state(store, keys, values, sliding_window)
-}
-
-#[tile]
-pub fn init_prefill_kv_cache_state_from_refs(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn init_prefill_kv_cache_artifact_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
     key_ref: RasterAttentionHeadsRef,
     value_ref: RasterAttentionHeadsRef,
     keys_id: RasterTensorId,
     values_id: RasterTensorId,
     sliding_window: Option<usize>,
-) -> Result<RasterKvCacheBuildState> {
-    init_kv_cache_build_state_from_refs(
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterKvCacheBuildArtifactState)> {
+    init_kv_cache_build_artifact_state_from_refs(
+        artifact_store_roots,
         key_ref,
         value_ref,
         keys_id,
@@ -1575,50 +950,28 @@ pub fn init_prefill_kv_cache_state_from_refs(
 }
 
 #[tile(kind = recursive)]
-pub fn transform_next_prefill_kv_cache_row(
-    state: RasterKvCacheBuildState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<(bool, RasterKvCacheBuildState)> {
-    compute_next_kv_cache_row(state, store)
+pub fn transform_next_prefill_kv_cache_artifact_row(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterKvCacheBuildArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterKvCacheBuildArtifactState,
+)> {
+    compute_next_kv_cache_artifact_row(artifact_store_roots, state)
 }
 
 #[tile]
-pub fn finalize_prefill_kv_cache_state(
-    state: RasterKvCacheBuildState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterKvCache> {
-    finalize_kv_cache_build_state(state, store)
-}
-
-#[tile]
-pub fn finalize_prefill_kv_cache_state_ref(
-    state: RasterKvCacheBuildState,
-    store: &mut AuthenticatedRasterTensorStore,
-) -> Result<RasterKvCacheRef> {
-    finalize_kv_cache_build_state_ref(state, store)
+pub fn finalize_prefill_kv_cache_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterKvCacheBuildArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterKvCacheRef)> {
+    finalize_kv_cache_build_artifact_state_ref(artifact_store_roots, state)
 }
 
 #[sequence]
-pub fn run_prefill_kv_cache(
-    keys: &RasterAttentionHeadSequence,
-    values: &RasterAttentionHeadSequence,
-    sliding_window: Option<usize>,
-) -> Result<RasterKvCache> {
-    let mut store = call_tile!(init_prefill_attention_store);
-    let state = call_tile!(
-        init_prefill_kv_cache_state,
-        &mut store,
-        keys,
-        values,
-        sliding_window
-    )?;
-    let state = call_recur_tile!(transform_next_prefill_kv_cache_row, state, &mut store)?;
-    call_tile!(finalize_prefill_kv_cache_state, state, &mut store)
-}
-
-#[sequence]
-pub fn run_prefill_layer_sequence_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn run_prefill_layer_sequence_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer: &GemmaPrefillLayerMetadata,
@@ -1628,7 +981,11 @@ pub fn run_prefill_layer_sequence_ref(
     attention_kv_rows_per_tile: usize,
     sequence_rows_per_tile: usize,
     head_rows_per_tile: usize,
-) -> Result<(RasterActivationSequenceRef, PrefillLayerCacheSlot)> {
+) -> Result<(
+    RasterArtifactStoreRoots,
+    RasterActivationSequenceRef,
+    PrefillLayerCacheSlot,
+)> {
     let scalars = call_tile!(read_prefill_layer_scalars, layer_source, layer.layer_idx)?;
     let input_norm_weights = call_tile!(
         read_prefill_layer_norm_weights,
@@ -1636,18 +993,18 @@ pub fn run_prefill_layer_sequence_ref(
         layer.layer_idx,
         GemmaPrefillLayerNormKind::InputLayer
     )?;
-    let normed_ref = call_seq!(
-        compute_sequence_rms_norm_ref,
-        store,
+    let (artifact_store_roots, normed_ref) = call_seq!(
+        compute_sequence_rms_norm_artifact_ref,
+        artifact_store_roots,
         input_ref.clone(),
         format!("prefill.layer.{}.attention.input_norm", layer.layer_idx),
         Some(&input_norm_weights),
         Some(scalars.rms_norm_eps),
         sequence_rows_per_tile
     )?;
-    let q_projected_ref = call_seq!(
-        project_sequence_with_prefill_source_ref,
-        store,
+    let (artifact_store_roots, q_projected_ref) = call_seq!(
+        project_sequence_with_prefill_source_artifact_ref,
+        artifact_store_roots,
         normed_ref.clone(),
         layer_source,
         layer.layer_idx,
@@ -1656,9 +1013,9 @@ pub fn run_prefill_layer_sequence_ref(
         projection_rows_per_tile,
         format!("prefill.layer.{}.q_proj", layer.layer_idx)
     )?;
-    let k_projected_ref = call_seq!(
-        project_sequence_with_prefill_source_ref,
-        store,
+    let (artifact_store_roots, k_projected_ref) = call_seq!(
+        project_sequence_with_prefill_source_artifact_ref,
+        artifact_store_roots,
         normed_ref.clone(),
         layer_source,
         layer.layer_idx,
@@ -1667,10 +1024,10 @@ pub fn run_prefill_layer_sequence_ref(
         projection_rows_per_tile,
         format!("prefill.layer.{}.k_proj", layer.layer_idx)
     )?;
-    let v_projected_ref = if layer.has_v_proj {
+    let (artifact_store_roots, v_projected_ref) = if layer.has_v_proj {
         call_seq!(
-            project_sequence_with_prefill_source_ref,
-            store,
+            project_sequence_with_prefill_source_artifact_ref,
+            artifact_store_roots,
             normed_ref,
             layer_source,
             layer.layer_idx,
@@ -1683,22 +1040,22 @@ pub fn run_prefill_layer_sequence_ref(
             format!("prefill.layer.{}.v_proj", layer.layer_idx)
         )?
     } else if layer.attention_k_eq_v {
-        k_projected_ref.clone()
+        (artifact_store_roots, k_projected_ref.clone())
     } else {
         bail!("Gemma prefill layer is missing v_proj without attention_k_eq_v enabled");
     };
 
-    let q_heads_ref = call_seq!(
-        reshape_heads_ref,
-        store,
+    let (artifact_store_roots, q_heads_ref) = call_seq!(
+        reshape_heads_artifact_ref,
+        artifact_store_roots,
         q_projected_ref,
         format!("prefill.layer.{}.q_heads", layer.layer_idx),
         layer.num_heads,
         layer.head_dim
     )?;
-    let k_heads_ref = call_seq!(
-        reshape_heads_ref,
-        store,
+    let (artifact_store_roots, k_heads_ref) = call_seq!(
+        reshape_heads_artifact_ref,
+        artifact_store_roots,
         k_projected_ref,
         format!("prefill.layer.{}.k_heads", layer.layer_idx),
         layer.num_kv_heads,
@@ -1710,9 +1067,9 @@ pub fn run_prefill_layer_sequence_ref(
         layer.layer_idx,
         GemmaPrefillLayerNormKind::Query
     )?;
-    let q_heads_ref = call_seq!(
-        compute_head_rms_norm_ref,
-        store,
+    let (artifact_store_roots, q_heads_ref) = call_seq!(
+        compute_head_rms_norm_artifact_ref,
+        artifact_store_roots,
         q_heads_ref,
         format!("prefill.layer.{}.q_norm", layer.layer_idx),
         Some(&q_norm_weights),
@@ -1725,34 +1082,34 @@ pub fn run_prefill_layer_sequence_ref(
         layer.layer_idx,
         GemmaPrefillLayerNormKind::Key
     )?;
-    let k_heads_ref = call_seq!(
-        compute_head_rms_norm_ref,
-        store,
+    let (artifact_store_roots, k_heads_ref) = call_seq!(
+        compute_head_rms_norm_artifact_ref,
+        artifact_store_roots,
         k_heads_ref,
         format!("prefill.layer.{}.k_norm", layer.layer_idx),
         Some(&k_norm_weights),
         Some(scalars.rms_norm_eps),
         head_rows_per_tile
     )?;
-    let v_heads_ref = call_seq!(
-        reshape_heads_ref,
-        store,
+    let (artifact_store_roots, v_heads_ref) = call_seq!(
+        reshape_heads_artifact_ref,
+        artifact_store_roots,
         v_projected_ref,
         format!("prefill.layer.{}.v_heads", layer.layer_idx),
         layer.num_kv_heads,
         layer.head_dim
     )?;
-    let v_heads_ref = call_seq!(
-        compute_value_rms_norm_ref,
-        store,
+    let (artifact_store_roots, v_heads_ref) = call_seq!(
+        compute_value_rms_norm_artifact_ref,
+        artifact_store_roots,
         v_heads_ref,
         format!("prefill.layer.{}.v_norm", layer.layer_idx),
         Some(scalars.rms_norm_eps),
         head_rows_per_tile
     )?;
-    let q_heads_ref = call_seq!(
-        compute_rope_ref,
-        store,
+    let (artifact_store_roots, q_heads_ref) = call_seq!(
+        compute_rope_artifact_ref,
+        artifact_store_roots,
         q_heads_ref,
         format!("prefill.layer.{}.q_rope", layer.layer_idx),
         layer.partial_rotary_dim,
@@ -1761,9 +1118,9 @@ pub fn run_prefill_layer_sequence_ref(
         0,
         head_rows_per_tile
     )?;
-    let k_heads_ref = call_seq!(
-        compute_rope_ref,
-        store,
+    let (artifact_store_roots, k_heads_ref) = call_seq!(
+        compute_rope_artifact_ref,
+        artifact_store_roots,
         k_heads_ref,
         format!("prefill.layer.{}.k_rope", layer.layer_idx),
         layer.partial_rotary_dim,
@@ -1775,19 +1132,23 @@ pub fn run_prefill_layer_sequence_ref(
 
     let retained_cache_len =
         retained_prefill_kv_cache_len(&k_heads_ref, layer.cache_sliding_window)?;
-    let layer_cache = if donor_cache.is_some() || retained_cache_len == 0 {
-        PrefillLayerCacheSlot::Empty {
-            num_kv_heads: layer.num_kv_heads,
-        }
+    let (artifact_store_roots, layer_cache) = if donor_cache.is_some() || retained_cache_len == 0 {
+        (
+            artifact_store_roots,
+            PrefillLayerCacheSlot::Empty {
+                num_kv_heads: layer.num_kv_heads,
+            },
+        )
     } else {
-        PrefillLayerCacheSlot::Ref(call_seq!(
-            build_kv_cache_ref,
-            store,
+        let (artifact_store_roots, cache_ref) = call_seq!(
+            build_kv_cache_artifact_ref,
+            artifact_store_roots,
             k_heads_ref.clone(),
             v_heads_ref.clone(),
             format!("prefill.layer.cache.{}", layer.layer_idx),
             layer.cache_sliding_window
-        )?)
+        )?;
+        (artifact_store_roots, PrefillLayerCacheSlot::Ref(cache_ref))
     };
     let attention_window = call_tile!(resolve_prefill_attention_window, layer)?;
     let donor_cache_ref = donor_cache
@@ -1798,9 +1159,9 @@ pub fn run_prefill_layer_sequence_ref(
             PrefillLayerCacheSlot::Ref(cache_ref) => Ok(cache_ref.clone()),
         })
         .transpose()?;
-    let attention_heads_ref = call_seq!(
-        compute_attention_ref,
-        store,
+    let (artifact_store_roots, attention_heads_ref) = call_seq!(
+        compute_attention_artifact_ref,
+        artifact_store_roots,
         q_heads_ref,
         k_heads_ref,
         v_heads_ref,
@@ -1809,15 +1170,15 @@ pub fn run_prefill_layer_sequence_ref(
         attention_window,
         attention_kv_rows_per_tile
     )?;
-    let attention_sequence_ref = call_seq!(
-        combine_heads_ref,
-        store,
+    let (artifact_store_roots, attention_sequence_ref) = call_seq!(
+        combine_heads_artifact_ref,
+        artifact_store_roots,
         attention_heads_ref,
         format!("prefill.layer.{}.attention.combine", layer.layer_idx)
     )?;
-    let attention_output_ref = call_seq!(
-        project_sequence_with_prefill_source_ref,
-        store,
+    let (artifact_store_roots, attention_output_ref) = call_seq!(
+        project_sequence_with_prefill_source_artifact_ref,
+        artifact_store_roots,
         attention_sequence_ref,
         layer_source,
         layer.layer_idx,
@@ -1832,27 +1193,27 @@ pub fn run_prefill_layer_sequence_ref(
         layer.layer_idx,
         GemmaPrefillLayerNormKind::PostAttention
     )?;
-    let attention_output_ref = call_seq!(
-        compute_sequence_rms_norm_ref,
-        store,
+    let (artifact_store_roots, attention_output_ref) = call_seq!(
+        compute_sequence_rms_norm_artifact_ref,
+        artifact_store_roots,
         attention_output_ref,
         format!("prefill.layer.{}.attention.post_norm", layer.layer_idx),
         Some(&post_attention_norm_weights),
         Some(scalars.rms_norm_eps),
         sequence_rows_per_tile
     )?;
-    let xs_ref = call_seq!(
-        compute_sequence_add_ref,
-        store,
+    let (artifact_store_roots, xs_ref) = call_seq!(
+        compute_sequence_add_artifact_ref,
+        artifact_store_roots,
         input_ref,
         attention_output_ref,
         format!("prefill.layer.{}.attention.residual", layer.layer_idx),
         sequence_rows_per_tile
     )?;
 
-    let xs_ref = call_seq!(
-        run_prefill_mlp_block_ref,
-        store,
+    let (artifact_store_roots, xs_ref) = call_seq!(
+        run_prefill_mlp_block_artifact_ref,
+        artifact_store_roots,
         xs_ref,
         layer_source,
         layer,
@@ -1860,10 +1221,11 @@ pub fn run_prefill_layer_sequence_ref(
         projection_rows_per_tile,
         sequence_rows_per_tile
     )?;
-    let mut xs_ref = if let Some(per_layer_input_ref) = per_layer_input_ref {
+    let (artifact_store_roots, mut xs_ref) = if let Some(per_layer_input_ref) = per_layer_input_ref
+    {
         call_seq!(
-            run_prefill_ple_block_ref,
-            store,
+            run_prefill_ple_block_artifact_ref,
+            artifact_store_roots,
             xs_ref,
             per_layer_input_ref,
             layer_source,
@@ -1873,356 +1235,27 @@ pub fn run_prefill_layer_sequence_ref(
             sequence_rows_per_tile
         )?
     } else {
-        xs_ref
+        (artifact_store_roots, xs_ref)
     };
     if scalars.layer_scalar.is_some() {
-        xs_ref = call_seq!(
-            compute_sequence_scale_ref,
-            store,
+        let scaled = call_seq!(
+            compute_sequence_scale_artifact_ref,
+            artifact_store_roots,
             xs_ref,
             format!("prefill.layer.{}.layer_scalar", layer.layer_idx),
             scalars.layer_scalar,
             sequence_rows_per_tile
         )?;
+        xs_ref = scaled.1;
+        return Ok((scaled.0, xs_ref, layer_cache));
     }
 
-    Ok((xs_ref, layer_cache))
+    Ok((artifact_store_roots, xs_ref, layer_cache))
 }
 
 #[sequence]
-pub fn run_prefill_layer_sequence(
-    input: &RasterActivationSequence,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
-    layer: &GemmaPrefillLayerMetadata,
-    donor_cache: Option<&RasterKvCache>,
-    per_layer_input: Option<&RasterActivationSequence>,
-    projection_rows_per_tile: usize,
-    attention_kv_rows_per_tile: usize,
-    sequence_rows_per_tile: usize,
-    head_rows_per_tile: usize,
-) -> Result<(RasterActivationSequence, RasterKvCache)> {
-    let scalars = call_tile!(read_prefill_layer_scalars, layer_source, layer.layer_idx)?;
-    let input_norm_weights = call_tile!(
-        read_prefill_layer_norm_weights,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerNormKind::InputLayer
-    )?;
-    let normed = call_seq!(
-        run_prefill_sequence_rms_norm_with_rows_per_tile,
-        input,
-        Some(&input_norm_weights),
-        Some(scalars.rms_norm_eps),
-        sequence_rows_per_tile,
-    )?;
-
-    let q_projected = call_seq!(
-        project_sequence_with_prefill_source,
-        &normed,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerMatrixKind::Query,
-        layer.q_proj_shape.rows,
-        projection_rows_per_tile,
-    )?;
-    let k_projected = call_seq!(
-        project_sequence_with_prefill_source,
-        &normed,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerMatrixKind::Key,
-        layer.k_proj_shape.rows,
-        projection_rows_per_tile,
-    )?;
-    let v_projected = if layer.has_v_proj {
-        Some(call_seq!(
-            project_sequence_with_prefill_source,
-            &normed,
-            layer_source,
-            layer.layer_idx,
-            GemmaPrefillLayerMatrixKind::Value,
-            layer
-                .v_proj_shape
-                .ok_or_else(|| anyhow!("Gemma prefill layer metadata is missing v_proj shape"))?
-                .rows,
-            projection_rows_per_tile,
-        )?)
-    } else {
-        None
-    };
-    let v_projected = call_tile!(
-        resolve_prefill_value_projection,
-        layer,
-        &k_projected,
-        v_projected
-    )?;
-
-    let q_heads = call_seq!(
-        run_prefill_reshape_heads,
-        &q_projected,
-        layer.num_heads,
-        layer.head_dim
-    )?;
-    let k_heads = call_seq!(
-        run_prefill_reshape_heads,
-        &k_projected,
-        layer.num_kv_heads,
-        layer.head_dim
-    )?;
-    let q_norm_weights = call_tile!(
-        read_prefill_layer_norm_weights,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerNormKind::Query
-    )?;
-    let q_heads = call_seq!(
-        run_prefill_head_rms_norm_with_rows_per_tile,
-        &q_heads,
-        Some(&q_norm_weights),
-        Some(scalars.rms_norm_eps),
-        head_rows_per_tile,
-    )?;
-    let k_norm_weights = call_tile!(
-        read_prefill_layer_norm_weights,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerNormKind::Key
-    )?;
-    let k_heads = call_seq!(
-        run_prefill_head_rms_norm_with_rows_per_tile,
-        &k_heads,
-        Some(&k_norm_weights),
-        Some(scalars.rms_norm_eps),
-        head_rows_per_tile,
-    )?;
-    let v_heads = call_seq!(
-        run_prefill_reshape_heads,
-        &v_projected,
-        layer.num_kv_heads,
-        layer.head_dim
-    )?;
-    let v_heads = call_seq!(
-        run_prefill_value_rms_norm_with_rows_per_tile,
-        &v_heads,
-        Some(scalars.rms_norm_eps),
-        head_rows_per_tile
-    )?;
-    let q_heads = call_seq!(
-        run_prefill_rope_heads_with_rows_per_tile,
-        &q_heads,
-        layer.partial_rotary_dim,
-        layer.rope_freq_base_dim,
-        scalars.rope_base,
-        0,
-        head_rows_per_tile,
-    )?;
-    let k_heads = call_seq!(
-        run_prefill_rope_heads_with_rows_per_tile,
-        &k_heads,
-        layer.partial_rotary_dim,
-        layer.rope_freq_base_dim,
-        scalars.rope_base,
-        0,
-        head_rows_per_tile,
-    )?;
-
-    let layer_cache = if donor_cache.is_some() {
-        call_tile!(empty_prefill_layer_cache, layer.num_kv_heads)
-    } else {
-        call_seq!(
-            run_prefill_kv_cache,
-            &k_heads,
-            &v_heads,
-            layer.cache_sliding_window
-        )?
-    };
-    let attention_window = call_tile!(resolve_prefill_attention_window, layer)?;
-    let attention_heads = call_seq!(
-        run_prefill_attention_rows,
-        &q_heads,
-        &k_heads,
-        &v_heads,
-        donor_cache,
-        attention_window,
-        attention_kv_rows_per_tile,
-    )?;
-    let attention_sequence = call_seq!(run_prefill_combine_heads, &attention_heads)?;
-    let attention_output = call_seq!(
-        project_sequence_with_prefill_source,
-        &attention_sequence,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerMatrixKind::Output,
-        layer.o_proj_shape.rows,
-        projection_rows_per_tile,
-    )?;
-    let post_attention_norm_weights = call_tile!(
-        read_prefill_layer_norm_weights,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerNormKind::PostAttention
-    )?;
-    let attention_output = call_seq!(
-        run_prefill_sequence_rms_norm_with_rows_per_tile,
-        &attention_output,
-        Some(&post_attention_norm_weights),
-        Some(scalars.rms_norm_eps),
-        sequence_rows_per_tile,
-    )?;
-    let xs = call_seq!(
-        run_prefill_sequence_add_with_rows_per_tile,
-        input,
-        &attention_output,
-        sequence_rows_per_tile
-    )?;
-
-    let pre_feedforward_norm_weights = call_tile!(
-        read_prefill_layer_norm_weights,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerNormKind::PreFeedForward
-    )?;
-    let normed = call_seq!(
-        run_prefill_sequence_rms_norm_with_rows_per_tile,
-        &xs,
-        Some(&pre_feedforward_norm_weights),
-        Some(scalars.rms_norm_eps),
-        sequence_rows_per_tile,
-    )?;
-    let gate = call_seq!(
-        project_sequence_with_prefill_source,
-        &normed,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerMatrixKind::Gate,
-        layer.gate_proj_shape.rows,
-        projection_rows_per_tile,
-    )?;
-    let gate = call_seq!(
-        run_prefill_sequence_gelu_with_rows_per_tile,
-        &gate,
-        sequence_rows_per_tile
-    )?;
-    let up = call_seq!(
-        project_sequence_with_prefill_source,
-        &normed,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerMatrixKind::Up,
-        layer.up_proj_shape.rows,
-        projection_rows_per_tile,
-    )?;
-    let ff_hidden = call_seq!(
-        run_prefill_sequence_mul_with_rows_per_tile,
-        &gate,
-        &up,
-        sequence_rows_per_tile
-    )?;
-    let ff_out = call_seq!(
-        project_sequence_with_prefill_source,
-        &ff_hidden,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerMatrixKind::Down,
-        layer.down_proj_shape.rows,
-        projection_rows_per_tile,
-    )?;
-    let post_feedforward_norm_weights = call_tile!(
-        read_prefill_layer_norm_weights,
-        layer_source,
-        layer.layer_idx,
-        GemmaPrefillLayerNormKind::PostFeedForward
-    )?;
-    let ff_out = call_seq!(
-        run_prefill_sequence_rms_norm_with_rows_per_tile,
-        &ff_out,
-        Some(&post_feedforward_norm_weights),
-        Some(scalars.rms_norm_eps),
-        sequence_rows_per_tile,
-    )?;
-    let mut xs = call_seq!(
-        run_prefill_sequence_add_with_rows_per_tile,
-        &xs,
-        &ff_out,
-        sequence_rows_per_tile
-    )?;
-
-    if let Some(per_layer_input) = per_layer_input {
-        let gated = call_seq!(
-            project_sequence_with_prefill_source,
-            &xs,
-            layer_source,
-            layer.layer_idx,
-            GemmaPrefillLayerMatrixKind::PleInputGate,
-            layer
-                .ple_input_gate_shape
-                .ok_or_else(|| {
-                    anyhow!("Gemma prefill layer metadata is missing PLE input gate shape")
-                })?
-                .rows,
-            projection_rows_per_tile,
-        )?;
-        let gated = call_seq!(
-            run_prefill_sequence_gelu_with_rows_per_tile,
-            &gated,
-            sequence_rows_per_tile
-        )?;
-        let gated = call_seq!(
-            run_prefill_sequence_mul_with_rows_per_tile,
-            &gated,
-            per_layer_input,
-            sequence_rows_per_tile
-        )?;
-        let projected = call_seq!(
-            project_sequence_with_prefill_source,
-            &gated,
-            layer_source,
-            layer.layer_idx,
-            GemmaPrefillLayerMatrixKind::PleLayerProjection,
-            layer
-                .ple_layer_projection_shape
-                .ok_or_else(|| {
-                    anyhow!("Gemma prefill layer metadata is missing PLE layer projection shape")
-                })?
-                .rows,
-            projection_rows_per_tile,
-        )?;
-        let ple_post_input_norm_weights = call_tile!(
-            read_prefill_layer_norm_weights,
-            layer_source,
-            layer.layer_idx,
-            GemmaPrefillLayerNormKind::PlePostInput
-        )?;
-        let projected = call_seq!(
-            run_prefill_sequence_rms_norm_with_rows_per_tile,
-            &projected,
-            Some(&ple_post_input_norm_weights),
-            Some(scalars.rms_norm_eps),
-            sequence_rows_per_tile,
-        )?;
-        xs = call_seq!(
-            run_prefill_sequence_add_with_rows_per_tile,
-            &xs,
-            &projected,
-            sequence_rows_per_tile
-        )?;
-    }
-
-    if scalars.layer_scalar.is_some() {
-        xs = call_seq!(
-            run_prefill_sequence_scale_with_rows_per_tile,
-            &xs,
-            scalars.layer_scalar,
-            sequence_rows_per_tile
-        )?;
-    }
-
-    Ok((xs, layer_cache))
-}
-
-#[sequence]
-fn project_sequence_with_prefill_source_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn project_sequence_with_prefill_source_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer_idx: usize,
@@ -2230,191 +1263,250 @@ fn project_sequence_with_prefill_source_ref(
     projection_rows: usize,
     rows_per_tile: usize,
     id_prefix: String,
-) -> Result<RasterActivationSequenceRef> {
-    let state = call_tile!(
-        init_prefill_sequence_projection_from_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_sequence_projection_artifact_from_ref,
+        artifact_store_roots,
         input_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         projection_rows,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(
-        project_next_prefill_sequence_rows,
-        state,
+    let (artifact_store_roots, state) = call_recur_tile!(
+        project_next_prefill_sequence_artifact_rows,
+        (artifact_store_roots, state),
         layer_source,
         layer_idx,
-        matrix,
-        store
+        matrix
     )?;
-    call_tile!(finalize_prefill_sequence_projection_ref, state, store)
+    call_tile!(
+        finalize_prefill_sequence_projection_artifact_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_sequence_rms_norm_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn compute_sequence_rms_norm_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     id_prefix: String,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
-    let state = call_tile!(
-        init_prefill_sequence_rms_norm_state_from_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_sequence_rms_norm_artifact_state_from_ref,
+        artifact_store_roots,
         input_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         norm_weights,
         eps,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, store)?;
-    call_tile!(finalize_prefill_sequence_unary_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_sequence_unary_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_sequence_unary_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_sequence_gelu_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn compute_sequence_gelu_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     id_prefix: String,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
-    let state = call_tile!(
-        init_prefill_sequence_gelu_state_from_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_sequence_gelu_artifact_state_from_ref,
+        artifact_store_roots,
         input_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, store)?;
-    call_tile!(finalize_prefill_sequence_unary_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_sequence_unary_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_sequence_unary_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_sequence_scale_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn compute_sequence_scale_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     id_prefix: String,
     scalar: Option<crate::shared::det_num::Act>,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
-    let state = call_tile!(
-        init_prefill_sequence_scale_state_from_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_sequence_scale_artifact_state_from_ref,
+        artifact_store_roots,
         input_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         scalar,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(transform_next_prefill_sequence_unary_row, state, store)?;
-    call_tile!(finalize_prefill_sequence_unary_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_sequence_unary_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_sequence_unary_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_sequence_add_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn compute_sequence_add_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     lhs_ref: RasterActivationSequenceRef,
     rhs_ref: RasterActivationSequenceRef,
     id_prefix: String,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
-    let state = call_tile!(
-        init_prefill_sequence_add_state_from_refs,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_sequence_add_artifact_state_from_refs,
+        artifact_store_roots,
         lhs_ref,
         rhs_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(transform_next_prefill_sequence_binary_row, state, store)?;
-    call_tile!(finalize_prefill_sequence_binary_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_sequence_binary_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_sequence_binary_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_sequence_mul_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn compute_sequence_mul_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     lhs_ref: RasterActivationSequenceRef,
     rhs_ref: RasterActivationSequenceRef,
     id_prefix: String,
     rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
-    let state = call_tile!(
-        init_prefill_sequence_mul_state_from_refs,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_sequence_mul_artifact_state_from_refs,
+        artifact_store_roots,
         lhs_ref,
         rhs_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(transform_next_prefill_sequence_binary_row, state, store)?;
-    call_tile!(finalize_prefill_sequence_binary_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_sequence_binary_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_sequence_binary_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn reshape_heads_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn reshape_heads_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     id_prefix: String,
     num_heads: usize,
     head_dim: usize,
-) -> Result<RasterAttentionHeadsRef> {
-    let state = call_tile!(
-        init_prefill_reshape_heads_state_from_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_reshape_heads_artifact_state_from_ref,
+        artifact_store_roots,
         input_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         num_heads,
         head_dim
     )?;
-    let state = call_recur_tile!(transform_next_prefill_reshape_row, state, store)?;
-    call_tile!(finalize_prefill_reshape_heads_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_reshape_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_reshape_heads_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_head_rms_norm_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn compute_head_rms_norm_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     id_prefix: String,
     norm_weights: Option<&[crate::shared::det_num::Wgt]>,
     eps: Option<crate::shared::det_num::Acc>,
     rows_per_tile: usize,
-) -> Result<RasterAttentionHeadsRef> {
-    let state = call_tile!(
-        init_prefill_head_rms_norm_state_from_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_head_rms_norm_artifact_state_from_ref,
+        artifact_store_roots,
         heads_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         norm_weights,
         eps,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(transform_next_prefill_head_row, state, store)?;
-    call_tile!(finalize_prefill_head_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_head_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_head_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_value_rms_norm_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn compute_value_rms_norm_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     id_prefix: String,
     eps: Option<crate::shared::det_num::Acc>,
     rows_per_tile: usize,
-) -> Result<RasterAttentionHeadsRef> {
-    let state = call_tile!(
-        init_prefill_value_rms_norm_state_from_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_value_rms_norm_artifact_state_from_ref,
+        artifact_store_roots,
         heads_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         eps,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(transform_next_prefill_head_row, state, store)?;
-    call_tile!(finalize_prefill_head_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_head_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_head_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_rope_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn compute_rope_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     id_prefix: String,
     rotary_dim: usize,
@@ -2422,10 +1514,10 @@ fn compute_rope_ref(
     base: Option<crate::shared::det_num::Acc>,
     position_offset: usize,
     rows_per_tile: usize,
-) -> Result<RasterAttentionHeadsRef> {
-    let state = call_tile!(
-        init_prefill_rope_state_from_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_rope_artifact_state_from_ref,
+        artifact_store_roots,
         heads_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rotary_dim,
@@ -2434,34 +1526,71 @@ fn compute_rope_ref(
         position_offset,
         rows_per_tile
     )?;
-    let state = call_recur_tile!(transform_next_prefill_head_row, state, store)?;
-    call_tile!(finalize_prefill_head_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_head_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_head_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn build_kv_cache_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn build_kv_cache_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     key_ref: RasterAttentionHeadsRef,
     value_ref: RasterAttentionHeadsRef,
     id_prefix: String,
     sliding_window: Option<usize>,
-) -> Result<RasterKvCacheRef> {
-    let state = call_tile!(
-        init_prefill_kv_cache_state_from_refs,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterKvCacheRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_kv_cache_artifact_state_from_refs,
+        artifact_store_roots,
         key_ref,
         value_ref,
         RasterTensorId::new(format!("{id_prefix}.keys"))?,
         RasterTensorId::new(format!("{id_prefix}.values"))?,
         sliding_window
     )?;
-    let state = call_recur_tile!(transform_next_prefill_kv_cache_row, state, store)?;
-    call_tile!(finalize_prefill_kv_cache_state_ref, state, store)
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_kv_cache_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_kv_cache_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn compute_attention_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn combine_heads_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    heads_ref: RasterAttentionHeadsRef,
+    id_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_combine_heads_artifact_state_from_ref,
+        artifact_store_roots,
+        heads_ref,
+        RasterTensorId::new(format!("{id_prefix}.output"))?
+    )?;
+    let (artifact_store_roots, state) = call_recur_tile!(
+        transform_next_prefill_combine_artifact_row,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_prefill_combine_heads_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
+}
+
+#[sequence]
+fn compute_attention_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     query_ref: RasterAttentionHeadsRef,
     key_ref: RasterAttentionHeadsRef,
     value_ref: RasterAttentionHeadsRef,
@@ -2469,10 +1598,10 @@ fn compute_attention_ref(
     id_prefix: String,
     attention_window: Option<usize>,
     kv_rows_per_tile: usize,
-) -> Result<RasterAttentionHeadsRef> {
-    let state = call_tile!(
-        init_prefill_attention_state_from_refs,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_prefill_attention_artifact_state_from_refs,
+        artifact_store_roots,
         query_ref,
         key_ref,
         value_ref,
@@ -2481,54 +1610,45 @@ fn compute_attention_ref(
         attention_window,
         kv_rows_per_tile
     )?;
-    let state = call_recur_tile!(project_next_prefill_attention_row, state, store)?;
-    call_tile!(finalize_prefill_attention_state_ref, store, state)
-}
-
-#[sequence]
-fn combine_heads_ref(
-    store: &mut AuthenticatedRasterTensorStore,
-    heads_ref: RasterAttentionHeadsRef,
-    id_prefix: String,
-) -> Result<RasterActivationSequenceRef> {
-    let state = call_tile!(
-        init_prefill_combine_heads_state_from_ref,
-        store,
-        heads_ref,
-        RasterTensorId::new(format!("{id_prefix}.output"))?
+    let (artifact_store_roots, state) = call_recur_tile!(
+        project_next_prefill_attention_artifact_row,
+        (artifact_store_roots, state)
     )?;
-    let state = call_recur_tile!(transform_next_prefill_combine_row, state, store)?;
-    call_tile!(finalize_prefill_combine_heads_state_ref, state, store)
+    call_tile!(
+        finalize_prefill_attention_artifact_state_ref,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
-fn run_prefill_mlp_block_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn run_prefill_mlp_block_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     xs_ref: RasterActivationSequenceRef,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer: &GemmaPrefillLayerMetadata,
     scalars: &GemmaPrefillLayerScalars,
     projection_rows_per_tile: usize,
     sequence_rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
     let pre_feedforward_norm_weights = call_tile!(
         read_prefill_layer_norm_weights,
         layer_source,
         layer.layer_idx,
         GemmaPrefillLayerNormKind::PreFeedForward
     )?;
-    let normed_ref = call_seq!(
-        compute_sequence_rms_norm_ref,
-        store,
+    let (artifact_store_roots, normed_ref) = call_seq!(
+        compute_sequence_rms_norm_artifact_ref,
+        artifact_store_roots,
         xs_ref.clone(),
         format!("prefill.layer.{}.mlp.pre_norm", layer.layer_idx),
         Some(&pre_feedforward_norm_weights),
         Some(scalars.rms_norm_eps),
         sequence_rows_per_tile
     )?;
-    let gate_ref = call_seq!(
-        project_sequence_with_prefill_source_ref,
-        store,
+    let (artifact_store_roots, gate_ref) = call_seq!(
+        project_sequence_with_prefill_source_artifact_ref,
+        artifact_store_roots,
         normed_ref.clone(),
         layer_source,
         layer.layer_idx,
@@ -2537,16 +1657,16 @@ fn run_prefill_mlp_block_ref(
         projection_rows_per_tile,
         format!("prefill.layer.{}.gate_proj", layer.layer_idx)
     )?;
-    let gate_ref = call_seq!(
-        compute_sequence_gelu_ref,
-        store,
+    let (artifact_store_roots, gate_ref) = call_seq!(
+        compute_sequence_gelu_artifact_ref,
+        artifact_store_roots,
         gate_ref,
         format!("prefill.layer.{}.gate_gelu", layer.layer_idx),
         sequence_rows_per_tile
     )?;
-    let up_ref = call_seq!(
-        project_sequence_with_prefill_source_ref,
-        store,
+    let (artifact_store_roots, up_ref) = call_seq!(
+        project_sequence_with_prefill_source_artifact_ref,
+        artifact_store_roots,
         normed_ref,
         layer_source,
         layer.layer_idx,
@@ -2555,17 +1675,17 @@ fn run_prefill_mlp_block_ref(
         projection_rows_per_tile,
         format!("prefill.layer.{}.up_proj", layer.layer_idx)
     )?;
-    let ff_hidden_ref = call_seq!(
-        compute_sequence_mul_ref,
-        store,
+    let (artifact_store_roots, ff_hidden_ref) = call_seq!(
+        compute_sequence_mul_artifact_ref,
+        artifact_store_roots,
         gate_ref,
         up_ref,
         format!("prefill.layer.{}.ff_hidden", layer.layer_idx),
         sequence_rows_per_tile
     )?;
-    let ff_out_ref = call_seq!(
-        project_sequence_with_prefill_source_ref,
-        store,
+    let (artifact_store_roots, ff_out_ref) = call_seq!(
+        project_sequence_with_prefill_source_artifact_ref,
+        artifact_store_roots,
         ff_hidden_ref,
         layer_source,
         layer.layer_idx,
@@ -2580,9 +1700,9 @@ fn run_prefill_mlp_block_ref(
         layer.layer_idx,
         GemmaPrefillLayerNormKind::PostFeedForward
     )?;
-    let ff_out_ref = call_seq!(
-        compute_sequence_rms_norm_ref,
-        store,
+    let (artifact_store_roots, ff_out_ref) = call_seq!(
+        compute_sequence_rms_norm_artifact_ref,
+        artifact_store_roots,
         ff_out_ref,
         format!("prefill.layer.{}.ff_post_norm", layer.layer_idx),
         Some(&post_feedforward_norm_weights),
@@ -2590,8 +1710,8 @@ fn run_prefill_mlp_block_ref(
         sequence_rows_per_tile
     )?;
     call_seq!(
-        compute_sequence_add_ref,
-        store,
+        compute_sequence_add_artifact_ref,
+        artifact_store_roots,
         xs_ref,
         ff_out_ref,
         format!("prefill.layer.{}.mlp.residual", layer.layer_idx),
@@ -2600,8 +1720,8 @@ fn run_prefill_mlp_block_ref(
 }
 
 #[sequence]
-fn run_prefill_ple_block_ref(
-    store: &mut AuthenticatedRasterTensorStore,
+fn run_prefill_ple_block_artifact_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
     xs_ref: RasterActivationSequenceRef,
     per_layer_input_ref: RasterActivationSequenceRef,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
@@ -2609,10 +1729,10 @@ fn run_prefill_ple_block_ref(
     scalars: &GemmaPrefillLayerScalars,
     projection_rows_per_tile: usize,
     sequence_rows_per_tile: usize,
-) -> Result<RasterActivationSequenceRef> {
-    let gated_ref = call_seq!(
-        project_sequence_with_prefill_source_ref,
-        store,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, gated_ref) = call_seq!(
+        project_sequence_with_prefill_source_artifact_ref,
+        artifact_store_roots,
         xs_ref.clone(),
         layer_source,
         layer.layer_idx,
@@ -2624,24 +1744,24 @@ fn run_prefill_ple_block_ref(
         projection_rows_per_tile,
         format!("prefill.layer.{}.ple_gate", layer.layer_idx)
     )?;
-    let gated_ref = call_seq!(
-        compute_sequence_gelu_ref,
-        store,
+    let (artifact_store_roots, gated_ref) = call_seq!(
+        compute_sequence_gelu_artifact_ref,
+        artifact_store_roots,
         gated_ref,
         format!("prefill.layer.{}.ple_gate_gelu", layer.layer_idx),
         sequence_rows_per_tile
     )?;
-    let gated_ref = call_seq!(
-        compute_sequence_mul_ref,
-        store,
+    let (artifact_store_roots, gated_ref) = call_seq!(
+        compute_sequence_mul_artifact_ref,
+        artifact_store_roots,
         gated_ref,
         per_layer_input_ref,
         format!("prefill.layer.{}.ple_input_mul", layer.layer_idx),
         sequence_rows_per_tile
     )?;
-    let projected_ref = call_seq!(
-        project_sequence_with_prefill_source_ref,
-        store,
+    let (artifact_store_roots, projected_ref) = call_seq!(
+        project_sequence_with_prefill_source_artifact_ref,
+        artifact_store_roots,
         gated_ref,
         layer_source,
         layer.layer_idx,
@@ -2661,9 +1781,9 @@ fn run_prefill_ple_block_ref(
         layer.layer_idx,
         GemmaPrefillLayerNormKind::PlePostInput
     )?;
-    let projected_ref = call_seq!(
-        compute_sequence_rms_norm_ref,
-        store,
+    let (artifact_store_roots, projected_ref) = call_seq!(
+        compute_sequence_rms_norm_artifact_ref,
+        artifact_store_roots,
         projected_ref,
         format!("prefill.layer.{}.ple_post_norm", layer.layer_idx),
         Some(&ple_post_input_norm_weights),
@@ -2671,8 +1791,8 @@ fn run_prefill_ple_block_ref(
         sequence_rows_per_tile
     )?;
     call_seq!(
-        compute_sequence_add_ref,
-        store,
+        compute_sequence_add_artifact_ref,
+        artifact_store_roots,
         xs_ref,
         projected_ref,
         format!("prefill.layer.{}.ple_residual", layer.layer_idx),
@@ -2682,34 +1802,23 @@ fn run_prefill_ple_block_ref(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        finalize_prefill_attention_state, init_prefill_attention_state,
-        project_next_prefill_attention_row, run_materialized_compat, run_prefill_attention_rows,
-        run_prefill_combine_heads, run_prefill_head_rms_norm, run_prefill_kv_cache,
-        run_prefill_reshape_heads, run_prefill_rope_heads, run_prefill_sequence_add,
-        run_prefill_sequence_gelu, run_prefill_sequence_mul, run_prefill_sequence_rms_norm,
-        run_prefill_sequence_scale, run_prefill_value_rms_norm,
-    };
     use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
     use crate::prefill_layer::deterministic_tiles;
-    use crate::prefill_layer::raster_utils::{
-        insert_ple_input_artifact, register_prefill_layer_cache,
+    use crate::prefill_layer::{
+        materialize_prefill_layer_output_refs, run_raster_refs_from_input_embedding,
     };
+    use crate::raster_authoring::prelude::auth_read;
     use crate::shared::artifact_io::ArtifactIo;
     use crate::shared::det_num::{Acc, Act, Wgt};
-    use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
-    use crate::shared::raster_prefill_ple::RasterPrefillPleInputRefs;
+    use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
+    use crate::shared::raster_prefill_layer::{
+        AuthenticatedGemmaPrefillLayerSource, GemmaPrefillLayerSourceMetadataRequest,
+    };
+    use crate::shared::raster_prefill_ple::store_prefill_ple_input_manifest_with_roots;
     use crate::shared::raster_row_store::{
         insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
-        RasterActivationSequenceRef, RasterTensorId,
     };
-    use crate::shared::raster_transformer_kernels::{
-        add_sequences, apply_rope_to_heads, build_raster_kv_cache,
-        causal_attention_heads_with_cache, combine_attention_heads, gelu_sequence, mul_sequences,
-        reshape_sequence_heads, rms_norm_heads, rms_norm_sequence, scale_sequence,
-        value_rms_norm_heads, RasterActivationRow, RasterActivationSequence,
-        RasterAttentionHeadSequence, RasterKvCache,
-    };
+    use crate::shared::raster_transformer_kernels::RasterActivationSequence;
     use crate::shared::transformer::{
         ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleLayerWeights,
@@ -2778,8 +1887,29 @@ mod tests {
             index += 1;
         }
 
-        assert!(source.contains("pub fn run_materialized_compat("));
-        assert!(source.contains("Compatibility adapter for dev/tests"));
+        let materialized_compat_fn = concat!("pub fn ", "run_materialized_compat(");
+        let compatibility_comment = concat!("Compatibility adapter", " for dev/tests");
+        assert!(!source.contains(materialized_compat_fn));
+        assert!(!source.contains(compatibility_comment));
+    }
+
+    #[test]
+    fn prefill_layer_main_threads_roots_without_local_tensor_store() {
+        let source = include_str!("raster_tiles.rs");
+        let main_start = source
+            .find("pub fn main(\n    artifact_store_roots: RasterArtifactStoreRoots,")
+            .expect("prefill layer main should exist");
+        let after_main = &source[main_start..];
+        let next_tile = after_main
+            .find("\n#[tile]\npub fn init_prefill_sequence_projection")
+            .expect("next authored helper marks end of main");
+        let main_body = &after_main[..next_tile];
+
+        assert!(main_body.contains("compute_next_prefill_layer_sequence_with_roots"));
+        assert!(
+            !main_body.contains("AuthenticatedRasterTensorStore::new()"),
+            "proof-shaped prefill main must thread artifact roots instead of creating a tensor store"
+        );
     }
 
     #[test]
@@ -2808,205 +1938,6 @@ mod tests {
             ],
         );
         assert_eq!(raster.1[0].current_len(), 1);
-    }
-
-    #[test]
-    fn prefill_layer_state_serializes_refs_not_materialized_rows() {
-        let (_path, model) = no_ple_model();
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-
-        let state =
-            super::init_prefill_layer_state(&mut store, &input, &source, None, raster_sizing(1))
-                .expect("state");
-
-        let encoded = serde_json::to_string(&state).expect("serialize state");
-        assert!(encoded.contains("current_activations_ref"));
-        assert!(encoded.contains("layer_caches"));
-        assert!(encoded.contains("per_layer_inputs"));
-        assert!(!encoded.contains("act_bits"));
-        assert!(!encoded.contains("\"keys\""));
-        assert!(!encoded.contains("\"values\""));
-    }
-
-    #[test]
-    fn prefill_layer_state_stays_ref_backed_after_layer_update() {
-        let (_path, model) = no_ple_model();
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let state =
-            super::init_prefill_layer_state(&mut store, &input, &source, None, raster_sizing(1))
-                .expect("state");
-
-        let (_done, state) = super::compute_next_prefill_layer_sequence(state, &source, &mut store)
-            .expect("layer should compute");
-        let encoded = serde_json::to_string(&state).expect("serialize state");
-
-        assert!(encoded.contains("current_activations_ref"));
-        assert!(!encoded.contains("prefill.layer.current.after.0"));
-        assert!(encoded.contains("layer_caches"));
-        assert!(encoded.contains("prefill.layer.cache.0.keys"));
-        assert!(encoded.contains("prefill.layer.cache.0.values"));
-        assert!(!encoded.contains("act_bits"));
-    }
-
-    #[test]
-    fn prefill_layer_ref_entrypoint_materializes_to_existing_result() {
-        let (_path, model) = no_ple_model();
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![
-            vec![Act::from_num(1.0), Act::from_num(0.0)],
-            vec![Act::from_num(0.0), Act::from_num(1.0)],
-        ]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-
-        let refs = super::run_refs_with_store(&mut store, &input, &source, None, raster_sizing(1))
-            .expect("ref-backed layer should run");
-        assert_eq!(store.materialization_counts(), (0, 0));
-
-        let materialized = super::materialize_prefill_layer_output_refs(&store, &refs)
-            .expect("materialize ref-backed layer output");
-        let deterministic = deterministic_tiles::run_internal(input.clone_internal(), &model, None)
-            .expect("deterministic prefill layer should run");
-
-        assert_eq!(materialized.0.activations, deterministic.0.activations);
-        assert_eq!(
-            materialized.0.det_activations_sha256,
-            deterministic.0.det_activations_sha256
-        );
-        assert_eq!(materialized.1, deterministic.1);
-        assert_eq!(refs.layer_caches.len(), deterministic.1.len());
-    }
-
-    #[test]
-    fn prefill_layer_consumes_input_embedding_refs_without_activation_materialization() {
-        let (_path, model) = no_ple_model();
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input_rows = vec![
-            vec![Act::from_num(1.0), Act::from_num(0.0)],
-            vec![Act::from_num(0.0), Act::from_num(1.0)],
-        ];
-        let input = RasterActivationSequence::from_acts(input_rows.clone());
-        let input_ref =
-            insert_activation_sequence_artifact_ref("prefill.layer.test.input_embedding", input)
-                .expect("input embedding ref");
-        let input_embedding_refs = RasterInputEmbeddingRefs {
-            artifact_store_roots: ArtifactIo::export_store_roots(),
-            source_id: "embedding-fixture".to_string(),
-            embedding_source_root: "embedding-root".to_string(),
-            prompt_token_ids_root: "token-root".to_string(),
-            prompt_token_count: input_ref.row_count(),
-            embedded_prompt_activations_ref: input_ref,
-        };
-        let mut store = AuthenticatedRasterTensorStore::new();
-
-        let refs = super::run_refs_from_input_embedding_with_store(
-            &mut store,
-            &input_embedding_refs,
-            &source,
-            None,
-            raster_sizing(1),
-        )
-        .expect("ref-backed layer should run");
-        assert_eq!(store.materialization_counts(), (0, 0));
-
-        let materialized = super::materialize_prefill_layer_output_refs(&store, &refs)
-            .expect("materialize ref-backed layer output");
-        let deterministic = deterministic_tiles::run_internal(
-            InternalActivationSequence::from_det_values(input_rows),
-            &model,
-            None,
-        )
-        .expect("deterministic prefill layer should run");
-
-        assert_eq!(materialized.0.activations, deterministic.0.activations);
-        assert_eq!(materialized.1, deterministic.1);
-    }
-
-    #[test]
-    fn recursive_layer_update_does_not_materialize_when_checkpointing_is_off() {
-        let (mut store, state, output_ref, cache_slot) = update_state_fixture();
-
-        let (_done, state) =
-            super::update_prefill_layer_state_refs(&mut store, state, 0, output_ref, cache_slot)
-                .expect("state update should succeed");
-
-        assert_eq!(store.materialization_counts(), (0, 0));
-        assert_eq!(state.next_layer_idx, 1);
-        assert!(state.completed_layer_output_sha256s.is_empty());
-        assert!(state.completed_layer_output_det_sha256s.is_empty());
-
-        let _ = super::finalize_prefill_layer_state(&store, state).expect("finalize");
-        let (sequence_materializations, cache_materializations) = store.materialization_counts();
-        assert!(sequence_materializations > 0);
-        assert!(cache_materializations > 0);
-    }
-
-    #[test]
-    fn checkpoint_enabled_layer_update_materializes_lazily_for_compat_payload() {
-        let (mut store, state, output_ref, cache_slot) = update_state_fixture();
-
-        let (_done, state) = crate::trace::with_checkpointing_enabled(true, || {
-            crate::trace::start_inference_trace(&serde_json::json!({ "test": "prefill.layer" }));
-            super::update_prefill_layer_state_refs(&mut store, state, 0, output_ref, cache_slot)
-                .expect("state update should succeed")
-        });
-
-        let (sequence_materializations, cache_materializations) = store.materialization_counts();
-        assert!(sequence_materializations > 0);
-        assert!(cache_materializations > 0);
-        assert_eq!(state.completed_layer_output_sha256s.len(), 1);
-        assert_eq!(state.completed_layer_output_det_sha256s.len(), 1);
-    }
-
-    #[test]
-    fn layer_token_terminal_checkpoint_pauses_without_full_materialization() {
-        let (mut store, state, output_ref, cache_slot) = update_state_fixture();
-        let terminal =
-            crate::trace::TerminalCheckpointSpec::parse("prefill.layer_token.layer_0.token_0")
-                .expect("terminal checkpoint should parse");
-
-        let (done, state) = crate::trace::with_terminal_checkpoint(Some(terminal), || {
-            super::update_prefill_layer_state_refs(&mut store, state, 0, output_ref, cache_slot)
-                .expect("state update should succeed")
-        });
-
-        assert!(done);
-        assert_eq!(state.next_layer_idx, 1);
-        assert_eq!(state.layer_count, 1);
-        assert_eq!(store.materialization_counts(), (0, 0));
-    }
-
-    #[test]
-    fn prefill_layer_cache_slots_materialize_empty_and_ref_caches() {
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let empty = super::materialize_prefill_layer_cache_from_store(
-            &store,
-            &super::PrefillLayerCacheSlot::Empty { num_kv_heads: 2 },
-        )
-        .expect("empty cache");
-        assert_eq!(empty.head_count(), 2);
-        assert_eq!(empty.current_len(), 0);
-
-        let cache = RasterKvCache::from_heads(
-            vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
-                1.0,
-            )])]],
-            vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
-                2.0,
-            )])]],
-        )
-        .expect("cache");
-        let slot = register_prefill_layer_cache(&mut store, 0, cache.clone()).expect("cache slot");
-        let materialized =
-            super::materialize_prefill_layer_cache_from_store(&store, &slot).expect("cache");
-        assert_eq!(materialized, cache);
     }
 
     #[test]
@@ -3051,9 +1982,8 @@ mod tests {
         let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let raster =
-            run_ref_path_with_optional_materialized_compat(&input, &source, None, raster_sizing(1))
-                .expect("zero-length self cache should succeed");
+        let raster = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
+            .expect("zero-length self cache should succeed");
 
         assert_eq!(raster.1.len(), 1);
         assert_eq!(raster.1[0].current_len(), 0);
@@ -3072,276 +2002,10 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
-        let error =
-            run_ref_path_with_optional_materialized_compat(&input, &source, None, raster_sizing(1))
-                .expect_err("empty donor cache should fail");
+        let error = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
+            .expect_err("empty donor cache should fail");
 
         assert!(error.to_string().contains("donor cache is empty"));
-    }
-
-    #[test]
-    fn prefill_attention_rows_match_full_attention() {
-        let queries = RasterAttentionHeadSequence::from_acts(vec![vec![
-            vec![Act::from_num(1.0), Act::from_num(0.0)],
-            vec![Act::from_num(0.0), Act::from_num(1.0)],
-        ]]);
-        let keys = queries.clone();
-        let values = RasterAttentionHeadSequence::from_acts(vec![vec![
-            vec![Act::from_num(2.0), Act::from_num(0.0)],
-            vec![Act::from_num(0.0), Act::from_num(4.0)],
-        ]]);
-
-        let row_output =
-            run_prefill_attention_rows(&queries, &keys, &values, None, None, usize::MAX)
-                .expect("row attention");
-        let full_output = causal_attention_heads_with_cache(&queries, &keys, &values, None, None)
-            .expect("full attention");
-
-        assert_eq!(head_bits(&row_output), head_bits(&full_output));
-    }
-
-    #[test]
-    fn prefill_attention_rows_match_sliding_window_attention() {
-        let queries = RasterAttentionHeadSequence::from_acts(vec![vec![
-            vec![Act::from_num(1.0), Act::from_num(0.0)],
-            vec![Act::from_num(0.0), Act::from_num(1.0)],
-            vec![Act::from_num(1.0), Act::from_num(0.0)],
-        ]]);
-        let keys = queries.clone();
-        let values = RasterAttentionHeadSequence::from_acts(vec![vec![
-            vec![Act::from_num(1.0), Act::from_num(0.0)],
-            vec![Act::from_num(0.0), Act::from_num(2.0)],
-            vec![Act::from_num(3.0), Act::from_num(0.0)],
-        ]]);
-
-        let row_output =
-            run_prefill_attention_rows(&queries, &keys, &values, None, Some(2), usize::MAX)
-                .expect("row attention");
-        let full_output =
-            causal_attention_heads_with_cache(&queries, &keys, &values, None, Some(2))
-                .expect("full attention");
-
-        assert_eq!(head_bits(&row_output), head_bits(&full_output));
-    }
-
-    #[test]
-    fn prefill_attention_rows_match_donor_cache_attention() {
-        let queries = RasterAttentionHeadSequence::from_acts(vec![vec![
-            vec![Act::from_num(1.0)],
-            vec![Act::from_num(1.0)],
-        ]]);
-        let current_keys = RasterAttentionHeadSequence::from_acts(vec![vec![
-            vec![Act::from_num(9.0)],
-            vec![Act::from_num(9.0)],
-        ]]);
-        let current_values = RasterAttentionHeadSequence::from_acts(vec![vec![
-            vec![Act::from_num(9.0)],
-            vec![Act::from_num(9.0)],
-        ]]);
-        let donor_cache = RasterKvCache::from_heads(
-            vec![vec![
-                RasterActivationRow::from_acts(vec![Act::from_num(1.0)]),
-                RasterActivationRow::from_acts(vec![Act::from_num(2.0)]),
-            ]],
-            vec![vec![
-                RasterActivationRow::from_acts(vec![Act::from_num(3.0)]),
-                RasterActivationRow::from_acts(vec![Act::from_num(4.0)]),
-            ]],
-        )
-        .expect("cache should build");
-
-        let row_output = run_prefill_attention_rows(
-            &queries,
-            &current_keys,
-            &current_values,
-            Some(&donor_cache),
-            Some(1),
-            usize::MAX,
-        )
-        .expect("row attention");
-        let full_output = causal_attention_heads_with_cache(
-            &queries,
-            &current_keys,
-            &current_values,
-            Some(&donor_cache),
-            Some(1),
-        )
-        .expect("full attention");
-
-        assert_eq!(head_bits(&row_output), head_bits(&full_output));
-    }
-
-    #[test]
-    fn prefill_attention_rows_match_grouped_kv_attention() {
-        let queries = RasterAttentionHeadSequence::from_acts(vec![
-            vec![vec![Act::from_num(1.0)]],
-            vec![vec![Act::from_num(2.0)]],
-            vec![vec![Act::from_num(3.0)]],
-            vec![vec![Act::from_num(4.0)]],
-        ]);
-        let keys = RasterAttentionHeadSequence::from_acts(vec![
-            vec![vec![Act::from_num(1.0)]],
-            vec![vec![Act::from_num(2.0)]],
-        ]);
-        let values = RasterAttentionHeadSequence::from_acts(vec![
-            vec![vec![Act::from_num(5.0)]],
-            vec![vec![Act::from_num(7.0)]],
-        ]);
-
-        let row_output =
-            run_prefill_attention_rows(&queries, &keys, &values, None, None, usize::MAX)
-                .expect("row attention");
-        let full_output = causal_attention_heads_with_cache(&queries, &keys, &values, None, None)
-            .expect("full attention");
-
-        assert_eq!(head_bits(&row_output), head_bits(&full_output));
-    }
-
-    #[test]
-    fn prefill_attention_row_tile_reports_done_after_completion() {
-        let queries = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(1.0)]]]);
-        let keys = queries.clone();
-        let values = RasterAttentionHeadSequence::from_acts(vec![vec![vec![Act::from_num(2.0)]]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let mut state = init_prefill_attention_state(
-            &mut store,
-            &queries,
-            &keys,
-            &values,
-            None,
-            None,
-            usize::MAX,
-        )
-        .expect("attention state");
-        let mut steps = 0;
-        loop {
-            if state.is_complete() {
-                break;
-            }
-            let (done, next_state) = project_next_prefill_attention_row(state, &mut store)
-                .expect("bounded attention phase should compute");
-            assert!(!done);
-            state = next_state;
-            steps += 1;
-            assert!(steps <= 10);
-        }
-        assert!(state.is_complete());
-        assert!(steps > 2);
-
-        let (done, state) = project_next_prefill_attention_row(state, &mut store)
-            .expect("complete state should return done");
-        assert!(done);
-        let output = finalize_prefill_attention_state(&mut store, state).expect("finalize");
-        assert_eq!(
-            output.heads()[0][0].act_bits(),
-            &[Act::from_num(2.0).to_bits()]
-        );
-    }
-
-    #[test]
-    fn phase_c_prefill_wrappers_match_full_helpers() {
-        let sequence = RasterActivationSequence::from_acts(vec![
-            vec![
-                Act::from_num(1.0),
-                Act::from_num(-0.5),
-                Act::from_num(0.25),
-                Act::from_num(0.75),
-            ],
-            vec![
-                Act::from_num(0.5),
-                Act::from_num(0.25),
-                Act::from_num(-0.25),
-                Act::from_num(1.0),
-            ],
-        ]);
-        let rhs = RasterActivationSequence::from_acts(vec![
-            vec![
-                Act::from_num(0.25),
-                Act::from_num(0.5),
-                Act::from_num(0.75),
-                Act::from_num(1.0),
-            ],
-            vec![
-                Act::from_num(1.0),
-                Act::from_num(-0.25),
-                Act::from_num(0.5),
-                Act::from_num(0.25),
-            ],
-        ]);
-        let sequence_weights = vec![
-            Wgt::from_num(1.0),
-            Wgt::from_num(0.5),
-            Wgt::from_num(0.25),
-            Wgt::from_num(0.75),
-        ];
-        let eps = Acc::from_num(0.001);
-
-        assert_eq!(
-            scaled_bits(
-                &run_prefill_sequence_rms_norm(&sequence, Some(&sequence_weights), Some(eps))
-                    .expect("rms")
-            ),
-            scaled_bits(
-                &rms_norm_sequence(&sequence, Some(&sequence_weights), Some(eps))
-                    .expect("full rms")
-            )
-        );
-        assert_eq!(
-            scaled_bits(&run_prefill_sequence_gelu(&sequence).expect("gelu")),
-            scaled_bits(&gelu_sequence(&sequence).expect("full gelu"))
-        );
-        assert_eq!(
-            scaled_bits(
-                &run_prefill_sequence_scale(&sequence, Some(Act::from_num(0.5))).expect("scale")
-            ),
-            scaled_bits(&scale_sequence(&sequence, Some(Act::from_num(0.5))).expect("full scale"))
-        );
-        assert_eq!(
-            scaled_bits(&run_prefill_sequence_add(&sequence, &rhs).expect("add")),
-            scaled_bits(&add_sequences(&sequence, &rhs).expect("full add"))
-        );
-        assert_eq!(
-            scaled_bits(&run_prefill_sequence_mul(&sequence, &rhs).expect("mul")),
-            scaled_bits(&mul_sequences(&sequence, &rhs).expect("full mul"))
-        );
-
-        let heads = run_prefill_reshape_heads(&sequence, 2, 2).expect("reshape");
-        let full_heads = reshape_sequence_heads(&sequence, 2, 2).expect("full reshape");
-        assert_eq!(head_bits(&heads), head_bits(&full_heads));
-
-        let head_weights = vec![Wgt::from_num(1.0), Wgt::from_num(0.5)];
-        assert_eq!(
-            head_bits(
-                &run_prefill_head_rms_norm(&heads, Some(&head_weights), Some(eps))
-                    .expect("head rms")
-            ),
-            head_bits(
-                &rms_norm_heads(&heads, Some(&head_weights), Some(eps)).expect("full head rms")
-            )
-        );
-        assert_eq!(
-            head_bits(&run_prefill_value_rms_norm(&heads, Some(eps)).expect("value rms")),
-            head_bits(&value_rms_norm_heads(&heads, Some(eps)).expect("full value rms"))
-        );
-        assert_eq!(
-            head_bits(
-                &run_prefill_rope_heads(&heads, 2, 2, Some(Acc::from_num(10_000.0)), 1)
-                    .expect("rope")
-            ),
-            head_bits(
-                &apply_rope_to_heads(&heads, 2, 2, Some(Acc::from_num(10_000.0)), 1)
-                    .expect("full rope")
-            )
-        );
-
-        assert_eq!(
-            scaled_bits(&run_prefill_combine_heads(&heads).expect("combine")),
-            scaled_bits(&combine_attention_heads(&heads).expect("full combine"))
-        );
-        assert_eq!(
-            run_prefill_kv_cache(&heads, &full_heads, Some(1)).expect("cache"),
-            build_raster_kv_cache(&heads, &full_heads, Some(1)).expect("full cache")
-        );
     }
 
     #[test]
@@ -3382,9 +2046,8 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
-        let error =
-            run_ref_path_with_optional_materialized_compat(&input, &source, None, raster_sizing(1))
-                .expect_err("self donor should fail");
+        let error = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
+            .expect_err("self donor should fail");
 
         assert!(error
             .to_string()
@@ -3416,9 +2079,8 @@ mod tests {
         let input_internal = InternalActivationSequence::from_det_values(rows);
         let input = activation_sequence_from_internal(input_internal.clone());
 
-        let raster =
-            run_ref_path_with_optional_materialized_compat(&input, &source, None, raster_sizing(2))
-                .expect("raster prefill layer should run");
+        let raster = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(2))
+            .expect("raster prefill layer should run");
         let deterministic = deterministic_tiles::run_internal(input_internal, &model, None)
             .expect("deterministic prefill layer should run");
 
@@ -3477,209 +2139,18 @@ mod tests {
     }
 
     #[test]
-    fn prefill_layer_init_from_refs_keeps_original_ple_refs() {
-        let (_path, model) = nonzero_model(true, false);
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_sequence = RasterActivationSequence::from_acts(vec![vec![
-            Act::from_num(0.5),
-            Act::from_num(0.25),
-        ]]);
-        let ple_ref = insert_ple_input_artifact(0, ple_sequence.clone()).expect("insert PLE ref");
-        let ple_refs =
-            RasterPrefillPleInputRefs::new("prefill-layer", 1, 1, vec![Some(ple_ref.clone())])
-                .expect("PLE refs");
-
-        let state = super::init_prefill_layer_state(
-            &mut store,
-            &input,
-            &source,
-            Some(&ple_refs),
-            raster_sizing(1),
-        )
-        .expect("state");
-
-        let imported_ref = state.per_layer_inputs[0].as_ref().expect("PLE ref");
-        assert_eq!(
-            store
-                .materialize_sequence(imported_ref)
-                .expect("materialize"),
-            ple_sequence
-        );
-    }
-
-    #[test]
     fn ple_layer_missing_input_fails_closed() {
         let (_path, model) = nonzero_model(true, false);
         let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
-        let error =
-            run_ref_path_with_optional_materialized_compat(&input, &source, None, raster_sizing(1))
-                .expect_err("missing PLE input should fail");
+        let error = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
+            .expect_err("missing PLE input should fail");
 
         assert!(error
             .to_string()
             .contains("requires PLE inputs but none were provided"));
-    }
-
-    #[test]
-    fn stale_ple_input_ref_fails_closed() {
-        let (_path, model) = nonzero_model(true, false);
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = insert_ple_input_artifact(
-            0,
-            RasterActivationSequence::from_acts(vec![vec![
-                Act::from_num(0.5),
-                Act::from_num(0.25),
-            ]]),
-        )
-        .expect("insert PLE ref");
-        ArtifactIo::reset_store();
-        let ple_refs = RasterPrefillPleInputRefs::new("prefill-layer", 1, 1, vec![Some(ple_ref)])
-            .expect("PLE refs");
-
-        let error = super::run_with_store(
-            &mut store,
-            &input,
-            &source,
-            Some(&ple_refs),
-            raster_sizing(1),
-        )
-        .expect_err("stale PLE ref should fail");
-
-        assert!(error.to_string().contains("is not registered"));
-    }
-
-    #[test]
-    fn ple_input_manifest_source_mismatch_fails_closed() {
-        let (_path, model) = nonzero_model(true, false);
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = insert_ple_input_artifact(
-            0,
-            RasterActivationSequence::from_acts(vec![vec![
-                Act::from_num(0.5),
-                Act::from_num(0.25),
-            ]]),
-        )
-        .expect("insert PLE ref");
-        let ple_refs = RasterPrefillPleInputRefs::new("other-source", 1, 1, vec![Some(ple_ref)])
-            .expect("PLE refs");
-
-        let error = super::init_prefill_layer_state(
-            &mut store,
-            &input,
-            &source,
-            Some(&ple_refs),
-            raster_sizing(1),
-        )
-        .expect_err("source mismatch should fail");
-
-        assert!(error
-            .to_string()
-            .contains("does not match prefill layer source"));
-    }
-
-    #[test]
-    fn ple_input_manifest_layer_count_mismatch_fails_closed() {
-        let (_path, model) = nonzero_model(true, false);
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = insert_ple_input_artifact(
-            0,
-            RasterActivationSequence::from_acts(vec![vec![
-                Act::from_num(0.5),
-                Act::from_num(0.25),
-            ]]),
-        )
-        .expect("insert PLE ref");
-        let ple_refs =
-            RasterPrefillPleInputRefs::new("prefill-layer", 2, 1, vec![Some(ple_ref), None])
-                .expect("PLE refs");
-
-        let error = super::init_prefill_layer_state(
-            &mut store,
-            &input,
-            &source,
-            Some(&ple_refs),
-            raster_sizing(1),
-        )
-        .expect_err("layer count mismatch should fail");
-
-        assert!(error.to_string().contains("contain 2 layers, expected 1"));
-    }
-
-    #[test]
-    fn ple_input_manifest_token_count_mismatch_fails_closed() {
-        let (_path, model) = nonzero_model(true, false);
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = insert_ple_input_artifact(
-            0,
-            RasterActivationSequence::from_acts(vec![vec![
-                Act::from_num(0.5),
-                Act::from_num(0.25),
-            ]]),
-        )
-        .expect("insert PLE ref");
-        let ple_refs = RasterPrefillPleInputRefs::new("prefill-layer", 1, 2, vec![Some(ple_ref)])
-            .expect("PLE refs");
-
-        let error = super::init_prefill_layer_state(
-            &mut store,
-            &input,
-            &source,
-            Some(&ple_refs),
-            raster_sizing(1),
-        )
-        .expect_err("token count mismatch should fail");
-
-        assert!(error.to_string().contains("contain 2 tokens, expected 1"));
-    }
-
-    #[test]
-    fn ple_input_ref_row_count_mismatch_fails_closed() {
-        let (_path, model) = nonzero_model(true, false);
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_ref = insert_ple_input_artifact(
-            0,
-            RasterActivationSequence::from_acts(vec![
-                vec![Act::from_num(0.5), Act::from_num(0.25)],
-                vec![Act::from_num(1.0), Act::from_num(-0.25)],
-            ]),
-        )
-        .expect("insert PLE ref");
-        let ple_refs = RasterPrefillPleInputRefs::new("prefill-layer", 1, 1, vec![Some(ple_ref)])
-            .expect("PLE refs");
-
-        let error = super::run_with_store(
-            &mut store,
-            &input,
-            &source,
-            Some(&ple_refs),
-            raster_sizing(1),
-        )
-        .expect_err("row count mismatch should fail");
-
-        assert!(error
-            .to_string()
-            .contains("PLE input has 2 rows, expected 1"));
     }
 
     #[test]
@@ -3690,8 +2161,9 @@ mod tests {
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         let ple_inputs = ple_inputs(vec![vec![Act::from_num(0.5), Act::from_num(0.25)]]);
 
-        let error = run_materialized_compat(&input, &source, Some(&ple_inputs), raster_sizing(1))
-            .expect_err("PLE input should fail");
+        let error =
+            run_roots_path_with_optional_ple(&input, &source, Some(&ple_inputs), raster_sizing(1))
+                .expect_err("PLE input should fail");
 
         assert!(error
             .to_string()
@@ -3710,8 +2182,9 @@ mod tests {
             Act::from_num(0.125),
         ]]);
 
-        let error = run_materialized_compat(&input, &source, Some(&ple_inputs), raster_sizing(1))
-            .expect_err("PLE width should fail");
+        let error =
+            run_roots_path_with_optional_ple(&input, &source, Some(&ple_inputs), raster_sizing(1))
+                .expect_err("PLE width should fail");
 
         assert!(error
             .to_string()
@@ -3745,9 +2218,8 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
-        let error =
-            run_ref_path_with_optional_materialized_compat(&input, &source, None, raster_sizing(1))
-                .expect_err("zero layers should fail");
+        let error = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
+            .expect_err("zero layers should fail");
 
         assert!(error
             .to_string()
@@ -3761,9 +2233,8 @@ mod tests {
             .expect("source should build");
         let input = activation_sequence(Vec::new());
 
-        let error =
-            run_ref_path_with_optional_materialized_compat(&input, &source, None, raster_sizing(1))
-                .expect_err("empty input should fail");
+        let error = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
+            .expect_err("empty input should fail");
 
         assert!(error
             .to_string()
@@ -3780,9 +2251,8 @@ mod tests {
             crate::shared::transformer_kernels::build_activation_commitment(&[vec![1.0, 0.0]]),
         );
 
-        let error =
-            run_ref_path_with_optional_materialized_compat(&input, &source, None, raster_sizing(1))
-                .expect_err("f32-only input should fail");
+        let error = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
+            .expect_err("f32-only input should fail");
 
         assert!(error.to_string().contains("requires canonical activations"));
     }
@@ -3810,13 +2280,9 @@ mod tests {
         let input_internal = InternalActivationSequence::from_det_values(rows);
         let input = activation_sequence_from_internal(input_internal.clone());
 
-        let raster = run_ref_path_with_optional_materialized_compat(
-            &input,
-            &source,
-            ple_inputs,
-            raster_sizing(1),
-        )
-        .expect("raster prefill layer should run");
+        let raster =
+            run_roots_path_with_optional_ple(&input, &source, ple_inputs, raster_sizing(1))
+                .expect("raster prefill layer should run");
         let deterministic = deterministic_tiles::run_internal(input_internal, model, ple_inputs)
             .expect("deterministic prefill layer should run");
 
@@ -3829,7 +2295,7 @@ mod tests {
         raster
     }
 
-    fn run_ref_path_with_optional_materialized_compat(
+    fn run_roots_path_with_optional_ple(
         input: &ActivationSequence,
         source: &AuthenticatedGemmaPrefillLayerSource,
         ple_inputs: Option<&Gemma4PrefillPleInputs>,
@@ -3838,84 +2304,93 @@ mod tests {
         ActivationSequence,
         Vec<crate::shared::transformer::LayerKvCache>,
     )> {
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let ple_input_refs = super::import_materialized_ple_inputs(&mut store, source, ple_inputs)?;
-        super::run_with_store(
-            &mut store,
-            input,
+        ArtifactIo::reset_store();
+        let input_internal = input.clone_internal();
+        let input_rows = input_internal.det_values().ok_or_else(|| {
+            anyhow::anyhow!("raster prefill layer requires canonical activations")
+        })?;
+        let input_ref = insert_activation_sequence_artifact_ref(
+            "prefill.layer.test.input_embedding",
+            RasterActivationSequence::from_acts(input_rows.to_vec()),
+        )?;
+        let artifact_store_roots = ArtifactIo::export_store_roots();
+        let input_embedding_refs = RasterInputEmbeddingRefs {
+            artifact_store_roots: artifact_store_roots.clone(),
+            source_id: "embedding-fixture".to_string(),
+            embedding_source_root: "embedding-root".to_string(),
+            prompt_token_ids_root: "token-root".to_string(),
+            prompt_token_count: input_ref.row_count(),
+            embedded_prompt_activations_ref: input_ref,
+        };
+        let (artifact_store_roots, ple_input_manifest_root) =
+            store_materialized_ple_inputs_with_roots(artifact_store_roots, source, ple_inputs)?;
+        let (_artifact_store_roots, refs) = run_raster_refs_from_input_embedding(
+            artifact_store_roots,
+            &input_embedding_refs,
             source,
-            ple_input_refs.as_ref(),
+            ple_input_manifest_root.as_deref(),
             raster_sizing,
-        )
+        )?;
+        let store = AuthenticatedRasterTensorStore::artifact_backed();
+        materialize_prefill_layer_output_refs(&store, &refs)
     }
 
-    fn update_state_fixture() -> (
-        AuthenticatedRasterTensorStore,
-        super::PrefillLayerRasterState,
-        RasterActivationSequenceRef,
-        super::PrefillLayerCacheSlot,
-    ) {
-        let (_path, model) = no_ple_model();
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
-            .expect("source should build");
-        let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
-        let mut store = AuthenticatedRasterTensorStore::new();
-        let state =
-            super::init_prefill_layer_state(&mut store, &input, &source, None, raster_sizing(1))
-                .expect("state");
-        let output_ref = store
-            .insert_activation_sequence(
-                RasterTensorId::new("test.prefill.layer.output").expect("output id"),
-                RasterActivationSequence::from_acts(vec![vec![
-                    Act::from_num(0.5),
-                    Act::from_num(0.25),
-                ]]),
-            )
-            .expect("output ref");
-        let cache = RasterKvCache::from_heads(
-            vec![vec![RasterActivationRow::from_acts(vec![
-                Act::from_num(1.0),
-                Act::from_num(0.0),
-            ])]],
-            vec![vec![RasterActivationRow::from_acts(vec![
-                Act::from_num(0.0),
-                Act::from_num(1.0),
-            ])]],
-        )
-        .expect("cache");
-        let cache_ref = store
-            .insert_kv_cache(
-                RasterTensorId::new("test.prefill.layer.cache.keys").expect("keys id"),
-                RasterTensorId::new("test.prefill.layer.cache.values").expect("values id"),
-                cache,
-            )
-            .expect("cache ref");
-        (
-            store,
-            state,
-            output_ref,
-            super::PrefillLayerCacheSlot::Ref(cache_ref),
-        )
+    fn store_materialized_ple_inputs_with_roots(
+        artifact_store_roots: RasterArtifactStoreRoots,
+        source: &AuthenticatedGemmaPrefillLayerSource,
+        ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
+        let Some(ple_inputs) = ple_inputs else {
+            return Ok((artifact_store_roots, None));
+        };
+        let metadata = auth_read!(source, GemmaPrefillLayerSourceMetadataRequest)?;
+        let mut token_count = None;
+        let mut per_layer_inputs = Vec::with_capacity(metadata.layer_count);
+
+        for layer_idx in 0..metadata.layer_count {
+            let input = ple_inputs.clone_layer_internal(layer_idx);
+            let Some(input) = input else {
+                per_layer_inputs.push(None);
+                continue;
+            };
+            let rows = input.det_values().ok_or_else(|| {
+                anyhow::anyhow!("raster PLE inputs require canonical activations")
+            })?;
+            match token_count {
+                Some(expected) if expected != rows.len() => {
+                    anyhow::bail!(
+                        "materialized PLE input layer {layer_idx} contains {} tokens, expected {expected}",
+                        rows.len()
+                    );
+                }
+                None => token_count = Some(rows.len()),
+                _ => {}
+            }
+            per_layer_inputs.push(Some(insert_activation_sequence_artifact_ref(
+                &format!("prefill.layer.test.ple.{layer_idx}"),
+                RasterActivationSequence::from_acts(rows.to_vec()),
+            )?));
+        }
+
+        if per_layer_inputs.iter().all(Option::is_none) {
+            return Ok((ArtifactIo::export_store_roots(), None));
+        }
+
+        let artifact_store_roots = ArtifactIo::export_store_roots();
+        let (artifact_store_roots, manifest_root) = store_prefill_ple_input_manifest_with_roots(
+            &artifact_store_roots,
+            metadata.source_id,
+            metadata.layer_count,
+            token_count.ok_or_else(|| {
+                anyhow::anyhow!("materialized PLE inputs contained no layer rows")
+            })?,
+            &per_layer_inputs,
+        )?;
+        Ok((artifact_store_roots, Some(manifest_root)))
     }
 
     fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {
         activation_sequence_from_internal(InternalActivationSequence::from_det_values(rows))
-    }
-
-    fn scaled_bits(sequence: &RasterActivationSequence) -> Vec<Vec<i32>> {
-        sequence
-            .rows()
-            .iter()
-            .map(|row| row.act_bits().to_vec())
-            .collect()
-    }
-
-    fn head_bits(sequence: &RasterAttentionHeadSequence) -> Vec<Vec<Vec<i32>>> {
-        sequence
-            .heads()
-            .iter()
-            .map(|head| head.iter().map(|row| row.act_bits().to_vec()).collect())
-            .collect()
     }
 
     fn activation_sequence_from_internal(

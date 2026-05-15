@@ -12,11 +12,17 @@ use crate::shared::det_num::{
     requantize, rms_norm as det_rms_norm, rope_rotate_pairs, scale_act,
     value_rms_norm as det_value_rms_norm, Acc, Act, Wgt,
 };
+use crate::shared::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
 use crate::shared::raster_prefill_layer::{
     GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMatrixRowRequest,
 };
 use crate::shared::raster_prefill_ple::GemmaPleModelProjectionRowRequest;
 use crate::shared::raster_row_store::{
+    append_head_row_by_source_name_with_roots, append_sequence_row_by_source_name_with_roots,
+    finalize_heads_builder_by_source_name_with_roots,
+    finalize_kv_cache_builders_by_source_name_with_roots,
+    finalize_sequence_builder_by_source_name_with_roots, read_head_row_from_roots,
+    read_kv_row_from_roots, read_sequence_row_from_roots, start_sequence_builder_with_roots,
     AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
     RasterHeadRowRequest, RasterKvCacheRef, RasterKvRowKind, RasterKvRowRequest,
     RasterProjectionOutputBuilderRef, RasterSequenceRowRequest, RasterTensorBuilderRef,
@@ -144,6 +150,26 @@ pub struct RasterAttentionRowState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterAttentionArtifactRowState {
+    query_ref: RasterAttentionHeadsRef,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    donor_cache_ref: Option<RasterKvCacheRef>,
+    output_source_name: String,
+    attention_window: Option<usize>,
+    phase: RasterAttentionArtifactRowPhase,
+    attention_id_prefix: String,
+    next_query_head_idx: usize,
+    next_query_token_idx: usize,
+    sequence_len: usize,
+    query_head_count: usize,
+    kv_head_count: usize,
+    kv_groups: usize,
+    kv_rows_per_tile: usize,
+    head_dim: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 enum RasterAttentionRowPhase {
     CollectScores {
         score_builder_ref: RasterTensorBuilderRef,
@@ -186,6 +212,48 @@ enum RasterAttentionRowPhase {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum RasterAttentionArtifactRowPhase {
+    CollectScores {
+        score_source_name: String,
+        next_kv_token_idx: usize,
+    },
+    FindSoftmaxMax {
+        score_ref: RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: Option<usize>,
+        max_logit_bits: i32,
+    },
+    SumSoftmaxExp {
+        score_ref: RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+    },
+    BuildRawSoftmaxWeights {
+        score_ref: RasterActivationSequenceRef,
+        raw_weight_source_name: String,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+        summed_weight_bits: i32,
+    },
+    CorrectSoftmaxResidual {
+        raw_weight_ref: RasterActivationSequenceRef,
+        final_weight_source_name: String,
+        next_weight_row_idx: usize,
+        max_index: usize,
+        residual_bits: i32,
+    },
+    ApplyValues {
+        weight_ref: RasterActivationSequenceRef,
+        next_kv_token_idx: usize,
+        weighted_sum_acc_bits: Vec<i64>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum RasterSequenceUnaryOp {
     RmsNorm {
         norm_weight_bits: Vec<i32>,
@@ -209,6 +277,17 @@ pub struct RasterSequenceUnaryState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterSequenceUnaryArtifactState {
+    input_ref: RasterActivationSequenceRef,
+    output_source_name: String,
+    op: RasterSequenceUnaryOp,
+    next_row_idx: usize,
+    row_count: usize,
+    width: usize,
+    rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum RasterSequenceBinaryOp {
     Add,
     Mul,
@@ -219,6 +298,18 @@ pub struct RasterSequenceBinaryState {
     lhs_ref: RasterActivationSequenceRef,
     rhs_ref: RasterActivationSequenceRef,
     output_builder_ref: RasterTensorBuilderRef,
+    op: RasterSequenceBinaryOp,
+    next_row_idx: usize,
+    row_count: usize,
+    width: usize,
+    rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterSequenceBinaryArtifactState {
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_source_name: String,
     op: RasterSequenceBinaryOp,
     next_row_idx: usize,
     row_count: usize,
@@ -257,11 +348,35 @@ pub struct RasterHeadUnaryState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterHeadUnaryArtifactState {
+    heads_ref: RasterAttentionHeadsRef,
+    output_source_name: String,
+    op: RasterHeadUnaryOp,
+    next_head_idx: usize,
+    next_token_idx: usize,
+    head_count: usize,
+    sequence_len: usize,
+    head_dim: usize,
+    rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterReshapeHeadsState {
     input_ref: RasterActivationSequenceRef,
     output_builder_ref: RasterTensorBuilderRef,
     num_heads: usize,
     head_dim: usize,
+    next_row_idx: usize,
+    row_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterReshapeHeadsArtifactState {
+    input_ref: RasterActivationSequenceRef,
+    output_source_name: String,
+    num_heads: usize,
+    head_dim: usize,
+    next_head_idx: usize,
     next_row_idx: usize,
     row_count: usize,
 }
@@ -277,6 +392,16 @@ pub struct RasterCombineHeadsState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterCombineHeadsArtifactState {
+    heads_ref: RasterAttentionHeadsRef,
+    output_source_name: String,
+    next_token_idx: usize,
+    head_count: usize,
+    sequence_len: usize,
+    head_dim: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterKvCacheBuildState {
     key_ref: RasterAttentionHeadsRef,
     value_ref: RasterAttentionHeadsRef,
@@ -285,6 +410,21 @@ pub struct RasterKvCacheBuildState {
     next_head_idx: usize,
     next_token_idx: usize,
     head_count: usize,
+    sequence_len: usize,
+    head_dim: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterKvCacheBuildArtifactState {
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    keys_source_name: String,
+    values_source_name: String,
+    retained_start: usize,
+    next_head_idx: usize,
+    next_token_idx: usize,
+    head_count: usize,
+    current_len: usize,
     sequence_len: usize,
     head_dim: usize,
 }
@@ -417,7 +557,27 @@ impl RasterAttentionRowState {
     }
 }
 
+impl RasterAttentionArtifactRowState {
+    pub fn is_complete(&self) -> bool {
+        self.next_query_head_idx >= self.query_head_count
+    }
+
+    pub fn next_query_head_idx(&self) -> usize {
+        self.next_query_head_idx
+    }
+
+    pub fn next_query_token_idx(&self) -> usize {
+        self.next_query_token_idx
+    }
+}
+
 impl RasterSequenceUnaryState {
+    pub fn is_complete(&self) -> bool {
+        self.next_row_idx >= self.row_count
+    }
+}
+
+impl RasterSequenceUnaryArtifactState {
     pub fn is_complete(&self) -> bool {
         self.next_row_idx >= self.row_count
     }
@@ -429,7 +589,19 @@ impl RasterSequenceBinaryState {
     }
 }
 
+impl RasterSequenceBinaryArtifactState {
+    pub fn is_complete(&self) -> bool {
+        self.next_row_idx >= self.row_count
+    }
+}
+
 impl RasterHeadUnaryState {
+    pub fn is_complete(&self) -> bool {
+        self.next_head_idx >= self.head_count
+    }
+}
+
+impl RasterHeadUnaryArtifactState {
     pub fn is_complete(&self) -> bool {
         self.next_head_idx >= self.head_count
     }
@@ -441,13 +613,31 @@ impl RasterReshapeHeadsState {
     }
 }
 
+impl RasterReshapeHeadsArtifactState {
+    pub fn is_complete(&self) -> bool {
+        self.next_head_idx >= self.num_heads
+    }
+}
+
 impl RasterCombineHeadsState {
     pub fn is_complete(&self) -> bool {
         self.next_token_idx >= self.sequence_len
     }
 }
 
+impl RasterCombineHeadsArtifactState {
+    pub fn is_complete(&self) -> bool {
+        self.next_token_idx >= self.sequence_len
+    }
+}
+
 impl RasterKvCacheBuildState {
+    pub fn is_complete(&self) -> bool {
+        self.next_head_idx >= self.head_count
+    }
+}
+
+impl RasterKvCacheBuildArtifactState {
     pub fn is_complete(&self) -> bool {
         self.next_head_idx >= self.head_count
     }
@@ -537,7 +727,50 @@ pub struct RasterSequenceProjectionState {
     rows_per_tile: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterSequenceProjectionArtifactState {
+    input_ref: RasterActivationSequenceRef,
+    output_source_name: String,
+    current_row_bits: Vec<i32>,
+    next_token_idx: usize,
+    next_projection_row_idx: usize,
+    token_count: usize,
+    input_width: usize,
+    projection_rows: usize,
+    rows_per_tile: usize,
+}
+
 impl RasterSequenceProjectionState {
+    pub fn next_token_idx(&self) -> usize {
+        self.next_token_idx
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    pub fn next_projection_row_idx(&self) -> usize {
+        self.next_projection_row_idx
+    }
+
+    pub fn input_width(&self) -> usize {
+        self.input_width
+    }
+
+    pub fn projection_rows(&self) -> usize {
+        self.projection_rows
+    }
+
+    pub fn rows_per_tile(&self) -> usize {
+        self.rows_per_tile
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.next_token_idx >= self.token_count
+    }
+}
+
+impl RasterSequenceProjectionArtifactState {
     pub fn next_token_idx(&self) -> usize {
         self.next_token_idx
     }
@@ -753,6 +986,146 @@ pub fn finalize_sequence_projection_state_ref(
     }
 
     store.finalize_projection_output_builder(state.output_builder_ref)
+}
+
+pub fn init_sequence_projection_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    projection_rows: usize,
+    rows_per_tile: usize,
+) -> Result<(
+    RasterArtifactStoreRoots,
+    RasterSequenceProjectionArtifactState,
+)> {
+    if projection_rows == 0 {
+        bail!("deterministic linear projection requires at least one projection row");
+    }
+    validate_projection_rows_per_tile(rows_per_tile)?;
+    let (token_count, input_width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    let output_source_name = output_id.source_name().to_string();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&output_source_name)?,
+        token_count,
+        projection_rows,
+    )?;
+
+    Ok((
+        artifact_store_roots,
+        RasterSequenceProjectionArtifactState {
+            input_ref,
+            output_source_name,
+            current_row_bits: Vec::new(),
+            next_token_idx: 0,
+            next_projection_row_idx: 0,
+            token_count,
+            input_width,
+            projection_rows,
+            rows_per_tile,
+        },
+    ))
+}
+
+pub fn append_projection_chunk_to_artifact_state(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: RasterSequenceProjectionArtifactState,
+    projection_rows: &[Vec<Wgt>],
+) -> Result<(
+    RasterArtifactStoreRoots,
+    RasterSequenceProjectionArtifactState,
+)> {
+    if state.is_complete() {
+        bail!(
+            "raster projection already completed {} token rows",
+            state.token_count
+        );
+    }
+    if projection_rows.is_empty() {
+        bail!("raster projection chunk requires at least one projection row");
+    }
+    if projection_rows.len() > state.rows_per_tile {
+        bail!(
+            "raster projection chunk has {} rows, exceeding rows_per_tile {}",
+            projection_rows.len(),
+            state.rows_per_tile
+        );
+    }
+    if projection_rows.len()
+        > state
+            .projection_rows
+            .saturating_sub(state.next_projection_row_idx)
+    {
+        bail!(
+            "raster projection chunk overshoots projection rows: start {}, len {}, total {}",
+            state.next_projection_row_idx,
+            projection_rows.len(),
+            state.projection_rows
+        );
+    }
+
+    let input_row = read_sequence_row_from_roots(
+        &artifact_store_roots,
+        RasterSequenceRowRequest {
+            tensor_ref: state.input_ref.clone(),
+            row_idx: state.next_token_idx,
+        },
+    )?;
+    if input_row.width() != state.input_width {
+        bail!(
+            "raster projection input row {} has width {}, expected {}",
+            state.next_token_idx,
+            input_row.width(),
+            state.input_width
+        );
+    }
+    let output_bits = projection_rows
+        .iter()
+        .map(|projection_row| {
+            project_row_with_weights(&input_row, projection_row)
+                .map(|projected| projected.to_bits())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    state.current_row_bits.extend(output_bits);
+    state.next_projection_row_idx = state.current_row_bits.len();
+    if state.current_row_bits.len() == state.projection_rows {
+        let row_bits = std::mem::take(&mut state.current_row_bits);
+        artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+            &artifact_store_roots,
+            &state.output_source_name,
+            state.next_token_idx,
+            RasterActivationRow::from_act_bits(row_bits),
+        )?;
+        state.next_token_idx += 1;
+        state.next_projection_row_idx = 0;
+    }
+    Ok((artifact_store_roots, state))
+}
+
+pub fn finalize_sequence_projection_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceProjectionArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    if state.next_token_idx != state.token_count || state.next_projection_row_idx != 0 {
+        bail!(
+            "raster projection completed token {}, projection row {}, expected {} complete token rows",
+            state.next_token_idx,
+            state.next_projection_row_idx,
+            state.token_count
+        );
+    }
+    if !state.current_row_bits.is_empty() {
+        bail!(
+            "raster projection finalized with partial row width {}",
+            state.current_row_bits.len()
+        );
+    }
+    let output_id = RasterTensorId::new(state.output_source_name.clone())?;
+    finalize_sequence_builder_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        output_id,
+    )
 }
 
 pub fn project_sequence_with_source<S>(
@@ -1247,6 +1620,193 @@ pub fn finalize_sequence_unary_row_state_ref(
     store.finalize_sequence_builder(state.output_builder_ref)
 }
 
+pub fn init_sequence_rms_norm_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    norm_weights: Option<&[Wgt]>,
+    eps: Option<Acc>,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let norm_weights = norm_weights
+        .ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical norm weights"))?;
+    let eps = eps.ok_or_else(|| anyhow!("deterministic RMSNorm requires canonical Acc epsilon"))?;
+    let (row_count, width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    if norm_weights.len() != width {
+        bail!(
+            "deterministic RMSNorm input width mismatch: row width {}, norm width {}",
+            width,
+            norm_weights.len()
+        );
+    }
+    init_sequence_unary_artifact_state(
+        artifact_store_roots,
+        input_ref,
+        output_id,
+        RasterSequenceUnaryOp::RmsNorm {
+            norm_weight_bits: norm_weights.iter().map(|weight| weight.to_bits()).collect(),
+            eps_bits: eps.to_bits(),
+        },
+        row_count,
+        width,
+        rows_per_tile,
+    )
+}
+
+pub fn init_sequence_gelu_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let (row_count, width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    init_sequence_unary_artifact_state(
+        artifact_store_roots,
+        input_ref,
+        output_id,
+        RasterSequenceUnaryOp::Gelu,
+        row_count,
+        width,
+        rows_per_tile,
+    )
+}
+
+pub fn init_sequence_scale_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    scalar: Option<Act>,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let scalar = scalar
+        .ok_or_else(|| anyhow!("deterministic sequence scaling requires canonical Act scalar"))?;
+    let (row_count, width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    init_sequence_unary_artifact_state(
+        artifact_store_roots,
+        input_ref,
+        output_id,
+        RasterSequenceUnaryOp::Scale {
+            scalar_bits: scalar.to_bits(),
+        },
+        row_count,
+        width,
+        rows_per_tile,
+    )
+}
+
+fn init_sequence_unary_artifact_state(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    op: RasterSequenceUnaryOp,
+    row_count: usize,
+    width: usize,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
+    let output_source_name = output_id.source_name().to_string();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&output_source_name)?,
+        row_count,
+        width,
+    )?;
+    Ok((
+        artifact_store_roots,
+        RasterSequenceUnaryArtifactState {
+            input_ref,
+            output_source_name,
+            op,
+            next_row_idx: 0,
+            row_count,
+            width,
+            rows_per_tile,
+        },
+    ))
+}
+
+pub fn compute_next_sequence_unary_artifact_row(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: RasterSequenceUnaryArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterSequenceUnaryArtifactState,
+)> {
+    if state.is_complete() {
+        return Ok((true, artifact_store_roots, state));
+    }
+
+    let end = state
+        .next_row_idx
+        .saturating_add(state.rows_per_tile)
+        .min(state.row_count);
+    while state.next_row_idx < end {
+        let row = read_sequence_row_from_roots(
+            &artifact_store_roots,
+            RasterSequenceRowRequest {
+                tensor_ref: state.input_ref.clone(),
+                row_idx: state.next_row_idx,
+            },
+        )?;
+        let output_row = match &state.op {
+            RasterSequenceUnaryOp::RmsNorm {
+                norm_weight_bits,
+                eps_bits,
+            } => {
+                let norm_weights = norm_weight_bits
+                    .iter()
+                    .copied()
+                    .map(Wgt::from_bits)
+                    .collect::<Vec<_>>();
+                RasterActivationRow::from_acts(det_rms_norm(
+                    &row.acts(),
+                    &norm_weights,
+                    Acc::from_bits(*eps_bits),
+                ))
+            }
+            RasterSequenceUnaryOp::Gelu => RasterActivationRow::from_acts(
+                row.acts().into_iter().map(gelu_pytorch_tanh_act).collect(),
+            ),
+            RasterSequenceUnaryOp::Scale { scalar_bits } => RasterActivationRow::from_acts(
+                row.acts()
+                    .into_iter()
+                    .map(|value| scale_act(value, Act::from_bits(*scalar_bits)))
+                    .collect(),
+            ),
+        };
+        artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+            &artifact_store_roots,
+            &state.output_source_name,
+            state.next_row_idx,
+            output_row,
+        )?;
+        state.next_row_idx += 1;
+    }
+    Ok((false, artifact_store_roots, state))
+}
+
+pub fn finalize_sequence_unary_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceUnaryArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    if !state.is_complete() {
+        bail!(
+            "sequence unary state completed {} rows, expected {}",
+            state.next_row_idx,
+            state.row_count
+        );
+    }
+    let output_id = RasterTensorId::new(state.output_source_name.clone())?;
+    finalize_sequence_builder_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        output_id,
+    )
+}
+
 pub fn init_sequence_add_row_state(
     store: &mut AuthenticatedRasterTensorStore,
     lhs: &RasterActivationSequence,
@@ -1448,6 +2008,158 @@ pub fn finalize_sequence_binary_row_state_ref(
     }
 
     store.finalize_sequence_builder(state.output_builder_ref)
+}
+
+pub fn init_sequence_add_artifact_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceBinaryArtifactState)> {
+    init_sequence_binary_artifact_state_from_refs(
+        artifact_store_roots,
+        lhs_ref,
+        rhs_ref,
+        output_id,
+        RasterSequenceBinaryOp::Add,
+        rows_per_tile,
+    )
+}
+
+pub fn init_sequence_mul_artifact_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceBinaryArtifactState)> {
+    init_sequence_binary_artifact_state_from_refs(
+        artifact_store_roots,
+        lhs_ref,
+        rhs_ref,
+        output_id,
+        RasterSequenceBinaryOp::Mul,
+        rows_per_tile,
+    )
+}
+
+fn init_sequence_binary_artifact_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    op: RasterSequenceBinaryOp,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterSequenceBinaryArtifactState)> {
+    validate_sequence_rows_per_tile(rows_per_tile)?;
+    let (lhs_rows, lhs_width) = lhs_ref.tensor_ref().shape().sequence_metadata()?;
+    let (rhs_rows, rhs_width) = rhs_ref.tensor_ref().shape().sequence_metadata()?;
+    if lhs_rows != rhs_rows {
+        bail!("sequence length mismatch: {lhs_rows} vs {rhs_rows}");
+    }
+    if lhs_width != rhs_width {
+        bail!("right sequence row 0 has width {rhs_width}, expected {lhs_width}");
+    }
+    let output_source_name = output_id.source_name().to_string();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&output_source_name)?,
+        lhs_rows,
+        lhs_width,
+    )?;
+    Ok((
+        artifact_store_roots,
+        RasterSequenceBinaryArtifactState {
+            lhs_ref,
+            rhs_ref,
+            output_source_name,
+            op,
+            next_row_idx: 0,
+            row_count: lhs_rows,
+            width: lhs_width,
+            rows_per_tile,
+        },
+    ))
+}
+
+pub fn compute_next_sequence_binary_artifact_row(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: RasterSequenceBinaryArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterSequenceBinaryArtifactState,
+)> {
+    if state.is_complete() {
+        return Ok((true, artifact_store_roots, state));
+    }
+
+    let end = state
+        .next_row_idx
+        .saturating_add(state.rows_per_tile)
+        .min(state.row_count);
+    while state.next_row_idx < end {
+        let lhs_row = read_sequence_row_from_roots(
+            &artifact_store_roots,
+            RasterSequenceRowRequest {
+                tensor_ref: state.lhs_ref.clone(),
+                row_idx: state.next_row_idx,
+            },
+        )?;
+        let rhs_row = read_sequence_row_from_roots(
+            &artifact_store_roots,
+            RasterSequenceRowRequest {
+                tensor_ref: state.rhs_ref.clone(),
+                row_idx: state.next_row_idx,
+            },
+        )?;
+        let output_row = match state.op {
+            RasterSequenceBinaryOp::Add => RasterActivationRow::from_acts(
+                lhs_row
+                    .acts()
+                    .into_iter()
+                    .zip(rhs_row.acts())
+                    .map(|(lhs_value, rhs_value)| add_sat(lhs_value, rhs_value))
+                    .collect(),
+            ),
+            RasterSequenceBinaryOp::Mul => RasterActivationRow::from_acts(
+                lhs_row
+                    .acts()
+                    .into_iter()
+                    .zip(rhs_row.acts())
+                    .map(|(lhs_value, rhs_value)| mul_sat(lhs_value, rhs_value))
+                    .collect(),
+            ),
+        };
+        artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+            &artifact_store_roots,
+            &state.output_source_name,
+            state.next_row_idx,
+            output_row,
+        )?;
+        state.next_row_idx += 1;
+    }
+    Ok((false, artifact_store_roots, state))
+}
+
+pub fn finalize_sequence_binary_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterSequenceBinaryArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    if !state.is_complete() {
+        bail!(
+            "sequence binary state completed {} rows, expected {}",
+            state.next_row_idx,
+            state.row_count
+        );
+    }
+    let output_id = RasterTensorId::new(state.output_source_name.clone())?;
+    finalize_sequence_builder_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        output_id,
+    )
 }
 
 pub fn reshape_sequence_heads(
@@ -1916,6 +2628,227 @@ pub fn finalize_head_unary_row_state_ref(
     store.finalize_heads_builder(state.output_builder_ref)
 }
 
+pub fn init_head_rms_norm_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+    norm_weights: Option<&[Wgt]>,
+    eps: Option<Acc>,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    validate_head_rows_per_tile(rows_per_tile)?;
+    let norm_weights = norm_weights
+        .ok_or_else(|| anyhow!("deterministic head RMSNorm requires canonical norm weights"))?;
+    let eps =
+        eps.ok_or_else(|| anyhow!("deterministic head RMSNorm requires canonical Acc epsilon"))?;
+    let (_, _, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    if norm_weights.len() != head_dim {
+        bail!(
+            "deterministic head RMSNorm weight width mismatch: {} vs {}",
+            norm_weights.len(),
+            head_dim
+        );
+    }
+    init_head_unary_artifact_state_from_ref(
+        artifact_store_roots,
+        heads_ref,
+        output_id,
+        RasterHeadUnaryOp::RmsNorm {
+            norm_weight_bits: norm_weights.iter().map(|weight| weight.to_bits()).collect(),
+            eps_bits: eps.to_bits(),
+        },
+        rows_per_tile,
+    )
+}
+
+pub fn init_value_rms_norm_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+    eps: Option<Acc>,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    validate_head_rows_per_tile(rows_per_tile)?;
+    let eps =
+        eps.ok_or_else(|| anyhow!("deterministic value RMSNorm requires canonical Acc epsilon"))?;
+    init_head_unary_artifact_state_from_ref(
+        artifact_store_roots,
+        heads_ref,
+        output_id,
+        RasterHeadUnaryOp::ValueRmsNorm {
+            eps_bits: eps.to_bits(),
+        },
+        rows_per_tile,
+    )
+}
+
+pub fn init_rope_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+    rotary_dim: usize,
+    freq_base_dim: usize,
+    base: Option<Acc>,
+    position_offset: usize,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    validate_head_rows_per_tile(rows_per_tile)?;
+    let (_, _, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    if rotary_dim != 0 {
+        if rotary_dim > head_dim {
+            bail!("RoPE rotary_dim {rotary_dim} exceeds attention head width {head_dim}");
+        }
+        base.ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
+    }
+    init_head_unary_artifact_state_from_ref(
+        artifact_store_roots,
+        heads_ref,
+        output_id,
+        RasterHeadUnaryOp::Rope {
+            rotary_dim,
+            freq_base_dim,
+            base_bits: base.map(Acc::to_bits),
+            position_offset,
+        },
+        rows_per_tile,
+    )
+}
+
+fn init_head_unary_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+    op: RasterHeadUnaryOp,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    let (head_count, sequence_len, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    let output_source_name = output_id.source_name().to_string();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&output_source_name)?,
+        head_count * sequence_len,
+        head_dim,
+    )?;
+    Ok((
+        artifact_store_roots,
+        RasterHeadUnaryArtifactState {
+            heads_ref,
+            output_source_name,
+            op,
+            next_head_idx: 0,
+            next_token_idx: 0,
+            head_count,
+            sequence_len,
+            head_dim,
+            rows_per_tile,
+        },
+    ))
+}
+
+pub fn compute_next_head_unary_artifact_row(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: RasterHeadUnaryArtifactState,
+) -> Result<(bool, RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
+    if state.is_complete() {
+        return Ok((true, artifact_store_roots, state));
+    }
+
+    let mut rows_processed = 0;
+    while rows_processed < state.rows_per_tile && !state.is_complete() {
+        let head_idx = state.next_head_idx;
+        let token_idx = state.next_token_idx;
+        let row = read_head_row_from_roots(
+            &artifact_store_roots,
+            RasterHeadRowRequest {
+                tensor_ref: state.heads_ref.clone(),
+                head_idx,
+                token_idx,
+            },
+        )?;
+        let output_row = match &state.op {
+            RasterHeadUnaryOp::RmsNorm {
+                norm_weight_bits,
+                eps_bits,
+            } => {
+                let norm_weights = norm_weight_bits
+                    .iter()
+                    .copied()
+                    .map(Wgt::from_bits)
+                    .collect::<Vec<_>>();
+                RasterActivationRow::from_acts(det_rms_norm(
+                    &row.acts(),
+                    &norm_weights,
+                    Acc::from_bits(*eps_bits),
+                ))
+            }
+            RasterHeadUnaryOp::ValueRmsNorm { eps_bits } => RasterActivationRow::from_acts(
+                det_value_rms_norm(&row.acts(), Acc::from_bits(*eps_bits)),
+            ),
+            RasterHeadUnaryOp::Rope {
+                rotary_dim,
+                freq_base_dim,
+                base_bits,
+                position_offset,
+            } => {
+                if *rotary_dim == 0 {
+                    row.clone()
+                } else {
+                    let base_bits = base_bits
+                        .ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
+                    RasterActivationRow::from_acts(rope_rotate_pairs(
+                        &row.acts(),
+                        *rotary_dim,
+                        *freq_base_dim,
+                        Acc::from_bits(base_bits),
+                        position_offset + token_idx,
+                    ))
+                }
+            }
+        };
+        artifact_store_roots = append_head_row_by_source_name_with_roots(
+            &artifact_store_roots,
+            &state.output_source_name,
+            head_idx,
+            token_idx,
+            state.sequence_len,
+            output_row,
+        )?;
+
+        if token_idx + 1 < state.sequence_len {
+            state.next_token_idx += 1;
+        } else {
+            state.next_head_idx += 1;
+            state.next_token_idx = 0;
+        }
+        rows_processed += 1;
+    }
+
+    Ok((false, artifact_store_roots, state))
+}
+
+pub fn finalize_head_unary_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterHeadUnaryArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    if !state.is_complete() {
+        bail!(
+            "head unary state finalized at head {} token {}, expected {} heads",
+            state.next_head_idx,
+            state.next_token_idx,
+            state.head_count
+        );
+    }
+    let output_id = RasterTensorId::new(state.output_source_name.clone())?;
+    finalize_heads_builder_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        output_id,
+        state.head_count,
+        state.sequence_len,
+        state.head_dim,
+    )
+}
+
 pub fn attention_output_row(
     query: &RasterActivationRow,
     key_rows: &[RasterActivationRow],
@@ -2273,6 +3206,106 @@ pub fn init_attention_row_state_from_refs(
     })
 }
 
+pub fn init_attention_artifact_row_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    query_ref: RasterAttentionHeadsRef,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    donor_cache_ref: Option<RasterKvCacheRef>,
+    output_id: RasterTensorId,
+    attention_window: Option<usize>,
+    kv_rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionArtifactRowState)> {
+    validate_attention_kv_rows_per_tile(kv_rows_per_tile)?;
+    let (query_head_count, sequence_len, query_width) =
+        query_ref.tensor_ref().shape().heads_metadata()?;
+    let (kv_head_count, key_sequence_len, key_width) =
+        key_ref.tensor_ref().shape().heads_metadata()?;
+    let (value_head_count, value_sequence_len, value_width) =
+        value_ref.tensor_ref().shape().heads_metadata()?;
+    if query_width != key_width || query_width != value_width {
+        bail!(
+            "attention head width mismatch: query {query_width}, key {key_width}, value {value_width}"
+        );
+    }
+    if value_head_count != kv_head_count {
+        bail!(
+            "attention key/value head count mismatch: {} vs {}",
+            kv_head_count,
+            value_head_count
+        );
+    }
+    if query_head_count % kv_head_count != 0 {
+        bail!(
+            "attention query head count {} must be divisible by KV head count {}",
+            query_head_count,
+            kv_head_count
+        );
+    }
+    if key_sequence_len != sequence_len || value_sequence_len != sequence_len {
+        bail!(
+            "attention sequence length mismatch: query {sequence_len}, key {key_sequence_len}, value {value_sequence_len}"
+        );
+    }
+    if let Some(cache_ref) = &donor_cache_ref {
+        let (cache_head_count, _, cache_head_dim) = cache_ref.shape().kv_cache_metadata()?;
+        if cache_head_count != kv_head_count {
+            bail!(
+                "attention donor cache head count mismatch: {} vs {}",
+                cache_head_count,
+                kv_head_count
+            );
+        }
+        if cache_head_dim != query_width {
+            bail!(
+                "attention donor cache head width mismatch: {} vs {}",
+                cache_head_dim,
+                query_width
+            );
+        }
+    }
+    let attention_id_prefix = output_id.source_name().to_string();
+    let output_source_name = attention_id_prefix.clone();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&output_source_name)?,
+        query_head_count * sequence_len,
+        query_width,
+    )?;
+    let (initial_visible_start, initial_visible_rows) =
+        attention_visible_range(0, attention_window);
+    let (artifact_store_roots, phase) = init_attention_artifact_score_phase(
+        artifact_store_roots,
+        &attention_id_prefix,
+        0,
+        0,
+        initial_visible_start,
+        initial_visible_rows,
+    )?;
+
+    Ok((
+        artifact_store_roots,
+        RasterAttentionArtifactRowState {
+            query_ref,
+            key_ref,
+            value_ref,
+            donor_cache_ref,
+            output_source_name,
+            attention_window,
+            phase,
+            attention_id_prefix,
+            next_query_head_idx: 0,
+            next_query_token_idx: 0,
+            sequence_len,
+            query_head_count,
+            kv_head_count,
+            kv_groups: query_head_count / kv_head_count,
+            kv_rows_per_tile,
+            head_dim: query_width,
+        },
+    ))
+}
+
 fn attention_visible_range(query_idx: usize, attention_window: Option<usize>) -> (usize, usize) {
     let start = attention_window
         .map(|window| query_idx.saturating_add(1).saturating_sub(window))
@@ -2299,6 +3332,30 @@ fn init_attention_score_phase(
         score_builder_ref,
         next_kv_token_idx: visible_start,
     })
+}
+
+fn init_attention_artifact_score_phase(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    id_prefix: &str,
+    query_head_idx: usize,
+    query_idx: usize,
+    visible_start: usize,
+    visible_row_count: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionArtifactRowPhase)> {
+    let score_source_name = format!("{id_prefix}.scores.head_{query_head_idx}.token_{query_idx}");
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&score_source_name)?,
+        visible_row_count,
+        1,
+    )?;
+    Ok((
+        artifact_store_roots,
+        RasterAttentionArtifactRowPhase::CollectScores {
+            score_source_name,
+            next_kv_token_idx: visible_start,
+        },
+    ))
 }
 
 pub fn compute_next_attention_row(
@@ -2653,6 +3710,424 @@ pub fn compute_next_attention_row(
     }
 }
 
+pub fn compute_next_attention_artifact_row(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: RasterAttentionArtifactRowState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterAttentionArtifactRowState,
+)> {
+    if state.is_complete() {
+        return Ok((true, artifact_store_roots, state));
+    }
+
+    let query_head_idx = state.next_query_head_idx;
+    let query_idx = state.next_query_token_idx;
+    let kv_head_idx = query_head_idx / state.kv_groups;
+    let (start, row_count) = attention_visible_range(query_idx, state.attention_window);
+    let query = read_head_row_from_roots(
+        &artifact_store_roots,
+        RasterHeadRowRequest {
+            tensor_ref: state.query_ref.clone(),
+            head_idx: query_head_idx,
+            token_idx: query_idx,
+        },
+    )?;
+
+    match state.phase.clone() {
+        RasterAttentionArtifactRowPhase::CollectScores {
+            score_source_name,
+            next_kv_token_idx,
+        } => {
+            let end = next_kv_token_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(start + row_count);
+            for token_idx in next_kv_token_idx..end {
+                let key_row = read_attention_artifact_key_row(
+                    &state,
+                    &artifact_store_roots,
+                    kv_head_idx,
+                    token_idx,
+                )?;
+                if key_row.width() != query.width() {
+                    bail!(
+                        "attention key row ({kv_head_idx}, {token_idx}) has width {}, expected {}",
+                        key_row.width(),
+                        query.width()
+                    );
+                }
+                let score = det_attention_score(&query.acts(), &key_row.acts());
+                artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+                    &artifact_store_roots,
+                    &score_source_name,
+                    token_idx - start,
+                    RasterActivationRow::from_acts(vec![score]),
+                )?;
+            }
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.scores head={} token={} kv_rows={}..{} of {}",
+                query_head_idx,
+                query_idx,
+                next_kv_token_idx,
+                end,
+                start + row_count
+            ));
+            if end < start + row_count {
+                state.phase = RasterAttentionArtifactRowPhase::CollectScores {
+                    score_source_name,
+                    next_kv_token_idx: end,
+                };
+                return Ok((false, artifact_store_roots, state));
+            }
+
+            let score_id = RasterTensorId::new(score_source_name.clone())?;
+            let (next_roots, score_ref) = finalize_sequence_builder_by_source_name_with_roots(
+                &artifact_store_roots,
+                &score_source_name,
+                score_id,
+            )?;
+            artifact_store_roots = next_roots;
+            state.phase = RasterAttentionArtifactRowPhase::FindSoftmaxMax {
+                score_ref,
+                next_score_row_idx: 0,
+                max_index: None,
+                max_logit_bits: 0,
+            };
+            Ok((false, artifact_store_roots, state))
+        }
+        RasterAttentionArtifactRowPhase::FindSoftmaxMax {
+            score_ref,
+            next_score_row_idx,
+            mut max_index,
+            mut max_logit_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(row_count);
+            for row_idx in next_score_row_idx..end {
+                let score = read_attention_artifact_scalar_row(
+                    &artifact_store_roots,
+                    &score_ref,
+                    row_idx,
+                    "score",
+                )?;
+                let score_bits = score.to_bits();
+                if max_index.is_none() || score_bits > max_logit_bits {
+                    max_index = Some(row_idx);
+                    max_logit_bits = score_bits;
+                }
+            }
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.softmax.max head={} token={} score_rows={}..{} of {}",
+                query_head_idx, query_idx, next_score_row_idx, end, row_count
+            ));
+            if end < row_count {
+                state.phase = RasterAttentionArtifactRowPhase::FindSoftmaxMax {
+                    score_ref,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                };
+                return Ok((false, artifact_store_roots, state));
+            }
+
+            let max_index = max_index
+                .ok_or_else(|| anyhow!("attention softmax requires at least one score"))?;
+            state.phase = RasterAttentionArtifactRowPhase::SumSoftmaxExp {
+                score_ref,
+                next_score_row_idx: 0,
+                max_index,
+                max_logit_bits,
+                sum_exp_bits: 0,
+            };
+            Ok((false, artifact_store_roots, state))
+        }
+        RasterAttentionArtifactRowPhase::SumSoftmaxExp {
+            score_ref,
+            next_score_row_idx,
+            max_index,
+            max_logit_bits,
+            mut sum_exp_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(row_count);
+            let max_logit = Act::from_bits(max_logit_bits);
+            let mut sum_exp = Acc::from_bits(sum_exp_bits);
+            for row_idx in next_score_row_idx..end {
+                let score = read_attention_artifact_scalar_row(
+                    &artifact_store_roots,
+                    &score_ref,
+                    row_idx,
+                    "score",
+                )?;
+                let exp_term = attention_softmax_exp_term(score, max_logit);
+                sum_exp = acc_add_sat(sum_exp, exp_term);
+            }
+            sum_exp_bits = sum_exp.to_bits();
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.softmax.exp_sum head={} token={} score_rows={}..{} of {}",
+                query_head_idx, query_idx, next_score_row_idx, end, row_count
+            ));
+            if end < row_count {
+                state.phase = RasterAttentionArtifactRowPhase::SumSoftmaxExp {
+                    score_ref,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                    sum_exp_bits,
+                };
+                return Ok((false, artifact_store_roots, state));
+            }
+            if sum_exp_bits == 0 {
+                bail!("attention softmax exp sum is zero");
+            }
+
+            let raw_weight_source_name = format!(
+                "{}.raw_weights.head_{query_head_idx}.token_{query_idx}",
+                state.attention_id_prefix
+            );
+            artifact_store_roots = start_sequence_builder_with_roots(
+                &artifact_store_roots,
+                RasterArtifactId::new(&raw_weight_source_name)?,
+                row_count,
+                1,
+            )?;
+            state.phase = RasterAttentionArtifactRowPhase::BuildRawSoftmaxWeights {
+                score_ref,
+                raw_weight_source_name,
+                next_score_row_idx: 0,
+                max_index,
+                max_logit_bits,
+                sum_exp_bits,
+                summed_weight_bits: 0,
+            };
+            Ok((false, artifact_store_roots, state))
+        }
+        RasterAttentionArtifactRowPhase::BuildRawSoftmaxWeights {
+            score_ref,
+            raw_weight_source_name,
+            next_score_row_idx,
+            max_index,
+            max_logit_bits,
+            sum_exp_bits,
+            mut summed_weight_bits,
+        } => {
+            let end = next_score_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(row_count);
+            let max_logit = Act::from_bits(max_logit_bits);
+            let sum_exp = Acc::from_bits(sum_exp_bits);
+            let mut summed_weight = Act::from_bits(summed_weight_bits);
+            for row_idx in next_score_row_idx..end {
+                let score = read_attention_artifact_scalar_row(
+                    &artifact_store_roots,
+                    &score_ref,
+                    row_idx,
+                    "score",
+                )?;
+                let exp_term = attention_softmax_exp_term(score, max_logit);
+                let weight = attention_softmax_raw_weight(exp_term, sum_exp);
+                artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+                    &artifact_store_roots,
+                    &raw_weight_source_name,
+                    row_idx,
+                    RasterActivationRow::from_acts(vec![weight]),
+                )?;
+                summed_weight = add_sat(summed_weight, weight);
+            }
+            summed_weight_bits = summed_weight.to_bits();
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.softmax.raw_weights head={} token={} score_rows={}..{} of {}",
+                query_head_idx, query_idx, next_score_row_idx, end, row_count
+            ));
+            if end < row_count {
+                state.phase = RasterAttentionArtifactRowPhase::BuildRawSoftmaxWeights {
+                    score_ref,
+                    raw_weight_source_name,
+                    next_score_row_idx: end,
+                    max_index,
+                    max_logit_bits,
+                    sum_exp_bits,
+                    summed_weight_bits,
+                };
+                return Ok((false, artifact_store_roots, state));
+            }
+
+            let raw_weight_id = RasterTensorId::new(raw_weight_source_name.clone())?;
+            let (next_roots, raw_weight_ref) = finalize_sequence_builder_by_source_name_with_roots(
+                &artifact_store_roots,
+                &raw_weight_source_name,
+                raw_weight_id,
+            )?;
+            artifact_store_roots = next_roots;
+            let final_weight_source_name = format!(
+                "{}.weights.head_{query_head_idx}.token_{query_idx}",
+                state.attention_id_prefix
+            );
+            artifact_store_roots = start_sequence_builder_with_roots(
+                &artifact_store_roots,
+                RasterArtifactId::new(&final_weight_source_name)?,
+                row_count,
+                1,
+            )?;
+            let residual = attention_softmax_residual(Act::from_bits(summed_weight_bits));
+            state.phase = RasterAttentionArtifactRowPhase::CorrectSoftmaxResidual {
+                raw_weight_ref,
+                final_weight_source_name,
+                next_weight_row_idx: 0,
+                max_index,
+                residual_bits: residual.to_bits(),
+            };
+            Ok((false, artifact_store_roots, state))
+        }
+        RasterAttentionArtifactRowPhase::CorrectSoftmaxResidual {
+            raw_weight_ref,
+            final_weight_source_name,
+            next_weight_row_idx,
+            max_index,
+            residual_bits,
+        } => {
+            let end = next_weight_row_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(row_count);
+            let residual = Act::from_bits(residual_bits);
+            for row_idx in next_weight_row_idx..end {
+                let mut weight = read_attention_artifact_scalar_row(
+                    &artifact_store_roots,
+                    &raw_weight_ref,
+                    row_idx,
+                    "weight",
+                )?;
+                if row_idx == max_index {
+                    weight = add_sat(weight, residual);
+                }
+                artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+                    &artifact_store_roots,
+                    &final_weight_source_name,
+                    row_idx,
+                    RasterActivationRow::from_acts(vec![weight]),
+                )?;
+            }
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.softmax.correct head={} token={} weight_rows={}..{} of {}",
+                query_head_idx, query_idx, next_weight_row_idx, end, row_count
+            ));
+            if end < row_count {
+                state.phase = RasterAttentionArtifactRowPhase::CorrectSoftmaxResidual {
+                    raw_weight_ref,
+                    final_weight_source_name,
+                    next_weight_row_idx: end,
+                    max_index,
+                    residual_bits,
+                };
+                return Ok((false, artifact_store_roots, state));
+            }
+
+            let final_weight_id = RasterTensorId::new(final_weight_source_name.clone())?;
+            let (next_roots, weight_ref) = finalize_sequence_builder_by_source_name_with_roots(
+                &artifact_store_roots,
+                &final_weight_source_name,
+                final_weight_id,
+            )?;
+            artifact_store_roots = next_roots;
+            state.phase = RasterAttentionArtifactRowPhase::ApplyValues {
+                weight_ref,
+                next_kv_token_idx: start,
+                weighted_sum_acc_bits: vec![0; query.width()],
+            };
+            Ok((false, artifact_store_roots, state))
+        }
+        RasterAttentionArtifactRowPhase::ApplyValues {
+            weight_ref,
+            next_kv_token_idx,
+            mut weighted_sum_acc_bits,
+        } => {
+            let end = next_kv_token_idx
+                .saturating_add(state.kv_rows_per_tile)
+                .min(start + row_count);
+            for token_idx in next_kv_token_idx..end {
+                let weight = read_attention_artifact_scalar_row(
+                    &artifact_store_roots,
+                    &weight_ref,
+                    token_idx - start,
+                    "weight",
+                )?;
+                let value_row = read_attention_artifact_value_row(
+                    &state,
+                    &artifact_store_roots,
+                    kv_head_idx,
+                    token_idx,
+                )?;
+                if value_row.width() != weighted_sum_acc_bits.len() {
+                    bail!(
+                        "attention value row ({kv_head_idx}, {token_idx}) has width {}, expected {}",
+                        value_row.width(),
+                        weighted_sum_acc_bits.len()
+                    );
+                }
+                for (acc_bits, value) in weighted_sum_acc_bits.iter_mut().zip(value_row.acts()) {
+                    *acc_bits = mac_bits(*acc_bits, value.to_bits(), weight.to_bits());
+                }
+            }
+            crate::trace::trace_event(format!(
+                "progress prefill.attention.values head={} token={} kv_rows={}..{} of {}",
+                query_head_idx,
+                query_idx,
+                next_kv_token_idx,
+                end,
+                start + row_count
+            ));
+            if end < start + row_count {
+                state.phase = RasterAttentionArtifactRowPhase::ApplyValues {
+                    weight_ref,
+                    next_kv_token_idx: end,
+                    weighted_sum_acc_bits,
+                };
+                return Ok((false, artifact_store_roots, state));
+            }
+
+            let output_row = RasterActivationRow::from_acts(
+                weighted_sum_acc_bits
+                    .into_iter()
+                    .map(|bits| requantize(Acc::from_bits(bits)))
+                    .collect(),
+            );
+            artifact_store_roots = append_head_row_by_source_name_with_roots(
+                &artifact_store_roots,
+                &state.output_source_name,
+                query_head_idx,
+                query_idx,
+                state.sequence_len,
+                output_row,
+            )?;
+
+            if query_idx + 1 < state.sequence_len {
+                state.next_query_token_idx += 1;
+            } else {
+                state.next_query_head_idx += 1;
+                state.next_query_token_idx = 0;
+            }
+            if !state.is_complete() {
+                let (next_start, next_row_count) =
+                    attention_visible_range(state.next_query_token_idx, state.attention_window);
+                let (next_roots, phase) = init_attention_artifact_score_phase(
+                    artifact_store_roots,
+                    &state.attention_id_prefix,
+                    state.next_query_head_idx,
+                    state.next_query_token_idx,
+                    next_start,
+                    next_row_count,
+                )?;
+                artifact_store_roots = next_roots;
+                state.phase = phase;
+            }
+            Ok((false, artifact_store_roots, state))
+        }
+    }
+}
+
 fn read_attention_key_row(
     state: &RasterAttentionRowState,
     store: &AuthenticatedRasterTensorStore,
@@ -2677,6 +4152,34 @@ fn read_attention_key_row(
                 head_idx: kv_head_idx,
                 token_idx,
             }
+        )
+    }
+}
+
+fn read_attention_artifact_key_row(
+    state: &RasterAttentionArtifactRowState,
+    roots: &RasterArtifactStoreRoots,
+    kv_head_idx: usize,
+    token_idx: usize,
+) -> Result<RasterActivationRow> {
+    if let Some(cache_ref) = &state.donor_cache_ref {
+        read_kv_row_from_roots(
+            roots,
+            RasterKvRowRequest {
+                cache_ref: cache_ref.clone(),
+                row_kind: RasterKvRowKind::Key,
+                head_idx: kv_head_idx,
+                token_idx,
+            },
+        )
+    } else {
+        read_head_row_from_roots(
+            roots,
+            RasterHeadRowRequest {
+                tensor_ref: state.key_ref.clone(),
+                head_idx: kv_head_idx,
+                token_idx,
+            },
         )
     }
 }
@@ -2709,6 +4212,34 @@ fn read_attention_value_row(
     }
 }
 
+fn read_attention_artifact_value_row(
+    state: &RasterAttentionArtifactRowState,
+    roots: &RasterArtifactStoreRoots,
+    kv_head_idx: usize,
+    token_idx: usize,
+) -> Result<RasterActivationRow> {
+    if let Some(cache_ref) = &state.donor_cache_ref {
+        read_kv_row_from_roots(
+            roots,
+            RasterKvRowRequest {
+                cache_ref: cache_ref.clone(),
+                row_kind: RasterKvRowKind::Value,
+                head_idx: kv_head_idx,
+                token_idx,
+            },
+        )
+    } else {
+        read_head_row_from_roots(
+            roots,
+            RasterHeadRowRequest {
+                tensor_ref: state.value_ref.clone(),
+                head_idx: kv_head_idx,
+                token_idx,
+            },
+        )
+    }
+}
+
 fn read_attention_scalar_row(
     store: &AuthenticatedRasterTensorStore,
     tensor_ref: &RasterActivationSequenceRef,
@@ -2721,6 +4252,28 @@ fn read_attention_scalar_row(
             tensor_ref: tensor_ref.clone(),
             row_idx,
         }
+    )?;
+    if row.width() != 1 {
+        bail!(
+            "attention {label} row {row_idx} has width {}, expected 1",
+            row.width()
+        );
+    }
+    Ok(row.acts()[0])
+}
+
+fn read_attention_artifact_scalar_row(
+    roots: &RasterArtifactStoreRoots,
+    tensor_ref: &RasterActivationSequenceRef,
+    row_idx: usize,
+    label: &str,
+) -> Result<Act> {
+    let row = read_sequence_row_from_roots(
+        roots,
+        RasterSequenceRowRequest {
+            tensor_ref: tensor_ref.clone(),
+            row_idx,
+        },
     )?;
     if row.width() != 1 {
         bail!(
@@ -2762,6 +4315,30 @@ pub fn finalize_attention_row_state_ref(
     }
 
     store.finalize_heads_builder(state.output_builder_ref)
+}
+
+pub fn finalize_attention_artifact_row_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterAttentionArtifactRowState,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    if !state.is_complete() {
+        bail!(
+            "attention row state finalized at head {} token {}, expected {} heads",
+            state.next_query_head_idx,
+            state.next_query_token_idx,
+            state.query_head_count
+        );
+    }
+
+    let output_id = RasterTensorId::new(state.output_source_name.clone())?;
+    finalize_heads_builder_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        output_id,
+        state.query_head_count,
+        state.sequence_len,
+        state.head_dim,
+    )
 }
 
 pub fn build_raster_kv_cache(
@@ -2912,6 +4489,110 @@ pub fn finalize_reshape_heads_state_ref(
     store.finalize_heads_builder(state.output_builder_ref)
 }
 
+pub fn init_reshape_heads_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    output_id: RasterTensorId,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterReshapeHeadsArtifactState)> {
+    if num_heads == 0 {
+        bail!("attention reshape requires at least one head");
+    }
+    if head_dim == 0 {
+        bail!("attention reshape requires non-zero head dimension");
+    }
+    let expected_width = num_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("attention reshape width overflowed"))?;
+    let (row_count, width) = input_ref.tensor_ref().shape().sequence_metadata()?;
+    if width != expected_width {
+        bail!(
+            "attention reshape input row width {width} does not match heads {num_heads} * head_dim {head_dim}"
+        );
+    }
+    let output_source_name = output_id.source_name().to_string();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&output_source_name)?,
+        num_heads * row_count,
+        head_dim,
+    )?;
+    Ok((
+        artifact_store_roots,
+        RasterReshapeHeadsArtifactState {
+            input_ref,
+            output_source_name,
+            num_heads,
+            head_dim,
+            next_head_idx: 0,
+            next_row_idx: 0,
+            row_count,
+        },
+    ))
+}
+
+pub fn compute_next_reshape_heads_artifact_row(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: RasterReshapeHeadsArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterReshapeHeadsArtifactState,
+)> {
+    if state.is_complete() {
+        return Ok((true, artifact_store_roots, state));
+    }
+
+    if state.next_row_idx >= state.row_count {
+        state.next_head_idx += 1;
+        state.next_row_idx = 0;
+        return Ok((false, artifact_store_roots, state));
+    }
+
+    let row = read_sequence_row_from_roots(
+        &artifact_store_roots,
+        RasterSequenceRowRequest {
+            tensor_ref: state.input_ref.clone(),
+            row_idx: state.next_row_idx,
+        },
+    )?;
+    let acts = row.acts();
+    let start = state.next_head_idx * state.head_dim;
+    artifact_store_roots = append_head_row_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        state.next_head_idx,
+        state.next_row_idx,
+        state.row_count,
+        RasterActivationRow::from_acts(acts[start..start + state.head_dim].to_vec()),
+    )?;
+    state.next_row_idx += 1;
+    Ok((false, artifact_store_roots, state))
+}
+
+pub fn finalize_reshape_heads_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterReshapeHeadsArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    if !state.is_complete() {
+        bail!(
+            "attention reshape completed {} rows, expected {}",
+            state.next_row_idx,
+            state.row_count
+        );
+    }
+    let output_id = RasterTensorId::new(state.output_source_name.clone())?;
+    finalize_heads_builder_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        output_id,
+        state.num_heads,
+        state.row_count,
+        state.head_dim,
+    )
+}
+
 pub fn init_combine_heads_state(
     store: &mut AuthenticatedRasterTensorStore,
     heads: &RasterAttentionHeadSequence,
@@ -3015,6 +4696,87 @@ pub fn finalize_combine_heads_state_ref(
         );
     }
     store.finalize_sequence_builder(state.output_builder_ref)
+}
+
+pub fn init_combine_heads_artifact_state_from_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: RasterTensorId,
+) -> Result<(RasterArtifactStoreRoots, RasterCombineHeadsArtifactState)> {
+    let (head_count, sequence_len, head_dim) = heads_ref.tensor_ref().shape().heads_metadata()?;
+    let output_source_name = output_id.source_name().to_string();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&output_source_name)?,
+        sequence_len,
+        head_count
+            .checked_mul(head_dim)
+            .ok_or_else(|| anyhow!("attention combine width overflowed"))?,
+    )?;
+    Ok((
+        artifact_store_roots,
+        RasterCombineHeadsArtifactState {
+            heads_ref,
+            output_source_name,
+            next_token_idx: 0,
+            head_count,
+            sequence_len,
+            head_dim,
+        },
+    ))
+}
+
+pub fn compute_next_combine_heads_artifact_row(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: RasterCombineHeadsArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterCombineHeadsArtifactState,
+)> {
+    if state.is_complete() {
+        return Ok((true, artifact_store_roots, state));
+    }
+
+    let mut row = Vec::new();
+    for head_idx in 0..state.head_count {
+        let head_row = read_head_row_from_roots(
+            &artifact_store_roots,
+            RasterHeadRowRequest {
+                tensor_ref: state.heads_ref.clone(),
+                head_idx,
+                token_idx: state.next_token_idx,
+            },
+        )?;
+        row.extend(head_row.acts());
+    }
+    artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        state.next_token_idx,
+        RasterActivationRow::from_acts(row),
+    )?;
+    state.next_token_idx += 1;
+    Ok((false, artifact_store_roots, state))
+}
+
+pub fn finalize_combine_heads_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterCombineHeadsArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    if !state.is_complete() {
+        bail!(
+            "attention combine completed {} rows, expected {}",
+            state.next_token_idx,
+            state.sequence_len
+        );
+    }
+    let output_id = RasterTensorId::new(state.output_source_name.clone())?;
+    finalize_sequence_builder_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.output_source_name,
+        output_id,
+    )
 }
 
 pub fn init_kv_cache_build_state(
@@ -3168,6 +4930,138 @@ pub fn finalize_kv_cache_build_state_ref(
         );
     }
     store.finalize_kv_cache_builder(state.output_builder_ref)
+}
+
+pub fn init_kv_cache_build_artifact_state_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    keys_id: RasterTensorId,
+    values_id: RasterTensorId,
+    sliding_window: Option<usize>,
+) -> Result<(RasterArtifactStoreRoots, RasterKvCacheBuildArtifactState)> {
+    let (head_count, sequence_len, head_dim) = key_ref.tensor_ref().shape().heads_metadata()?;
+    let (value_head_count, value_sequence_len, value_head_dim) =
+        value_ref.tensor_ref().shape().heads_metadata()?;
+    if head_count != value_head_count
+        || sequence_len != value_sequence_len
+        || head_dim != value_head_dim
+    {
+        bail!("key/value attention heads shape mismatch");
+    }
+    let retained_start = sliding_window.map_or(0, |window| sequence_len.saturating_sub(window));
+    let current_len = sequence_len.saturating_sub(retained_start);
+    let keys_source_name = keys_id.source_name().to_string();
+    let values_source_name = values_id.source_name().to_string();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&keys_source_name)?,
+        head_count * current_len,
+        head_dim,
+    )?;
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&values_source_name)?,
+        head_count * current_len,
+        head_dim,
+    )?;
+    Ok((
+        artifact_store_roots,
+        RasterKvCacheBuildArtifactState {
+            key_ref,
+            value_ref,
+            keys_source_name,
+            values_source_name,
+            retained_start,
+            next_head_idx: 0,
+            next_token_idx: retained_start,
+            head_count,
+            current_len,
+            sequence_len,
+            head_dim,
+        },
+    ))
+}
+
+pub fn compute_next_kv_cache_artifact_row(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: RasterKvCacheBuildArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    RasterKvCacheBuildArtifactState,
+)> {
+    if state.is_complete() {
+        return Ok((true, artifact_store_roots, state));
+    }
+
+    if state.next_token_idx >= state.sequence_len {
+        state.next_head_idx += 1;
+        state.next_token_idx = state.retained_start;
+        return Ok((false, artifact_store_roots, state));
+    }
+
+    let key_row = read_head_row_from_roots(
+        &artifact_store_roots,
+        RasterHeadRowRequest {
+            tensor_ref: state.key_ref.clone(),
+            head_idx: state.next_head_idx,
+            token_idx: state.next_token_idx,
+        },
+    )?;
+    let value_row = read_head_row_from_roots(
+        &artifact_store_roots,
+        RasterHeadRowRequest {
+            tensor_ref: state.value_ref.clone(),
+            head_idx: state.next_head_idx,
+            token_idx: state.next_token_idx,
+        },
+    )?;
+    let output_token_idx = state.next_token_idx - state.retained_start;
+    artifact_store_roots = append_head_row_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.keys_source_name,
+        state.next_head_idx,
+        output_token_idx,
+        state.current_len,
+        key_row,
+    )?;
+    artifact_store_roots = append_head_row_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.values_source_name,
+        state.next_head_idx,
+        output_token_idx,
+        state.current_len,
+        value_row,
+    )?;
+    state.next_token_idx += 1;
+    Ok((false, artifact_store_roots, state))
+}
+
+pub fn finalize_kv_cache_build_artifact_state_ref(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: RasterKvCacheBuildArtifactState,
+) -> Result<(RasterArtifactStoreRoots, RasterKvCacheRef)> {
+    if !state.is_complete() {
+        bail!(
+            "KV cache build finalized at head {} token {}, expected {} heads",
+            state.next_head_idx,
+            state.next_token_idx,
+            state.head_count
+        );
+    }
+    let keys_id = RasterTensorId::new(state.keys_source_name.clone())?;
+    let values_id = RasterTensorId::new(state.values_source_name.clone())?;
+    finalize_kv_cache_builders_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.keys_source_name,
+        &state.values_source_name,
+        keys_id,
+        values_id,
+        state.head_count,
+        state.current_len,
+        state.head_dim,
+    )
 }
 
 fn project_row(

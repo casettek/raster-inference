@@ -95,6 +95,20 @@ impl ArtifactIo {
         )
     }
 
+    pub fn append_leaf_by_builder_source_name_with_roots(
+        roots: &RasterArtifactStoreRoots,
+        source_name: &str,
+        leaf_idx: usize,
+        payload: Vec<u8>,
+    ) -> Result<(RasterArtifactStoreRoots, String)> {
+        raster_artifact_store::append_leaf_by_builder_source_name_with_roots(
+            roots,
+            source_name,
+            leaf_idx,
+            payload,
+        )
+    }
+
     pub fn finalize_builder_by_root(builder_root: &str) -> Result<RasterArtifactRef> {
         raster_artifact_store::finalize_builder_by_root(builder_root)
     }
@@ -104,6 +118,13 @@ impl ArtifactIo {
         builder_root: &str,
     ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
         raster_artifact_store::finalize_builder_by_root_with_roots(roots, builder_root)
+    }
+
+    pub fn finalize_builder_by_source_name_with_roots(
+        roots: &RasterArtifactStoreRoots,
+        source_name: &str,
+    ) -> Result<(RasterArtifactStoreRoots, RasterArtifactRef)> {
+        raster_artifact_store::finalize_builder_by_source_name_with_roots(roots, source_name)
     }
 
     pub fn finalize_builder(builder_ref: RasterArtifactBuilderRef) -> Result<RasterArtifactRef> {
@@ -126,6 +147,10 @@ impl ArtifactIo {
 
     pub fn artifact_ref_for_root(root: &str) -> Result<RasterArtifactRef> {
         raster_artifact_store::artifact_ref_for_root(root)
+    }
+
+    pub fn artifact_ref_for_root_any(root: &str) -> Result<RasterArtifactRef> {
+        raster_artifact_store::artifact_ref_for_root_any(root)
     }
 
     pub fn verify_artifact_read(

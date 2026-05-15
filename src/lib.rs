@@ -501,11 +501,12 @@ pub fn run_inference_with_controls(
                     let input_embedding_refs = raster_input_embedding_refs
                         .as_ref()
                         .expect("raster prefill requires raster input embedding refs");
-                    let ple_input_refs = prefill_prepare_aux::run_raster_refs_from_input_embedding(
-                        input_embedding_refs,
-                        &ple_source,
-                        raster_sizing,
-                    )?;
+                    let (layer_roots, ple_input_manifest_root) =
+                        prefill_prepare_aux::run_raster_refs_from_input_embedding(
+                            input_embedding_refs,
+                            &ple_source,
+                            raster_sizing,
+                        )?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                         trace::phase_paused(PhaseId::TransformerStateTransition);
                         return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
@@ -516,19 +517,17 @@ pub fn run_inference_with_controls(
                             raster_tile_invocations: None,
                         }));
                     }
-                    let mut raster_prefill_store =
-                        prefill_prepare_aux::raster_tensor_store_snapshot();
                     let layer_source =
                     crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let layer_refs =
-                        prefill_layer::run_raster_refs_from_input_embedding_with_store(
-                            &mut raster_prefill_store,
+                    let (_layer_roots, layer_refs) =
+                        prefill_layer::run_raster_refs_from_input_embedding(
+                            layer_roots,
                             input_embedding_refs,
                             &layer_source,
-                            ple_input_refs.as_ref(),
+                            ple_input_manifest_root.as_deref(),
                             raster_sizing,
                         )?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
@@ -546,6 +545,8 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
+                    let mut raster_prefill_store =
+                        crate::shared::raster_row_store::AuthenticatedRasterTensorStore::artifact_backed();
                     prefill_finalize::run_raster_refs_with_store(
                         &mut raster_prefill_store,
                         &prompt_preparation.prompt_token_ids,
@@ -800,9 +801,7 @@ mod tests {
     use crate::shared::det_num::{f32_to_acc, Act, Wgt};
     use crate::shared::gemma_tokenizer::GemmaAddedToken;
     use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
-    use crate::shared::raster_row_store::{
-        insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
-    };
+    use crate::shared::raster_row_store::insert_activation_sequence_artifact_ref;
     use crate::shared::raster_transformer_kernels::RasterActivationSequence;
     use crate::shared::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4LayerMatrixSource, GemmaEmbeddingTensorSource,
@@ -1063,6 +1062,7 @@ mod tests {
             crate::trace::checkpoint_payload_for_tests()
         });
 
+        crate::shared::artifact_io::ArtifactIo::reset_store();
         let input_ref = insert_activation_sequence_artifact_ref(
             "test.prefill.layer.input_embedding",
             RasterActivationSequence::from_acts(input_rows),
@@ -1083,9 +1083,8 @@ mod tests {
         .expect("prefill layer source");
         let raster_payload = crate::trace::with_checkpointing_enabled(true, || {
             crate::trace::start_inference_trace(&json!({ "test": "raster-prefill-layer" }));
-            let mut store = AuthenticatedRasterTensorStore::new();
-            crate::prefill_layer::raster_tiles::run_refs_from_input_embedding_with_store(
-                &mut store,
+            crate::prefill_layer::run_raster_refs_from_input_embedding(
+                input_embedding_refs.artifact_store_roots.clone(),
                 &input_embedding_refs,
                 &layer_source,
                 None,
