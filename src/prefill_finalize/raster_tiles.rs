@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 
+use super::raster_utils::{build_prefill_result, import_materialized_final_hidden_states};
 use crate::raster_authoring::prelude::{auth_read, call_recur_tile, call_tile, sequence, tile};
 use crate::shared::det_num::{softcap_act, Act};
 use crate::shared::raster_prefill_finalize::{
@@ -190,7 +191,7 @@ pub fn finalize_prefill_result_materialized_compat(
     prefill_logits.det_final_logits_sha256 =
         Some(crate::shared::transformer_kernels::build_det_vector_commitment(&det_logits));
 
-    super::build_prefill_result(
+    build_prefill_result(
         prompt_token_count,
         final_hidden_states,
         layer_caches,
@@ -225,7 +226,7 @@ pub fn finalize_prefill_result_from_refs(
 }
 
 #[sequence]
-pub fn run_refs_with_store(
+pub fn main(
     store: &mut AuthenticatedRasterTensorStore,
     prompt_token_ids: &[u32],
     final_hidden_states_ref: RasterActivationSequenceRef,
@@ -297,27 +298,9 @@ pub fn run(
     )
 }
 
-fn import_materialized_final_hidden_states(
-    store: &mut AuthenticatedRasterTensorStore,
-    final_hidden_states: &ActivationSequence,
-) -> Result<RasterActivationSequenceRef> {
-    // Compatibility bridge for public/dev callers that still hold full final
-    // hidden states. Projection still enters the ref-backed tile path above.
-    let internal = final_hidden_states.clone_internal();
-    let det_rows = internal.det_values().ok_or_else(|| {
-        anyhow!("deterministic raster prefill finalize requires canonical final hidden activations")
-    })?;
-    store.insert_activation_sequence(
-        RasterTensorId::new("prefill.finalize.final_hidden_states")?,
-        RasterActivationSequence::from_acts(det_rows.to_vec()),
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        init_prefill_finalize_projection, init_prefill_finalize_store, run, run_refs_with_store,
-    };
+    use super::{init_prefill_finalize_projection, init_prefill_finalize_store, main, run};
     use crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot;
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::input::InferenceExecutionMode;
@@ -388,7 +371,7 @@ mod tests {
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = run_refs_with_store(
+        let raster = main(
             &mut store,
             &[3, 4],
             final_hidden_states_ref,
@@ -466,7 +449,7 @@ mod tests {
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = run_refs_with_store(
+        let raster = main(
             &mut store,
             &[9],
             final_hidden_states_ref,
@@ -522,7 +505,7 @@ mod tests {
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = run_refs_with_store(
+        let raster = main(
             &mut store,
             &[1],
             final_hidden_states_ref,
@@ -582,7 +565,7 @@ mod tests {
             insert_activation_ref(&mut source_store, "finalize.hidden", &final_hidden_states);
         let mut empty_store = AuthenticatedRasterTensorStore::new();
 
-        let error = run_refs_with_store(
+        let error = main(
             &mut empty_store,
             &[1],
             final_hidden_states_ref,
@@ -609,7 +592,7 @@ mod tests {
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let error = run_refs_with_store(
+        let error = main(
             &mut store,
             &[1],
             final_hidden_states_ref,
@@ -708,7 +691,7 @@ mod tests {
             )
             .expect("cache ref");
 
-        let raster = run_refs_with_store(
+        let raster = main(
             &mut store,
             &[1],
             final_hidden_states_ref,
@@ -734,7 +717,7 @@ mod tests {
 
         assert_signature_omits(
             source,
-            "pub fn run_refs_with_store",
+            "pub fn main",
             &[
                 ": &ActivationSequence",
                 ": ActivationSequence",

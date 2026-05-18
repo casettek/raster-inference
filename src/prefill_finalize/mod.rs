@@ -1,5 +1,4 @@
 use anyhow::Result;
-use serde_json::json;
 
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource;
@@ -7,12 +6,12 @@ use crate::shared::raster_row_store::{
     AuthenticatedRasterTensorStore, RasterActivationSequenceRef,
 };
 use crate::shared::transformer::{
-    ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerDecodeState,
-    TransformerPrefillResult, TransformerStateTransitionState,
+    ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerPrefillResult,
 };
-use crate::trace::trace_event;
 
 pub mod raster_tiles;
+mod raster_utils;
+pub mod tiles;
 
 pub fn run(
     prompt_token_ids: &[u32],
@@ -21,29 +20,12 @@ pub fn run(
     layer_caches: Vec<LayerKvCache>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerPrefillResult> {
-    trace_event("prefill.select_final_position");
-    let final_position = crate::shared::transformer_kernels::select_final_position_internal(
-        &final_hidden_states.clone_internal(),
-    )?;
-    trace_event("prefill.project_to_logits");
-    let prefill_logits =
-        crate::shared::transformer_kernels::project_internal_hidden_to_prefill_logits(
-            final_position,
-            &model.final_norm_weight,
-            model.final_norm_weight_det.as_deref(),
-            model.rms_norm_eps,
-            model.rms_norm_eps_det,
-            &model.logits_projection,
-            model.embedding_source.as_ref(),
-            execution_mode,
-            model.final_logit_softcapping,
-            model.final_logit_softcapping_det,
-        )?;
-    build_prefill_result(
-        prompt_token_ids.len(),
+    tiles::run(
+        prompt_token_ids,
+        model,
         final_hidden_states,
         layer_caches,
-        prefill_logits,
+        execution_mode,
     )
 }
 
@@ -71,7 +53,7 @@ pub fn run_raster_refs_with_store(
     layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
 ) -> Result<TransformerPrefillResult> {
-    raster_tiles::run_refs_with_store(
+    raster_tiles::main(
         store,
         prompt_token_ids,
         final_hidden_states_ref,
@@ -79,39 +61,4 @@ pub fn run_raster_refs_with_store(
         finalize_source,
         projection_rows_per_tile,
     )
-}
-
-pub(crate) fn build_prefill_result(
-    prompt_token_count: usize,
-    final_hidden_states: ActivationSequence,
-    layer_caches: Vec<LayerKvCache>,
-    prefill_logits: crate::shared::transformer::PrefillLogits,
-) -> Result<TransformerPrefillResult> {
-    crate::trace::trace_checkpoint(
-        "prefill.finalize",
-        &json!({
-            "final_hidden_states": final_hidden_states.activations.clone(),
-            "final_hidden_states_sha256": final_hidden_states.activations_sha256.clone(),
-            "det_final_hidden_states_sha256": final_hidden_states.det_activations_sha256.clone(),
-            "prefill_logits": prefill_logits.logits.clone(),
-            "prefill_logits_sha256": prefill_logits.final_logits_sha256.clone(),
-            "det_prefill_logits_sha256": prefill_logits.det_final_logits_sha256.clone(),
-            "decode_position": prompt_token_count,
-            "decode_token_count": prompt_token_count,
-            "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-            "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
-        }),
-    );
-
-    Ok(TransformerPrefillResult {
-        transformer_decode_state: TransformerDecodeState {
-            layer_caches,
-            position: prompt_token_count,
-            token_count: prompt_token_count,
-        },
-        transformer_state: TransformerStateTransitionState {
-            activation_states: vec![final_hidden_states],
-            prefill_logits,
-        },
-    })
 }
