@@ -6,7 +6,8 @@ use crate::shared::det_num::{argmax_first, Act};
 use crate::shared::output::OutputDecodeStopReason;
 use crate::shared::raster_artifact_store::{
     read_token_id_from_roots, token_id_leaf, token_ids_ref_for_root, RasterArtifactId,
-    RasterArtifactMetadata, RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
+    RasterArtifactMetadata, RasterArtifactStoreRoots, RasterSelectedTokenRef,
+    RasterTokenIdSequenceRef,
 };
 use crate::shared::raster_row_store::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
@@ -28,6 +29,7 @@ pub struct RasterDecodeSelectInputRoots {
     pub token_ids_per_tile: usize,
     pub output_full_token_ids_source_name: String,
     pub output_generated_token_ids_source_name: String,
+    pub output_selected_token_source_name: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -54,6 +56,7 @@ pub struct DecodeSelectAppendState {
     token_ids_per_tile: usize,
     output_full_token_ids_source_name: String,
     output_generated_token_ids_source_name: String,
+    output_selected_token_source_name: String,
     logits_ref: RasterActivationSequenceRef,
 }
 
@@ -61,6 +64,7 @@ pub struct DecodeSelectAppendState {
 pub struct RasterDecodeSelectOutputRefs {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub next_token: u32,
+    pub selected_token_ref: RasterSelectedTokenRef,
     pub full_token_ids_ref: RasterTokenIdSequenceRef,
     pub generated_token_ids_ref: RasterTokenIdSequenceRef,
     pub logits_ref: RasterActivationSequenceRef,
@@ -229,6 +233,7 @@ pub fn init_decode_select_append_state(
         output_generated_token_ids_source_name: input_roots
             .output_generated_token_ids_source_name
             .clone(),
+        output_selected_token_source_name: input_roots.output_selected_token_source_name.clone(),
         logits_ref: input_roots.logits_ref.clone(),
     })
 }
@@ -375,10 +380,30 @@ pub fn finalize_decode_select_refs(
             &state.output_generated_token_ids_source_name,
         )?;
     let generated_token_ids_ref = RasterTokenIdSequenceRef::new(generated_token_ids_ref)?;
+    let (artifact_store_roots, _builder) = ArtifactIo::start_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(state.output_selected_token_source_name.clone())?,
+        RasterArtifactMetadata::token_ids(1),
+    )?;
+    let (artifact_store_roots, _builder_root) =
+        ArtifactIo::append_leaf_by_builder_source_name_with_roots(
+            &artifact_store_roots,
+            &state.output_selected_token_source_name,
+            0,
+            token_id_leaf(state.next_token),
+        )?;
+    let (artifact_store_roots, selected_token_ref) =
+        ArtifactIo::finalize_builder_by_source_name_with_roots(
+            &artifact_store_roots,
+            &state.output_selected_token_source_name,
+        )?;
+    let selected_token_ref =
+        RasterSelectedTokenRef::new(RasterTokenIdSequenceRef::new(selected_token_ref)?)?;
 
     Ok(RasterDecodeSelectOutputRefs {
         artifact_store_roots,
         next_token: state.next_token,
+        selected_token_ref,
         full_token_ids_ref,
         generated_token_ids_ref,
         logit_count: state.logits_ref.tensor_ref().shape().sequence_metadata()?.0,
@@ -446,9 +471,9 @@ mod tests {
     use crate::shared::det_num::Act;
     use crate::shared::input::InferenceExecutionMode;
     use crate::shared::raster_artifact_store::{
-        activation_row_leaf, read_token_id_from_roots, token_id_leaf,
-        RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
-        RasterArtifactStoreRoots,
+        activation_row_leaf, read_selected_token_from_roots, read_token_id_from_ref_roots,
+        token_id_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
+        RasterArtifactMetadata, RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
     };
     use crate::shared::raster_row_store::{
         activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
@@ -480,20 +505,24 @@ mod tests {
             .expect("should select token");
 
         assert_eq!(output.next_token, 2);
+        assert_eq!(output.selected_token_ref.token_ids_ref().token_count(), 1);
         assert_eq!(
-            materialize_token_ids(
+            read_selected_token_from_roots(
                 &output.artifact_store_roots,
-                output.full_token_ids_ref.root(),
-                output.full_token_ids_ref.token_count()
+                &output.selected_token_ref,
             )
-            .expect("full token ids"),
+            .expect("selected token artifact"),
+            2
+        );
+        assert_eq!(
+            materialize_token_ids(&output.artifact_store_roots, &output.full_token_ids_ref,)
+                .expect("full token ids"),
             vec![10, 2]
         );
         assert_eq!(
             materialize_token_ids(
                 &output.artifact_store_roots,
-                output.generated_token_ids_ref.root(),
-                output.generated_token_ids_ref.token_count()
+                &output.generated_token_ids_ref,
             )
             .expect("generated token ids"),
             vec![2]
@@ -560,6 +589,14 @@ mod tests {
         )
         .expect("single chunk should run")
         .expect("single chunk should select");
+        let single_full_tokens =
+            materialize_token_ids(&single.artifact_store_roots, &single.full_token_ids_ref)
+                .expect("single full tokens");
+        let single_generated_tokens = materialize_token_ids(
+            &single.artifact_store_roots,
+            &single.generated_token_ids_ref,
+        )
+        .expect("single generated tokens");
         let multi = main(
             input_roots(
                 vec![1, 2],
@@ -577,32 +614,14 @@ mod tests {
 
         assert_eq!(single.next_token, multi.next_token);
         assert_eq!(
-            materialize_token_ids(
-                &single.artifact_store_roots,
-                single.full_token_ids_ref.root(),
-                single.full_token_ids_ref.token_count()
-            )
-            .expect("single full tokens"),
-            materialize_token_ids(
-                &multi.artifact_store_roots,
-                multi.full_token_ids_ref.root(),
-                multi.full_token_ids_ref.token_count()
-            )
-            .expect("multi full tokens")
+            single_full_tokens,
+            materialize_token_ids(&multi.artifact_store_roots, &multi.full_token_ids_ref,)
+                .expect("multi full tokens")
         );
         assert_eq!(
-            materialize_token_ids(
-                &single.artifact_store_roots,
-                single.generated_token_ids_ref.root(),
-                single.generated_token_ids_ref.token_count()
-            )
-            .expect("single generated tokens"),
-            materialize_token_ids(
-                &multi.artifact_store_roots,
-                multi.generated_token_ids_ref.root(),
-                multi.generated_token_ids_ref.token_count()
-            )
-            .expect("multi generated tokens")
+            single_generated_tokens,
+            materialize_token_ids(&multi.artifact_store_roots, &multi.generated_token_ids_ref,)
+                .expect("multi generated tokens")
         );
     }
 
@@ -692,6 +711,31 @@ mod tests {
         let error = copy_next_full_token_chunk(state).expect_err("stale roots should fail");
 
         assert!(error.to_string().contains("snapshot"));
+    }
+
+    #[test]
+    fn selected_token_ref_fails_closed_with_missing_roots() {
+        let input = input_roots(
+            vec![1],
+            vec![],
+            vec![Act::from_bits(1), Act::from_bits(9)],
+            1,
+            1,
+            1,
+            "selected-missing",
+        )
+        .expect("input roots");
+        let output = main(input)
+            .expect("raster select should run")
+            .expect("should select token");
+
+        let error = read_selected_token_from_roots(
+            &RasterArtifactStoreRoots::default(),
+            &output.selected_token_ref,
+        )
+        .expect_err("missing selected-token root should fail");
+
+        assert!(error.to_string().contains("not present"));
     }
 
     #[test]
@@ -808,6 +852,7 @@ mod tests {
             token_ids_per_tile,
             output_full_token_ids_source_name: format!("{source_prefix}.output.full"),
             output_generated_token_ids_source_name: format!("{source_prefix}.output.generated"),
+            output_selected_token_source_name: format!("{source_prefix}.output.selected"),
         })
     }
 
@@ -853,13 +898,10 @@ mod tests {
 
     fn materialize_token_ids(
         roots: &RasterArtifactStoreRoots,
-        token_ids_root: &str,
-        token_count: usize,
+        token_ids_ref: &RasterTokenIdSequenceRef,
     ) -> Result<Vec<u32>> {
-        (0..token_count)
-            .map(|token_idx| {
-                read_token_id_from_roots(roots, token_ids_root, token_count, token_idx)
-            })
+        (0..token_ids_ref.token_count())
+            .map(|token_idx| read_token_id_from_ref_roots(roots, token_ids_ref, token_idx))
             .collect()
     }
 }

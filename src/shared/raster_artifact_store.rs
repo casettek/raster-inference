@@ -469,6 +469,39 @@ impl RasterTokenIdSequenceRef {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+pub struct RasterSelectedTokenRef {
+    token_ids_ref: RasterTokenIdSequenceRef,
+}
+
+impl RasterSelectedTokenRef {
+    pub fn new(token_ids_ref: RasterTokenIdSequenceRef) -> Result<Self> {
+        if token_ids_ref.token_count() != 1 {
+            bail!(
+                "raster selected-token ref requires exactly one token, got {}",
+                token_ids_ref.token_count()
+            );
+        }
+        Ok(Self { token_ids_ref })
+    }
+
+    pub fn token_ids_ref(&self) -> &RasterTokenIdSequenceRef {
+        &self.token_ids_ref
+    }
+
+    pub fn id(&self) -> &RasterArtifactId {
+        self.token_ids_ref.id()
+    }
+
+    pub fn source_name(&self) -> &str {
+        self.token_ids_ref.id().source_name()
+    }
+
+    pub fn root(&self) -> &str {
+        self.token_ids_ref.root()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub struct RasterActivationSequenceArtifactRef {
     artifact_ref: RasterArtifactRef,
 }
@@ -1181,6 +1214,38 @@ pub fn read_token_id_from_roots(
     let read = read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
     verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
     decode_token_id_leaf(read.payload())
+}
+
+pub fn read_token_id_from_ref_roots(
+    roots: &RasterArtifactStoreRoots,
+    token_ids_ref: &RasterTokenIdSequenceRef,
+    token_idx: usize,
+) -> Result<u32> {
+    if token_idx >= token_ids_ref.token_count() {
+        bail!(
+            "token-id index {token_idx} is out of range for {} tokens",
+            token_ids_ref.token_count()
+        );
+    }
+    let entry = roots.artifact_entry_for_source_name(token_ids_ref.id().source_name())?;
+    if entry.root() != token_ids_ref.root() {
+        bail!(
+            "token-id artifact root mismatch for {}: snapshot has {}, ref has {}",
+            token_ids_ref.id().source_name(),
+            entry.root(),
+            token_ids_ref.root()
+        );
+    }
+    let read = read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
+    verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
+    decode_token_id_leaf(read.payload())
+}
+
+pub fn read_selected_token_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    selected_token_ref: &RasterSelectedTokenRef,
+) -> Result<u32> {
+    read_token_id_from_ref_roots(roots, selected_token_ref.token_ids_ref(), 0)
 }
 
 pub fn activation_row_leaf(row: &RasterActivationRow) -> Vec<u8> {

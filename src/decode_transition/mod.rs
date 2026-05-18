@@ -118,6 +118,13 @@ pub fn run_raster(
     raster_tiles::run(transformer_decode_state, next_token, source, raster_sizing)
 }
 
+pub fn run_raster_with_roots(
+    input_roots: raster_tiles::RasterDecodeTransitionInputRoots,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<raster_tiles::RasterDecodeTransitionOutputRefs> {
+    raster_tiles::main(input_roots, source)
+}
+
 pub fn finalize(decode_state: &DecodeState) -> Result<()> {
     crate::trace::trace_checkpoint(
         "decode.finalize",
@@ -127,11 +134,59 @@ pub fn finalize(decode_state: &DecodeState) -> Result<()> {
             "generated_token_ids": decode_state.generated_token_ids.clone(),
             "generated_token_ids_sha256": crate::output_finalize::tiles::build_output_decode_commitment(&decode_state.generated_token_ids)?,
             "current_logits": decode_state.current_logits.clone(),
-            "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
+            "current_logits_sha256": current_logits_commitment(decode_state),
+            "det_current_logits_sha256": current_det_logits_commitment(decode_state),
             "decode_position": decode_state.transformer_decode_state.position,
             "decode_token_count": decode_state.transformer_decode_state.token_count,
             "layer_caches": crate::trace::serialize_layer_caches(&decode_state.transformer_decode_state.layer_caches),
         }),
     );
     Ok(())
+}
+
+fn current_logits_commitment(decode_state: &DecodeState) -> String {
+    let logits = decode_state.clone_internal_logits();
+    crate::shared::transformer_kernels::build_vector_commitment(logits.as_f32_slice())
+}
+
+fn current_det_logits_commitment(decode_state: &DecodeState) -> Option<String> {
+    let logits = decode_state.clone_internal_logits();
+    logits
+        .det_values()
+        .map(crate::shared::transformer_kernels::build_det_vector_commitment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{current_det_logits_commitment, current_logits_commitment};
+    use crate::shared::det_num::Act;
+    use crate::shared::output::DecodeState;
+    use crate::shared::transformer::{InternalLogits, TransformerDecodeState};
+
+    #[test]
+    fn decode_finalize_uses_internal_logits_commitment_methodology() {
+        let mut decode_state = DecodeState::new(
+            vec![7],
+            vec![999.0, -999.0],
+            TransformerDecodeState::default(),
+        );
+        decode_state.set_internal_logits(InternalLogits::from_det_values(vec![
+            Act::from_bits(3),
+            Act::from_bits(5),
+        ]));
+
+        let internal = decode_state.clone_internal_logits();
+        assert_eq!(
+            current_logits_commitment(&decode_state),
+            crate::shared::transformer_kernels::build_vector_commitment(internal.as_f32_slice())
+        );
+        assert_eq!(
+            current_det_logits_commitment(&decode_state),
+            Some(
+                crate::shared::transformer_kernels::build_det_vector_commitment(
+                    internal.det_values().expect("det logits")
+                )
+            )
+        );
+    }
 }

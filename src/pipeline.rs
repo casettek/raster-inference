@@ -401,27 +401,56 @@ fn run_output_decode_with_mode_internal(
         }
 
         trace_event("decode.select_token");
-        let next_token = if raster_select_token {
-            crate::decode_select_token::run_raster(&mut decode_state, max_new_tokens)?
+        let raster_select_output = if raster_select_token {
+            Some(
+                crate::decode_select_token::run_raster_refs(&mut decode_state, max_new_tokens)?
+                    .expect("stop condition should have returned earlier"),
+            )
         } else {
-            crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
-        }
-        .expect("stop condition should have returned earlier");
+            None
+        };
+        let next_token = match raster_select_output.as_ref() {
+            Some(output) => output.next_token,
+            None => {
+                crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
+                    .expect("stop condition should have returned earlier")
+            }
+        };
 
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
+        let transition_position = transformer_decode_state.position;
         let decode_transition = if raster_decode_transition {
             let source =
                 crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource::from_model(
                     format!("decode.transition.position_{}", transformer_decode_state.position),
                     transformer_model,
                 )?;
-            crate::decode_transition::run_raster(
-                transformer_decode_state,
-                next_token,
-                &source,
-                raster_sizing.expect("raster decode transition requires sizing controls"),
-            )?
+            if let Some(select_output) = raster_select_output {
+                crate::decode_transition::run_raster_with_roots(
+                    crate::decode_transition::raster_tiles::RasterDecodeTransitionInputRoots {
+                        artifact_store_roots: select_output.artifact_store_roots,
+                        transformer_decode_state,
+                        selected_token_ref: select_output.selected_token_ref,
+                        decode_transition_source_name: source.identifier().to_string(),
+                        output_source_prefix: format!(
+                            "decode.transition.position_{}",
+                            transition_position
+                        ),
+                        raster_sizing: raster_sizing
+                            .expect("raster decode transition requires sizing controls"),
+                    },
+                    &source,
+                )?
+                .transition_result
+            } else {
+                crate::decode_transition::run_raster(
+                    transformer_decode_state,
+                    next_token,
+                    &source,
+                    raster_sizing.expect("raster decode transition requires sizing controls"),
+                )?
+            }
         } else {
             crate::decode_transition::run_with_mode(
                 transformer_decode_state,

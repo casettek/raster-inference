@@ -6,10 +6,15 @@ use serde_json::json;
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
+use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::det_num::{
     acc_add_sat, add_sat, attention_score as det_attention_score, attention_softmax_exp_term,
     attention_softmax_raw_weight, attention_softmax_residual, mac_bits, requantize, softcap_act,
     Acc, Act,
+};
+use crate::shared::raster_artifact_store::{
+    activation_row_leaf, read_selected_token_from_roots, RasterActivationSequenceArtifactRef,
+    RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots, RasterSelectedTokenRef,
 };
 use crate::shared::raster_decode_transition::{
     AuthenticatedGemmaDecodeTransitionSource, GemmaDecodeAttentionKind,
@@ -22,10 +27,11 @@ use crate::shared::raster_decode_transition::{
     GemmaDecodeProjectionRowRequest, GemmaDecodeTransitionMetadataRequest,
 };
 use crate::shared::raster_row_store::{
-    AuthenticatedRasterTensorStore, RasterAttentionHeadsRef, RasterHeadRowRequest,
-    RasterKvCacheBuilderRef, RasterKvCacheRef, RasterKvRowKind, RasterKvRowRequest,
-    RasterProjectionOutputBuilderRef, RasterSequenceRowRequest, RasterTensorBuilderRef,
-    RasterTensorId,
+    activation_sequence_ref_from_artifact, read_sequence_row_from_roots,
+    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
+    RasterHeadRowRequest, RasterKvCacheBuilderRef, RasterKvCacheRef, RasterKvRowKind,
+    RasterKvRowRequest, RasterProjectionOutputBuilderRef, RasterSequenceRowRequest,
+    RasterTensorBuilderRef, RasterTensorId,
 };
 use crate::shared::raster_transformer_kernels::{
     add_sequences, apply_rope_to_heads, combine_attention_heads, gelu_sequence, mul_sequences,
@@ -43,8 +49,9 @@ use super::tiles::ActivationSequenceWithCache;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DecodeTransitionRasterState {
-    decode_input: RasterActivationRow,
-    current_activation: RasterActivationRow,
+    artifact_store_roots: RasterArtifactStoreRoots,
+    decode_input_ref: RasterActivationSequenceRef,
+    current_activation_ref: RasterActivationSequenceRef,
     next_token: u32,
     position: usize,
     token_count: usize,
@@ -56,6 +63,23 @@ pub struct DecodeTransitionRasterState {
     completed_layer_output_det_sha256s: Vec<Option<String>>,
     projection_rows_per_tile: usize,
     attention_kv_rows_per_tile: usize,
+    output_source_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterDecodeTransitionInputRoots {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub transformer_decode_state: TransformerDecodeState,
+    pub selected_token_ref: RasterSelectedTokenRef,
+    pub decode_transition_source_name: String,
+    pub output_source_prefix: String,
+    pub raster_sizing: RasterSizingControls,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterDecodeTransitionOutputRefs {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub transition_result: TransformerDecodeStepResult,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -192,6 +216,34 @@ pub fn init_decode_transition_state(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<DecodeTransitionRasterState> {
+    let output_source_prefix = format!(
+        "decode.transition.position_{}.token_count_{}",
+        transformer_decode_state.position, transformer_decode_state.token_count
+    );
+    ArtifactIo::reset_store();
+    let roots = ArtifactIo::export_store_roots();
+    let (_, state) = init_decode_transition_state_with_roots(
+        store,
+        roots,
+        transformer_decode_state,
+        next_token,
+        source,
+        raster_sizing,
+        output_source_prefix,
+    )?;
+    Ok(state)
+}
+
+#[tile]
+pub fn init_decode_transition_state_with_roots(
+    store: &mut AuthenticatedRasterTensorStore,
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    transformer_decode_state: TransformerDecodeState,
+    next_token: u32,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
+    output_source_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
     validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
     let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
@@ -219,6 +271,11 @@ pub fn init_decode_transition_state(
             metadata.embedding_width
         );
     }
+    let (_activation_roots, decode_input_ref) = insert_decode_activation_row_with_roots(
+        &artifact_store_roots,
+        format!("{output_source_prefix}.input.selected_token_embedding"),
+        &embedded,
+    )?;
     let original_layer_caches = transformer_decode_state
         .layer_caches
         .iter()
@@ -228,22 +285,44 @@ pub fn init_decode_transition_state(
             register_decode_layer_cache(store, "decode.original.cache", layer_idx, cache)
         })
         .collect::<Result<Vec<_>>>()?;
+    artifact_store_roots = ArtifactIo::export_store_roots();
 
-    Ok(DecodeTransitionRasterState {
-        decode_input: embedded.clone(),
-        current_activation: embedded,
-        next_token,
-        position: transformer_decode_state.position,
-        token_count: transformer_decode_state.token_count,
-        next_layer_idx: 0,
-        layer_count: metadata.layer_count,
-        original_layer_caches,
-        updated_layer_caches: Vec::with_capacity(metadata.layer_count),
-        completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
-        completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
-        projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
-        attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
-    })
+    Ok((
+        artifact_store_roots.clone(),
+        DecodeTransitionRasterState {
+            artifact_store_roots,
+            decode_input_ref: decode_input_ref.clone(),
+            current_activation_ref: decode_input_ref,
+            next_token,
+            position: transformer_decode_state.position,
+            token_count: transformer_decode_state.token_count,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            original_layer_caches,
+            updated_layer_caches: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+            projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
+            attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
+            output_source_prefix,
+        },
+    ))
+}
+
+#[tile]
+fn read_decode_selected_token(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    selected_token_ref: &RasterSelectedTokenRef,
+) -> Result<u32> {
+    read_selected_token_from_roots(artifact_store_roots, selected_token_ref)
+}
+
+#[tile]
+fn read_decode_single_activation_row(
+    state: &DecodeTransitionRasterState,
+    activation_ref: &RasterActivationSequenceRef,
+) -> Result<RasterActivationRow> {
+    read_activation_row_from_ref_roots(&state.artifact_store_roots, activation_ref)
 }
 
 #[sequence(kind = recursive)]
@@ -266,11 +345,21 @@ pub fn compute_next_decode_layer(
         context.layer.kv_shared_layer_index,
         layer_idx = context.layer_idx
     ));
+    let decode_input = call_tile!(
+        read_decode_single_activation_row,
+        &state,
+        &state.decode_input_ref
+    )?;
+    let current_activation = call_tile!(
+        read_decode_single_activation_row,
+        &state,
+        &state.current_activation_ref
+    )?;
     let per_layer_input = call_seq!(
         compute_decode_ple_input,
         store,
         state.next_token,
-        &state.decode_input,
+        &decode_input,
         source,
         &context.layer,
         state.projection_rows_per_tile
@@ -278,7 +367,7 @@ pub fn compute_next_decode_layer(
     let (layer_output, updated_cache) = call_seq!(
         run_basic_decode_layer,
         store,
-        &state.current_activation,
+        &current_activation,
         source,
         &context.layer,
         context.cache_slot,
@@ -330,18 +419,30 @@ fn update_decode_layer_state(
     layer_output: RasterActivationRow,
     updated_cache: DecodeLayerCacheSlot,
 ) -> Result<DecodeTransitionRasterState> {
-    state.current_activation = layer_output;
+    state.artifact_store_roots = ArtifactIo::export_store_roots();
+    let (artifact_store_roots, current_activation_ref) = insert_decode_activation_row_with_roots(
+        &state.artifact_store_roots,
+        format!(
+            "{}.layer_{}.position_{}.output",
+            state.output_source_prefix, layer_idx, state.position
+        ),
+        &layer_output,
+    )?;
+    state.artifact_store_roots = artifact_store_roots;
+    state.current_activation_ref = current_activation_ref;
     state.updated_layer_caches.push(updated_cache);
-    let current_activation_values = state.current_activation.to_f32_values();
-    let current_activation_acts = state.current_activation.acts();
+    let current_activation_values = layer_output.to_f32_values();
+    let current_activation_acts = layer_output.acts();
     state.completed_layer_output_sha256s.push(
         crate::shared::transformer_kernels::build_vector_commitment(&current_activation_values),
     );
     state.completed_layer_output_det_sha256s.push(Some(
         crate::shared::transformer_kernels::build_det_vector_commitment(&current_activation_acts),
     ));
-    let decode_input_values = state.decode_input.to_f32_values();
-    let decode_input_acts = state.decode_input.acts();
+    let decode_input =
+        read_activation_row_from_ref_roots(&state.artifact_store_roots, &state.decode_input_ref)?;
+    let decode_input_values = decode_input.to_f32_values();
+    let decode_input_acts = decode_input.acts();
     let current_activation_sha256 = state
         .completed_layer_output_sha256s
         .last()
@@ -403,8 +504,12 @@ pub fn finalize_decode_layer_state(
         );
     }
 
-    let det_row = state.current_activation.acts();
-    let values = vec![state.current_activation.to_f32_values()];
+    let current_activation = read_activation_row_from_ref_roots(
+        &state.artifact_store_roots,
+        &state.current_activation_ref,
+    )?;
+    let det_row = current_activation.acts();
+    let values = vec![current_activation.to_f32_values()];
     let internal = InternalActivationSequence::from_det_values(vec![det_row.clone()]);
     let mut activation_state = ActivationSequence::from_internal(
         internal,
@@ -617,6 +722,68 @@ pub fn run(
         },
         layer_output.activation_state
     )
+}
+
+#[sequence]
+pub fn main(
+    input_roots: RasterDecodeTransitionInputRoots,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<RasterDecodeTransitionOutputRefs> {
+    if input_roots.decode_transition_source_name != source.identifier() {
+        bail!(
+            "raster decode transition source {} does not match input source {}",
+            source.identifier(),
+            input_roots.decode_transition_source_name
+        );
+    }
+    let next_token = call_tile!(
+        read_decode_selected_token,
+        &input_roots.artifact_store_roots,
+        &input_roots.selected_token_ref
+    )?;
+    let mut store = call_tile!(init_decode_transition_store);
+    let (_artifact_store_roots, state) = call_tile!(
+        init_decode_transition_state_with_roots,
+        &mut store,
+        input_roots.artifact_store_roots,
+        input_roots.transformer_decode_state.clone(),
+        next_token,
+        source,
+        input_roots.raster_sizing,
+        input_roots.output_source_prefix
+    )?;
+    let state = call_recur_seq!(compute_next_decode_layer, state, source, &mut store)?;
+    let layer_output = call_tile!(finalize_decode_layer_state, &store, state)?;
+    let normalized = call_tile!(
+        normalize_decode_final_position,
+        &layer_output.activation_state,
+        source
+    )?;
+    let logits_state = call_tile!(
+        init_decode_logits_projection,
+        &mut store,
+        normalized,
+        source,
+        input_roots.raster_sizing.projection_rows_per_tile
+    )?;
+    let logits_state =
+        call_recur_tile!(project_next_decode_logit, logits_state, source, &mut store)?;
+    let transition_result = call_tile!(
+        finalize_decode_transition_result,
+        &mut store,
+        logits_state,
+        TransformerDecodeState {
+            layer_caches: layer_output.layer_caches,
+            position: input_roots.transformer_decode_state.position,
+            token_count: input_roots.transformer_decode_state.token_count,
+        },
+        layer_output.activation_state
+    )?;
+    let artifact_store_roots = ArtifactIo::export_store_roots();
+    Ok(RasterDecodeTransitionOutputRefs {
+        artifact_store_roots,
+        transition_result,
+    })
 }
 
 #[sequence]
@@ -2384,6 +2551,41 @@ fn layer_cache_from_raster(cache: RasterKvCache) -> LayerKvCache {
     )
 }
 
+fn insert_decode_activation_row_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name: String,
+    row: &RasterActivationRow,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (roots, artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        roots,
+        RasterArtifactId::new(source_name.clone())?,
+        RasterArtifactMetadata::activation_rows(1, row.width())?,
+        vec![activation_row_leaf(row)],
+    )?;
+    let activation_ref = activation_sequence_ref_from_artifact(
+        RasterTensorId::new(source_name)?,
+        RasterActivationSequenceArtifactRef::new(artifact_ref)?,
+    )?;
+    Ok((roots, activation_ref))
+}
+
+fn read_activation_row_from_ref_roots(
+    roots: &RasterArtifactStoreRoots,
+    activation_ref: &RasterActivationSequenceRef,
+) -> Result<RasterActivationRow> {
+    let (row_count, _width) = activation_ref.tensor_ref().shape().sequence_metadata()?;
+    if row_count != 1 {
+        bail!("raster decode transition activation ref contains {row_count} rows, expected one");
+    }
+    read_sequence_row_from_roots(
+        roots,
+        RasterSequenceRowRequest {
+            tensor_ref: activation_ref.clone(),
+            row_idx: 0,
+        },
+    )
+}
+
 fn scale_row(row: &RasterActivationRow, scalar: Option<Act>) -> Result<RasterActivationRow> {
     first_row(
         scale_sequence(
@@ -2445,11 +2647,16 @@ mod tests {
     use super::{
         append_decode_kv_cache_ref, compute_next_decode_layer, finalize_decode_layer_state,
         init_decode_logits_projection, init_decode_transition_state, init_decode_transition_store,
-        materialize_decode_layer_cache_from_store, prepare_next_decode_layer_context,
-        register_decode_layer_cache, run, DecodeLayerCacheSlot,
+        main, materialize_decode_layer_cache_from_store, prepare_next_decode_layer_context,
+        register_decode_layer_cache, run, DecodeLayerCacheSlot, RasterDecodeTransitionInputRoots,
     };
+    use crate::shared::artifact_io::ArtifactIo;
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::input::InferenceExecutionMode;
+    use crate::shared::raster_artifact_store::{
+        token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
+        RasterSelectedTokenRef, RasterTokenIdSequenceRef,
+    };
     use crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource;
     use crate::shared::raster_row_store::RasterTensorId;
     use crate::shared::raster_transformer_kernels::{
@@ -2489,6 +2696,69 @@ mod tests {
             raster.transformer_decode_state,
             deterministic.transformer_decode_state
         );
+    }
+
+    #[test]
+    fn root_backed_main_reads_selected_token_ref() {
+        let (_path, model) = no_ple_model(false);
+        let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
+            .expect("source should build");
+        let decode_state = decode_state_with_cache(1);
+        let (roots, selected_token_ref) =
+            selected_token_ref("decode.transition.selected", 1).expect("selected token ref");
+
+        let raster = main(
+            RasterDecodeTransitionInputRoots {
+                artifact_store_roots: roots,
+                transformer_decode_state: decode_state.clone(),
+                selected_token_ref,
+                decode_transition_source_name: source.identifier().to_string(),
+                output_source_prefix: "decode.transition.root-backed".to_string(),
+                raster_sizing: raster_sizing(1),
+            },
+            &source,
+        )
+        .expect("root-backed raster decode should run")
+        .transition_result;
+        let deterministic = crate::decode_transition::run_with_mode(
+            decode_state,
+            1,
+            &model,
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("deterministic decode should run");
+
+        assert_eq!(raster.activation_state, deterministic.activation_state);
+        assert_eq!(raster.prefill_logits, deterministic.prefill_logits);
+        assert_eq!(
+            raster.transformer_decode_state,
+            deterministic.transformer_decode_state
+        );
+    }
+
+    #[test]
+    fn root_backed_main_rejects_missing_selected_token_root() {
+        let (_path, model) = no_ple_model(false);
+        let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
+            .expect("source should build");
+        let (_roots, selected_token_ref) =
+            selected_token_ref("decode.transition.missing.selected", 1)
+                .expect("selected token ref");
+
+        let error = main(
+            RasterDecodeTransitionInputRoots {
+                artifact_store_roots: RasterArtifactStoreRoots::default(),
+                transformer_decode_state: decode_state_with_cache(1),
+                selected_token_ref,
+                decode_transition_source_name: source.identifier().to_string(),
+                output_source_prefix: "decode.transition.missing".to_string(),
+                raster_sizing: raster_sizing(1),
+            },
+            &source,
+        )
+        .expect_err("missing selected-token root should fail");
+
+        assert!(error.to_string().contains("not present"));
     }
 
     #[test]
@@ -2559,8 +2829,13 @@ mod tests {
                 .expect("state should initialize");
         let encoded = serde_json::to_string(&state).expect("state should serialize");
 
+        assert!(encoded.contains("artifact_store_roots"));
+        assert!(encoded.contains("decode_input_ref"));
+        assert!(encoded.contains("current_activation_ref"));
         assert!(encoded.contains("original_layer_caches"));
         assert!(encoded.contains("Ref"));
+        assert!(!encoded.contains("decode_input_activation"));
+        assert!(!encoded.contains("current_activation\":["));
         assert!(!encoded.contains("\"keys\":[[["));
         assert!(!encoded.contains("\"values\":[[["));
 
@@ -2825,6 +3100,23 @@ mod tests {
             raster.transformer_decode_state,
             deterministic.transformer_decode_state
         );
+    }
+
+    fn selected_token_ref(
+        source_name: &str,
+        token_id: u32,
+    ) -> Result<(RasterArtifactStoreRoots, RasterSelectedTokenRef)> {
+        ArtifactIo::reset_store();
+        let roots = ArtifactIo::export_store_roots();
+        let (roots, artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+            &roots,
+            RasterArtifactId::new(source_name)?,
+            RasterArtifactMetadata::token_ids(1),
+            vec![token_id_leaf(token_id)],
+        )?;
+        let selected_token_ref =
+            RasterSelectedTokenRef::new(RasterTokenIdSequenceRef::new(artifact_ref)?)?;
+        Ok((roots, selected_token_ref))
     }
 
     fn no_ple_model(sliding: bool) -> (PathBuf, Gemma4TransformerModel) {

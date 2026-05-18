@@ -5,9 +5,9 @@ use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::input::InferenceExecutionMode;
 use crate::shared::output::DecodeState;
 use crate::shared::raster_artifact_store::{
-    activation_row_leaf, read_token_id_from_roots, token_id_leaf,
+    activation_row_leaf, read_token_id_from_ref_roots, token_id_leaf,
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
-    RasterArtifactStoreRoots,
+    RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
 use crate::shared::raster_row_store::{
     activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
@@ -40,6 +40,13 @@ pub fn run(
 }
 
 pub fn run_raster(decode_state: &mut DecodeState, max_new_tokens: usize) -> Result<Option<u32>> {
+    Ok(run_raster_refs(decode_state, max_new_tokens)?.map(|output| output.next_token))
+}
+
+pub fn run_raster_refs(
+    decode_state: &mut DecodeState,
+    max_new_tokens: usize,
+) -> Result<Option<raster_tiles::RasterDecodeSelectOutputRefs>> {
     if raster_tiles::check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens)
         .is_some()
     {
@@ -50,21 +57,17 @@ pub fn run_raster(decode_state: &mut DecodeState, max_new_tokens: usize) -> Resu
     let output =
         raster_tiles::main(input_roots)?.expect("stop condition should have returned earlier");
 
-    decode_state.full_token_ids = materialize_token_ids(
-        &output.artifact_store_roots,
-        output.full_token_ids_ref.root(),
-        output.full_token_ids_ref.token_count(),
-    )?;
+    decode_state.full_token_ids =
+        materialize_token_ids(&output.artifact_store_roots, &output.full_token_ids_ref)?;
     decode_state.generated_token_ids = materialize_token_ids(
         &output.artifact_store_roots,
-        output.generated_token_ids_ref.root(),
-        output.generated_token_ids_ref.token_count(),
+        &output.generated_token_ids_ref,
     )?;
     crate::trace::trace_checkpoint(
         "decode.select_token",
         &decode_select_checkpoint_state(decode_state, output.next_token, max_new_tokens)?,
     );
-    Ok(Some(output.next_token))
+    Ok(Some(output))
 }
 
 pub fn run_raster_with_roots(
@@ -112,6 +115,7 @@ fn prepare_raster_decode_select_input_roots(
         output_generated_token_ids_source_name: format!(
             "{source_prefix}.output.generated_token_ids"
         ),
+        output_selected_token_source_name: format!("{source_prefix}.output.selected_token"),
     })
 }
 
@@ -165,12 +169,11 @@ fn insert_logits_artifact_with_roots(
 
 fn materialize_token_ids(
     artifact_store_roots: &RasterArtifactStoreRoots,
-    token_ids_root: &str,
-    token_count: usize,
+    token_ids_ref: &RasterTokenIdSequenceRef,
 ) -> Result<Vec<u32>> {
-    (0..token_count)
+    (0..token_ids_ref.token_count())
         .map(|token_idx| {
-            read_token_id_from_roots(artifact_store_roots, token_ids_root, token_count, token_idx)
+            read_token_id_from_ref_roots(artifact_store_roots, token_ids_ref, token_idx)
         })
         .collect()
 }
