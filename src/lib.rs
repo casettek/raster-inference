@@ -804,7 +804,7 @@ mod tests {
     use crate::shared::raster_transformer_kernels::RasterActivationSequence;
     use crate::shared::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4LayerMatrixSource, GemmaEmbeddingTensorSource,
-        InternalActivationSequence,
+        InternalActivationSequence, InternalLogits,
     };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -1198,6 +1198,44 @@ mod tests {
         assert_eq!(
             checkpoint_commitments(&deterministic_payload, "prefill.finalize"),
             checkpoint_commitments(&raster_payload, "prefill.finalize")
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_decode_select_checkpoint_commitment_matches_raster() {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let det_logits = vec![Act::from_bits(2), Act::from_bits(5), Act::from_bits(3)];
+        let internal_logits = InternalLogits::from_det_values(det_logits);
+
+        let deterministic_payload = crate::trace::with_checkpointing_enabled(true, || {
+            crate::trace::start_inference_trace(&json!({ "test": "deterministic-decode-select" }));
+            let mut decode_state = DecodeState::new(
+                vec![7],
+                internal_logits.clone_f32(),
+                crate::shared::transformer::TransformerDecodeState::default(),
+            );
+            decode_state.set_internal_logits(internal_logits.clone());
+            run_decode_select_token(&mut decode_state, 1, InferenceExecutionMode::Deterministic)
+                .expect("deterministic decode select should run");
+            crate::trace::checkpoint_payload_for_tests()
+        });
+
+        let raster_payload = crate::trace::with_checkpointing_enabled(true, || {
+            crate::trace::start_inference_trace(&json!({ "test": "raster-decode-select" }));
+            let mut decode_state = DecodeState::new(
+                vec![7],
+                internal_logits.clone_f32(),
+                crate::shared::transformer::TransformerDecodeState::default(),
+            );
+            decode_state.set_internal_logits(internal_logits.clone());
+            crate::decode_select_token::run_raster(&mut decode_state, 1)
+                .expect("raster decode select should run");
+            crate::trace::checkpoint_payload_for_tests()
+        });
+
+        assert_eq!(
+            checkpoint_commitments(&deterministic_payload, "decode.select_token"),
+            checkpoint_commitments(&raster_payload, "decode.select_token")
         );
     }
 

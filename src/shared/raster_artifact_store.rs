@@ -1139,6 +1139,50 @@ pub fn verify_artifact_read(
     )
 }
 
+pub fn token_id_leaf(token_id: u32) -> Vec<u8> {
+    token_id.to_le_bytes().to_vec()
+}
+
+pub fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
+    if payload.len() != 4 {
+        bail!("token-id leaf payload must be exactly four bytes");
+    }
+    Ok(u32::from_le_bytes(
+        payload.try_into().expect("payload length checked above"),
+    ))
+}
+
+pub fn token_ids_ref_for_root(
+    roots: &RasterArtifactStoreRoots,
+    token_ids_root: &str,
+    token_count: usize,
+) -> Result<RasterTokenIdSequenceRef> {
+    roots.artifact_entry_for_root(token_ids_root)?;
+    let token_ids_ref = RasterTokenIdSequenceRef::new(artifact_ref_for_root(token_ids_root)?)?;
+    if token_ids_ref.token_count() != token_count {
+        bail!(
+            "token-id artifact {token_ids_root} contains {} tokens, expected {token_count}",
+            token_ids_ref.token_count()
+        );
+    }
+    Ok(token_ids_ref)
+}
+
+pub fn read_token_id_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    token_ids_root: &str,
+    token_count: usize,
+    token_idx: usize,
+) -> Result<u32> {
+    if token_idx >= token_count {
+        bail!("token-id index {token_idx} is out of range for {token_count} tokens");
+    }
+    let token_ids_ref = token_ids_ref_for_root(roots, token_ids_root, token_count)?;
+    let read = read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
+    verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
+    decode_token_id_leaf(read.payload())
+}
+
 pub fn activation_row_leaf(row: &RasterActivationRow) -> Vec<u8> {
     let mut payload = Vec::with_capacity(8 + row.width() * std::mem::size_of::<i32>());
     payload.extend_from_slice(&(row.width() as u64).to_le_bytes());
@@ -1536,6 +1580,45 @@ mod tests {
             materialize_token_ids(&store, &token_ref).expect("materialize"),
             vec![17, 23]
         );
+    }
+
+    #[test]
+    fn roots_aware_token_id_read_fails_closed() {
+        reset_artifact_store();
+        let roots = artifact_store_roots_snapshot();
+        let (roots, builder) = start_builder_with_roots(
+            &roots,
+            artifact_id("roots.tokens"),
+            RasterArtifactMetadata::token_ids(1),
+        )
+        .expect("builder should start");
+        let (roots, builder_root) = append_leaf_by_builder_root_with_roots(
+            &roots,
+            builder.running_root(),
+            0,
+            token_id_leaf(42),
+        )
+        .expect("token should append");
+        let (roots, token_ref) = finalize_builder_by_root_with_roots(&roots, &builder_root)
+            .expect("token builder should finalize");
+
+        assert_eq!(
+            read_token_id_from_roots(&roots, token_ref.root(), 1, 0).expect("token should read"),
+            42
+        );
+        assert!(read_token_id_from_roots(
+            &RasterArtifactStoreRoots::default(),
+            token_ref.root(),
+            1,
+            0
+        )
+        .expect_err("missing root should fail")
+        .to_string()
+        .contains("not present"));
+        assert!(read_token_id_from_roots(&roots, token_ref.root(), 1, 1)
+            .expect_err("out-of-range token should fail")
+            .to_string()
+            .contains("out of range"));
     }
 
     #[test]
