@@ -141,6 +141,17 @@ When `--deterministic` is set, the model path must point to either:
 - a directory containing `config.json` and `model.detwgt`
 - a direct path to a `model.detwgt` file with a sibling `config.json`
 
+For faster development runs, generate a tiny representative Gemma-style bundle:
+
+```bash
+cargo run --bin tiny-gemma-dev -- --output-dir assets/tiny-gemma-dev --force
+```
+
+The generated bundle includes `config.json`, `model.safetensors`, `model.detwgt`,
+`tokenizer.json`, and `chat_template.jinja`. It keeps the deterministic `Wgt`
+artifact format while shrinking the model to tiny PLE-enabled layers with a
+small Gemma-compatible BPE tokenizer.
+
 This Phase 1 deterministic path is a **converted-weight parity path** with a canonical-state runtime core. It requires `.detwgt` provenance, loads canonical `Wgt` bytes from `model.detwgt`, keeps deterministic KV cache rows and layer activations in canonical `Act` form across deterministic prefill/decode boundaries, and converts config-derived scalars once into canonical `Act`/`Acc` carriers. The existing `f32` fields remain compatibility views for public API and JSON consumers.
 
 Deterministic checkpoints may include optional `det_*_sha256` fields next to the compatibility hashes. Compatibility fields such as `activations_sha256`, `final_logits_sha256`, and serialized `layer_caches` still describe the public f32 views; `det_*` fields describe canonical fixed-point bytes and are omitted when deterministic internals are not present.

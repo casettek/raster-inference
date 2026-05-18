@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::shared::output::DecodeState;
 use crate::shared::{
@@ -20,26 +20,14 @@ pub fn run(
         return Ok(None);
     }
 
-    let next_token =
-        tiles::select_next_token_internal(&decode_state.clone_internal_logits(), execution_mode)?;
+    let logits = decode_state.clone_internal_logits();
+    let next_token = tiles::select_next_token_internal(&logits, execution_mode)?;
     decode_state.full_token_ids = tiles::append_token(&decode_state.full_token_ids, next_token);
     decode_state.generated_token_ids =
         tiles::append_token(&decode_state.generated_token_ids, next_token);
     crate::trace::trace_checkpoint(
         "decode.select_token",
-        &json!({
-            "full_token_ids": decode_state.full_token_ids.clone(),
-            "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
-            "generated_token_ids": decode_state.generated_token_ids.clone(),
-            "generated_token_ids_sha256": crate::output_finalize::tiles::build_output_decode_commitment(&decode_state.generated_token_ids)?,
-            "current_logits": decode_state.current_logits.clone(),
-            "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
-            "selected_next_token": next_token,
-            "decode_position": decode_state.transformer_decode_state.position,
-            "decode_token_count": decode_state.transformer_decode_state.token_count,
-            "layer_caches": crate::trace::serialize_layer_caches(&decode_state.transformer_decode_state.layer_caches),
-            "max_new_tokens": max_new_tokens,
-        }),
+        &decode_select_checkpoint_state(decode_state, next_token, max_new_tokens)?,
     );
     Ok(Some(next_token))
 }
@@ -71,22 +59,29 @@ pub fn run_raster(decode_state: &mut DecodeState, max_new_tokens: usize) -> Resu
     decode_state.generated_token_ids = output.generated_token_ids;
     crate::trace::trace_checkpoint(
         "decode.select_token",
-        &json!({
-            "full_token_ids": decode_state.full_token_ids.clone(),
-            "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
-            "generated_token_ids": decode_state.generated_token_ids.clone(),
-            "generated_token_ids_sha256": crate::output_finalize::tiles::build_output_decode_commitment(&decode_state.generated_token_ids)?,
-            "current_logits": decode_state.current_logits.clone(),
-            "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
-            "det_current_logits_sha256": output.det_current_logits_sha256,
-            "selected_next_token": output.next_token,
-            "decode_position": decode_state.transformer_decode_state.position,
-            "decode_token_count": decode_state.transformer_decode_state.token_count,
-            "layer_caches": crate::trace::serialize_layer_caches(&decode_state.transformer_decode_state.layer_caches),
-            "max_new_tokens": max_new_tokens,
-        }),
+        &decode_select_checkpoint_state(decode_state, output.next_token, max_new_tokens)?,
     );
     Ok(Some(output.next_token))
+}
+
+fn decode_select_checkpoint_state(
+    decode_state: &DecodeState,
+    selected_next_token: u32,
+    max_new_tokens: usize,
+) -> Result<Value> {
+    Ok(json!({
+        "full_token_ids": decode_state.full_token_ids.clone(),
+        "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
+        "generated_token_ids": decode_state.generated_token_ids.clone(),
+        "generated_token_ids_sha256": crate::output_finalize::tiles::build_output_decode_commitment(&decode_state.generated_token_ids)?,
+        "current_logits": decode_state.current_logits.clone(),
+        "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
+        "selected_next_token": selected_next_token,
+        "decode_position": decode_state.transformer_decode_state.position,
+        "decode_token_count": decode_state.transformer_decode_state.token_count,
+        "layer_caches": crate::trace::serialize_layer_caches(&decode_state.transformer_decode_state.layer_caches),
+        "max_new_tokens": max_new_tokens,
+    }))
 }
 
 #[cfg(test)]

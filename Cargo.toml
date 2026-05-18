@@ -11,6 +11,10 @@ path = "tools/gemma-fp32-converter/main.rs"
 name = "gemma-det-num-wgt-converter"
 path = "tools/gemma-det-num-wgt-converter/main.rs"
 
+[[bin]]
+name = "tiny-gemma-dev"
+path = "tools/tiny-gemma-dev/main.rs"
+
 [dependencies]
 anyhow = "1"
 fixed = "1.30.0"
