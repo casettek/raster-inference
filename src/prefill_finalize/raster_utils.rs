@@ -1,28 +1,41 @@
-use anyhow::{anyhow, Result};
+use anyhow::{bail, Result};
 use serde_json::json;
 
-use crate::shared::raster_row_store::{
-    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterTensorId,
+use crate::prefill_finalize::raster_tiles::{
+    RasterPrefillFinalizeRefs, PREFILL_LOGITS_ARTIFACT_NAME,
 };
-use crate::shared::raster_transformer_kernels::RasterActivationSequence;
+use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
+use crate::shared::raster_row_store::{
+    read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
+};
 use crate::shared::transformer::{
-    ActivationSequence, LayerKvCache, PrefillLogits, TransformerDecodeState,
+    ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerDecodeState,
     TransformerPrefillResult, TransformerStateTransitionState,
 };
 
-pub fn import_materialized_final_hidden_states(
-    store: &mut AuthenticatedRasterTensorStore,
-    final_hidden_states: &ActivationSequence,
-) -> Result<RasterActivationSequenceRef> {
-    // Compatibility bridge for public/dev callers that still hold full final
-    // hidden states. Projection still enters the ref-backed tile path.
-    let internal = final_hidden_states.clone_internal();
-    let det_rows = internal.det_values().ok_or_else(|| {
-        anyhow!("deterministic raster prefill finalize requires canonical final hidden activations")
-    })?;
-    store.insert_activation_sequence(
-        RasterTensorId::new("prefill.finalize.final_hidden_states")?,
-        RasterActivationSequence::from_acts(det_rows.to_vec()),
+pub fn build_prefill_result_from_root_refs(
+    roots: &RasterArtifactStoreRoots,
+    refs: &RasterPrefillFinalizeRefs,
+) -> Result<TransformerPrefillResult> {
+    let layer_refs = crate::prefill_layer::raster_tiles::PrefillLayerOutputRefs {
+        final_hidden_states_ref: refs.final_hidden_states_ref.clone(),
+        layer_caches: refs.layer_caches.clone(),
+    };
+    let (final_hidden_states, layer_caches) =
+        crate::prefill_layer::materialize_prefill_layer_output_refs_from_roots(roots, &layer_refs)?;
+    let det_logits = materialize_prefill_logits_from_roots(roots, &refs.logits_ref)?;
+    let internal_logits = InternalLogits::from_det_values(det_logits.clone());
+    let final_logits_sha256 =
+        crate::shared::transformer_kernels::build_vector_commitment(internal_logits.as_f32_slice());
+    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
+    prefill_logits.det_final_logits_sha256 =
+        Some(crate::shared::transformer_kernels::build_det_vector_commitment(&det_logits));
+
+    build_prefill_result(
+        refs.prompt_token_count,
+        final_hidden_states,
+        layer_caches,
+        prefill_logits,
     )
 }
 
@@ -59,4 +72,35 @@ pub fn build_prefill_result(
             prefill_logits,
         },
     })
+}
+
+fn materialize_prefill_logits_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    logits_ref: &RasterActivationSequenceRef,
+) -> Result<Vec<crate::shared::det_num::Act>> {
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    if width != 1 {
+        bail!(
+            "raster prefill logits artifact width {width}, expected 1 for {PREFILL_LOGITS_ARTIFACT_NAME}"
+        );
+    }
+    let mut logits = Vec::with_capacity(row_count);
+    for row_idx in 0..row_count {
+        let row = read_sequence_row_from_roots(
+            roots,
+            RasterSequenceRowRequest {
+                tensor_ref: logits_ref.clone(),
+                row_idx,
+            },
+        )?;
+        let acts = row.acts();
+        let [logit] = acts.as_slice() else {
+            bail!(
+                "raster prefill logit row {row_idx} has width {}",
+                acts.len()
+            );
+        };
+        logits.push(*logit);
+    }
+    Ok(logits)
 }

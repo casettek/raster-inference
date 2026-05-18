@@ -522,7 +522,7 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let (_layer_roots, layer_refs) =
+                    let (layer_roots, layer_refs) =
                         prefill_layer::run_raster_refs_from_input_embedding(
                             layer_roots,
                             input_embedding_refs,
@@ -545,11 +545,9 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let mut raster_prefill_store =
-                        crate::shared::raster_row_store::AuthenticatedRasterTensorStore::artifact_backed();
-                    prefill_finalize::run_raster_refs_with_store(
-                        &mut raster_prefill_store,
-                        &prompt_preparation.prompt_token_ids,
+                    prefill_finalize::run_raster_refs_with_roots(
+                        layer_roots,
+                        prompt_preparation.prompt_token_ids.len(),
                         &finalize_source,
                         layer_refs.final_hidden_states_ref,
                         layer_refs.layer_caches,
@@ -800,6 +798,7 @@ mod tests {
     };
     use crate::shared::det_num::{f32_to_acc, Act, Wgt};
     use crate::shared::gemma_tokenizer::GemmaAddedToken;
+    use crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource;
     use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
     use crate::shared::raster_row_store::insert_activation_sequence_artifact_ref;
     use crate::shared::raster_transformer_kernels::RasterActivationSequence;
@@ -1099,6 +1098,106 @@ mod tests {
         assert_eq!(
             checkpoint_commitments(&deterministic_payload, "prefill.layer"),
             checkpoint_commitments(&raster_payload, "prefill.layer")
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_prefill_finalize_checkpoint_commitment_matches_raster() {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let token_ids = vec![1, 2];
+        let input_rows = vec![
+            vec![
+                Act::from_num(1.0),
+                Act::from_num(0.0),
+                Act::from_num(0.0),
+                Act::from_num(0.0),
+            ],
+            vec![
+                Act::from_num(0.0),
+                Act::from_num(1.0),
+                Act::from_num(0.0),
+                Act::from_num(0.0),
+            ],
+        ];
+
+        let deterministic_payload = crate::trace::with_checkpointing_enabled(true, || {
+            crate::trace::start_inference_trace(
+                &json!({ "test": "deterministic-prefill-finalize" }),
+            );
+            let (final_hidden_states, layer_caches) = crate::prefill_layer::run_with_mode_internal(
+                InternalActivationSequence::from_det_values(input_rows.clone()),
+                &transformer_fixture.model,
+                None,
+                InferenceExecutionMode::Deterministic,
+            )
+            .expect("deterministic prefill layer should run");
+            crate::prefill_finalize::run(
+                &token_ids,
+                &transformer_fixture.model,
+                final_hidden_states,
+                layer_caches,
+                InferenceExecutionMode::Deterministic,
+            )
+            .expect("deterministic prefill finalize should run");
+            crate::trace::checkpoint_payload_for_tests()
+        });
+
+        crate::shared::artifact_io::ArtifactIo::reset_store();
+        let input_ref = insert_activation_sequence_artifact_ref(
+            "test.prefill.finalize.input_embedding",
+            RasterActivationSequence::from_acts(input_rows),
+        )
+        .expect("input embedding activation ref");
+        let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
+            artifact_store_roots: crate::shared::artifact_io::ArtifactIo::export_store_roots(),
+            source_id: "embedding-fixture".to_string(),
+            embedding_source_root: "embedding-root".to_string(),
+            prompt_token_ids_root: "token-root".to_string(),
+            prompt_token_count: input_ref.row_count(),
+            embedded_prompt_activations_ref: input_ref,
+        };
+        let layer_source = AuthenticatedGemmaPrefillLayerSource::from_model(
+            "prefill-finalize-layer",
+            &transformer_fixture.model,
+        )
+        .expect("prefill layer source");
+        let finalize_source = AuthenticatedGemmaPrefillFinalizeSource::from_model(
+            "prefill-finalize",
+            &transformer_fixture.model,
+        )
+        .expect("prefill finalize source");
+        let raster_payload = crate::trace::with_checkpointing_enabled(true, || {
+            crate::trace::start_inference_trace(&json!({ "test": "raster-prefill-finalize" }));
+            let (layer_roots, layer_refs) =
+                crate::prefill_layer::run_raster_refs_from_input_embedding(
+                    input_embedding_refs.artifact_store_roots.clone(),
+                    &input_embedding_refs,
+                    &layer_source,
+                    None,
+                    InferenceControls::default()
+                        .raster_sizing_controls()
+                        .expect("default sizing"),
+                )
+                .expect("raster prefill layer should run");
+            crate::prefill_finalize::run_raster_refs_with_roots(
+                layer_roots,
+                token_ids.len(),
+                &finalize_source,
+                layer_refs.final_hidden_states_ref,
+                layer_refs.layer_caches,
+                InferenceControls::default()
+                    .raster_sizing_controls()
+                    .expect("default sizing")
+                    .projection_rows_per_tile,
+            )
+            .expect("raster prefill finalize should run");
+            crate::trace::checkpoint_payload_for_tests()
+        });
+
+        assert_eq!(
+            checkpoint_commitments(&deterministic_payload, "prefill.finalize"),
+            checkpoint_commitments(&raster_payload, "prefill.finalize")
         );
     }
 

@@ -1,16 +1,25 @@
-use std::sync::Arc;
+use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
+use serde::Serialize;
 
 use crate::shared::artifact_io::AuthRead;
 use crate::shared::det_num::{Acc, Act, Wgt};
+use crate::shared::external_artifacts::{
+    register_external_source_leaves, CommittedExternalSource, ExternalSourceId, ExternalSourceRef,
+};
 use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
 use crate::shared::transformer::{
     DetNumMatrix, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource,
 };
 
-#[derive(Debug, Clone)]
+const GEMMA_PREFILL_FINALIZE_SOURCE_KIND: &str = "gemma_prefill_finalize";
+const GEMMA_PREFILL_FINALIZE_SOURCE_DOMAIN: &str =
+    "raster-external-source-gemma-prefill-finalize-merkle-v1";
+const GEMMA_PREFILL_FINALIZE_SOURCE_CHUNK_BYTES: usize = 1 << 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedGemmaPrefillFinalizeSource {
     identifier: String,
     metadata: GemmaPrefillFinalizeMetadata,
@@ -19,9 +28,29 @@ pub struct AuthenticatedGemmaPrefillFinalizeSource {
     projection: GemmaPrefillFinalizeProjectionBacking,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum GemmaPrefillFinalizeProjectionBacking {
     Matrix(Arc<DetNumMatrix>),
+}
+
+#[derive(Serialize)]
+struct GemmaPrefillFinalizeSourcePayload<'a> {
+    identifier: &'a str,
+    metadata: &'a GemmaPrefillFinalizeMetadata,
+    final_norm_weight_bits: Vec<i32>,
+    rms_norm_eps_bits: i64,
+    final_logit_softcapping_bits: Option<i32>,
+    projection: GemmaPrefillFinalizeSourcePayloadProjection,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GemmaPrefillFinalizeSourcePayloadProjection {
+    Matrix {
+        rows: usize,
+        cols: usize,
+        values: Vec<i32>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -117,6 +146,49 @@ impl AuthenticatedGemmaPrefillFinalizeSource {
     pub fn identifier(&self) -> &str {
         &self.identifier
     }
+
+    pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
+        let source_ref = register_external_source_leaves(
+            ExternalSourceId::new(format!("prefill-finalize:{}", self.identifier))?,
+            GEMMA_PREFILL_FINALIZE_SOURCE_KIND,
+            GEMMA_PREFILL_FINALIZE_SOURCE_DOMAIN,
+            source_payload_chunks(&self.source_payload()),
+        )?;
+        register_native_committed_prefill_finalize(source_ref.root(), self)?;
+        Ok(source_ref)
+    }
+
+    pub fn committed_source(&self) -> Result<CommittedExternalSource> {
+        Ok(CommittedExternalSource::new(self.committed_source_ref()?))
+    }
+
+    fn source_payload(&self) -> Vec<u8> {
+        let projection = match &self.projection {
+            GemmaPrefillFinalizeProjectionBacking::Matrix(matrix) => {
+                GemmaPrefillFinalizeSourcePayloadProjection::Matrix {
+                    rows: matrix.rows,
+                    cols: matrix.cols,
+                    values: matrix.values.clone(),
+                }
+            }
+        };
+        serde_json::to_vec(&GemmaPrefillFinalizeSourcePayload {
+            identifier: &self.identifier,
+            metadata: &self.metadata,
+            final_norm_weight_bits: self
+                .final_norm_weights
+                .iter()
+                .map(|value| value.to_bits())
+                .collect(),
+            rms_norm_eps_bits: self.scalars.rms_norm_eps.to_bits(),
+            final_logit_softcapping_bits: self
+                .scalars
+                .final_logit_softcapping
+                .map(|value| value.to_bits()),
+            projection,
+        })
+        .expect("canonical prefill finalize source payload should serialize")
+    }
 }
 
 impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for AuthenticatedGemmaPrefillFinalizeSource {
@@ -155,6 +227,107 @@ impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest>
             }
         }
     }
+}
+
+impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for CommittedExternalSource {
+    type Output = GemmaPrefillFinalizeMetadata;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeMetadataRequest) -> Result<Self::Output> {
+        with_native_committed_prefill_finalize(self.root(), |source| source.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for CommittedExternalSource {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeNormWeightsRequest) -> Result<Self::Output> {
+        with_native_committed_prefill_finalize(self.root(), |source| source.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for CommittedExternalSource {
+    type Output = GemmaPrefillFinalizeScalars;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeScalarsRequest) -> Result<Self::Output> {
+        with_native_committed_prefill_finalize(self.root(), |source| source.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest> for CommittedExternalSource {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeProjectionRowRequest) -> Result<Self::Output> {
+        with_native_committed_prefill_finalize(self.root(), |source| source.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for str {
+    type Output = GemmaPrefillFinalizeMetadata;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeMetadataRequest) -> Result<Self::Output> {
+        with_native_committed_prefill_finalize(self, |source| source.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for str {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeNormWeightsRequest) -> Result<Self::Output> {
+        with_native_committed_prefill_finalize(self, |source| source.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for str {
+    type Output = GemmaPrefillFinalizeScalars;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeScalarsRequest) -> Result<Self::Output> {
+        with_native_committed_prefill_finalize(self, |source| source.auth_read(request))
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest> for str {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeProjectionRowRequest) -> Result<Self::Output> {
+        with_native_committed_prefill_finalize(self, |source| source.auth_read(request))
+    }
+}
+
+thread_local! {
+    static NATIVE_COMMITTED_PREFILL_FINALIZE_SOURCES: RefCell<HashMap<String, AuthenticatedGemmaPrefillFinalizeSource>> =
+        RefCell::new(HashMap::new());
+}
+
+fn register_native_committed_prefill_finalize(
+    root: &str,
+    source: &AuthenticatedGemmaPrefillFinalizeSource,
+) -> Result<()> {
+    NATIVE_COMMITTED_PREFILL_FINALIZE_SOURCES.with(|sources_ref| {
+        let mut sources = sources_ref.borrow_mut();
+        match sources.get(root) {
+            Some(existing) if existing != source => {
+                bail!("committed prefill finalize root {root} is already registered with different data")
+            }
+            Some(_) => Ok(()),
+            None => {
+                sources.insert(root.to_string(), source.clone());
+                Ok(())
+            }
+        }
+    })
+}
+
+fn with_native_committed_prefill_finalize<T>(
+    root: &str,
+    f: impl FnOnce(&AuthenticatedGemmaPrefillFinalizeSource) -> Result<T>,
+) -> Result<T> {
+    NATIVE_COMMITTED_PREFILL_FINALIZE_SOURCES.with(|sources_ref| {
+        let sources = sources_ref.borrow();
+        let source = sources.get(root).ok_or_else(|| {
+            anyhow!("committed prefill finalize root {root} is not registered natively")
+        })?;
+        f(source)
+    })
 }
 
 fn validate_identifier(identifier: String) -> Result<String> {
@@ -249,6 +422,13 @@ fn matrix_row_wgts(matrix: &DetNumMatrix, row_idx: usize, label: &str) -> Result
     det_num_matrix_row_wgts(matrix, row_idx, label)
 }
 
+fn source_payload_chunks(payload: &[u8]) -> Vec<Vec<u8>> {
+    payload
+        .chunks(GEMMA_PREFILL_FINALIZE_SOURCE_CHUNK_BYTES)
+        .map(|chunk| chunk.to_vec())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -299,6 +479,56 @@ mod tests {
         )
         .expect("projection row should read");
         assert_eq!(row, vec![Wgt::from_num(0.0), Wgt::from_num(1.0)]);
+    }
+
+    #[test]
+    fn committed_source_root_reads_metadata_scalars_norm_and_projection_rows() {
+        let model = untied_model();
+        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("committed", &model)
+            .expect("source should build");
+        let committed = source.committed_source().expect("source should commit");
+        let root = committed.root().to_string();
+
+        let direct_metadata = crate::auth_read!(&source, GemmaPrefillFinalizeMetadataRequest)
+            .expect("direct metadata should read");
+        let committed_metadata =
+            crate::auth_read!(root.as_str(), GemmaPrefillFinalizeMetadataRequest)
+                .expect("committed metadata should read");
+        assert_eq!(committed_metadata, direct_metadata);
+        assert_eq!(
+            crate::auth_read!(&committed, GemmaPrefillFinalizeNormWeightsRequest)
+                .expect("committed norm should read"),
+            vec![Wgt::from_num(1.0), Wgt::from_num(0.5)]
+        );
+        assert_eq!(
+            crate::auth_read!(
+                root.as_str(),
+                GemmaPrefillFinalizeProjectionRowRequest { row_idx: 1 },
+            )
+            .expect("committed projection row should read"),
+            vec![Wgt::from_num(0.0), Wgt::from_num(1.0)]
+        );
+        assert!(crate::auth_read!(
+            "missing-prefill-finalize-root",
+            GemmaPrefillFinalizeScalarsRequest
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn committed_source_rejects_same_id_with_different_data() {
+        let source =
+            AuthenticatedGemmaPrefillFinalizeSource::from_model("conflict", &untied_model())
+                .expect("source should build");
+        source
+            .committed_source_ref()
+            .expect("first source should commit");
+        let mut model = untied_model();
+        model.final_norm_weight_det = Some(vec![Wgt::from_num(2.0), Wgt::from_num(0.5)]);
+        let conflicting = AuthenticatedGemmaPrefillFinalizeSource::from_model("conflict", &model)
+            .expect("conflicting source should build");
+
+        assert!(conflicting.committed_source_ref().is_err());
     }
 
     #[test]

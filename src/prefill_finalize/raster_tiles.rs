@@ -1,97 +1,111 @@
 use anyhow::{anyhow, bail, Result};
 
-use super::raster_utils::{build_prefill_result, import_materialized_final_hidden_states};
+use super::raster_utils::build_prefill_result_from_root_refs;
 use crate::raster_authoring::prelude::{auth_read, call_recur_tile, call_tile, sequence, tile};
 use crate::shared::det_num::{softcap_act, Act};
+use crate::shared::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
 use crate::shared::raster_prefill_finalize::{
-    AuthenticatedGemmaPrefillFinalizeSource, GemmaPrefillFinalizeMetadataRequest,
-    GemmaPrefillFinalizeNormWeightsRequest, GemmaPrefillFinalizeProjectionRowRequest,
-    GemmaPrefillFinalizeScalarsRequest,
+    GemmaPrefillFinalizeMetadataRequest, GemmaPrefillFinalizeNormWeightsRequest,
+    GemmaPrefillFinalizeProjectionRowRequest, GemmaPrefillFinalizeScalarsRequest,
 };
 use crate::shared::raster_row_store::{
-    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterProjectionOutputBuilderRef,
-    RasterSequenceRowRequest, RasterTensorId,
+    append_sequence_row_by_source_name_with_roots,
+    finalize_sequence_builder_by_source_name_with_roots, read_sequence_row_from_roots,
+    start_sequence_builder_with_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
+    RasterTensorId,
 };
 use crate::shared::raster_transformer_kernels::{
     project_row_with_weights, rms_norm_sequence, validate_projection_rows_per_tile,
     RasterActivationRow, RasterActivationSequence,
 };
-use crate::shared::transformer::{
-    ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerPrefillResult,
-};
+use crate::shared::transformer::TransformerPrefillResult;
+
+pub const NORMALIZED_FINAL_POSITION_ARTIFACT_NAME: &str =
+    "prefill.finalize.normalized_final_position";
+pub const PREFILL_LOGITS_ARTIFACT_NAME: &str = "prefill.finalize.logits";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterPrefillFinalizeInputRoots {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub prompt_token_count: usize,
+    pub finalize_source_root: String,
+    pub final_hidden_states_ref: RasterActivationSequenceRef,
+    pub layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
+    pub projection_rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterPrefillFinalizeRefs {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub source_id: String,
+    pub finalize_source_root: String,
+    pub prompt_token_count: usize,
+    pub final_hidden_states_ref: RasterActivationSequenceRef,
+    pub layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
+    pub normalized_final_position_ref: RasterActivationSequenceRef,
+    pub logits_ref: RasterActivationSequenceRef,
+    pub logit_count: usize,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillFinalizeRasterState {
-    normalized_final_position: RasterActivationRow,
+    artifact_store_roots: RasterArtifactStoreRoots,
+    source_id: String,
+    finalize_source_root: String,
+    prompt_token_count: usize,
+    final_hidden_states_ref: RasterActivationSequenceRef,
+    normalized_final_position_ref: Option<RasterActivationSequenceRef>,
     next_logit_idx: usize,
     logit_count: usize,
-    output_builder_ref: RasterProjectionOutputBuilderRef,
+    hidden_width: usize,
     softcap_bits: Option<i32>,
     projection_rows_per_tile: usize,
 }
 
-#[tile]
-pub fn init_prefill_finalize_store() -> AuthenticatedRasterTensorStore {
-    AuthenticatedRasterTensorStore::new()
+impl PrefillFinalizeRasterState {
+    fn is_complete(&self) -> bool {
+        self.next_logit_idx >= self.logit_count
+    }
 }
 
 #[tile]
-pub fn select_final_position_ref(
-    store: &AuthenticatedRasterTensorStore,
+pub fn init_prefill_finalize_state(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    prompt_token_count: usize,
+    finalize_source_root: String,
     final_hidden_states_ref: RasterActivationSequenceRef,
-) -> Result<RasterActivationRow> {
-    let (row_count, _) = final_hidden_states_ref
+    layer_caches: &[crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot],
+    projection_rows_per_tile: usize,
+) -> Result<PrefillFinalizeRasterState> {
+    validate_projection_rows_per_tile(projection_rows_per_tile)?;
+    if prompt_token_count == 0 {
+        bail!("raster prefill finalize requires at least one prompt token");
+    }
+    let (row_count, hidden_width) = final_hidden_states_ref
         .tensor_ref()
         .shape()
         .sequence_metadata()?;
     if row_count == 0 {
         bail!("transformer final-position selection requires at least one activation row");
     }
-    auth_read!(
-        store,
-        RasterSequenceRowRequest {
-            tensor_ref: final_hidden_states_ref,
-            row_idx: row_count - 1,
-        }
-    )
-}
-
-#[tile]
-pub fn normalize_final_position(
-    final_position: RasterActivationRow,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
-) -> Result<RasterActivationRow> {
-    let norm_weights = auth_read!(finalize_source, GemmaPrefillFinalizeNormWeightsRequest)?;
-    let scalars = auth_read!(finalize_source, GemmaPrefillFinalizeScalarsRequest)?;
-    let normalized = rms_norm_sequence(
-        &RasterActivationSequence::from_rows(vec![final_position]),
-        Some(&norm_weights),
-        Some(scalars.rms_norm_eps),
+    ensure_artifact_root_present(
+        &artifact_store_roots,
+        final_hidden_states_ref.tensor_ref().det_commitment(),
     )?;
-    normalized
-        .into_rows()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("deterministic final RMSNorm returned no rows"))
-}
+    validate_layer_cache_roots(&artifact_store_roots, layer_caches)?;
 
-#[tile]
-pub fn init_prefill_finalize_projection(
-    store: &mut AuthenticatedRasterTensorStore,
-    normalized_final_position: RasterActivationRow,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
-    projection_rows_per_tile: usize,
-) -> Result<PrefillFinalizeRasterState> {
-    validate_projection_rows_per_tile(projection_rows_per_tile)?;
-    let metadata = auth_read!(finalize_source, GemmaPrefillFinalizeMetadataRequest)?;
+    let metadata = auth_read!(
+        finalize_source_root.as_str(),
+        GemmaPrefillFinalizeMetadataRequest
+    )?;
     if metadata.projection_rows == 0 {
         bail!("deterministic logits projection requires at least one projection row");
     }
-    if normalized_final_position.width() != metadata.hidden_width {
+    if hidden_width != metadata.hidden_width {
         bail!(
             "deterministic final logits projection input has width {}, expected {}",
-            normalized_final_position.width(),
-            metadata.hidden_width
+            hidden_width,
+            metadata.hidden_width,
         );
     }
     if metadata.projection_cols != metadata.hidden_width {
@@ -101,74 +115,156 @@ pub fn init_prefill_finalize_projection(
             metadata.hidden_width
         );
     }
-
-    let scalars = auth_read!(finalize_source, GemmaPrefillFinalizeScalarsRequest)?;
-    let output_builder_ref = store.start_projection_output_builder(
-        RasterTensorId::new("prefill.finalize.logits")?,
-        1,
-        metadata.projection_rows,
+    let scalars = auth_read!(
+        finalize_source_root.as_str(),
+        GemmaPrefillFinalizeScalarsRequest
     )?;
+    artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(NORMALIZED_FINAL_POSITION_ARTIFACT_NAME)?,
+        1,
+        hidden_width,
+    )?;
+    artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(PREFILL_LOGITS_ARTIFACT_NAME)?,
+        metadata.projection_rows,
+        1,
+    )?;
+
     Ok(PrefillFinalizeRasterState {
-        normalized_final_position,
+        artifact_store_roots,
+        source_id: metadata.source_id,
+        finalize_source_root,
+        prompt_token_count,
+        final_hidden_states_ref,
+        normalized_final_position_ref: None,
         next_logit_idx: 0,
         logit_count: metadata.projection_rows,
-        output_builder_ref,
+        hidden_width,
         softcap_bits: scalars.final_logit_softcapping.map(Act::to_bits),
         projection_rows_per_tile,
     })
 }
 
-#[tile(kind = recursive)]
-pub fn project_next_prefill_logit(
+#[tile]
+pub fn normalize_final_position_to_artifact(
     mut state: PrefillFinalizeRasterState,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
-    store: &mut AuthenticatedRasterTensorStore,
+) -> Result<PrefillFinalizeRasterState> {
+    let (row_count, _) = state
+        .final_hidden_states_ref
+        .tensor_ref()
+        .shape()
+        .sequence_metadata()?;
+    let final_position = read_sequence_row_from_roots(
+        &state.artifact_store_roots,
+        RasterSequenceRowRequest {
+            tensor_ref: state.final_hidden_states_ref.clone(),
+            row_idx: row_count - 1,
+        },
+    )?;
+    let norm_weights = auth_read!(
+        state.finalize_source_root.as_str(),
+        GemmaPrefillFinalizeNormWeightsRequest
+    )?;
+    let scalars = auth_read!(
+        state.finalize_source_root.as_str(),
+        GemmaPrefillFinalizeScalarsRequest
+    )?;
+    let normalized = rms_norm_sequence(
+        &RasterActivationSequence::from_rows(vec![final_position]),
+        Some(&norm_weights),
+        Some(scalars.rms_norm_eps),
+    )?
+    .into_rows()
+    .into_iter()
+    .next()
+    .ok_or_else(|| anyhow!("deterministic final RMSNorm returned no rows"))?;
+    if normalized.width() != state.hidden_width {
+        bail!(
+            "deterministic final RMSNorm produced width {}, expected {}",
+            normalized.width(),
+            state.hidden_width
+        );
+    }
+    state.artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+        &state.artifact_store_roots,
+        NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
+        0,
+        normalized,
+    )?;
+    let (artifact_store_roots, normalized_final_position_ref) =
+        finalize_sequence_builder_by_source_name_with_roots(
+            &state.artifact_store_roots,
+            NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
+            RasterTensorId::new(NORMALIZED_FINAL_POSITION_ARTIFACT_NAME)?,
+        )?;
+    state.artifact_store_roots = artifact_store_roots;
+    state.normalized_final_position_ref = Some(normalized_final_position_ref);
+    Ok(state)
+}
+
+#[tile(kind = recursive)]
+pub fn project_next_prefill_logit_chunk(
+    mut state: PrefillFinalizeRasterState,
 ) -> Result<(bool, PrefillFinalizeRasterState)> {
-    if state.next_logit_idx >= state.logit_count {
+    if state.is_complete() {
         return Ok((true, state));
+    }
+    let normalized_final_position_ref = state
+        .normalized_final_position_ref
+        .clone()
+        .ok_or_else(|| anyhow!("raster prefill finalize projection missing normalized row ref"))?;
+    let normalized_final_position = read_sequence_row_from_roots(
+        &state.artifact_store_roots,
+        RasterSequenceRowRequest {
+            tensor_ref: normalized_final_position_ref,
+            row_idx: 0,
+        },
+    )?;
+    if normalized_final_position.width() != state.hidden_width {
+        bail!(
+            "deterministic final logits projection input has width {}, expected {}",
+            normalized_final_position.width(),
+            state.hidden_width
+        );
     }
 
     let end = state
         .next_logit_idx
         .saturating_add(state.projection_rows_per_tile)
         .min(state.logit_count);
-    let start_logit_idx = state.next_logit_idx;
-    let mut logit_bits = Vec::with_capacity(end - start_logit_idx);
     while state.next_logit_idx < end {
         let projection_row = auth_read!(
-            finalize_source,
+            state.finalize_source_root.as_str(),
             GemmaPrefillFinalizeProjectionRowRequest {
                 row_idx: state.next_logit_idx,
             },
         )?;
-        let mut logit =
-            project_row_with_weights(&state.normalized_final_position, &projection_row)?;
+        let mut logit = project_row_with_weights(&normalized_final_position, &projection_row)?;
         if let Some(softcap_bits) = state.softcap_bits {
             logit = softcap_act(logit, Act::from_bits(softcap_bits));
         }
-        logit_bits.push(logit.to_bits());
+        state.artifact_store_roots = append_sequence_row_by_source_name_with_roots(
+            &state.artifact_store_roots,
+            PREFILL_LOGITS_ARTIFACT_NAME,
+            state.next_logit_idx,
+            RasterActivationRow::from_acts(vec![logit]),
+        )?;
         state.next_logit_idx += 1;
     }
-    store.append_projection_output_chunk(
-        &mut state.output_builder_ref,
-        0,
-        start_logit_idx,
-        &logit_bits,
-    )?;
-    Ok((false, state))
+    Ok((state.is_complete(), state))
 }
 
 #[tile]
-pub fn finalize_prefill_result_materialized_compat(
-    store: &mut AuthenticatedRasterTensorStore,
+pub fn finalize_prefill_finalize_refs(
     state: PrefillFinalizeRasterState,
-    prompt_token_count: usize,
-    final_hidden_states: ActivationSequence,
-    layer_caches: Vec<LayerKvCache>,
-) -> Result<TransformerPrefillResult> {
-    // Public compatibility boundary. The logits and layer caches are shaped
-    // like the existing native `TransformerPrefillResult`; replay-critical
-    // projection state above carries only the output builder ref/cursors.
+    layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
+) -> Result<RasterPrefillFinalizeRefs> {
+    let normalized_final_position_ref = state
+        .normalized_final_position_ref
+        .clone()
+        .ok_or_else(|| anyhow!("raster prefill finalize missing normalized row ref"))?;
     if state.next_logit_idx != state.logit_count {
         bail!(
             "raster prefill finalize completed {} logits, expected {}",
@@ -176,134 +272,91 @@ pub fn finalize_prefill_result_materialized_compat(
             state.logit_count
         );
     }
-    let logits_ref = store.finalize_projection_output_builder(state.output_builder_ref)?;
-    let logits_sequence = store.materialize_sequence(&logits_ref)?;
-    let det_logits = logits_sequence
-        .into_rows()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("raster prefill finalize produced no logits row"))?
-        .acts();
-    let internal_logits = InternalLogits::from_det_values(det_logits.clone());
-    let final_logits_sha256 =
-        crate::shared::transformer_kernels::build_vector_commitment(internal_logits.as_f32_slice());
-    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_vector_commitment(&det_logits));
-
-    build_prefill_result(
-        prompt_token_count,
-        final_hidden_states,
+    let (artifact_store_roots, logits_ref) = finalize_sequence_builder_by_source_name_with_roots(
+        &state.artifact_store_roots,
+        PREFILL_LOGITS_ARTIFACT_NAME,
+        RasterTensorId::new(PREFILL_LOGITS_ARTIFACT_NAME)?,
+    )?;
+    Ok(RasterPrefillFinalizeRefs {
+        artifact_store_roots,
+        source_id: state.source_id,
+        finalize_source_root: state.finalize_source_root,
+        prompt_token_count: state.prompt_token_count,
+        final_hidden_states_ref: state.final_hidden_states_ref,
         layer_caches,
-        prefill_logits,
+        normalized_final_position_ref,
+        logits_ref,
+        logit_count: state.logit_count,
+    })
+}
+
+#[sequence]
+pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<TransformerPrefillResult> {
+    crate::trace::trace_event("prefill.select_final_position");
+    let state = call_tile!(
+        init_prefill_finalize_state,
+        input_roots.artifact_store_roots,
+        input_roots.prompt_token_count,
+        input_roots.finalize_source_root,
+        input_roots.final_hidden_states_ref,
+        &input_roots.layer_caches,
+        input_roots.projection_rows_per_tile
+    )?;
+    let state = call_tile!(normalize_final_position_to_artifact, state)?;
+    crate::trace::trace_event("prefill.project_to_logits");
+    let state = call_recur_tile!(project_next_prefill_logit_chunk, state)?;
+    let refs = call_tile!(
+        finalize_prefill_finalize_refs,
+        state,
+        input_roots.layer_caches
+    )?;
+    call_tile!(
+        build_prefill_result_from_refs,
+        refs.artifact_store_roots.clone(),
+        refs
     )
 }
 
 #[tile]
-pub fn finalize_prefill_result_from_refs(
-    store: &mut AuthenticatedRasterTensorStore,
-    state: PrefillFinalizeRasterState,
-    prompt_token_count: usize,
-    final_hidden_states_ref: RasterActivationSequenceRef,
-    layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
+pub fn build_prefill_result_from_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    refs: RasterPrefillFinalizeRefs,
 ) -> Result<TransformerPrefillResult> {
-    // Public compatibility boundary. The shared-store path projects logits from
-    // refs; only the final public result shape requires full hidden states and
-    // layer caches.
-    let layer_refs = crate::prefill_layer::raster_tiles::PrefillLayerOutputRefs {
-        final_hidden_states_ref,
-        layer_caches,
-    };
-    let (final_hidden_states, layer_caches) =
-        crate::prefill_layer::materialize_prefill_layer_output_refs(store, &layer_refs)?;
-    finalize_prefill_result_materialized_compat(
-        store,
-        state,
-        prompt_token_count,
-        final_hidden_states,
-        layer_caches,
-    )
+    build_prefill_result_from_root_refs(&artifact_store_roots, &refs)
 }
 
-#[sequence]
-pub fn main(
-    store: &mut AuthenticatedRasterTensorStore,
-    prompt_token_ids: &[u32],
-    final_hidden_states_ref: RasterActivationSequenceRef,
-    layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
-    projection_rows_per_tile: usize,
-) -> Result<TransformerPrefillResult> {
-    crate::trace::trace_event("prefill.select_final_position");
-    let final_position = call_tile!(
-        select_final_position_ref,
-        store,
-        final_hidden_states_ref.clone()
-    )?;
-    crate::trace::trace_event("prefill.project_to_logits");
-    let normalized = call_tile!(normalize_final_position, final_position, finalize_source)?;
-    let state = call_tile!(
-        init_prefill_finalize_projection,
-        store,
-        normalized,
-        finalize_source,
-        projection_rows_per_tile
-    )?;
-    let state = call_recur_tile!(project_next_prefill_logit, state, finalize_source, store)?;
-    call_tile!(
-        finalize_prefill_result_from_refs,
-        store,
-        state,
-        prompt_token_ids.len(),
-        final_hidden_states_ref,
-        layer_caches
-    )
+fn validate_layer_cache_roots(
+    roots: &RasterArtifactStoreRoots,
+    layer_caches: &[crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot],
+) -> Result<()> {
+    for cache in layer_caches {
+        if let crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot::Ref(cache_ref) = cache {
+            ensure_artifact_root_present(roots, cache_ref.keys().det_commitment())?;
+            ensure_artifact_root_present(roots, cache_ref.values().det_commitment())?;
+        }
+    }
+    Ok(())
 }
 
-#[sequence]
-pub fn run(
-    prompt_token_ids: &[u32],
-    final_hidden_states: ActivationSequence,
-    layer_caches: Vec<LayerKvCache>,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
-    projection_rows_per_tile: usize,
-) -> Result<TransformerPrefillResult> {
-    crate::trace::trace_event("prefill.select_final_position");
-    let mut store = call_tile!(init_prefill_finalize_store);
-    let final_hidden_states_ref =
-        import_materialized_final_hidden_states(&mut store, &final_hidden_states)?;
-    let final_position = call_tile!(select_final_position_ref, &store, final_hidden_states_ref)?;
-    crate::trace::trace_event("prefill.project_to_logits");
-    let normalized = call_tile!(normalize_final_position, final_position, finalize_source)?;
-    let state = call_tile!(
-        init_prefill_finalize_projection,
-        &mut store,
-        normalized,
-        finalize_source,
-        projection_rows_per_tile
-    )?;
-    let state = call_recur_tile!(
-        project_next_prefill_logit,
-        state,
-        finalize_source,
-        &mut store
-    )?;
-    call_tile!(
-        finalize_prefill_result_materialized_compat,
-        &mut store,
-        state,
-        prompt_token_ids.len(),
-        final_hidden_states,
-        layer_caches
-    )
+fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) -> Result<()> {
+    if roots.artifacts.iter().any(|entry| entry.root() == root) {
+        return Ok(());
+    }
+    bail!("raster artifact root {root} is not present in the store roots snapshot")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{init_prefill_finalize_projection, init_prefill_finalize_store, main, run};
+    use super::{
+        finalize_prefill_finalize_refs, init_prefill_finalize_state, main,
+        normalize_final_position_to_artifact, project_next_prefill_logit_chunk,
+        RasterPrefillFinalizeInputRoots, NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
+    };
     use crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot;
+    use crate::shared::artifact_io::ArtifactIo;
     use crate::shared::det_num::{Acc, Act, Wgt};
     use crate::shared::input::InferenceExecutionMode;
+    use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
     use crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource;
     use crate::shared::raster_row_store::{AuthenticatedRasterTensorStore, RasterTensorId};
     use crate::shared::raster_transformer_kernels::{
@@ -328,9 +381,13 @@ mod tests {
             vec![Act::from_num(0.25), Act::from_num(0.5)],
             vec![Act::from_num(1.0), Act::from_num(-0.5)],
         ]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = run(&[3, 4], final_hidden_states.clone(), vec![], &source, 1)
-            .expect("raster finalize should run");
+        let raster = run_ref_backed_finalize(2, final_hidden_states_ref, vec![], &source, 1)
+            .expect("root-backed raster finalize should run");
         let native = crate::prefill_finalize::run(
             &[3, 4],
             &model,
@@ -359,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn ref_backed_finalize_matches_materialized_finalize_for_untied_projection() {
+    fn ref_backed_finalize_matches_native_deterministic_for_untied_projection() {
         let model = untied_model(false);
         let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
             .expect("source should build");
@@ -367,25 +424,25 @@ mod tests {
             vec![Act::from_num(0.25), Act::from_num(0.5)],
             vec![Act::from_num(1.0), Act::from_num(-0.5)],
         ]);
+        ArtifactIo::reset_store();
         let mut store = AuthenticatedRasterTensorStore::new();
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = main(
-            &mut store,
+        let raster = run_ref_backed_finalize(2, final_hidden_states_ref, vec![], &source, 1)
+            .expect("ref-backed raster finalize should run");
+        let native = crate::prefill_finalize::run(
             &[3, 4],
-            final_hidden_states_ref,
+            &model,
+            final_hidden_states,
             vec![],
-            &source,
-            1,
+            InferenceExecutionMode::Deterministic,
         )
-        .expect("ref-backed raster finalize should run");
-        let materialized = run(&[3, 4], final_hidden_states, vec![], &source, 1)
-            .expect("materialized raster finalize should run");
+        .expect("native finalize should run");
 
         assert_eq!(
             raster.transformer_state.prefill_logits,
-            materialized.transformer_state.prefill_logits
+            native.transformer_state.prefill_logits
         );
         assert_eq!(raster.transformer_decode_state.position, 2);
         assert_eq!(raster.transformer_decode_state.token_count, 2);
@@ -396,19 +453,71 @@ mod tests {
         let model = untied_model(false);
         let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
             .expect("source should build");
-        let final_position =
-            RasterActivationRow::from_acts(vec![Act::from_num(1.0), Act::from_num(0.0)]);
-        let mut store = init_prefill_finalize_store();
+        let source_ref = source.committed_source_ref().expect("source should commit");
+        let final_hidden_states =
+            activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+        let roots = ArtifactIo::export_store_roots();
 
-        let state = init_prefill_finalize_projection(&mut store, final_position, &source, 1)
-            .expect("init finalize projection");
+        let state = init_prefill_finalize_state(
+            roots,
+            1,
+            source_ref.root().to_string(),
+            final_hidden_states_ref,
+            &[],
+            1,
+        )
+        .expect("init finalize projection");
         let encoded = serde_json::to_string(&state).expect("serialize state");
 
-        assert!(encoded.contains("output_builder_ref"));
-        assert!(encoded.contains("normalized_final_position"));
+        assert!(encoded.contains("artifact_store_roots"));
+        assert!(!encoded.contains("normalized_final_position\":"));
         assert!(!encoded.contains("logit_bits"));
         assert!(!encoded.contains("layer_caches"));
-        assert!(!encoded.contains("final_hidden_states"));
+        assert!(!encoded.contains("final_hidden_states\":["));
+        assert!(!encoded.contains("prefill_logits"));
+        assert!(!encoded.contains("token_ids"));
+    }
+
+    #[test]
+    fn in_progress_projection_state_serializes_refs_not_payloads() {
+        let model = untied_model(false);
+        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("in-progress", &model)
+            .expect("source should build");
+        let source_ref = source.committed_source_ref().expect("source should commit");
+        let final_hidden_states =
+            activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+        let state = init_prefill_finalize_state(
+            ArtifactIo::export_store_roots(),
+            1,
+            source_ref.root().to_string(),
+            final_hidden_states_ref,
+            &[],
+            1,
+        )
+        .expect("init finalize state");
+        let state =
+            normalize_final_position_to_artifact(state).expect("normalization should write a ref");
+        let (done, state) =
+            project_next_prefill_logit_chunk(state).expect("first projection chunk should run");
+        assert!(!done);
+
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+        assert!(encoded.contains("normalized_final_position_ref"));
+        assert!(!encoded.contains("normalized_final_position\":"));
+        assert!(!encoded.contains("logit_bits"));
+        assert!(!encoded.contains("current_row_bits"));
+        assert!(!encoded.contains("layer_caches"));
+        assert!(!encoded.contains("final_hidden_states\":["));
+        assert!(!encoded.contains("prefill_logits"));
+        assert!(!encoded.contains("token_ids"));
     }
 
     #[test]
@@ -418,9 +527,13 @@ mod tests {
             .expect("source should build");
         let final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(0.5), Act::from_num(-0.25)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = run(&[9], final_hidden_states.clone(), vec![], &source, 1)
-            .expect("raster finalize should run");
+        let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
+            .expect("root-backed raster finalize should run");
         let native = crate::prefill_finalize::run(
             &[9],
             &model,
@@ -439,31 +552,31 @@ mod tests {
     }
 
     #[test]
-    fn ref_backed_finalize_matches_materialized_finalize_for_tied_projection() {
+    fn ref_backed_finalize_matches_native_deterministic_for_tied_projection() {
         let (_path, model) = tied_model().expect("tied fixture should build");
         let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("tied", &model)
             .expect("source should build");
         let final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(0.5), Act::from_num(-0.25)]]);
+        ArtifactIo::reset_store();
         let mut store = AuthenticatedRasterTensorStore::new();
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = main(
-            &mut store,
+        let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
+            .expect("ref-backed raster finalize should run");
+        let native = crate::prefill_finalize::run(
             &[9],
-            final_hidden_states_ref,
+            &model,
+            final_hidden_states,
             vec![],
-            &source,
-            1,
+            InferenceExecutionMode::Deterministic,
         )
-        .expect("ref-backed raster finalize should run");
-        let materialized = run(&[9], final_hidden_states, vec![], &source, 1)
-            .expect("materialized raster finalize should run");
+        .expect("native finalize should run");
 
         assert_eq!(
             raster.transformer_state.prefill_logits,
-            materialized.transformer_state.prefill_logits
+            native.transformer_state.prefill_logits
         );
         assert_eq!(raster.transformer_decode_state.position, 1);
         assert_eq!(raster.transformer_decode_state.token_count, 1);
@@ -476,9 +589,13 @@ mod tests {
             .expect("source should build");
         let final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = run(&[1], final_hidden_states.clone(), vec![], &source, 2)
-            .expect("raster finalize should run");
+        let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 2)
+            .expect("root-backed raster finalize should run");
         let native = crate::prefill_finalize::run(
             &[1],
             &model,
@@ -495,48 +612,59 @@ mod tests {
     }
 
     #[test]
-    fn ref_backed_finalize_matches_materialized_finalize_with_softcap() {
+    fn raster_finalize_projection_chunk_sizes_do_not_change_result() {
+        let model = untied_model(true);
+        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("chunks", &model)
+            .expect("source should build");
+        let final_hidden_states =
+            activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+        ArtifactIo::reset_store();
+        let mut single_store = AuthenticatedRasterTensorStore::new();
+        let single_ref =
+            insert_activation_ref(&mut single_store, "finalize.hidden", &final_hidden_states);
+        let single = run_ref_backed_finalize(1, single_ref, vec![], &source, 1)
+            .expect("single-row chunks should run");
+
+        ArtifactIo::reset_store();
+        let mut multi_store = AuthenticatedRasterTensorStore::new();
+        let multi_ref =
+            insert_activation_ref(&mut multi_store, "finalize.hidden", &final_hidden_states);
+        let multi = run_ref_backed_finalize(1, multi_ref, vec![], &source, 2)
+            .expect("multi-row chunks should run");
+
+        assert_eq!(
+            single.transformer_state.prefill_logits,
+            multi.transformer_state.prefill_logits
+        );
+    }
+
+    #[test]
+    fn ref_backed_finalize_matches_native_deterministic_with_softcap() {
         let model = untied_model(true);
         let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("softcap", &model)
             .expect("source should build");
         let final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+        ArtifactIo::reset_store();
         let mut store = AuthenticatedRasterTensorStore::new();
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = main(
-            &mut store,
+        let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 2)
+            .expect("ref-backed raster finalize should run");
+        let native = crate::prefill_finalize::run(
             &[1],
-            final_hidden_states_ref,
+            &model,
+            final_hidden_states,
             vec![],
-            &source,
-            2,
+            InferenceExecutionMode::Deterministic,
         )
-        .expect("ref-backed raster finalize should run");
-        let materialized = run(&[1], final_hidden_states, vec![], &source, 2)
-            .expect("materialized raster finalize should run");
+        .expect("native finalize should run");
 
         assert_eq!(
             raster.transformer_state.prefill_logits,
-            materialized.transformer_state.prefill_logits
+            native.transformer_state.prefill_logits
         );
-    }
-
-    #[test]
-    fn raster_finalize_rejects_f32_only_final_hidden_states() {
-        let model = untied_model(false);
-        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
-            .expect("source should build");
-        let final_hidden_states =
-            ActivationSequence::from_values(vec![vec![1.0, 0.0]], "f32-only".to_string());
-
-        let error = run(&[1], final_hidden_states, vec![], &source, 1)
-            .expect_err("f32-only input should fail");
-
-        assert!(error
-            .to_string()
-            .contains("canonical final hidden activations"));
     }
 
     #[test]
@@ -546,8 +674,12 @@ mod tests {
             .expect("source should build");
         let final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let error = run(&[1], final_hidden_states, vec![], &source, 0)
+        let error = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 0)
             .expect_err("zero rows per tile should fail");
 
         assert!(error.to_string().contains("greater than zero"));
@@ -560,14 +692,14 @@ mod tests {
             .expect("source should build");
         let final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        ArtifactIo::reset_store();
         let mut source_store = AuthenticatedRasterTensorStore::new();
         let final_hidden_states_ref =
             insert_activation_ref(&mut source_store, "finalize.hidden", &final_hidden_states);
-        let mut empty_store = AuthenticatedRasterTensorStore::new();
 
-        let error = main(
-            &mut empty_store,
-            &[1],
+        let error = run_ref_backed_finalize_with_roots(
+            RasterArtifactStoreRoots::default(),
+            1,
             final_hidden_states_ref,
             vec![],
             &source,
@@ -575,7 +707,7 @@ mod tests {
         )
         .expect_err("missing sequence ref should fail");
 
-        assert!(error.to_string().contains("is not registered"));
+        assert!(error.to_string().contains("not present"));
     }
 
     #[test]
@@ -588,21 +720,150 @@ mod tests {
             Act::from_num(0.0),
             Act::from_num(0.5),
         ]]);
+        ArtifactIo::reset_store();
         let mut store = AuthenticatedRasterTensorStore::new();
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let error = main(
-            &mut store,
-            &[1],
+        let error = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
+            .expect_err("width mismatch should fail");
+
+        assert!(error.to_string().contains("width"));
+    }
+
+    #[test]
+    fn ref_backed_finalize_fails_closed_for_bad_source_root() {
+        let model = untied_model(false);
+        let _source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+            .expect("source should build");
+        let final_hidden_states =
+            activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+
+        let error = main(RasterPrefillFinalizeInputRoots {
+            artifact_store_roots: ArtifactIo::export_store_roots(),
+            prompt_token_count: 1,
+            finalize_source_root: "missing-finalize-source-root".to_string(),
             final_hidden_states_ref,
-            vec![],
+            layer_caches: vec![],
+            projection_rows_per_tile: 1,
+        })
+        .expect_err("bad source root should fail");
+
+        assert!(error.to_string().contains("not registered"));
+    }
+
+    #[test]
+    fn ref_backed_finalize_fails_closed_for_missing_cache_roots() {
+        let model = untied_model(false);
+        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+            .expect("source should build");
+        let final_hidden_states =
+            activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+        let stale_roots = ArtifactIo::export_store_roots();
+        let cache = RasterKvCache::from_heads(
+            vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
+                0.25,
+            )])]],
+            vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
+                -0.25,
+            )])]],
+        )
+        .expect("cache");
+        let cache_ref = store
+            .insert_kv_cache(
+                RasterTensorId::new("finalize.cache.keys").expect("keys id"),
+                RasterTensorId::new("finalize.cache.values").expect("values id"),
+                cache,
+            )
+            .expect("cache ref");
+
+        let error = run_ref_backed_finalize_with_roots(
+            stale_roots,
+            1,
+            final_hidden_states_ref,
+            vec![PrefillLayerCacheSlot::Ref(cache_ref)],
             &source,
             1,
         )
-        .expect_err("width mismatch should fail");
+        .expect_err("missing cache roots should fail");
 
-        assert!(error.to_string().contains("width"));
+        assert!(error.to_string().contains("not present"));
+    }
+
+    #[test]
+    fn prefill_finalize_roots_aware_mutation_rejects_stale_builder_root() {
+        let model = untied_model(false);
+        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("stale", &model)
+            .expect("source should build");
+        let source_ref = source.committed_source_ref().expect("source should commit");
+        let final_hidden_states =
+            activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+        let state = init_prefill_finalize_state(
+            ArtifactIo::export_store_roots(),
+            1,
+            source_ref.root().to_string(),
+            final_hidden_states_ref,
+            &[],
+            1,
+        )
+        .expect("init should build roots-backed state");
+        ArtifactIo::append_leaf_by_builder_source_name_with_roots(
+            &state.artifact_store_roots,
+            NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
+            0,
+            crate::shared::raster_artifact_store::activation_row_leaf(
+                &RasterActivationRow::from_acts(vec![Act::from_num(0.0), Act::from_num(0.0)]),
+            ),
+        )
+        .expect("external append should stale the state roots");
+
+        let error = normalize_final_position_to_artifact(state)
+            .expect_err("stale builder root should fail");
+
+        assert!(error.to_string().contains("snapshot"));
+    }
+
+    #[test]
+    fn finalize_refs_rejects_overadvanced_projection_cursor() {
+        let model = untied_model(false);
+        let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("overadvanced", &model)
+            .expect("source should build");
+        let source_ref = source.committed_source_ref().expect("source should commit");
+        let final_hidden_states =
+            activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+        let state = init_prefill_finalize_state(
+            ArtifactIo::export_store_roots(),
+            1,
+            source_ref.root().to_string(),
+            final_hidden_states_ref,
+            &[],
+            1,
+        )
+        .expect("init should build state");
+        let mut state =
+            normalize_final_position_to_artifact(state).expect("normalization should finish");
+        state.next_logit_idx = state.logit_count + 1;
+
+        let error = finalize_prefill_finalize_refs(state, vec![])
+            .expect_err("overadvanced cursor should fail closed");
+
+        assert!(error.to_string().contains("completed"));
     }
 
     #[test]
@@ -613,9 +874,13 @@ mod tests {
         let mut final_hidden_states =
             activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
         final_hidden_states.activations = vec![vec![0.0, 1.0]];
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
 
-        let raster = run(&[1], final_hidden_states.clone(), vec![], &source, 1)
-            .expect("raster finalize should run");
+        let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
+            .expect("root-backed raster finalize should run");
         let native = crate::prefill_finalize::run(
             &[1],
             &model,
@@ -642,15 +907,35 @@ mod tests {
             vec![VecDeque::from(vec![vec![Act::from_num(0.25)]])],
             vec![VecDeque::from(vec![vec![Act::from_num(-0.25)]])],
         );
+        let raster_cache = RasterKvCache::from_heads(
+            vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
+                0.25,
+            )])]],
+            vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
+                -0.25,
+            )])]],
+        )
+        .expect("cache");
+        ArtifactIo::reset_store();
+        let mut store = AuthenticatedRasterTensorStore::new();
+        let final_hidden_states_ref =
+            insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+        let cache_ref = store
+            .insert_kv_cache(
+                RasterTensorId::new("finalize.cache.keys").expect("keys id"),
+                RasterTensorId::new("finalize.cache.values").expect("values id"),
+                raster_cache,
+            )
+            .expect("cache ref");
 
-        let raster = run(
-            &[1, 2, 3],
-            final_hidden_states,
-            vec![layer_cache.clone()],
+        let raster = run_ref_backed_finalize(
+            3,
+            final_hidden_states_ref,
+            vec![PrefillLayerCacheSlot::Ref(cache_ref)],
             &source,
             2,
         )
-        .expect("raster finalize should run");
+        .expect("root-backed raster finalize should run");
 
         assert_eq!(raster.transformer_decode_state.position, 3);
         assert_eq!(raster.transformer_decode_state.token_count, 3);
@@ -680,6 +965,7 @@ mod tests {
             vec![VecDeque::from(vec![vec![Act::from_num(0.25)]])],
             vec![VecDeque::from(vec![vec![Act::from_num(-0.25)]])],
         );
+        ArtifactIo::reset_store();
         let mut store = AuthenticatedRasterTensorStore::new();
         let final_hidden_states_ref =
             insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
@@ -691,9 +977,8 @@ mod tests {
             )
             .expect("cache ref");
 
-        let raster = main(
-            &mut store,
-            &[1],
+        let raster = run_ref_backed_finalize(
+            1,
             final_hidden_states_ref,
             vec![PrefillLayerCacheSlot::Ref(cache_ref)],
             &source,
@@ -727,7 +1012,7 @@ mod tests {
         );
         assert_signature_omits(
             source,
-            "pub fn select_final_position_ref",
+            "pub fn init_prefill_finalize_state",
             &[
                 ": &ActivationSequence",
                 ": ActivationSequence",
@@ -737,7 +1022,7 @@ mod tests {
         );
         assert_signature_omits(
             source,
-            "pub fn finalize_prefill_result_from_refs",
+            "pub fn finalize_prefill_finalize_refs",
             &[
                 ": &ActivationSequence",
                 ": ActivationSequence",
@@ -745,6 +1030,42 @@ mod tests {
                 ": LayerKvCache",
             ],
         );
+    }
+
+    fn run_ref_backed_finalize(
+        prompt_token_count: usize,
+        final_hidden_states_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        layer_caches: Vec<PrefillLayerCacheSlot>,
+        source: &AuthenticatedGemmaPrefillFinalizeSource,
+        projection_rows_per_tile: usize,
+    ) -> Result<crate::shared::transformer::TransformerPrefillResult> {
+        run_ref_backed_finalize_with_roots(
+            ArtifactIo::export_store_roots(),
+            prompt_token_count,
+            final_hidden_states_ref,
+            layer_caches,
+            source,
+            projection_rows_per_tile,
+        )
+    }
+
+    fn run_ref_backed_finalize_with_roots(
+        artifact_store_roots: RasterArtifactStoreRoots,
+        prompt_token_count: usize,
+        final_hidden_states_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        layer_caches: Vec<PrefillLayerCacheSlot>,
+        source: &AuthenticatedGemmaPrefillFinalizeSource,
+        projection_rows_per_tile: usize,
+    ) -> Result<crate::shared::transformer::TransformerPrefillResult> {
+        let source_ref = source.committed_source_ref()?;
+        main(RasterPrefillFinalizeInputRoots {
+            artifact_store_roots,
+            prompt_token_count,
+            finalize_source_root: source_ref.root().to_string(),
+            final_hidden_states_ref,
+            layer_caches,
+            projection_rows_per_tile,
+        })
     }
 
     fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {

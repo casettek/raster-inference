@@ -1,10 +1,9 @@
 use anyhow::Result;
 
 use crate::shared::input::InferenceExecutionMode;
+use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource;
-use crate::shared::raster_row_store::{
-    AuthenticatedRasterTensorStore, RasterActivationSequenceRef,
-};
+use crate::shared::raster_row_store::RasterActivationSequenceRef;
 use crate::shared::transformer::{
     ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerPrefillResult,
 };
@@ -29,36 +28,21 @@ pub fn run(
     )
 }
 
-pub fn run_raster(
-    prompt_token_ids: &[u32],
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
-    final_hidden_states: ActivationSequence,
-    layer_caches: Vec<LayerKvCache>,
-    projection_rows_per_tile: usize,
-) -> Result<TransformerPrefillResult> {
-    raster_tiles::run(
-        prompt_token_ids,
-        final_hidden_states,
-        layer_caches,
-        finalize_source,
-        projection_rows_per_tile,
-    )
-}
-
-pub fn run_raster_refs_with_store(
-    store: &mut AuthenticatedRasterTensorStore,
-    prompt_token_ids: &[u32],
+pub fn run_raster_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    prompt_token_count: usize,
     finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
     final_hidden_states_ref: RasterActivationSequenceRef,
     layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
 ) -> Result<TransformerPrefillResult> {
-    raster_tiles::main(
-        store,
-        prompt_token_ids,
+    let finalize_source_ref = finalize_source.committed_source_ref()?;
+    raster_tiles::main(raster_tiles::RasterPrefillFinalizeInputRoots {
+        artifact_store_roots,
+        prompt_token_count,
+        finalize_source_root: finalize_source_ref.root().to_string(),
         final_hidden_states_ref,
         layer_caches,
-        finalize_source,
         projection_rows_per_tile,
-    )
+    })
 }
