@@ -420,21 +420,22 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let input_embedding_refs = input_embedding::run_raster_refs_with_roots(
+                    let input_embedding_output = input_embedding::run_raster_output_with_roots(
                         raster_prompt_preparation_roots,
                         raster_prompt_preparation,
                         &embedding_source,
                     )?;
-                    let token_embeddings =
-                        input_embedding::materialize_input_embedding_refs(&input_embedding_refs)?;
-                    (token_embeddings, Some(input_embedding_refs))
+                    let token_embeddings = input_embedding::materialize_input_embedding_refs(
+                        &input_embedding_output.refs,
+                    )?;
+                    (token_embeddings, Some(input_embedding_output))
                 } else {
                     let token_embeddings = input_embedding::run(
                         &prompt_preparation.prompt_token_ids,
                         transformer_model,
                         request.execution_mode,
                     )?;
-                    let input_embedding_refs = raster_prompt_preparation_for_embedding
+                    let input_embedding_output = raster_prompt_preparation_for_embedding
                         .as_ref()
                         .map(|raster_prompt_preparation| {
                             let embedding_source =
@@ -451,7 +452,7 @@ pub fn run_inference_with_controls(
                             )
                         })
                         .transpose()?;
-                    (token_embeddings, input_embedding_refs)
+                    (token_embeddings, input_embedding_output)
                 };
                 let input_embedding = InputEmbeddingState {
                     prompt_preparation: prompt_preparation.clone(),
@@ -477,7 +478,9 @@ pub fn run_inference_with_controls(
                 input_embedding::trace_input_embedding_checkpoint(
                     &prompt_preparation.prompt_token_ids,
                     &token_embeddings,
-                    raster_input_embedding_refs.as_ref(),
+                    raster_input_embedding_refs
+                        .as_ref()
+                        .map(|output| &output.refs),
                 );
                 if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                     return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
@@ -498,12 +501,13 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let input_embedding_refs = raster_input_embedding_refs
+                    let input_embedding_output = raster_input_embedding_refs
                         .as_ref()
                         .expect("raster prefill requires raster input embedding refs");
                     let (layer_roots, ple_input_manifest_root) =
                         prefill_prepare_aux::run_raster_refs_from_input_embedding(
-                            input_embedding_refs,
+                            input_embedding_output.artifact_store_roots.clone(),
+                            &input_embedding_output.refs,
                             &ple_source,
                             raster_sizing,
                         )?;
@@ -525,7 +529,7 @@ pub fn run_inference_with_controls(
                     let (layer_roots, layer_refs) =
                         prefill_layer::run_raster_refs_from_input_embedding(
                             layer_roots,
-                            input_embedding_refs,
+                            &input_embedding_output.refs,
                             &layer_source,
                             ple_input_manifest_root.as_deref(),
                             raster_sizing,
@@ -555,7 +559,7 @@ pub fn run_inference_with_controls(
                     )?
                 } else {
                     let ple_inputs =
-                        if let Some(input_embedding_refs) = raster_input_embedding_refs.as_ref() {
+                        if let Some(input_embedding_output) = raster_input_embedding_refs.as_ref() {
                             let ple_source = AuthenticatedGemmaPleSource::from_model(
                                 model.model_id.clone(),
                                 transformer_model,
@@ -565,7 +569,8 @@ pub fn run_inference_with_controls(
                                 transformer_model,
                                 &token_embeddings,
                                 request.execution_mode,
-                                input_embedding_refs,
+                                input_embedding_output.artifact_store_roots.clone(),
+                                &input_embedding_output.refs,
                                 &ple_source,
                             )?
                         } else {
@@ -1067,8 +1072,8 @@ mod tests {
             RasterActivationSequence::from_acts(input_rows),
         )
         .expect("input embedding activation ref");
+        let input_embedding_roots = crate::shared::artifact_io::ArtifactIo::export_store_roots();
         let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
-            artifact_store_roots: crate::shared::artifact_io::ArtifactIo::export_store_roots(),
             source_id: "embedding-fixture".to_string(),
             embedding_source_root: "embedding-root".to_string(),
             prompt_token_ids_root: "token-root".to_string(),
@@ -1083,7 +1088,7 @@ mod tests {
         let raster_payload = crate::trace::with_checkpointing_enabled(true, || {
             crate::trace::start_inference_trace(&json!({ "test": "raster-prefill-layer" }));
             crate::prefill_layer::run_raster_refs_from_input_embedding(
-                input_embedding_refs.artifact_store_roots.clone(),
+                input_embedding_roots.clone(),
                 &input_embedding_refs,
                 &layer_source,
                 None,
@@ -1149,8 +1154,8 @@ mod tests {
             RasterActivationSequence::from_acts(input_rows),
         )
         .expect("input embedding activation ref");
+        let input_embedding_roots = crate::shared::artifact_io::ArtifactIo::export_store_roots();
         let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
-            artifact_store_roots: crate::shared::artifact_io::ArtifactIo::export_store_roots(),
             source_id: "embedding-fixture".to_string(),
             embedding_source_root: "embedding-root".to_string(),
             prompt_token_ids_root: "token-root".to_string(),
@@ -1171,7 +1176,7 @@ mod tests {
             crate::trace::start_inference_trace(&json!({ "test": "raster-prefill-finalize" }));
             let (layer_roots, layer_refs) =
                 crate::prefill_layer::run_raster_refs_from_input_embedding(
-                    input_embedding_refs.artifact_store_roots.clone(),
+                    input_embedding_roots.clone(),
                     &input_embedding_refs,
                     &layer_source,
                     None,

@@ -1,9 +1,13 @@
 use anyhow::{anyhow, bail, Result};
 
 use super::raster_utils::build_prefill_result_from_root_refs;
-use crate::raster_authoring::prelude::{auth_read, call_recur_tile, call_tile, sequence, tile};
+use crate::raster_authoring::prelude::{
+    auth_read, call_recur_tile, call_tile, call_seq, sequence, tile,
+};
 use crate::shared::det_num::{softcap_act, Act};
-use crate::shared::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
+use crate::shared::raster_artifact_store::{
+    RasterArtifactId, RasterArtifactStoreRoots, RasterRoutineOutput,
+};
 use crate::shared::raster_prefill_finalize::{
     GemmaPrefillFinalizeMetadataRequest, GemmaPrefillFinalizeNormWeightsRequest,
     GemmaPrefillFinalizeProjectionRowRequest, GemmaPrefillFinalizeScalarsRequest,
@@ -36,7 +40,6 @@ pub struct RasterPrefillFinalizeInputRoots {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterPrefillFinalizeRefs {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
     pub source_id: String,
     pub finalize_source_root: String,
     pub prompt_token_count: usize,
@@ -46,6 +49,8 @@ pub struct RasterPrefillFinalizeRefs {
     pub logits_ref: RasterActivationSequenceRef,
     pub logit_count: usize,
 }
+
+pub type RasterPrefillFinalizeOutput = RasterRoutineOutput<RasterPrefillFinalizeRefs>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillFinalizeRasterState {
@@ -260,7 +265,7 @@ pub fn project_next_prefill_logit_chunk(
 pub fn finalize_prefill_finalize_refs(
     state: PrefillFinalizeRasterState,
     layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
-) -> Result<RasterPrefillFinalizeRefs> {
+) -> Result<(RasterArtifactStoreRoots, RasterPrefillFinalizeRefs)> {
     let normalized_final_position_ref = state
         .normalized_final_position_ref
         .clone()
@@ -277,21 +282,25 @@ pub fn finalize_prefill_finalize_refs(
         PREFILL_LOGITS_ARTIFACT_NAME,
         RasterTensorId::new(PREFILL_LOGITS_ARTIFACT_NAME)?,
     )?;
-    Ok(RasterPrefillFinalizeRefs {
+    Ok((
         artifact_store_roots,
-        source_id: state.source_id,
-        finalize_source_root: state.finalize_source_root,
-        prompt_token_count: state.prompt_token_count,
-        final_hidden_states_ref: state.final_hidden_states_ref,
-        layer_caches,
-        normalized_final_position_ref,
-        logits_ref,
-        logit_count: state.logit_count,
-    })
+        RasterPrefillFinalizeRefs {
+            source_id: state.source_id,
+            finalize_source_root: state.finalize_source_root,
+            prompt_token_count: state.prompt_token_count,
+            final_hidden_states_ref: state.final_hidden_states_ref,
+            layer_caches,
+            normalized_final_position_ref,
+            logits_ref,
+            logit_count: state.logit_count,
+        },
+    ))
 }
 
 #[sequence]
-pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<TransformerPrefillResult> {
+pub fn main_refs(
+    input_roots: RasterPrefillFinalizeInputRoots,
+) -> Result<RasterPrefillFinalizeOutput> {
     crate::trace::trace_event("prefill.select_final_position");
     let state = call_tile!(
         init_prefill_finalize_state,
@@ -305,15 +314,21 @@ pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<TransformerP
     let state = call_tile!(normalize_final_position_to_artifact, state)?;
     crate::trace::trace_event("prefill.project_to_logits");
     let state = call_recur_tile!(project_next_prefill_logit_chunk, state)?;
-    let refs = call_tile!(
+    let (artifact_store_roots, refs) = call_tile!(
         finalize_prefill_finalize_refs,
         state,
         input_roots.layer_caches
     )?;
+    Ok(RasterPrefillFinalizeOutput::new(artifact_store_roots, refs))
+}
+
+#[sequence]
+pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<TransformerPrefillResult> {
+    let output = call_seq!(main_refs, input_roots)?;
     call_tile!(
         build_prefill_result_from_refs,
-        refs.artifact_store_roots.clone(),
-        refs
+        output.artifact_store_roots,
+        output.refs
     )
 }
 

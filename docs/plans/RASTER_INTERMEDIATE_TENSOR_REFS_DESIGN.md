@@ -67,6 +67,8 @@ The tile then reads only the row or bounded row window it needs.
 - Store enough metadata in refs to validate shape before row reads.
 - Store commitments in refs/builders so reads and finalization can be verified.
 - Materialize tensors at public/checkpoint boundaries to preserve current commitments.
+- Carry `RasterArtifactStoreRoots` as a separate routine boundary value, not inside routine-specific refs.
+- Bind static model/tokenizer sources through committed roots or explicit static source refs instead of free-form source-name comparisons.
 
 ## Reference Taxonomy
 
@@ -153,6 +155,18 @@ RasterKvCacheRef
 ```
 
 The wrappers should enforce kind/shape compatibility at construction time.
+
+### Routine Outputs
+
+Each raster routine should return a proof-shaped output envelope:
+
+```text
+RasterRoutineOutput
+  artifact_store_roots
+  refs
+```
+
+The `refs` value should contain only compact artifact refs and small public metadata. It should not duplicate the artifact-store root snapshot. This keeps the one root chain explicit as prompt preparation, input embedding, prefill, decode select/transition, and output finalization append artifacts.
 
 ## Commitment Model
 

@@ -5,8 +5,8 @@ use crate::raster_authoring::prelude::{
 };
 use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::gemma_tokenizer::{
-    GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest, GemmaBpeOutput, GemmaBpeState,
-    GemmaTokenIdRequest,
+    AuthenticatedGemmaTokenizer, GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest,
+    GemmaBpeOutput, GemmaBpeState, GemmaTokenIdRequest,
 };
 use crate::shared::input::RasterPromptPreparationState;
 use crate::shared::raster_artifact_store::{
@@ -77,6 +77,7 @@ pub struct RasterPromptInputRoots {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterTokenizationResult {
+    pub token_ids_root: String,
     pub token_count: usize,
 }
 
@@ -515,6 +516,7 @@ pub fn finalize_tokenize_prompt(
     Ok((
         artifact_store_roots,
         RasterTokenizationResult {
+            token_ids_root: token_ids_ref.root().to_string(),
             token_count: token_ids_ref.token_count(),
         },
     ))
@@ -550,6 +552,30 @@ pub fn tokenize_bpe_state(
         tokenizer_source_root.as_str()
     )?;
     call_tile!(finalize_tokenize_prompt, token_id_state)
+}
+
+pub fn tokenize_prompt(
+    prompt_ref: &str,
+    tokenizer_ref: &AuthenticatedGemmaTokenizer,
+    add_special_tokens: bool,
+) -> Result<RasterTokenizationResult> {
+    super::raster_utils::tokenize_prompt(prompt_ref, tokenizer_ref, add_special_tokens)
+}
+
+pub fn tokenize_prompt_with_controls(
+    prompt_ref: &str,
+    tokenizer_ref: &AuthenticatedGemmaTokenizer,
+    add_special_tokens: bool,
+    bpe_pairs_per_tile: usize,
+    bpe_pieces_per_tile: usize,
+) -> Result<RasterTokenizationResult> {
+    super::raster_utils::tokenize_prompt_with_controls(
+        prompt_ref,
+        tokenizer_ref,
+        add_special_tokens,
+        bpe_pairs_per_tile,
+        bpe_pieces_per_tile,
+    )
 }
 
 #[tile]

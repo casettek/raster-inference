@@ -2315,7 +2315,6 @@ mod tests {
         )?;
         let artifact_store_roots = ArtifactIo::export_store_roots();
         let input_embedding_refs = RasterInputEmbeddingRefs {
-            artifact_store_roots: artifact_store_roots.clone(),
             source_id: "embedding-fixture".to_string(),
             embedding_source_root: "embedding-root".to_string(),
             prompt_token_ids_root: "token-root".to_string(),

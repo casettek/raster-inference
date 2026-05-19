@@ -46,3 +46,22 @@ pub fn run_raster_refs_with_roots(
         projection_rows_per_tile,
     })
 }
+
+pub fn run_raster_output_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    prompt_token_count: usize,
+    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
+    final_hidden_states_ref: RasterActivationSequenceRef,
+    layer_caches: Vec<crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot>,
+    projection_rows_per_tile: usize,
+) -> Result<raster_tiles::RasterPrefillFinalizeOutput> {
+    let finalize_source_ref = finalize_source.committed_source_ref()?;
+    raster_tiles::main_refs(raster_tiles::RasterPrefillFinalizeInputRoots {
+        artifact_store_roots,
+        prompt_token_count,
+        finalize_source_root: finalize_source_ref.root().to_string(),
+        final_hidden_states_ref,
+        layer_caches,
+        projection_rows_per_tile,
+    })
+}

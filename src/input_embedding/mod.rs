@@ -3,7 +3,7 @@ use serde_json::json;
 
 use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::input::{InferenceExecutionMode, RasterPromptPreparationState};
-use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
+use crate::shared::raster_artifact_store::{RasterArtifactStoreRoots, RasterRoutineOutput};
 use crate::shared::raster_input_embedding::AuthenticatedGemmaInputEmbeddingSource;
 use crate::shared::transformer::{ActivationSequence, Gemma4TransformerModel};
 
@@ -50,12 +50,29 @@ pub fn run_raster_refs_for_roots(
     prompt_token_count: usize,
     embedding_source_root: String,
 ) -> Result<raster_tiles::RasterInputEmbeddingRefs> {
-    raster_tiles::main(
+    Ok(raster_tiles::main(
         artifact_store_roots,
         raster_tiles::RasterInputEmbeddingInputRoots {
             prompt_token_ids_root,
             prompt_token_count,
             embedding_source_root,
+        },
+    )?
+    .refs)
+}
+
+pub fn run_raster_output_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    prompt_preparation: &RasterPromptPreparationState,
+    embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
+) -> Result<raster_tiles::RasterInputEmbeddingOutput> {
+    let embedding_source_ref = embedding_source.committed_source_ref()?;
+    raster_tiles::main(
+        artifact_store_roots,
+        raster_tiles::RasterInputEmbeddingInputRoots {
+            prompt_token_ids_root: prompt_preparation.prompt_token_ids_root.clone(),
+            prompt_token_count: prompt_preparation.prompt_token_count,
+            embedding_source_root: embedding_source_ref.root().to_string(),
         },
     )
 }
@@ -82,7 +99,7 @@ pub fn format_native_input_embedding_as_raster_checkpoint(
     embedding_source_root: impl Into<String>,
     prompt_preparation: &RasterPromptPreparationState,
     token_embeddings: &ActivationSequence,
-) -> Result<raster_tiles::RasterInputEmbeddingRefs> {
+) -> Result<raster_tiles::RasterInputEmbeddingOutput> {
     let embedded_prompt_activations_ref = raster_utils::insert_activation_sequence(
         crate::shared::raster_artifact_store::RasterArtifactId::new(
             "input.embedding.embedded_prompt",
@@ -90,14 +107,16 @@ pub fn format_native_input_embedding_as_raster_checkpoint(
         raster_utils::raster_activation_sequence_from_embedding(token_embeddings)?,
     )?;
 
-    Ok(raster_tiles::RasterInputEmbeddingRefs {
-        artifact_store_roots: ArtifactIo::export_store_roots(),
-        source_id: source_id.into(),
-        embedding_source_root: embedding_source_root.into(),
-        prompt_token_ids_root: prompt_preparation.prompt_token_ids_root.clone(),
-        prompt_token_count: prompt_preparation.prompt_token_count,
-        embedded_prompt_activations_ref,
-    })
+    Ok(RasterRoutineOutput::new(
+        ArtifactIo::export_store_roots(),
+        raster_tiles::RasterInputEmbeddingRefs {
+            source_id: source_id.into(),
+            embedding_source_root: embedding_source_root.into(),
+            prompt_token_ids_root: prompt_preparation.prompt_token_ids_root.clone(),
+            prompt_token_count: prompt_preparation.prompt_token_count,
+            embedded_prompt_activations_ref,
+        },
+    ))
 }
 
 pub fn trace_input_embedding_checkpoint(
@@ -222,6 +241,7 @@ mod tests {
             &materialized,
         )
         .expect("native checkpoint refs");
+        let native_refs = native_refs.refs;
 
         assert_eq!(native_refs.source_id, raster_refs.source_id);
         assert_eq!(

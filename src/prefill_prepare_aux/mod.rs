@@ -35,11 +35,13 @@ pub fn run_with_input_embedding_checkpoint(
     model: &Gemma4TransformerModel,
     token_embeddings: &ActivationSequence,
     execution_mode: InferenceExecutionMode,
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let ple_inputs = tiles::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     let ple_input_refs = format_native_prefill_prepare_aux_as_raster_checkpoint(
+        artifact_store_roots,
         input_embedding_refs,
         ple_source,
         ple_inputs.as_ref(),
@@ -110,16 +112,18 @@ pub fn run_raster_refs(
 }
 
 pub fn run_raster_refs_from_input_embedding(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
-    let (artifact_store_roots, ple_input_manifest_root) =
-        raster_tiles::run_with_input_embedding_refs(
-            input_embedding_refs,
-            ple_source,
-            raster_sizing,
-        )?;
+    let output = raster_tiles::run_with_input_embedding_refs(
+        artifact_store_roots,
+        input_embedding_refs,
+        ple_source,
+        raster_sizing,
+    )?;
+    let (artifact_store_roots, ple_input_manifest_root) = output.into_parts();
     let ple_input_refs = prefill_ple_input_refs_from_manifest(
         artifact_store_roots.clone(),
         ple_input_manifest_root.as_deref(),
@@ -145,6 +149,7 @@ pub fn prefill_ple_input_refs_from_manifest(
 }
 
 pub fn format_native_prefill_prepare_aux_as_raster_checkpoint(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
@@ -154,7 +159,6 @@ pub fn format_native_prefill_prepare_aux_as_raster_checkpoint(
         return Ok(None);
     };
 
-    let mut artifact_store_roots = input_embedding_refs.artifact_store_roots.clone();
     let per_layer_inputs = ple_inputs
         .internal_per_layer_inputs
         .iter()

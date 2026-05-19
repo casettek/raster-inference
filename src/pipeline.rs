@@ -401,7 +401,10 @@ fn run_output_decode_with_mode_internal(
                         crate::output_finalize::raster_tiles::RasterOutputFinalizeInputRoots {
                             artifact_store_roots,
                             generated_token_ids_ref,
-                            tokenizer_source_name: raster_tokenizer.identifier().to_string(),
+                            tokenizer_source_root: raster_tokenizer
+                                .committed_source_ref()?
+                                .root()
+                                .to_string(),
                             output_text_source_name: "output.finalize.output.text".to_string(),
                             pending_bytes_source_prefix: "output.finalize.output.pending_bytes"
                                 .to_string(),
@@ -427,8 +430,16 @@ fn run_output_decode_with_mode_internal(
 
         trace_event("decode.select_token");
         let raster_select_output = if raster_select_token {
+            let artifact_store_roots = latest_raster_generated_tokens
+                .as_ref()
+                .map(|(artifact_store_roots, _)| artifact_store_roots.clone())
+                .unwrap_or_else(crate::shared::artifact_io::ArtifactIo::export_store_roots);
             Some(
-                crate::decode_select_token::run_raster_refs(&mut decode_state, max_new_tokens)?
+                crate::decode_select_token::run_raster_refs_with_roots(
+                    &mut decode_state,
+                    max_new_tokens,
+                    artifact_store_roots,
+                )?
                     .expect("stop condition should have returned earlier"),
             )
         } else {
@@ -463,7 +474,7 @@ fn run_output_decode_with_mode_internal(
                         artifact_store_roots: select_output.artifact_store_roots,
                         transformer_decode_state,
                         selected_token_ref: select_output.selected_token_ref,
-                        decode_transition_source_name: source.identifier().to_string(),
+                        decode_transition_source_root: source.static_source_root(),
                         output_source_prefix: format!(
                             "decode.transition.position_{}",
                             transition_position

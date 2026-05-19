@@ -86,20 +86,20 @@ pub fn run_raster_with_roots(
     let refs = raster_tiles::main(input_roots, tokenizer)?;
     let generated_token_ids = raster_tiles::materialize_token_ids_from_roots(
         &refs.artifact_store_roots,
-        &refs.generated_token_ids_ref,
+        &refs.refs.generated_token_ids_ref,
     )?;
     let generated_text = crate::shared::raster_output_finalize::materialize_text_from_roots(
         &refs.artifact_store_roots,
-        &refs.generated_text_ref,
+        &refs.refs.generated_text_ref,
     )?;
-    let stop_reason = refs.stop_reason.clone();
+    let stop_reason = refs.refs.stop_reason.clone();
     crate::trace::trace_checkpoint(
         "output.finalize",
         &json!({
             "full_token_ids": decode_state.full_token_ids.clone(),
             "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
             "generated_token_ids": generated_token_ids.clone(),
-            "generated_token_ids_sha256": refs.generated_token_ids_sha256.clone(),
+            "generated_token_ids_sha256": refs.refs.generated_token_ids_sha256.clone(),
             "generated_text": generated_text.clone(),
             "generated_token_count": generated_token_count,
             "stop_reason": stop_reason,
@@ -109,9 +109,9 @@ pub fn run_raster_with_roots(
     Ok(OutputDecodeState {
         generated_token_count,
         generated_token_ids,
-        generated_token_ids_sha256: refs.generated_token_ids_sha256,
+        generated_token_ids_sha256: refs.refs.generated_token_ids_sha256,
         generated_text,
-        stop_reason: refs.stop_reason,
+        stop_reason: refs.refs.stop_reason,
         decode_transition_states: Vec::new(),
     })
 }

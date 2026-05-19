@@ -265,6 +265,25 @@ pub struct RasterArtifactStoreRoots {
     pub builders: Vec<RasterArtifactBuilderRootEntry>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterRoutineOutput<T> {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub refs: T,
+}
+
+impl<T> RasterRoutineOutput<T> {
+    pub fn new(artifact_store_roots: RasterArtifactStoreRoots, refs: T) -> Self {
+        Self {
+            artifact_store_roots,
+            refs,
+        }
+    }
+
+    pub fn into_parts(self) -> (RasterArtifactStoreRoots, T) {
+        (self.artifact_store_roots, self.refs)
+    }
+}
+
 impl RasterArtifactStoreRoots {
     pub fn artifact_root_for_source_name(&self, source_name: &str) -> Result<&str> {
         Ok(self.artifact_entry_for_source_name(source_name)?.root())

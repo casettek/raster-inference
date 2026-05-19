@@ -4,6 +4,7 @@ use crate::raster_authoring::prelude::{call_recur_tile, call_tile, sequence, til
 use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
+    RasterRoutineOutput,
 };
 use crate::shared::raster_input_embedding::{
     GemmaInputEmbeddingMetadataRequest, GemmaInputEmbeddingRowRequest,
@@ -27,13 +28,14 @@ pub struct RasterInputEmbeddingInputRoots {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterInputEmbeddingRefs {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
     pub source_id: String,
     pub embedding_source_root: String,
     pub prompt_token_ids_root: String,
     pub prompt_token_count: usize,
     pub embedded_prompt_activations_ref: RasterActivationSequenceArtifactRef,
 }
+
+pub type RasterInputEmbeddingOutput = RasterRoutineOutput<RasterInputEmbeddingRefs>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct InputEmbeddingRasterState {
@@ -152,7 +154,6 @@ pub fn finalize_input_embedding_refs(
     Ok((
         artifact_store_roots.clone(),
         RasterInputEmbeddingRefs {
-            artifact_store_roots,
             source_id: state.source_id,
             embedding_source_root: state.embedding_source_root,
             prompt_token_ids_root: state.prompt_token_ids_root,
@@ -166,7 +167,7 @@ pub fn finalize_input_embedding_refs(
 pub fn main(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterInputEmbeddingInputRoots,
-) -> Result<RasterInputEmbeddingRefs> {
+) -> Result<RasterInputEmbeddingOutput> {
     let (artifact_store_roots, state) = call_tile!(
         init_input_embedding_state,
         artifact_store_roots,
@@ -178,5 +179,5 @@ pub fn main(
     )?;
     let (_artifact_store_roots, refs) =
         call_tile!(finalize_input_embedding_refs, artifact_store_roots, state)?;
-    Ok(refs)
+    Ok(RasterInputEmbeddingOutput::new(_artifact_store_roots, refs))
 }

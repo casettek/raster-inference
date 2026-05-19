@@ -31,6 +31,27 @@ public outputs:
 
 The public statement should not include full tensors, full token streams, full text, full KV caches, or accumulated output rows. Those values belong in authenticated artifacts.
 
+## Routine Boundary Contract
+
+Raster routines should hand state to the next routine as a root-chain envelope plus compact refs:
+
+```text
+input:
+  artifact_store_roots
+  input artifact refs
+  static source roots or static source refs
+  small controls such as counts, positions, sizing, and stop reasons
+
+output:
+  artifact_store_roots
+  output artifact refs
+  small public summaries
+```
+
+Routine-specific refs must not own a full `RasterArtifactStoreRoots` snapshot. The active root chain is carried separately by the routine input/output envelope, while refs carry artifact identity, shape/count metadata, and their own commitment root. This preserves proof-shaped handoffs and makes stale-root failures explicit at the next routine boundary.
+
+Materialized transformer structs remain compatibility outputs for public APIs and checkpoint payloads. Raster-to-raster handoffs should prefer proof-shaped refs and materialize only through named adapter functions at those public/checkpoint boundaries.
+
 ## Value Categories
 
 ### Inline Public State

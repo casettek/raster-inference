@@ -5,7 +5,7 @@ use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::det_num::{argmax_first, Act};
 use crate::shared::output::OutputDecodeStopReason;
 use crate::shared::raster_artifact_store::{
-    read_token_id_from_roots, token_id_leaf, token_ids_ref_for_root, RasterArtifactId,
+    read_token_id_from_ref_roots, token_id_leaf, RasterArtifactId,
     RasterArtifactMetadata, RasterArtifactStoreRoots, RasterSelectedTokenRef,
     RasterTokenIdSequenceRef,
 };
@@ -20,9 +20,9 @@ pub const DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE: usize = 64;
 pub struct RasterDecodeSelectInputRoots {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub logits_ref: RasterActivationSequenceRef,
-    pub full_token_ids_root: Option<String>,
+    pub full_token_ids_ref: Option<RasterTokenIdSequenceRef>,
     pub full_token_count: usize,
-    pub generated_token_ids_root: Option<String>,
+    pub generated_token_ids_ref: Option<RasterTokenIdSequenceRef>,
     pub generated_token_count: usize,
     pub max_new_tokens: usize,
     pub logits_per_tile: usize,
@@ -46,9 +46,9 @@ pub struct DecodeSelectArgmaxState {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DecodeSelectAppendState {
     artifact_store_roots: RasterArtifactStoreRoots,
-    full_token_ids_root: Option<String>,
+    full_token_ids_ref: Option<RasterTokenIdSequenceRef>,
     full_token_count: usize,
-    generated_token_ids_root: Option<String>,
+    generated_token_ids_ref: Option<RasterTokenIdSequenceRef>,
     generated_token_count: usize,
     next_full_token_idx: usize,
     next_generated_token_idx: usize,
@@ -195,13 +195,13 @@ pub fn init_decode_select_append_state(
     }
     validate_token_input(
         &artifact_store_roots,
-        input_roots.full_token_ids_root.as_deref(),
+        input_roots.full_token_ids_ref.as_ref(),
         input_roots.full_token_count,
         "full",
     )?;
     validate_token_input(
         &artifact_store_roots,
-        input_roots.generated_token_ids_root.as_deref(),
+        input_roots.generated_token_ids_ref.as_ref(),
         input_roots.generated_token_count,
         "generated",
     )?;
@@ -221,9 +221,9 @@ pub fn init_decode_select_append_state(
 
     Ok(DecodeSelectAppendState {
         artifact_store_roots,
-        full_token_ids_root: input_roots.full_token_ids_root.clone(),
+        full_token_ids_ref: input_roots.full_token_ids_ref.clone(),
         full_token_count: input_roots.full_token_count,
-        generated_token_ids_root: input_roots.generated_token_ids_root.clone(),
+        generated_token_ids_ref: input_roots.generated_token_ids_ref.clone(),
         generated_token_count: input_roots.generated_token_count,
         next_full_token_idx: 0,
         next_generated_token_idx: 0,
@@ -248,7 +248,7 @@ pub fn copy_next_full_token_chunk(
     if state.token_ids_per_tile == 0 {
         bail!("raster decode select token ids per tile must be greater than zero");
     }
-    let Some(token_ids_root) = state.full_token_ids_root.clone() else {
+    let Some(token_ids_ref) = state.full_token_ids_ref.clone() else {
         bail!("raster decode select full token ids root is missing");
     };
     let end = state
@@ -256,10 +256,9 @@ pub fn copy_next_full_token_chunk(
         .saturating_add(state.token_ids_per_tile)
         .min(state.full_token_count);
     while state.next_full_token_idx < end {
-        let token_id = read_token_id_from_roots(
+        let token_id = read_token_id_from_ref_roots(
             &state.artifact_store_roots,
-            &token_ids_root,
-            state.full_token_count,
+            &token_ids_ref,
             state.next_full_token_idx,
         )?;
         let (next_roots, _builder_root) =
@@ -285,7 +284,7 @@ pub fn copy_next_generated_token_chunk(
     if state.token_ids_per_tile == 0 {
         bail!("raster decode select token ids per tile must be greater than zero");
     }
-    let Some(token_ids_root) = state.generated_token_ids_root.clone() else {
+    let Some(token_ids_ref) = state.generated_token_ids_ref.clone() else {
         bail!("raster decode select generated token ids root is missing");
     };
     let end = state
@@ -293,10 +292,9 @@ pub fn copy_next_generated_token_chunk(
         .saturating_add(state.token_ids_per_tile)
         .min(state.generated_token_count);
     while state.next_generated_token_idx < end {
-        let token_id = read_token_id_from_roots(
+        let token_id = read_token_id_from_ref_roots(
             &state.artifact_store_roots,
-            &token_ids_root,
-            state.generated_token_count,
+            &token_ids_ref,
             state.next_generated_token_idx,
         )?;
         let (next_roots, _builder_root) =
@@ -413,13 +411,21 @@ pub fn finalize_decode_select_refs(
 
 fn validate_token_input(
     artifact_store_roots: &RasterArtifactStoreRoots,
-    token_ids_root: Option<&str>,
+    token_ids_ref: Option<&RasterTokenIdSequenceRef>,
     token_count: usize,
     label: &str,
 ) -> Result<()> {
-    match (token_ids_root, token_count) {
-        (Some(root), count) => {
-            token_ids_ref_for_root(artifact_store_roots, root, count)?;
+    match (token_ids_ref, token_count) {
+        (Some(token_ids_ref), count) => {
+            if token_ids_ref.token_count() != count {
+                bail!(
+                    "raster decode select {label} token count mismatch: ref has {}, expected {count}",
+                    token_ids_ref.token_count()
+                );
+            }
+            if count > 0 {
+                read_token_id_from_ref_roots(artifact_store_roots, token_ids_ref, 0)?;
+            }
             Ok(())
         }
         (None, 0) => Ok(()),
@@ -652,7 +658,7 @@ mod tests {
 
         assert!(encoded_argmax.contains("artifact_store_roots"));
         assert!(encoded_argmax.contains("logits_ref"));
-        assert!(encoded_append.contains("full_token_ids_root"));
+        assert!(encoded_append.contains("full_token_ids_ref"));
         for encoded in [&encoded_argmax, &encoded_append] {
             assert!(!encoded.contains("current_logits"));
             assert!(!encoded.contains("\"logit_bits\":["));
@@ -827,12 +833,12 @@ mod tests {
     ) -> Result<RasterDecodeSelectInputRoots> {
         ArtifactIo::reset_store();
         let roots = ArtifactIo::export_store_roots();
-        let (roots, full_token_ids_root) = insert_token_ids(
+        let (roots, full_token_ids_ref) = insert_token_ids(
             roots,
             format!("{source_prefix}.input.full"),
             &full_token_ids,
         )?;
-        let (roots, generated_token_ids_root) = insert_token_ids(
+        let (roots, generated_token_ids_ref) = insert_token_ids(
             roots,
             format!("{source_prefix}.input.generated"),
             &generated_token_ids,
@@ -843,9 +849,9 @@ mod tests {
         Ok(RasterDecodeSelectInputRoots {
             artifact_store_roots: roots,
             logits_ref,
-            full_token_ids_root,
+            full_token_ids_ref,
             full_token_count: full_token_ids.len(),
-            generated_token_ids_root,
+            generated_token_ids_ref,
             generated_token_count: generated_token_ids.len(),
             max_new_tokens,
             logits_per_tile,
@@ -860,7 +866,7 @@ mod tests {
         roots: RasterArtifactStoreRoots,
         source_name: String,
         token_ids: &[u32],
-    ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
+    ) -> Result<(RasterArtifactStoreRoots, Option<RasterTokenIdSequenceRef>)> {
         if token_ids.is_empty() {
             return Ok((roots, None));
         }
@@ -871,7 +877,7 @@ mod tests {
             RasterArtifactMetadata::token_ids(token_ids.len()),
             leaves,
         )?;
-        Ok((roots, Some(token_ids_ref.root().to_string())))
+        Ok((roots, Some(RasterTokenIdSequenceRef::new(token_ids_ref)?)))
     }
 
     fn insert_logits(

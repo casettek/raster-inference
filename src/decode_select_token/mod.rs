@@ -47,13 +47,29 @@ pub fn run_raster_refs(
     decode_state: &mut DecodeState,
     max_new_tokens: usize,
 ) -> Result<Option<raster_tiles::RasterDecodeSelectOutputRefs>> {
+    run_raster_refs_with_roots(
+        decode_state,
+        max_new_tokens,
+        ArtifactIo::export_store_roots(),
+    )
+}
+
+pub fn run_raster_refs_with_roots(
+    decode_state: &mut DecodeState,
+    max_new_tokens: usize,
+    artifact_store_roots: RasterArtifactStoreRoots,
+) -> Result<Option<raster_tiles::RasterDecodeSelectOutputRefs>> {
     if raster_tiles::check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens)
         .is_some()
     {
         return Ok(None);
     }
 
-    let input_roots = prepare_raster_decode_select_input_roots(decode_state, max_new_tokens)?;
+    let input_roots = prepare_raster_decode_select_input_roots(
+        artifact_store_roots,
+        decode_state,
+        max_new_tokens,
+    )?;
     let output =
         raster_tiles::main(input_roots)?.expect("stop condition should have returned earlier");
 
@@ -77,20 +93,19 @@ pub fn run_raster_with_roots(
 }
 
 fn prepare_raster_decode_select_input_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
     decode_state: &DecodeState,
     max_new_tokens: usize,
 ) -> Result<raster_tiles::RasterDecodeSelectInputRoots> {
-    ArtifactIo::reset_store();
-    let artifact_store_roots = ArtifactIo::export_store_roots();
     let position = decode_state.transformer_decode_state.position;
     let generated_count = decode_state.generated_token_ids.len();
     let source_prefix = format!("decode.select_token.position_{position}.step_{generated_count}");
-    let (artifact_store_roots, full_token_ids_root) = insert_token_ids_artifact_with_roots(
+    let (artifact_store_roots, full_token_ids_ref) = insert_token_ids_artifact_with_roots(
         artifact_store_roots,
         format!("{source_prefix}.input.full_token_ids"),
         &decode_state.full_token_ids,
     )?;
-    let (artifact_store_roots, generated_token_ids_root) = insert_token_ids_artifact_with_roots(
+    let (artifact_store_roots, generated_token_ids_ref) = insert_token_ids_artifact_with_roots(
         artifact_store_roots,
         format!("{source_prefix}.input.generated_token_ids"),
         &decode_state.generated_token_ids,
@@ -104,9 +119,9 @@ fn prepare_raster_decode_select_input_roots(
     Ok(raster_tiles::RasterDecodeSelectInputRoots {
         artifact_store_roots,
         logits_ref,
-        full_token_ids_root,
+        full_token_ids_ref,
         full_token_count: decode_state.full_token_ids.len(),
-        generated_token_ids_root,
+        generated_token_ids_ref,
         generated_token_count: decode_state.generated_token_ids.len(),
         max_new_tokens,
         logits_per_tile: raster_tiles::DEFAULT_DECODE_SELECT_LOGITS_PER_TILE,
@@ -123,7 +138,7 @@ fn insert_token_ids_artifact_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     source_name: String,
     token_ids: &[u32],
-) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
+) -> Result<(RasterArtifactStoreRoots, Option<RasterTokenIdSequenceRef>)> {
     if token_ids.is_empty() {
         return Ok((artifact_store_roots, None));
     }
@@ -134,7 +149,10 @@ fn insert_token_ids_artifact_with_roots(
         RasterArtifactMetadata::token_ids(token_ids.len()),
         leaves,
     )?;
-    Ok((artifact_store_roots, Some(token_ids_ref.root().to_string())))
+    Ok((
+        artifact_store_roots,
+        Some(RasterTokenIdSequenceRef::new(token_ids_ref)?),
+    ))
 }
 
 fn insert_logits_artifact_with_roots(

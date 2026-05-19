@@ -326,6 +326,14 @@ impl AuthenticatedGemmaDecodeTransitionSource {
         &self.identifier
     }
 
+    pub fn static_source_root(&self) -> String {
+        crate::trace::sha256_hex(&(
+            "raster-decode-transition-static-source-v1",
+            self.identifier.as_str(),
+            &self.metadata,
+        ))
+    }
+
     fn layer_metadata(&self, layer_idx: usize) -> Result<GemmaDecodeLayerMetadata> {
         self.layers.get(layer_idx).cloned().ok_or_else(|| {
             anyhow!(

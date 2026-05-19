@@ -8,6 +8,7 @@ use crate::shared::artifact_io::ArtifactIo;
 use crate::shared::det_num::{add_sat, rms_norm as det_rms_norm, scale_act, Acc, Act, Wgt};
 use crate::shared::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
+    RasterRoutineOutput,
 };
 use crate::shared::raster_prefill_ple::{
     store_prefill_ple_input_manifest_with_roots, AuthenticatedGemmaPleSource,
@@ -23,11 +24,13 @@ use crate::RasterSizingControls;
 
 use super::raster_utils::{
     append_sequence_row_by_builder_root_with_roots, finalize_sequence_builder_by_root_with_roots,
-    insert_activation_sequence, insert_activation_sequence_with_roots,
-    raster_activation_sequence_from_embedding, read_activation_row_from_ref, read_prefill_token_id,
-    reset_artifact_store, start_sequence_builder_with_roots, store_prefill_token_ids_artifact,
-    store_prefill_token_ids_artifact_with_roots,
+    insert_activation_sequence_with_roots, raster_activation_sequence_from_embedding,
+    read_activation_row_from_ref, read_prefill_token_id, reset_artifact_store,
+    start_sequence_builder_with_roots, store_prefill_token_ids_artifact_with_roots,
 };
+
+#[cfg(test)]
+use super::raster_utils::{insert_activation_sequence, store_prefill_token_ids_artifact};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillPleRasterState {
@@ -52,6 +55,8 @@ pub struct RasterPrefillPleInputRoots {
     has_ple_global: bool,
     raster_sizing: RasterSizingControls,
 }
+
+pub type RasterPrefillPleOutput = RasterRoutineOutput<Option<String>>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillPleLayerContext {
@@ -253,13 +258,13 @@ pub fn prepare_raster_prefill_ple_input_roots(
 }
 
 pub fn prepare_raster_prefill_ple_input_roots_from_embedding_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
     validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
-    let artifact_store_roots = input_embedding_refs.artifact_store_roots.clone();
     let token_ids_source_name = artifact_source_name_for_root(
         &artifact_store_roots,
         &input_embedding_refs.prompt_token_ids_root,
@@ -707,17 +712,20 @@ pub fn run(
 }
 
 pub fn run_with_input_embedding_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
-) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
+) -> Result<RasterPrefillPleOutput> {
     let (artifact_store_roots, input_roots) =
         prepare_raster_prefill_ple_input_roots_from_embedding_refs(
+            artifact_store_roots,
             input_embedding_refs,
             ple_source,
             raster_sizing,
         )?;
-    main(artifact_store_roots, input_roots, ple_source)
+    let (artifact_store_roots, refs) = main(artifact_store_roots, input_roots, ple_source)?;
+    Ok(RasterPrefillPleOutput::new(artifact_store_roots, refs))
 }
 
 #[sequence]
@@ -1430,8 +1438,8 @@ mod tests {
             ]),
         )
         .expect("activation ref");
+        let input_embedding_roots = ArtifactIo::export_store_roots();
         let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
-            artifact_store_roots: ArtifactIo::export_store_roots(),
             source_id: "embedding-fixture".to_string(),
             embedding_source_root: "embedding-source-root".to_string(),
             prompt_token_ids_root: token_ids_ref.root().to_string(),
@@ -1459,6 +1467,7 @@ mod tests {
 
         let (_artifact_store_roots, roots) =
             prepare_raster_prefill_ple_input_roots_from_embedding_refs(
+                input_embedding_roots,
                 &input_embedding_refs,
                 &ple_source,
                 raster_sizing_with_projection_rows(1),

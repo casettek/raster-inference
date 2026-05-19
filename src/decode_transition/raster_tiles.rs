@@ -77,7 +77,7 @@ pub struct RasterDecodeTransitionInputRoots {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub transformer_decode_state: TransformerDecodeState,
     pub selected_token_ref: RasterSelectedTokenRef,
-    pub decode_transition_source_name: String,
+    pub decode_transition_source_root: String,
     pub output_source_prefix: String,
     pub raster_sizing: RasterSizingControls,
 }
@@ -797,7 +797,7 @@ pub fn run(
             artifact_store_roots,
             transformer_decode_state,
             selected_token_ref,
-            decode_transition_source_name: source.identifier().to_string(),
+            decode_transition_source_root: source.static_source_root(),
             output_source_prefix,
             raster_sizing,
         },
@@ -811,11 +811,11 @@ pub fn main(
     input_roots: RasterDecodeTransitionInputRoots,
     source: &AuthenticatedGemmaDecodeTransitionSource,
 ) -> Result<RasterDecodeTransitionOutputRefs> {
-    if input_roots.decode_transition_source_name != source.identifier() {
+    if input_roots.decode_transition_source_root != source.static_source_root() {
         bail!(
-            "raster decode transition source {} does not match input source {}",
-            source.identifier(),
-            input_roots.decode_transition_source_name
+            "raster decode transition source root {} does not match input source root {}",
+            source.static_source_root(),
+            input_roots.decode_transition_source_root
         );
     }
     let next_token = call_tile!(
@@ -925,7 +925,7 @@ pub fn init_decode_transition_state_refs_with_roots(
         let cache = raster_cache_from_layer_cache(cache)?;
         let (roots, cache_slot) = register_decode_layer_cache_with_roots(
             &artifact_store_roots,
-            "decode.original.cache",
+            &format!("{output_source_prefix}.original.cache"),
             layer_idx,
             cache,
         )?;
@@ -1588,7 +1588,8 @@ fn run_decode_attention_with_roots(
         v_heads_ref,
         layer.layer_idx,
         layer.cache_sliding_window,
-        attention_kv_rows_per_tile
+        attention_kv_rows_per_tile,
+        format!("{output_prefix}.updated_cache")
     )?;
     let attention_cache_slot = donor_cache_slot.unwrap_or(&updated_cache_slot);
     let attention_cache_ref = call_tile!(resolve_decode_attention_cache_ref, attention_cache_slot)?;
@@ -2494,6 +2495,7 @@ fn update_decode_attention_cache_with_roots(
     layer_idx: usize,
     cache_window: Option<usize>,
     rows_per_tile: usize,
+    output_prefix: String,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
     if use_donor_cache {
         return Ok((artifact_store_roots, cache_slot));
@@ -2506,7 +2508,8 @@ fn update_decode_attention_cache_with_roots(
         v_heads_ref,
         layer_idx,
         cache_window,
-        rows_per_tile
+        rows_per_tile,
+        output_prefix
     )
 }
 
@@ -2519,6 +2522,7 @@ fn append_decode_kv_cache_ref_with_roots(
     layer_idx: usize,
     cache_window: Option<usize>,
     rows_per_tile: usize,
+    output_prefix: String,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
     let (artifact_store_roots, state) = call_tile!(
         init_decode_kv_cache_append_state_with_roots,
@@ -2526,8 +2530,8 @@ fn append_decode_kv_cache_ref_with_roots(
         cache_slot,
         key_ref,
         value_ref,
-        RasterTensorId::new(format!("decode.updated.cache.{layer_idx}.keys"))?,
-        RasterTensorId::new(format!("decode.updated.cache.{layer_idx}.values"))?,
+        RasterTensorId::new(format!("{output_prefix}.{layer_idx}.keys"))?,
+        RasterTensorId::new(format!("{output_prefix}.{layer_idx}.values"))?,
         cache_window,
         rows_per_tile
     )?;
@@ -5080,7 +5084,7 @@ mod tests {
                 artifact_store_roots: roots,
                 transformer_decode_state: decode_state.clone(),
                 selected_token_ref,
-                decode_transition_source_name: source.identifier().to_string(),
+                decode_transition_source_root: source.static_source_root(),
                 output_source_prefix: "decode.transition.root-backed".to_string(),
                 raster_sizing: raster_sizing(1),
             },
@@ -5118,7 +5122,7 @@ mod tests {
                 artifact_store_roots: RasterArtifactStoreRoots::default(),
                 transformer_decode_state: decode_state_with_cache(1),
                 selected_token_ref,
-                decode_transition_source_name: source.identifier().to_string(),
+                decode_transition_source_root: source.static_source_root(),
                 output_source_prefix: "decode.transition.missing".to_string(),
                 raster_sizing: raster_sizing(1),
             },

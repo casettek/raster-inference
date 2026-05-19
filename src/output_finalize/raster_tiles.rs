@@ -12,7 +12,7 @@ use crate::shared::{
     output::{OutputDecodeState, OutputDecodeStopReason},
     raster_artifact_store::{
         read_token_id_from_ref_roots, token_id_leaf, RasterArtifactId, RasterArtifactStoreRoots,
-        RasterTokenIdSequenceRef,
+        RasterRoutineOutput, RasterTokenIdSequenceRef,
     },
     raster_output_finalize::{
         build_output_token_ids_commitment, OutputPendingBytesRef, OutputTextRef,
@@ -27,7 +27,7 @@ const INVALID_UTF8_REPLACEMENT: &str = "�";
 pub struct RasterOutputFinalizeInputRoots {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub generated_token_ids_ref: RasterTokenIdSequenceRef,
-    pub tokenizer_source_name: String,
+    pub tokenizer_source_root: String,
     pub output_text_source_name: String,
     pub pending_bytes_source_prefix: String,
     pub byte_flush_bytes_per_tile: usize,
@@ -36,7 +36,6 @@ pub struct RasterOutputFinalizeInputRoots {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterOutputFinalizeRefs {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
     pub generated_token_ids_ref: RasterTokenIdSequenceRef,
     pub generated_text_ref: OutputTextRef,
     pub generated_token_ids_sha256: String,
@@ -44,13 +43,15 @@ pub struct RasterOutputFinalizeRefs {
     pub stop_reason: OutputDecodeStopReason,
 }
 
+pub type RasterOutputFinalizeOutput = RasterRoutineOutput<RasterOutputFinalizeRefs>;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterOutputDetokenizeState {
     artifact_store_roots: RasterArtifactStoreRoots,
     token_ids_ref: RasterTokenIdSequenceRef,
     next_token_idx: usize,
     token_count: usize,
-    tokenizer_source_name: String,
+    tokenizer_source_root: String,
     text_builder_source_name: String,
     pending_bytes_source_prefix: String,
     pending_bytes_builder_source_name: Option<String>,
@@ -107,11 +108,12 @@ pub fn init_raster_output_detokenize(
     tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<(RasterArtifactStoreRoots, RasterOutputDetokenizeState)> {
     validate_output_byte_flush_bytes_per_tile(input_roots.byte_flush_bytes_per_tile)?;
-    if input_roots.tokenizer_source_name != tokenizer.identifier() {
+    let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
+    if input_roots.tokenizer_source_root != tokenizer_source_root {
         bail!(
-            "raster output finalize tokenizer source {} does not match input source {}",
-            tokenizer.identifier(),
-            input_roots.tokenizer_source_name
+            "raster output finalize tokenizer source root {} does not match input source root {}",
+            tokenizer_source_root,
+            input_roots.tokenizer_source_root
         );
     }
     let entry = artifact_store_roots
@@ -144,7 +146,7 @@ pub fn init_raster_output_detokenize(
             token_ids_ref: input_roots.generated_token_ids_ref.clone(),
             next_token_idx: 0,
             token_count: input_roots.generated_token_ids_ref.token_count(),
-            tokenizer_source_name: input_roots.tokenizer_source_name,
+            tokenizer_source_root: input_roots.tokenizer_source_root,
             text_builder_source_name: input_roots.output_text_source_name,
             pending_bytes_source_prefix: input_roots.pending_bytes_source_prefix,
             pending_bytes_builder_source_name: None,
@@ -169,11 +171,12 @@ pub fn decode_next_output_token_with_roots(
     mut state: RasterOutputDetokenizeState,
     tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<(bool, RasterOutputDetokenizeState)> {
-    if state.tokenizer_source_name != tokenizer.identifier() {
+    let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
+    if state.tokenizer_source_root != tokenizer_source_root {
         bail!(
-            "raster output finalize tokenizer source {} does not match state source {}",
-            tokenizer.identifier(),
-            state.tokenizer_source_name
+            "raster output finalize tokenizer source root {} does not match state source root {}",
+            tokenizer_source_root,
+            state.tokenizer_source_root
         );
     }
     match state.phase.clone() {
@@ -536,7 +539,6 @@ pub fn finalize_raster_output_detokenize_refs(
     Ok((
         state.artifact_store_roots.clone(),
         RasterOutputFinalizeRefs {
-            artifact_store_roots: state.artifact_store_roots,
             generated_token_ids_ref: state.token_ids_ref,
             generated_text_ref: text_ref,
             generated_token_ids_sha256,
@@ -570,7 +572,7 @@ pub fn detokenize_output_tokens_with_byte_flush_bytes_per_tile(
     let refs = call_seq!(main, input_roots, tokenizer)?;
     crate::shared::raster_output_finalize::materialize_text_from_roots(
         &refs.artifact_store_roots,
-        &refs.generated_text_ref,
+        &refs.refs.generated_text_ref,
     )
 }
 
@@ -590,7 +592,7 @@ pub fn detokenize_output_tokens(
 pub fn detokenize_output_tokens_ref_with_roots(
     input_roots: RasterOutputFinalizeInputRoots,
     tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<RasterOutputFinalizeRefs> {
+) -> Result<RasterOutputFinalizeOutput> {
     let (_artifact_store_roots, state) = call_tile!(
         init_raster_output_detokenize,
         input_roots.artifact_store_roots.clone(),
@@ -599,14 +601,14 @@ pub fn detokenize_output_tokens_ref_with_roots(
     )?;
     let state = call_recur_tile!(decode_next_output_token_with_roots, state, tokenizer)?;
     let (_artifact_store_roots, refs) = call_tile!(finalize_raster_output_detokenize_refs, state)?;
-    Ok(refs)
+    Ok(RasterOutputFinalizeOutput::new(_artifact_store_roots, refs))
 }
 
 #[sequence]
 pub fn main(
     input_roots: RasterOutputFinalizeInputRoots,
     tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<RasterOutputFinalizeRefs> {
+) -> Result<RasterOutputFinalizeOutput> {
     detokenize_output_tokens_ref_with_roots(input_roots, tokenizer)
 }
 
@@ -647,16 +649,16 @@ pub fn run_with_byte_flush_bytes_per_tile(
     let refs = call_seq!(main, input_roots, tokenizer)?;
     let generated_token_ids = materialize_token_ids_from_roots(
         &refs.artifact_store_roots,
-        &refs.generated_token_ids_ref,
+        &refs.refs.generated_token_ids_ref,
     )?;
     let generated_text = crate::shared::raster_output_finalize::materialize_text_from_roots(
         &refs.artifact_store_roots,
-        &refs.generated_text_ref,
+        &refs.refs.generated_text_ref,
     )?;
     Ok(call_tile!(
         finalize_output_decode,
         generated_token_ids,
-        refs.generated_token_ids_sha256,
+        refs.refs.generated_token_ids_sha256,
         generated_text
     ))
 }
@@ -698,7 +700,7 @@ pub fn prepare_raster_output_finalize_input_roots(
     Ok(RasterOutputFinalizeInputRoots {
         artifact_store_roots,
         generated_token_ids_ref: RasterTokenIdSequenceRef::new(generated_token_ids_ref)?,
-        tokenizer_source_name: tokenizer.identifier().to_string(),
+        tokenizer_source_root: tokenizer.committed_source_ref()?.root().to_string(),
         output_text_source_name: format!("{source_prefix}.output.text"),
         pending_bytes_source_prefix: format!("{source_prefix}.output.pending_bytes"),
         byte_flush_bytes_per_tile,
@@ -890,25 +892,25 @@ mod tests {
 
         let refs = main(input_roots, &tokenizer).expect("root-backed finalize should run");
 
-        assert_eq!(refs.generated_token_count, 2);
+        assert_eq!(refs.refs.generated_token_count, 2);
         assert_eq!(
-            refs.generated_token_ids_sha256,
+            refs.refs.generated_token_ids_sha256,
             build_output_decode_commitment(&[4, 3]).expect("commitment should build")
         );
         assert_eq!(
             materialize_token_ids_from_roots(
                 &refs.artifact_store_roots,
-                &refs.generated_token_ids_ref
+                &refs.refs.generated_token_ids_ref
             )
             .expect("token ids should materialize"),
             vec![4, 3]
         );
         assert_eq!(
-            materialize_text_from_roots(&refs.artifact_store_roots, &refs.generated_text_ref)
+            materialize_text_from_roots(&refs.artifact_store_roots, &refs.refs.generated_text_ref)
                 .expect("text should materialize"),
             " ab"
         );
-        assert!(refs.generated_text_ref.root().is_some());
+        assert!(refs.refs.generated_text_ref.root().is_some());
     }
 
     #[test]
@@ -933,7 +935,7 @@ mod tests {
         .expect("default chunking should run");
         let default_text = materialize_text_from_roots(
             &default_refs.artifact_store_roots,
-            &default_refs.generated_text_ref,
+            &default_refs.refs.generated_text_ref,
         )
         .expect("default text should materialize");
 
@@ -951,15 +953,15 @@ mod tests {
         .expect("wide chunking should run");
         let wide_text = materialize_text_from_roots(
             &wide_refs.artifact_store_roots,
-            &wide_refs.generated_text_ref,
+            &wide_refs.refs.generated_text_ref,
         )
         .expect("wide text should materialize");
 
         assert_eq!(default_text, wide_text);
         assert_eq!(wide_text, "é".repeat(20));
         assert_eq!(
-            default_refs.generated_token_ids_sha256,
-            wide_refs.generated_token_ids_sha256
+            default_refs.refs.generated_token_ids_sha256,
+            wide_refs.refs.generated_token_ids_sha256
         );
     }
 
@@ -1061,7 +1063,7 @@ mod tests {
             "output.finalize.bad_source",
         )
         .expect("input roots should prepare");
-        bad_source.tokenizer_source_name = "wrong-tokenizer".to_string();
+        bad_source.tokenizer_source_root = "wrong-tokenizer-root".to_string();
         assert!(main(bad_source, &tokenizer)
             .expect_err("bad tokenizer route should fail")
             .to_string()
@@ -1086,7 +1088,7 @@ mod tests {
         .expect("root-backed finalize should run");
 
         assert_eq!(
-            refs.generated_token_ids_sha256,
+            refs.refs.generated_token_ids_sha256,
             build_output_decode_commitment(&token_ids).expect("commitment should build")
         );
     }
