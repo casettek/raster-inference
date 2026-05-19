@@ -4,6 +4,14 @@ use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 
 use crate::shared::artifact_io::AuthRead;
+use crate::shared::raster_artifact_store::{
+    RasterArtifactMetadata, RasterArtifactRef, RasterArtifactStoreRoots,
+};
+
+pub const OUTPUT_TEXT_CHUNK_ARTIFACT_KIND: &str = "output_text_chunks";
+pub const OUTPUT_PENDING_BYTE_ARTIFACT_KIND: &str = "output_pending_bytes";
+pub const OUTPUT_TEXT_CHUNK_ARTIFACT_DOMAIN: &str = "raster-output-text-chunks-merkle-v1";
+pub const OUTPUT_PENDING_BYTE_ARTIFACT_DOMAIN: &str = "raster-output-pending-bytes-merkle-v1";
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedOutputTokenIdsSource {
@@ -41,6 +49,8 @@ pub struct OutputTextRef {
     byte_len: usize,
     char_count: usize,
     det_text_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_ref: Option<RasterArtifactRef>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -175,6 +185,29 @@ impl OutputTokenIdsRef {
 }
 
 impl OutputTextRef {
+    pub fn from_artifact(
+        artifact_ref: RasterArtifactRef,
+        byte_len: usize,
+        char_count: usize,
+        det_text_sha256: String,
+    ) -> Result<Self> {
+        if artifact_ref.metadata().kind() != OUTPUT_TEXT_CHUNK_ARTIFACT_KIND {
+            bail!(
+                "raster output text artifact kind mismatch: {}",
+                artifact_ref.metadata().kind()
+            );
+        }
+        let chunk_count = artifact_ref.metadata().leaf_count();
+        Ok(Self {
+            output_id: artifact_ref.id().source_name().to_string(),
+            chunk_count,
+            byte_len,
+            char_count,
+            det_text_sha256,
+            artifact_ref: Some(artifact_ref),
+        })
+    }
+
     pub fn chunk_count(&self) -> usize {
         self.chunk_count
     }
@@ -189,6 +222,16 @@ impl OutputTextRef {
 
     pub fn det_text_sha256(&self) -> &str {
         &self.det_text_sha256
+    }
+
+    pub fn artifact_ref(&self) -> Result<&RasterArtifactRef> {
+        self.artifact_ref
+            .as_ref()
+            .ok_or_else(|| anyhow!("raster output text ref is not artifact-backed"))
+    }
+
+    pub fn root(&self) -> Option<&str> {
+        self.artifact_ref.as_ref().map(RasterArtifactRef::root)
     }
 }
 
@@ -276,6 +319,7 @@ impl AuthenticatedOutputFinalizeStore {
             byte_len: text.len(),
             char_count: text.chars().count(),
             det_text_sha256: build_text_commitment(&text),
+            artifact_ref: None,
         };
         self.texts.insert(
             builder_ref.output_id,
@@ -300,6 +344,7 @@ impl AuthenticatedOutputFinalizeStore {
             byte_len: stored.text.len(),
             char_count: stored.text.chars().count(),
             det_text_sha256: build_text_commitment(&stored.text),
+            artifact_ref: None,
         };
         if expected != *text_ref {
             bail!("raster output text ref metadata mismatch");
@@ -438,6 +483,340 @@ pub fn build_output_token_ids_commitment(token_ids: &[u32]) -> Result<String> {
         serde_json::to_vec(token_ids).map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let digest = Sha256::digest(payload);
     Ok(format!("{digest:x}"))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OutputTokenIdsCommitmentState {
+    h: [u32; 8],
+    buffer: Vec<u8>,
+    total_len: u64,
+    finalized: bool,
+}
+
+impl OutputTokenIdsCommitmentState {
+    pub fn new() -> Self {
+        let mut state = Self {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buffer: Vec::new(),
+            total_len: 0,
+            finalized: false,
+        };
+        state.update(b"[");
+        state
+    }
+
+    pub fn update_token(&mut self, token_id: u32, token_idx: usize) -> Result<()> {
+        if self.finalized {
+            bail!("raster output token commitment is already finalized");
+        }
+        if token_idx > 0 {
+            self.update(b",");
+        }
+        self.update(token_id.to_string().as_bytes());
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> String {
+        if !self.finalized {
+            self.update(b"]");
+            self.finalize_padding();
+            self.finalized = true;
+        }
+        self.h
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.total_len = self
+            .total_len
+            .checked_add(input.len() as u64)
+            .expect("output token commitment input length should fit in u64");
+        if !self.buffer.is_empty() {
+            let remaining = 64 - self.buffer.len();
+            let take = remaining.min(input.len());
+            self.buffer.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.buffer.len() == 64 {
+                let block: [u8; 64] = self
+                    .buffer
+                    .as_slice()
+                    .try_into()
+                    .expect("buffer length checked");
+                self.compress(&block);
+                self.buffer.clear();
+            }
+        }
+        while input.len() >= 64 {
+            let block: [u8; 64] = input[..64].try_into().expect("block length checked");
+            self.compress(&block);
+            input = &input[64..];
+        }
+        if !input.is_empty() {
+            self.buffer.extend_from_slice(input);
+        }
+    }
+
+    fn finalize_padding(&mut self) {
+        let bit_len = self
+            .total_len
+            .checked_mul(8)
+            .expect("output token commitment bit length should fit in u64");
+        self.buffer.push(0x80);
+        while self.buffer.len() % 64 != 56 {
+            self.buffer.push(0);
+        }
+        self.buffer.extend_from_slice(&bit_len.to_be_bytes());
+        let blocks = std::mem::take(&mut self.buffer);
+        for block in blocks.chunks_exact(64) {
+            let block: [u8; 64] = block.try_into().expect("padding block length checked");
+            self.compress(&block);
+        }
+    }
+
+    fn compress(&mut self, block: &[u8; 64]) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut w = [0u32; 64];
+        for (idx, chunk) in block.chunks_exact(4).take(16).enumerate() {
+            w[idx] = u32::from_be_bytes(chunk.try_into().expect("word length checked"));
+        }
+        for idx in 16..64 {
+            let s0 =
+                w[idx - 15].rotate_right(7) ^ w[idx - 15].rotate_right(18) ^ (w[idx - 15] >> 3);
+            let s1 = w[idx - 2].rotate_right(17) ^ w[idx - 2].rotate_right(19) ^ (w[idx - 2] >> 10);
+            w[idx] = w[idx - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[idx - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.h;
+        for idx in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[idx])
+                .wrapping_add(w[idx]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        self.h[0] = self.h[0].wrapping_add(a);
+        self.h[1] = self.h[1].wrapping_add(b);
+        self.h[2] = self.h[2].wrapping_add(c);
+        self.h[3] = self.h[3].wrapping_add(d);
+        self.h[4] = self.h[4].wrapping_add(e);
+        self.h[5] = self.h[5].wrapping_add(f);
+        self.h[6] = self.h[6].wrapping_add(g);
+        self.h[7] = self.h[7].wrapping_add(h);
+    }
+}
+
+impl Default for OutputTokenIdsCommitmentState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OutputUtf8ValidationState {
+    needed: u8,
+    min_next: u8,
+    max_next: u8,
+}
+
+impl OutputUtf8ValidationState {
+    pub fn new() -> Self {
+        Self {
+            needed: 0,
+            min_next: 0x80,
+            max_next: 0xbf,
+        }
+    }
+
+    pub fn push(&mut self, byte: u8) -> bool {
+        if self.needed == 0 {
+            match byte {
+                0x00..=0x7f => true,
+                0xc2..=0xdf => {
+                    self.expect_continuations(1, 0x80, 0xbf);
+                    true
+                }
+                0xe0 => {
+                    self.expect_continuations(2, 0xa0, 0xbf);
+                    true
+                }
+                0xe1..=0xec | 0xee..=0xef => {
+                    self.expect_continuations(2, 0x80, 0xbf);
+                    true
+                }
+                0xed => {
+                    self.expect_continuations(2, 0x80, 0x9f);
+                    true
+                }
+                0xf0 => {
+                    self.expect_continuations(3, 0x90, 0xbf);
+                    true
+                }
+                0xf1..=0xf3 => {
+                    self.expect_continuations(3, 0x80, 0xbf);
+                    true
+                }
+                0xf4 => {
+                    self.expect_continuations(3, 0x80, 0x8f);
+                    true
+                }
+                _ => false,
+            }
+        } else if (self.min_next..=self.max_next).contains(&byte) {
+            self.needed -= 1;
+            self.min_next = 0x80;
+            self.max_next = 0xbf;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.needed == 0
+    }
+
+    fn expect_continuations(&mut self, needed: u8, min_next: u8, max_next: u8) {
+        self.needed = needed;
+        self.min_next = min_next;
+        self.max_next = max_next;
+    }
+}
+
+impl Default for OutputUtf8ValidationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OutputPendingBytesRef {
+    artifact_ref: RasterArtifactRef,
+}
+
+impl OutputPendingBytesRef {
+    pub fn new(artifact_ref: RasterArtifactRef) -> Result<Self> {
+        if artifact_ref.metadata().kind() != OUTPUT_PENDING_BYTE_ARTIFACT_KIND {
+            bail!(
+                "raster output pending-byte artifact kind mismatch: {}",
+                artifact_ref.metadata().kind()
+            );
+        }
+        Ok(Self { artifact_ref })
+    }
+
+    pub fn artifact_ref(&self) -> &RasterArtifactRef {
+        &self.artifact_ref
+    }
+
+    pub fn byte_count(&self) -> usize {
+        self.artifact_ref.metadata().leaf_count()
+    }
+}
+
+pub fn output_text_metadata() -> Result<RasterArtifactMetadata> {
+    RasterArtifactMetadata::open(
+        OUTPUT_TEXT_CHUNK_ARTIFACT_KIND,
+        OUTPUT_TEXT_CHUNK_ARTIFACT_DOMAIN,
+        Vec::new(),
+    )
+}
+
+pub fn output_pending_bytes_metadata() -> Result<RasterArtifactMetadata> {
+    RasterArtifactMetadata::open(
+        OUTPUT_PENDING_BYTE_ARTIFACT_KIND,
+        OUTPUT_PENDING_BYTE_ARTIFACT_DOMAIN,
+        Vec::new(),
+    )
+}
+
+pub fn text_chunk_leaf(chunk: &str) -> Vec<u8> {
+    chunk.as_bytes().to_vec()
+}
+
+pub fn decode_text_chunk_leaf(payload: &[u8]) -> Result<String> {
+    Ok(std::str::from_utf8(payload)?.to_string())
+}
+
+pub fn pending_byte_leaf(byte: u8) -> Vec<u8> {
+    vec![byte]
+}
+
+pub fn decode_pending_byte_leaf(payload: &[u8]) -> Result<u8> {
+    let [byte] = payload else {
+        bail!("raster output pending-byte leaf payload must contain exactly one byte");
+    };
+    Ok(*byte)
+}
+
+pub fn build_output_text_commitment(text: &str) -> String {
+    build_text_commitment(text)
+}
+
+pub fn materialize_text_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    text_ref: &OutputTextRef,
+) -> Result<String> {
+    let artifact_ref = text_ref.artifact_ref()?;
+    let entry = roots.artifact_entry_for_source_name(artifact_ref.id().source_name())?;
+    if entry.root() != artifact_ref.root() {
+        bail!(
+            "raster output text artifact root mismatch for {}: snapshot has {}, ref has {}",
+            artifact_ref.id().source_name(),
+            entry.root(),
+            artifact_ref.root()
+        );
+    }
+
+    let mut text = String::new();
+    for chunk_idx in 0..text_ref.chunk_count() {
+        let read = crate::shared::artifact_io::ArtifactIo::read_leaf(artifact_ref, chunk_idx)?;
+        crate::shared::artifact_io::ArtifactIo::verify_artifact_read(artifact_ref, &read)?;
+        text.push_str(&decode_text_chunk_leaf(read.payload())?);
+    }
+    let text_commitment = build_text_commitment(&text);
+    let artifact_commitment = artifact_ref.root();
+    if text.len() != text_ref.byte_len()
+        || text.chars().count() != text_ref.char_count()
+        || (text_commitment != text_ref.det_text_sha256()
+            && artifact_commitment != text_ref.det_text_sha256())
+    {
+        bail!("raster output text ref metadata mismatch");
+    }
+    Ok(text)
 }
 
 fn validate_identifier(identifier: String, label: &str) -> Result<String> {

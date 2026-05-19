@@ -355,6 +355,10 @@ fn run_output_decode_with_mode_internal(
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
     let mut decode_transition_states = Vec::new();
+    let mut latest_raster_generated_tokens: Option<(
+        crate::shared::raster_artifact_store::RasterArtifactStoreRoots,
+        crate::shared::raster_artifact_store::RasterTokenIdSequenceRef,
+    )> = None;
     let mut decode_state = crate::shared::output::DecodeState::new(
         prompt_token_ids.to_vec(),
         initial_transformer_state
@@ -386,13 +390,34 @@ fn run_output_decode_with_mode_internal(
         if stop_condition.is_some() {
             trace_event("output.detokenize");
             let mut output_decode_state = if let Some(raster_tokenizer) = raster_tokenizer {
-                crate::output_finalize::run_raster_with_byte_flush_bytes_per_tile(
-                    decode_state,
-                    raster_tokenizer,
-                    raster_sizing
-                        .expect("raster output finalize requires sizing controls")
-                        .output_byte_flush_bytes_per_tile,
-                )?
+                let byte_flush_bytes_per_tile = raster_sizing
+                    .expect("raster output finalize requires sizing controls")
+                    .output_byte_flush_bytes_per_tile;
+                if let Some((artifact_store_roots, generated_token_ids_ref)) =
+                    latest_raster_generated_tokens.take()
+                {
+                    crate::output_finalize::run_raster_with_roots(
+                        decode_state,
+                        crate::output_finalize::raster_tiles::RasterOutputFinalizeInputRoots {
+                            artifact_store_roots,
+                            generated_token_ids_ref,
+                            tokenizer_source_name: raster_tokenizer.identifier().to_string(),
+                            output_text_source_name: "output.finalize.output.text".to_string(),
+                            pending_bytes_source_prefix: "output.finalize.output.pending_bytes"
+                                .to_string(),
+                            byte_flush_bytes_per_tile,
+                            stop_reason:
+                                crate::shared::output::OutputDecodeStopReason::MaxNewTokens,
+                        },
+                        raster_tokenizer,
+                    )?
+                } else {
+                    crate::output_finalize::run_raster_with_byte_flush_bytes_per_tile(
+                        decode_state,
+                        raster_tokenizer,
+                        byte_flush_bytes_per_tile,
+                    )?
+                }
             } else {
                 crate::output_finalize::run(decode_state, tokenizer)?
             };
@@ -409,6 +434,12 @@ fn run_output_decode_with_mode_internal(
         } else {
             None
         };
+        if let Some(output) = raster_select_output.as_ref() {
+            latest_raster_generated_tokens = Some((
+                output.artifact_store_roots.clone(),
+                output.generated_token_ids_ref.clone(),
+            ));
+        }
         let next_token = match raster_select_output.as_ref() {
             Some(output) => output.next_token,
             None => {
@@ -427,7 +458,7 @@ fn run_output_decode_with_mode_internal(
                     transformer_model,
                 )?;
             if let Some(select_output) = raster_select_output {
-                crate::decode_transition::run_raster_with_roots(
+                let transition_output = crate::decode_transition::run_raster_with_roots(
                     crate::decode_transition::raster_tiles::RasterDecodeTransitionInputRoots {
                         artifact_store_roots: select_output.artifact_store_roots,
                         transformer_decode_state,
@@ -441,8 +472,13 @@ fn run_output_decode_with_mode_internal(
                             .expect("raster decode transition requires sizing controls"),
                     },
                     &source,
-                )?
-                .transition_result
+                )?;
+                if let Some((artifact_store_roots, _generated_token_ids_ref)) =
+                    latest_raster_generated_tokens.as_mut()
+                {
+                    *artifact_store_roots = transition_output.artifact_store_roots.clone();
+                }
+                transition_output.transition_result
             } else {
                 crate::decode_transition::run_raster(
                     transformer_decode_state,

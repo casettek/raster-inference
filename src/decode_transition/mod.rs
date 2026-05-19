@@ -132,7 +132,7 @@ pub fn finalize(decode_state: &DecodeState) -> Result<()> {
             "full_token_ids": decode_state.full_token_ids.clone(),
             "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
             "generated_token_ids": decode_state.generated_token_ids.clone(),
-            "generated_token_ids_sha256": crate::output_finalize::tiles::build_output_decode_commitment(&decode_state.generated_token_ids)?,
+            "generated_token_ids_sha256": generated_token_ids_commitment(decode_state)?,
             "current_logits": decode_state.current_logits.clone(),
             "current_logits_sha256": current_logits_commitment(decode_state),
             "det_current_logits_sha256": current_det_logits_commitment(decode_state),
@@ -142,6 +142,10 @@ pub fn finalize(decode_state: &DecodeState) -> Result<()> {
         }),
     );
     Ok(())
+}
+
+fn generated_token_ids_commitment(decode_state: &DecodeState) -> Result<String> {
+    crate::output_finalize::tiles::build_output_decode_commitment(&decode_state.generated_token_ids)
 }
 
 fn current_logits_commitment(decode_state: &DecodeState) -> String {
@@ -158,7 +162,9 @@ fn current_det_logits_commitment(decode_state: &DecodeState) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_det_logits_commitment, current_logits_commitment};
+    use super::{
+        current_det_logits_commitment, current_logits_commitment, generated_token_ids_commitment,
+    };
     use crate::shared::det_num::Act;
     use crate::shared::output::DecodeState;
     use crate::shared::transformer::{InternalLogits, TransformerDecodeState};
@@ -187,6 +193,21 @@ mod tests {
                     internal.det_values().expect("det logits")
                 )
             )
+        );
+    }
+
+    #[test]
+    fn decode_finalize_uses_output_finalize_token_commitment_methodology() {
+        let mut decode_state =
+            DecodeState::new(vec![7], vec![0.0], TransformerDecodeState::default());
+        decode_state.generated_token_ids = vec![4, 3, 6, 7];
+
+        assert_eq!(
+            generated_token_ids_commitment(&decode_state).expect("commitment should build"),
+            crate::output_finalize::tiles::build_output_decode_commitment(
+                &decode_state.generated_token_ids
+            )
+            .expect("output commitment should build")
         );
     }
 }
