@@ -1,0 +1,228 @@
+use anyhow::{anyhow, Result};
+use serde_json::{json, Value};
+
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::api::output::DecodeState;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
+    activation_row_leaf, read_token_id_from_ref_roots, token_id_leaf,
+    RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
+    RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
+};
+use crate::shared::raster_kernels::transformer::RasterActivationRow;
+use crate::shared::tensors::raster_row_store::{
+    activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
+};
+
+pub mod native;
+pub mod raster;
+
+pub fn run(
+    decode_state: &mut DecodeState,
+    max_new_tokens: usize,
+    execution_mode: InferenceExecutionMode,
+) -> Result<Option<u32>> {
+    if native::check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens)
+        .is_some()
+    {
+        return Ok(None);
+    }
+
+    let logits = decode_state.clone_internal_logits();
+    let next_token = native::select_next_token_internal(&logits, execution_mode)?;
+    decode_state.full_token_ids = native::append_token(&decode_state.full_token_ids, next_token);
+    decode_state.generated_token_ids =
+        native::append_token(&decode_state.generated_token_ids, next_token);
+    crate::trace::trace_checkpoint(
+        "decode.select_token",
+        &decode_select_checkpoint_state(decode_state, next_token, max_new_tokens)?,
+    );
+    Ok(Some(next_token))
+}
+
+pub fn run_raster(decode_state: &mut DecodeState, max_new_tokens: usize) -> Result<Option<u32>> {
+    Ok(run_raster_refs(decode_state, max_new_tokens)?.map(|output| output.next_token))
+}
+
+pub fn run_raster_refs(
+    decode_state: &mut DecodeState,
+    max_new_tokens: usize,
+) -> Result<Option<raster::RasterDecodeSelectOutputRefs>> {
+    run_raster_refs_with_roots(
+        decode_state,
+        max_new_tokens,
+        ArtifactIo::export_store_roots(),
+    )
+}
+
+pub fn run_raster_refs_with_roots(
+    decode_state: &mut DecodeState,
+    max_new_tokens: usize,
+    artifact_store_roots: RasterArtifactStoreRoots,
+) -> Result<Option<raster::RasterDecodeSelectOutputRefs>> {
+    if raster::check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens)
+        .is_some()
+    {
+        return Ok(None);
+    }
+
+    let input_roots = prepare_raster_decode_select_input_roots(
+        artifact_store_roots,
+        decode_state,
+        max_new_tokens,
+    )?;
+    let output = raster::main(input_roots)?.expect("stop condition should have returned earlier");
+
+    decode_state.full_token_ids =
+        materialize_token_ids(&output.artifact_store_roots, &output.full_token_ids_ref)?;
+    decode_state.generated_token_ids = materialize_token_ids(
+        &output.artifact_store_roots,
+        &output.generated_token_ids_ref,
+    )?;
+    crate::trace::trace_checkpoint(
+        "decode.select_token",
+        &decode_select_checkpoint_state(decode_state, output.next_token, max_new_tokens)?,
+    );
+    Ok(Some(output))
+}
+
+pub fn run_raster_with_roots(
+    input_roots: raster::RasterDecodeSelectInputRoots,
+) -> Result<Option<raster::RasterDecodeSelectOutputRefs>> {
+    raster::main(input_roots)
+}
+
+fn prepare_raster_decode_select_input_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    decode_state: &DecodeState,
+    max_new_tokens: usize,
+) -> Result<raster::RasterDecodeSelectInputRoots> {
+    let position = decode_state.transformer_decode_state.position;
+    let generated_count = decode_state.generated_token_ids.len();
+    let source_prefix = format!("decode.select_token.position_{position}.step_{generated_count}");
+    let (artifact_store_roots, full_token_ids_ref) = insert_token_ids_artifact_with_roots(
+        artifact_store_roots,
+        format!("{source_prefix}.input.full_token_ids"),
+        &decode_state.full_token_ids,
+    )?;
+    let (artifact_store_roots, generated_token_ids_ref) = insert_token_ids_artifact_with_roots(
+        artifact_store_roots,
+        format!("{source_prefix}.input.generated_token_ids"),
+        &decode_state.generated_token_ids,
+    )?;
+    let (artifact_store_roots, logits_ref) = insert_logits_artifact_with_roots(
+        artifact_store_roots,
+        format!("{source_prefix}.input.logits"),
+        decode_state,
+    )?;
+
+    Ok(raster::RasterDecodeSelectInputRoots {
+        artifact_store_roots,
+        logits_ref,
+        full_token_ids_ref,
+        full_token_count: decode_state.full_token_ids.len(),
+        generated_token_ids_ref,
+        generated_token_count: decode_state.generated_token_ids.len(),
+        max_new_tokens,
+        logits_per_tile: raster::DEFAULT_DECODE_SELECT_LOGITS_PER_TILE,
+        token_ids_per_tile: raster::DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE,
+        output_full_token_ids_source_name: format!("{source_prefix}.output.full_token_ids"),
+        output_generated_token_ids_source_name: format!(
+            "{source_prefix}.output.generated_token_ids"
+        ),
+        output_selected_token_source_name: format!("{source_prefix}.output.selected_token"),
+    })
+}
+
+fn insert_token_ids_artifact_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    source_name: String,
+    token_ids: &[u32],
+) -> Result<(RasterArtifactStoreRoots, Option<RasterTokenIdSequenceRef>)> {
+    if token_ids.is_empty() {
+        return Ok((artifact_store_roots, None));
+    }
+    let leaves = token_ids.iter().copied().map(token_id_leaf).collect();
+    let (artifact_store_roots, token_ids_ref) = ArtifactIo::insert_artifact_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(source_name)?,
+        RasterArtifactMetadata::token_ids(token_ids.len()),
+        leaves,
+    )?;
+    Ok((
+        artifact_store_roots,
+        Some(RasterTokenIdSequenceRef::new(token_ids_ref)?),
+    ))
+}
+
+fn insert_logits_artifact_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    source_name: String,
+    decode_state: &DecodeState,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let logits = decode_state.clone_internal_logits();
+    let det_logits = logits.det_values().ok_or_else(|| {
+        anyhow!("raster decode select token requires canonical deterministic logits")
+    })?;
+    if det_logits.is_empty() {
+        anyhow::bail!("raster decode select token requires at least one canonical logit");
+    }
+
+    let leaves = det_logits
+        .iter()
+        .map(|logit| activation_row_leaf(&RasterActivationRow::from_acts(vec![*logit])))
+        .collect::<Vec<_>>();
+    let (artifact_store_roots, logits_artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(source_name.clone())?,
+        RasterArtifactMetadata::activation_rows(det_logits.len(), 1)?,
+        leaves,
+    )?;
+    let logits_ref = activation_sequence_ref_from_artifact(
+        RasterTensorId::new(source_name)?,
+        RasterActivationSequenceArtifactRef::new(logits_artifact_ref)?,
+    )?;
+    Ok((artifact_store_roots, logits_ref))
+}
+
+fn materialize_token_ids(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    token_ids_ref: &RasterTokenIdSequenceRef,
+) -> Result<Vec<u32>> {
+    (0..token_ids_ref.token_count())
+        .map(|token_idx| {
+            read_token_id_from_ref_roots(artifact_store_roots, token_ids_ref, token_idx)
+        })
+        .collect()
+}
+
+fn decode_select_checkpoint_state(
+    decode_state: &DecodeState,
+    selected_next_token: u32,
+    max_new_tokens: usize,
+) -> Result<Value> {
+    Ok(json!({
+        "full_token_ids": decode_state.full_token_ids.clone(),
+        "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
+        "generated_token_ids": decode_state.generated_token_ids.clone(),
+        "generated_token_ids_sha256": crate::output_finalize::native::build_output_decode_commitment(&decode_state.generated_token_ids)?,
+        "current_logits": decode_state.current_logits.clone(),
+        "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
+        "det_current_logits_sha256": current_det_logits_commitment(decode_state),
+        "selected_next_token": selected_next_token,
+        "decode_position": decode_state.transformer_decode_state.position,
+        "decode_token_count": decode_state.transformer_decode_state.token_count,
+        "layer_caches": crate::trace::serialize_layer_caches(&decode_state.transformer_decode_state.layer_caches),
+        "max_new_tokens": max_new_tokens,
+    }))
+}
+
+fn current_det_logits_commitment(decode_state: &DecodeState) -> Option<String> {
+    let logits = decode_state.clone_internal_logits();
+    logits
+        .det_values()
+        .map(crate::shared::numerics::transformer_kernels::build_det_vector_commitment)
+}
+
+#[cfg(test)]
+mod tests;

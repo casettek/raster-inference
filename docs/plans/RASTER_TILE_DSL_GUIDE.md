@@ -4,7 +4,7 @@
 
 Raster tiles are replayable implementations of existing routine tiles. They should produce the same observable result as their corresponding native path while using an DSL shape that can later be executed and checked in a zkVM in isolation.
 
-The completed prompt-preparation conversion in `src/prompt_prepare/raster_tiles.rs` is the illustrative example for this guide. It mirrors `src/prompt_prepare/tiles.rs`, but replaces direct library calls and open-ended control flow with explicit tile boundaries, sequence composition, authenticated reads, and recursive state transitions.
+The completed prompt-preparation conversion in `src/routines/prompt_prepare/raster/tiles.rs` is the illustrative example for this guide. It mirrors `src/routines/prompt_prepare/native/tiles.rs`, but replaces direct library calls and open-ended control flow with explicit tile boundaries, sequence composition, authenticated reads, and recursive state transitions.
 
 ---
 
@@ -255,7 +255,7 @@ The native CPU path in `src/prompt_prepare/mod.rs` is intentionally simple:
 4. Tokenize the rendered prompt with `tokenizers::Tokenizer::encode_fast`.
 5. Build the prompt-token commitment.
 
-The completed raster path in `src/prompt_prepare/raster_tiles.rs` preserves that semantic pipeline, but changes the execution and state shape. Instead of carrying raw values through an in-memory library call, it commits each meaningful large value as an artifact root and decomposes tokenization into bounded replayable work.
+The completed raster path in `src/routines/prompt_prepare/raster/tiles.rs` preserves that semantic pipeline, but changes the execution and state shape. Instead of carrying raw values through an in-memory library call, it commits each meaningful large value as an artifact root and decomposes tokenization into bounded replayable work.
 
 The raster prompt-preparation checkpoint carries:
 

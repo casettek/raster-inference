@@ -35,15 +35,14 @@ fn run() -> anyhow::Result<()> {
     }
     let chat_template = load_chat_template(&cli_args.template_path)?;
     let tokenizer = load_tokenizer_from_path(&cli_args.tokenizer_path)?;
-    let raster_tokenizer_source = if cli_args.raster_tiles
-        || cli_args.execution_mode == InferenceExecutionMode::Deterministic
-    {
-        Some(AuthenticatedGemmaTokenizer::new(
-            load_gemma_tokenizer_spec_from_path(&cli_args.tokenizer_path)?,
-        ))
-    } else {
-        None
-    };
+    let raster_tokenizer_source =
+        if cli_args.raster || cli_args.execution_mode == InferenceExecutionMode::Deterministic {
+            Some(AuthenticatedGemmaTokenizer::new(
+                load_gemma_tokenizer_spec_from_path(&cli_args.tokenizer_path)?,
+            ))
+        } else {
+            None
+        };
     let transformer_model = match cli_args.execution_mode {
         InferenceExecutionMode::Fp32 => {
             load_transformer_state_model_from_gemma_model_path(&cli_args.model_path)?
@@ -78,7 +77,7 @@ fn run() -> anyhow::Result<()> {
     let controls = InferenceControls {
         commit_checkpoints: cli_args.commit_checkpoints,
         terminal_checkpoint: cli_args.terminal_checkpoint,
-        raster_tiles: cli_args.raster_tiles,
+        raster: cli_args.raster,
         raster_decode_only: cli_args.raster_decode_only,
         raster_tokenizer_source,
         raster_projection_rows_per_tile: cli_args.raster_projection_rows_per_tile,
@@ -115,7 +114,7 @@ fn run() -> anyhow::Result<()> {
 struct CliArgs {
     commit_checkpoints: bool,
     execution_mode: InferenceExecutionMode,
-    raster_tiles: bool,
+    raster: bool,
     raster_decode_only: bool,
     raster_trace_tiles: bool,
     raster_projection_rows_per_tile: Option<usize>,
@@ -137,7 +136,7 @@ impl CliArgs {
     fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
         let mut commit_checkpoints = false;
         let mut execution_mode = InferenceExecutionMode::Fp32;
-        let mut raster_tiles = false;
+        let mut raster = false;
         let mut raster_decode_only = false;
         let mut raster_trace_tiles = false;
         let mut raster_projection_rows_per_tile = None;
@@ -154,7 +153,7 @@ impl CliArgs {
             match arg.as_str() {
                 "--commit-checkpoints" => commit_checkpoints = true,
                 "--deterministic" => execution_mode = InferenceExecutionMode::Deterministic,
-                "--raster" => raster_tiles = true,
+                "--raster" => raster = true,
                 "--raster-decode-only" => raster_decode_only = true,
                 "--raster-trace-tiles" => raster_trace_tiles = true,
                 "--raster-projection-rows-per-tile" => {
@@ -280,39 +279,39 @@ impl CliArgs {
         if positional_args.len() < 5 {
             anyhow::bail!("expected at least 5 positional arguments");
         }
-        if raster_decode_only && !raster_tiles {
+        if raster_decode_only && !raster {
             anyhow::bail!("--raster-decode-only requires --raster");
         }
-        if raster_projection_rows_per_tile.is_some() && !raster_tiles {
+        if raster_projection_rows_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-projection-rows-per-tile requires --raster");
         }
-        if raster_attention_kv_rows_per_tile.is_some() && !raster_tiles {
+        if raster_attention_kv_rows_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-attention-kv-rows-per-tile requires --raster");
         }
-        if raster_sequence_rows_per_tile.is_some() && !raster_tiles {
+        if raster_sequence_rows_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-sequence-rows-per-tile requires --raster");
         }
-        if raster_head_rows_per_tile.is_some() && !raster_tiles {
+        if raster_head_rows_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-head-rows-per-tile requires --raster");
         }
-        if raster_tokenizer_bpe_pairs_per_tile.is_some() && !raster_tiles {
+        if raster_tokenizer_bpe_pairs_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-tokenizer-bpe-pairs-per-tile requires --raster");
         }
-        if raster_tokenizer_bpe_pieces_per_tile.is_some() && !raster_tiles {
+        if raster_tokenizer_bpe_pieces_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-tokenizer-bpe-pieces-per-tile requires --raster");
         }
-        if raster_output_byte_flush_bytes_per_tile.is_some() && !raster_tiles {
+        if raster_output_byte_flush_bytes_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-output-byte-flush-bytes-per-tile requires --raster");
         }
 
-        if raster_tiles {
+        if raster {
             execution_mode = InferenceExecutionMode::Deterministic;
         }
 
         Ok(Self {
             commit_checkpoints,
             execution_mode,
-            raster_tiles,
+            raster,
             raster_decode_only,
             raster_trace_tiles,
             raster_projection_rows_per_tile,
@@ -425,7 +424,7 @@ mod tests {
             Some("prefill.finalize")
         );
         assert_eq!(args.execution_mode, InferenceExecutionMode::Fp32);
-        assert!(!args.raster_tiles);
+        assert!(!args.raster);
     }
 
     #[test]
@@ -473,7 +472,7 @@ mod tests {
         ])
         .expect("cli args should parse");
 
-        assert!(args.raster_tiles);
+        assert!(args.raster);
         assert!(!args.raster_decode_only);
         assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
         assert!(!args.raster_trace_tiles);
@@ -495,7 +494,7 @@ mod tests {
         ])
         .expect("cli args should parse");
 
-        assert!(args.raster_tiles);
+        assert!(args.raster);
         assert!(args.raster_decode_only);
         assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
     }

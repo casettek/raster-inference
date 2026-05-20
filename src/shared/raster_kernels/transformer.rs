@@ -5417,7 +5417,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_can_read_rows_from_raster_auth_source() {
+    fn projection_can_read_rows_from_raster_source() {
         let source = ProjectionSource::new(HashMap::from([
             ((0, 0), vec![Wgt::from_num(0.5), Wgt::from_num(1.0)]),
             ((0, 1), vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)]),
@@ -5586,7 +5586,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_projection_can_read_rows_from_raster_auth_source() {
+    fn prefill_projection_can_read_rows_from_raster_source() {
         let source = PrefillProjectionSource::new(HashMap::from([
             (
                 (0, GemmaPrefillLayerMatrixKind::Query, 0),

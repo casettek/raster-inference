@@ -25,15 +25,15 @@ Important existing files:
 
 - `src/lib.rs`: raster control flow and inference summary output.
 - `src/dsl.rs`: tile/sequence call macros and tile invocation counting.
-- `src/prefill_layer/raster_tiles.rs`: current coarse prefill layer raster implementation.
+- `src/routines/prefill_layer/raster/tiles.rs`: current coarse prefill layer raster implementation.
 - `src/shared/raster_transformer_kernels.rs`: deterministic raster kernels and chunked projection helpers.
-- `src/prefill_prepare_aux/raster_tiles.rs`: PLE prefill raster implementation.
-- `src/prefill_finalize/raster_tiles.rs`: logits projection pattern using recursive bounded projection.
+- `src/routines/prefill_prepare_aux/raster/tiles.rs`: PLE prefill raster implementation.
+- `src/routines/prefill_finalize/raster/tiles.rs`: logits projection pattern using recursive bounded projection.
 - `RASTER_TILE_DSL_GUIDE.md`: general DSL rules.
 
 ## Problem Frame
 
-`compute_next_prefill_layer` in `src/prefill_layer/raster_tiles.rs` is currently the heaviest tile. One invocation processes an entire transformer prefill layer over the whole prompt.
+`compute_next_prefill_layer` in `src/routines/prefill_layer/raster/tiles.rs` is currently the heaviest tile. One invocation processes an entire transformer prefill layer over the whole prompt.
 
 It currently:
 
@@ -169,7 +169,7 @@ run_prefill_layer_sequence
 ### Files To Plan Around
 
 - `src/dsl.rs`
-- `src/prefill_layer/raster_tiles.rs`
+- `src/routines/prefill_layer/raster/tiles.rs`
 - `src/shared/raster_transformer_kernels.rs`
 
 ### Tests To Include
@@ -236,7 +236,7 @@ run_prefill_attention_rows
 
 ### Files To Plan Around
 
-- `src/prefill_layer/raster_tiles.rs`
+- `src/routines/prefill_layer/raster/tiles.rs`
 - `src/shared/raster_transformer_kernels.rs`
 
 ### Tests To Include
@@ -303,7 +303,7 @@ Do not chunk everything blindly. Prioritize operations that show up as heavy in 
 
 ### Files To Plan Around
 
-- `src/prefill_layer/raster_tiles.rs`
+- `src/routines/prefill_layer/raster/tiles.rs`
 - `src/shared/raster_transformer_kernels.rs`
 
 ### Tests To Include

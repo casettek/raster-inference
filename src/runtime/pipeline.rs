@@ -204,7 +204,7 @@ pub fn decode_step_with_mode(
             let embedded_token = embedded_token.activations.first().ok_or_else(|| {
                 anyhow::anyhow!("transformer embedding returned no activation rows")
             })?;
-            crate::decode_transition::native_tiles::run_text_layers_decode_step(
+            crate::decode_transition::native::run_text_layers_decode_step(
                 embedded_token,
                 next_token,
                 model,
@@ -216,7 +216,7 @@ pub fn decode_step_with_mode(
             let embedded_token = embedded_token.clone_internal().last_row().ok_or_else(|| {
                 anyhow::anyhow!("transformer embedding returned no activation rows")
             })?;
-            crate::decode_transition::deterministic_tiles::run_text_layers_decode_step_internal(
+            crate::decode_transition::native::deterministic_tiles::run_text_layers_decode_step_internal(
                 embedded_token,
                 next_token,
                 model,
@@ -317,7 +317,7 @@ pub(crate) fn run_output_decode_with_mode_and_raster_select(
     )
 }
 
-pub(crate) fn run_output_decode_with_mode_and_raster_tiles(
+pub(crate) fn run_output_decode_with_mode_and_raster(
     prompt_token_ids: &[u32],
     initial_transformer_state: &TransformerPrefillResult,
     sampling: &SamplingConfig,
@@ -378,12 +378,12 @@ fn run_output_decode_with_mode_internal(
 
     loop {
         let stop_condition = if raster_select_token {
-            crate::decode_select_token::raster_tiles::check_stop_condition(
+            crate::decode_select_token::raster::check_stop_condition(
                 decode_state.generated_token_ids.len(),
                 max_new_tokens,
             )
         } else {
-            crate::decode_select_token::native_tiles::check_stop_condition(
+            crate::decode_select_token::native::check_stop_condition(
                 decode_state.generated_token_ids.len(),
                 max_new_tokens,
             )
@@ -399,7 +399,7 @@ fn run_output_decode_with_mode_internal(
                 {
                     crate::output_finalize::run_raster_with_roots(
                         decode_state,
-                        crate::output_finalize::raster_tiles::RasterOutputFinalizeInputRoots {
+                        crate::output_finalize::raster::RasterOutputFinalizeInputRoots {
                             artifact_store_roots,
                             generated_token_ids_ref,
                             tokenizer_source_root: raster_tokenizer
@@ -467,13 +467,13 @@ fn run_output_decode_with_mode_internal(
         let transition_position = transformer_decode_state.position;
         let decode_transition = if raster_decode_transition {
             let source =
-                crate::decode_transition::raster_auth_source::AuthenticatedGemmaDecodeTransitionSource::from_model(
+                crate::decode_transition::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource::from_model(
                     format!("decode.transition.position_{}", transformer_decode_state.position),
                     transformer_model,
                 )?;
             if let Some(select_output) = raster_select_output {
                 let transition_output = crate::decode_transition::run_raster_with_roots(
-                    crate::decode_transition::raster_tiles::RasterDecodeTransitionInputRoots {
+                    crate::decode_transition::raster::RasterDecodeTransitionInputRoots {
                         artifact_store_roots: select_output.artifact_store_roots,
                         transformer_decode_state,
                         selected_token_ref: select_output.selected_token_ref,
@@ -533,7 +533,7 @@ fn build_current_output_decode_state(
     raster_sizing: Option<RasterSizingControls>,
 ) -> Result<OutputDecodeState> {
     if let Some(raster_tokenizer) = raster_tokenizer {
-        return crate::output_finalize::raster_tiles::run_with_byte_flush_bytes_per_tile(
+        return crate::output_finalize::raster::run_with_byte_flush_bytes_per_tile(
             &decode_state.generated_token_ids,
             raster_tokenizer,
             raster_sizing
@@ -543,12 +543,10 @@ fn build_current_output_decode_state(
     }
 
     let generated_token_ids = decode_state.generated_token_ids.clone();
-    let generated_text = crate::output_finalize::native_tiles::detokenize_output_tokens(
-        tokenizer,
-        &generated_token_ids,
-    )?;
+    let generated_text =
+        crate::output_finalize::native::detokenize_output_tokens(tokenizer, &generated_token_ids)?;
     let generated_token_ids_sha256 =
-        crate::output_finalize::native_tiles::build_output_decode_commitment(&generated_token_ids)?;
+        crate::output_finalize::native::build_output_decode_commitment(&generated_token_ids)?;
 
     Ok(OutputDecodeState {
         generated_token_count: generated_token_ids.len(),
