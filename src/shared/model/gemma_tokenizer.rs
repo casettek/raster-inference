@@ -901,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_tokenizer_reads_match_authenticated_source() {
+    fn committed_tokenizer_reads_match_raster_auth_source() {
         let source = AuthenticatedGemmaTokenizer::new(test_spec());
         let committed = source
             .committed_source()

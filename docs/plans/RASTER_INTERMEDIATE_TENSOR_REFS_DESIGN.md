@@ -421,7 +421,7 @@ AuthRead<RasterAppend...Request>
 AuthRead<RasterFinalizeTensorRequest>
 ```
 
-Although append/finalize have side-effect-like semantics, keep the API explicit and typed. If `AuthRead` is semantically too read-only for append operations, introduce a sibling trait in a later implementation plan only after evaluating the local authoring model.
+Although append/finalize have side-effect-like semantics, keep the API explicit and typed. If `AuthRead` is semantically too read-only for append operations, introduce a sibling trait in a later implementation plan only after evaluating the local DSL model.
 
 ### Why Not Hidden Globals
 

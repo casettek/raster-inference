@@ -19,17 +19,17 @@ Already implemented foundations:
 - Raster prefill projections use chunked row reads through `RasterSequenceProjectionState`.
 - Model-backed PLE projection row reads no longer materialize the full PLE projection matrix.
 - Raster inference reports `raster_tile_invocations` in completed and paused outputs.
-- Tile invocation counting happens at the raster authoring macro layer and is only enabled for raster inference.
+- Tile invocation counting happens at the DSL macro layer and is only enabled for raster inference.
 
 Important existing files:
 
 - `src/lib.rs`: raster control flow and inference summary output.
-- `src/raster_authoring.rs`: tile/sequence call macros and tile invocation counting.
+- `src/dsl.rs`: tile/sequence call macros and tile invocation counting.
 - `src/prefill_layer/raster_tiles.rs`: current coarse prefill layer raster implementation.
 - `src/shared/raster_transformer_kernels.rs`: deterministic raster kernels and chunked projection helpers.
 - `src/prefill_prepare_aux/raster_tiles.rs`: PLE prefill raster implementation.
 - `src/prefill_finalize/raster_tiles.rs`: logits projection pattern using recursive bounded projection.
-- `RASTER_TILE_AUTHORING_GUIDE.md`: general raster authoring rules.
+- `RASTER_TILE_DSL_GUIDE.md`: general DSL rules.
 
 ## Problem Frame
 
@@ -127,7 +127,7 @@ Stop treating an entire prefill layer as one heavy tile.
 
 Introduce fallible recursive sequence support if needed.
 
-Today `compute_next_prefill_layer` is invoked through `call_recur_tile!`. If it becomes a recursive sequence returning `Result<(bool, State)>`, the raster authoring layer likely needs a `call_recur_seq!` macro that mirrors `call_recur_tile!`.
+Today `compute_next_prefill_layer` is invoked through `call_recur_tile!`. If it becomes a recursive sequence returning `Result<(bool, State)>`, the DSL layer likely needs a `call_recur_seq!` macro that mirrors `call_recur_tile!`.
 
 This macro should:
 
@@ -168,7 +168,7 @@ run_prefill_layer_sequence
 
 ### Files To Plan Around
 
-- `src/raster_authoring.rs`
+- `src/dsl.rs`
 - `src/prefill_layer/raster_tiles.rs`
 - `src/shared/raster_transformer_kernels.rs`
 
@@ -355,7 +355,7 @@ Avoid adding per-tile names or detailed event logs by default. The current requi
 
 When implementing any plan generated from this document:
 
-1. Read `RASTER_TILE_AUTHORING_GUIDE.md` first.
+1. Read `RASTER_TILE_DSL_GUIDE.md` first.
 2. Keep changes scoped to raster paths unless a shared helper must be added for raster use.
 3. Do not change native fp32 or non-raster deterministic execution.
 4. Keep sequence functions as orchestration.

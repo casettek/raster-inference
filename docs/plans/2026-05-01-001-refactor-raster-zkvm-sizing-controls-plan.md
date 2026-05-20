@@ -69,7 +69,7 @@ This plan turns those observations into a sequence of implementation-ready work 
 
 - `src/lib.rs` owns `InferenceControls` and the default `raster_projection_rows_per_tile`.
 - `src/main.rs` parses `--raster-projection-rows-per-tile`.
-- `src/raster_authoring.rs` records tile/sequence invocations through raster authoring macros.
+- `src/dsl.rs` records tile/sequence invocations through DSL macros.
 - `src/shared/raster_row_store.rs` defines typed refs, row requests, builders, and the in-memory store.
 - `src/shared/raster_transformer_kernels.rs` contains the reference-backed row kernels and projection chunk loop.
 - `src/prefill_layer/raster_tiles.rs` orchestrates raster prefill layer execution and projection calls.
@@ -563,7 +563,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 - **State lifecycle risks:** Ref-backed builders can leave partial outputs. Finalizers must reject missing rows, duplicate/skipped rows, wrong widths, and incomplete chunks.
 - **API surface parity:** Native fp32 and deterministic non-raster paths should remain unchanged. Raster public outputs should remain `ActivationSequence`, `LayerKvCache`, and existing checkpoint summary shapes.
 - **Integration coverage:** Unit tests for individual kernels are not enough. Each major refactor needs prefill-layer and prepare-aux parity coverage.
-- **Unchanged invariants:** Deterministic arithmetic, model weight reads, checkpoint commitments, and tile/sequence authoring rules remain stable unless explicitly changed in a follow-up plan.
+- **Unchanged invariants:** Deterministic arithmetic, model weight reads, checkpoint commitments, and tile/sequence DSL rules remain stable unless explicitly changed in a follow-up plan.
 
 ---
 

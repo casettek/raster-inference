@@ -2065,7 +2065,7 @@ fn ensure_commitment(expected: &str, actual: &str, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raster_authoring::auth_read;
+    use crate::dsl::auth_read;
     use crate::shared::numerics::det_num::Act;
     use crate::shared::numerics::transformer_kernels::build_det_activation_commitment;
 
