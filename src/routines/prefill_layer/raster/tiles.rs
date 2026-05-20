@@ -2,9 +2,10 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use super::utils::{
-    layer_caches_from_raster, materialize_prefill_activation_sequence_from_store,
-    materialize_prefill_layer_caches, raster_sequence_acts, resolve_prefill_donor_cache_index,
-    retained_prefill_kv_cache_len, validate_prefill_layer_ple_input_ref,
+    layer_caches_from_raster, materialize_prefill_activation_sequence_from_roots,
+    materialize_prefill_layer_caches_from_roots, raster_sequence_acts,
+    resolve_prefill_donor_cache_index, retained_prefill_kv_cache_len,
+    validate_prefill_layer_ple_input_ref,
 };
 use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
@@ -41,10 +42,10 @@ use crate::shared::raster_kernels::transformer::{
     RasterSequenceBinaryArtifactState, RasterSequenceProjectionArtifactState,
     RasterSequenceUnaryArtifactState,
 };
-use crate::shared::tensors::raster_row_store::{
+use crate::shared::tensors::raster_tensor_artifacts::{
     activation_sequence_ref_from_artifact, read_sequence_row_from_roots,
-    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
-    RasterKvCacheRef, RasterSequenceRowRequest, RasterTensorId,
+    RasterActivationSequenceRef, RasterAttentionHeadsRef, RasterKvCacheRef,
+    RasterSequenceRowRequest, RasterTensorId,
 };
 use crate::trace::{trace_event, trace_scope};
 use crate::RasterSizingControls;
@@ -350,7 +351,8 @@ pub fn update_prefill_layer_state_refs_with_roots(
     state.current_activations_ref = layer_output_ref;
     state.layer_caches.push(layer_cache);
 
-    let completed_layer_output = trace_prefill_layer_checkpoint_with_roots(&state, layer_idx)?;
+    let completed_layer_output =
+        trace_prefill_layer_checkpoint_with_roots(&artifact_store_roots, &state, layer_idx)?;
     if let Some((sha256, det_sha256)) = completed_layer_output {
         state.completed_layer_output_sha256s.push(sha256);
         state.completed_layer_output_det_sha256s.push(det_sha256);
@@ -373,14 +375,14 @@ fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) ->
 }
 
 fn trace_prefill_layer_checkpoint(
-    store: &AuthenticatedRasterTensorStore,
+    artifact_store_roots: &RasterArtifactStoreRoots,
     state: &PrefillLayerRasterState,
     layer_idx: usize,
 ) -> Result<Option<(String, Option<String>)>> {
     let mut completed_layer_output = None;
     let reached = crate::trace::trace_checkpoint_lazy_result("prefill.layer", || {
-        let current_activations = materialize_prefill_activation_sequence_from_store(
-            store,
+        let current_activations = materialize_prefill_activation_sequence_from_roots(
+            artifact_store_roots,
             &state.current_activations_ref,
         )?;
         let current_values = current_activations.to_f32_values();
@@ -394,7 +396,8 @@ fn trace_prefill_layer_checkpoint(
                 &current_det_activations,
             ),
         );
-        let raster_layer_caches = materialize_prefill_layer_caches(store, &state.layer_caches)?;
+        let raster_layer_caches =
+            materialize_prefill_layer_caches_from_roots(artifact_store_roots, &state.layer_caches)?;
         let layer_caches = layer_caches_from_raster(&raster_layer_caches);
         let mut completed_layer_output_sha256s = state.completed_layer_output_sha256s.clone();
         completed_layer_output_sha256s.push(current_sha256.clone());
@@ -421,11 +424,11 @@ fn trace_prefill_layer_checkpoint(
 }
 
 fn trace_prefill_layer_checkpoint_with_roots(
+    artifact_store_roots: &RasterArtifactStoreRoots,
     state: &PrefillLayerRasterState,
     layer_idx: usize,
 ) -> Result<Option<(String, Option<String>)>> {
-    let store = AuthenticatedRasterTensorStore::artifact_backed();
-    trace_prefill_layer_checkpoint(&store, state, layer_idx)
+    trace_prefill_layer_checkpoint(artifact_store_roots, state, layer_idx)
 }
 
 fn trace_prefill_layer_token_checkpoints_with_roots(

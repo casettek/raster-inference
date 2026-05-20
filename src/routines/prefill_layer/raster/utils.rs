@@ -2,11 +2,13 @@ use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Result};
 
+use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::LayerKvCache;
 use crate::shared::raster_contracts::prefill_layer::GemmaPrefillLayerMetadata;
 use crate::shared::raster_kernels::transformer::{RasterActivationSequence, RasterKvCache};
-use crate::shared::tensors::raster_row_store::{
-    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
+use crate::shared::tensors::raster_tensor_artifacts::{
+    read_kv_row_from_roots, read_sequence_row_from_roots, RasterActivationSequenceRef,
+    RasterAttentionHeadsRef, RasterKvRowKind, RasterKvRowRequest, RasterSequenceRowRequest,
 };
 
 use super::PrefillLayerCacheSlot;
@@ -89,34 +91,73 @@ pub(in super::super) fn resolve_prefill_donor_cache_index(
         .transpose()
 }
 
-pub(in super::super) fn materialize_prefill_activation_sequence_from_store(
-    store: &AuthenticatedRasterTensorStore,
+pub(in super::super) fn materialize_prefill_activation_sequence_from_roots(
+    roots: &RasterArtifactStoreRoots,
     sequence_ref: &RasterActivationSequenceRef,
 ) -> Result<RasterActivationSequence> {
     // Public/dev compatibility boundary. zkVM-target substeps should consume the
     // ref directly and avoid this materializer.
-    store.materialize_sequence(sequence_ref)
+    let (row_count, _) = sequence_ref.tensor_ref().shape().sequence_metadata()?;
+    let rows = (0..row_count)
+        .map(|row_idx| {
+            read_sequence_row_from_roots(
+                roots,
+                RasterSequenceRowRequest {
+                    tensor_ref: sequence_ref.clone(),
+                    row_idx,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RasterActivationSequence::from_rows(rows))
 }
 
-pub(in super::super) fn materialize_prefill_layer_cache_from_store(
-    store: &AuthenticatedRasterTensorStore,
+pub(in super::super) fn materialize_prefill_layer_cache_from_roots(
+    roots: &RasterArtifactStoreRoots,
     cache: &PrefillLayerCacheSlot,
 ) -> Result<RasterKvCache> {
     // Public/dev compatibility boundary. Shared-store layer substeps use
     // `PrefillLayerCacheSlot::Ref` directly when replaying zkVM-shaped work.
     match cache {
         PrefillLayerCacheSlot::Empty { num_kv_heads } => Ok(RasterKvCache::empty(*num_kv_heads)),
-        PrefillLayerCacheSlot::Ref(cache_ref) => store.materialize_kv_cache(cache_ref),
+        PrefillLayerCacheSlot::Ref(cache_ref) => {
+            let (head_count, current_len, _) = cache_ref.shape().kv_cache_metadata()?;
+            let mut keys = vec![Vec::with_capacity(current_len); head_count];
+            let mut values = vec![Vec::with_capacity(current_len); head_count];
+            for head_idx in 0..head_count {
+                for token_idx in 0..current_len {
+                    keys[head_idx].push(read_kv_row_from_roots(
+                        roots,
+                        RasterKvRowRequest {
+                            cache_ref: cache_ref.clone(),
+                            row_kind: RasterKvRowKind::Key,
+                            head_idx,
+                            token_idx,
+                        },
+                    )?);
+                    values[head_idx].push(read_kv_row_from_roots(
+                        roots,
+                        RasterKvRowRequest {
+                            cache_ref: cache_ref.clone(),
+                            row_kind: RasterKvRowKind::Value,
+                            head_idx,
+                            token_idx,
+                        },
+                    )?);
+                }
+            }
+            RasterKvCache::from_heads(keys, values)
+        }
     }
 }
 
-pub(in super::super) fn materialize_prefill_layer_caches(
-    store: &AuthenticatedRasterTensorStore,
+pub(in super::super) fn materialize_prefill_layer_caches_from_roots(
+    roots: &RasterArtifactStoreRoots,
     caches: &[PrefillLayerCacheSlot],
 ) -> Result<Vec<RasterKvCache>> {
     caches
         .iter()
-        .map(|cache| materialize_prefill_layer_cache_from_store(store, cache))
+        .map(|cache| materialize_prefill_layer_cache_from_roots(roots, cache))
         .collect()
 }
 

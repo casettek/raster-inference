@@ -70,8 +70,8 @@ This plan turns those observations into a sequence of implementation-ready work 
 - `src/lib.rs` owns `InferenceControls` and the default `raster_projection_rows_per_tile`.
 - `src/main.rs` parses `--raster-projection-rows-per-tile`.
 - `src/dsl.rs` records tile/sequence invocations through DSL macros.
-- `src/shared/raster_row_store.rs` defines typed refs, row requests, builders, and the in-memory store.
-- `src/shared/raster_transformer_kernels.rs` contains the reference-backed row kernels and projection chunk loop.
+- `src/shared/tensors/raster_tensor_artifacts.rs` defines typed refs, row requests, builders, and the in-memory store.
+- `src/shared/raster_kernels/transformer.rs` contains the reference-backed row kernels and projection chunk loop.
 - `src/routines/prefill_layer/raster/tiles.rs` orchestrates raster prefill layer execution and projection calls.
 - `src/routines/prefill_prepare_aux/raster/tiles.rs` still carries materialized PLE recursive state.
 - `src/routines/prefill_finalize/raster/tiles.rs` is a useful existing pattern for bounded final logits projection.
@@ -303,12 +303,12 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 **Dependencies:** U1 is helpful but not required
 
 **Files:**
-- Modify: `src/shared/raster_row_store.rs`
-- Modify: `src/shared/raster_transformer_kernels.rs`
+- Modify: `src/shared/tensors/raster_tensor_artifacts.rs`
+- Modify: `src/shared/raster_kernels/transformer.rs`
 - Modify: `src/routines/prefill_layer/raster/tiles.rs`
 - Modify: `src/routines/prefill_prepare_aux/raster/tiles.rs`
-- Test: `src/shared/raster_row_store.rs`
-- Test: `src/shared/raster_transformer_kernels.rs`
+- Test: `src/shared/tensors/raster_tensor_artifacts.rs`
+- Test: `src/shared/raster_kernels/transformer.rs`
 
 **Approach:**
 - Clarify which data crosses a tile boundary in the future zkVM replay model: refs/cursors/control values should cross; full tensor maps should not.
@@ -317,8 +317,8 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 - Avoid changing public checkpoint payloads. Materialize at checkpoint boundaries as compatibility behavior.
 
 **Patterns to follow:**
-- `RasterSequenceRowRequest`, `RasterHeadRowRequest`, and `RasterKvRowRequest` in `src/shared/raster_row_store.rs`.
-- Reference-backed states in `src/shared/raster_transformer_kernels.rs`.
+- `RasterSequenceRowRequest`, `RasterHeadRowRequest`, and `RasterKvRowRequest` in `src/shared/tensors/raster_tensor_artifacts.rs`.
+- Reference-backed states in `src/shared/raster_kernels/transformer.rs`.
 - `RASTER_INTERMEDIATE_TENSOR_REFS_DESIGN.md`.
 
 **Test scenarios:**
@@ -342,8 +342,8 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 **Files:**
 - Modify: `src/routines/prefill_prepare_aux/raster/tiles.rs`
-- Modify: `src/shared/raster_row_store.rs`
-- Modify: `src/shared/raster_transformer_kernels.rs`
+- Modify: `src/shared/tensors/raster_tensor_artifacts.rs`
+- Modify: `src/shared/raster_kernels/transformer.rs`
 - Test: `src/routines/prefill_prepare_aux/raster/tiles.rs`
 
 **Approach:**
@@ -353,7 +353,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 - Ensure PLE projection uses the existing projection chunking control and reads the input row through refs.
 
 **Patterns to follow:**
-- `RasterSequenceProjectionState` ref/cursor shape in `src/shared/raster_transformer_kernels.rs`.
+- `RasterSequenceProjectionState` ref/cursor shape in `src/shared/raster_kernels/transformer.rs`.
 - `PrefillLayerRasterState` use of `RasterActivationSequenceRef` in `src/routines/prefill_layer/raster/tiles.rs`.
 
 **Test scenarios:**
@@ -376,11 +376,11 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 **Dependencies:** U2
 
 **Files:**
-- Modify: `src/shared/raster_transformer_kernels.rs`
+- Modify: `src/shared/raster_kernels/transformer.rs`
 - Modify: `src/routines/prefill_layer/raster/tiles.rs`
 - Modify: `src/lib.rs`
 - Modify: `src/main.rs`
-- Test: `src/shared/raster_transformer_kernels.rs`
+- Test: `src/shared/raster_kernels/transformer.rs`
 - Test: `src/routines/prefill_layer/raster/tiles.rs`
 - Test: `src/main.rs`
 
@@ -392,7 +392,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 - Split exact softmax into bounded max, exponent-sum, raw-weight, residual-correction, and weighted-sum phases over committed intermediate refs.
 
 **Patterns to follow:**
-- `compute_next_attention_row` in `src/shared/raster_transformer_kernels.rs`.
+- `compute_next_attention_row` in `src/shared/raster_kernels/transformer.rs`.
 - Existing attention parity tests for full, sliding-window, and donor-cache attention.
 
 **Test scenarios:**
@@ -419,10 +419,10 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 **Files:**
 - Modify: `src/routines/prefill_layer/raster/tiles.rs`
-- Modify: `src/shared/raster_transformer_kernels.rs`
-- Modify: `src/shared/raster_row_store.rs`
+- Modify: `src/shared/raster_kernels/transformer.rs`
+- Modify: `src/shared/tensors/raster_tensor_artifacts.rs`
 - Test: `src/routines/prefill_layer/raster/tiles.rs`
-- Test: `src/shared/raster_transformer_kernels.rs`
+- Test: `src/shared/raster_kernels/transformer.rs`
 
 **Approach:**
 - Move layer substep helpers toward accepting and returning refs where possible.
@@ -432,7 +432,7 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 
 **Patterns to follow:**
 - Existing `PrefillLayerRasterState` ref usage for `current_activations_ref`.
-- Sequence/head/KV builder finalization patterns in `src/shared/raster_row_store.rs`.
+- Sequence/head/KV builder finalization patterns in `src/shared/tensors/raster_tensor_artifacts.rs`.
 
 **Test scenarios:**
 - Integration: one-layer prefill parity remains unchanged with and without PLE input.
@@ -454,11 +454,11 @@ Implement this plan one phase at a time. Each phase should leave the raster path
 **Dependencies:** U1, U2
 
 **Files:**
-- Modify: `src/shared/raster_transformer_kernels.rs`
+- Modify: `src/shared/raster_kernels/transformer.rs`
 - Modify: `src/routines/prefill_layer/raster/tiles.rs`
 - Modify: `src/lib.rs`
 - Modify: `src/main.rs`
-- Test: `src/shared/raster_transformer_kernels.rs`
+- Test: `src/shared/raster_kernels/transformer.rs`
 - Test: `src/routines/prefill_layer/raster/tiles.rs`
 - Test: `src/main.rs`
 
@@ -624,11 +624,11 @@ Phase 7 keeps the public checkpoint format unchanged and documents the remaining
 | PLE public inputs | `src/routines/prefill_prepare_aux/raster/tiles.rs` `finalize_prefill_ple_inputs` | Public compatibility output | Materialize from refs into `Gemma4PrefillPleInputs` at finalize only. Recursive PLE state remains ref-backed. |
 | Prefill layer current activations | `src/routines/prefill_layer/raster/tiles.rs` `compute_next_prefill_layer_sequence` | Internal compatibility bridge | Materialized per layer while `run_prefill_layer_sequence` still consumes value tensors. The recursive orchestration state stores refs before and after each layer. |
 | Prefill layer PLE inputs | `src/routines/prefill_layer/raster/tiles.rs` `compute_next_prefill_layer_sequence` | Internal compatibility bridge | Materialized only when entering the value-based layer sequence. Source state stores per-layer input refs. |
-| Donor/cache inputs | `src/routines/prefill_layer/raster/tiles.rs` `materialize_prefill_layer_cache_from_store` | Internal compatibility bridge and checkpoint source | Empty caches stay compact; non-empty caches materialize when the current layer needs donor values or checkpoint serialization needs public cache shape. |
+| Donor/cache inputs | `src/routines/prefill_layer/raster/tiles.rs` `materialize_prefill_layer_cache_from_roots` | Internal compatibility bridge and checkpoint source | Empty caches stay compact; non-empty caches materialize when the current layer needs donor values or checkpoint serialization needs public cache shape. |
 | Prefill layer checkpoint payload | `src/routines/prefill_layer/raster/tiles.rs` `finalize_prefill_layer_state` | Durable checkpoint compatibility | Keep existing f32/deterministic commitment payload shape. Do not serialize refs into checkpoint bundles without a versioned trace format. |
 | Terminal token checkpoints | `src/routines/prefill_layer/raster/tiles.rs` `finalize_prefill_layer_state`; filter in `src/runtime/trace.rs` | Terminal checkpoint / verbose observability | Continue excluding `prefill.layer_token.*` from committed checkpoint bundles. Emit/check terminal hits only when verbose tracing or a matching terminal checkpoint observes them. |
 | Prefill finalize inputs and logits | `src/routines/prefill_finalize/raster/tiles.rs` | Public compatibility output | Keep materializing final hidden state and logits projection output for the existing `prefill.finalize` payload and return type. Projection reads remain chunked by `raster_projection_rows_per_tile`. |
-| Row-store builder finalization | `src/shared/raster_row_store.rs` | Internal ref boundary | Builders reject incomplete/skipped/duplicate rows and materialize only when a public output or compatibility bridge requests it. No separate materialization chunk control is needed for Phase 7. |
+| Tensor artifact builder finalization | `src/shared/tensors/raster_tensor_artifacts.rs` | Internal ref boundary | Builders reject incomplete/skipped/duplicate rows and materialize only when a public output or compatibility bridge requests it. No separate materialization chunk control is needed for Phase 7. |
 
 Deferred decision: implement `raster_materialize_rows_per_tile` only if a future versioned checkpoint plan changes durable checkpoint payloads to commit refs or chunked materialization products. The current compatibility checkpoints intentionally remain full materialization boundaries.
 
@@ -648,7 +648,7 @@ Deferred decision: implement `raster_materialize_rows_per_tile` only if a future
 - Related roadmap: `RASTER_ZKVM_STATE_REFACTOR_ROADMAP.md`
 - Related design: `RASTER_INTERMEDIATE_TENSOR_REFS_DESIGN.md`
 - Related guide: `RASTER_PREFILL_ZKVM_REFACTOR_GUIDE.md`
-- Projection implementation: `src/shared/raster_transformer_kernels.rs`
-- Row store implementation: `src/shared/raster_row_store.rs`
+- Projection implementation: `src/shared/raster_kernels/transformer.rs`
+- Tensor artifact helper implementation: `src/shared/tensors/raster_tensor_artifacts.rs`
 - Prefill layer orchestration: `src/routines/prefill_layer/raster/tiles.rs`
 - PLE prepare-aux orchestration: `src/routines/prefill_prepare_aux/raster/tiles.rs`

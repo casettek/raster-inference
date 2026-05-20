@@ -7,7 +7,10 @@ use crate::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinal
 use crate::prefill_layer::raster::PrefillLayerCacheSlot;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
-use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
+use crate::shared::artifacts::raster_artifact_store::{
+    activation_row_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
+    RasterArtifactMetadata, RasterArtifactStoreRoots,
+};
 use crate::shared::model::transformer::{
     ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, Gemma4LogitsProjection,
     Gemma4ModelProvenance, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
@@ -17,7 +20,10 @@ use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::{
     RasterActivationRow, RasterActivationSequence, RasterKvCache,
 };
-use crate::shared::tensors::raster_row_store::{AuthenticatedRasterTensorStore, RasterTensorId};
+use crate::shared::tensors::raster_tensor_artifacts::{
+    activation_sequence_ref_from_artifact, insert_activation_sequence_artifact_ref,
+    kv_cache_ref_from_artifacts, RasterTensorId,
+};
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -33,9 +39,7 @@ fn raster_finalize_matches_native_deterministic_for_untied_projection() {
         vec![Act::from_num(1.0), Act::from_num(-0.5)],
     ]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let raster = run_ref_backed_finalize(2, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
@@ -76,9 +80,7 @@ fn ref_backed_finalize_matches_native_deterministic_for_untied_projection() {
         vec![Act::from_num(1.0), Act::from_num(-0.5)],
     ]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let raster = run_ref_backed_finalize(2, final_hidden_states_ref, vec![], &source, 1)
         .expect("ref-backed raster finalize should run");
@@ -108,9 +110,7 @@ fn finalize_projection_state_serializes_builder_not_logits() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
     let roots = ArtifactIo::export_store_roots();
 
     let state = init_prefill_finalize_state(
@@ -142,9 +142,7 @@ fn in_progress_projection_state_serializes_refs_not_payloads() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
     let state = init_prefill_finalize_state(
         ArtifactIo::export_store_roots(),
         1,
@@ -179,9 +177,7 @@ fn raster_finalize_matches_native_deterministic_for_tied_projection() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(0.5), Act::from_num(-0.25)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
@@ -210,9 +206,7 @@ fn ref_backed_finalize_matches_native_deterministic_for_tied_projection() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(0.5), Act::from_num(-0.25)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("ref-backed raster finalize should run");
@@ -241,9 +235,7 @@ fn raster_finalize_matches_native_deterministic_with_softcap() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 2)
         .expect("root-backed raster finalize should run");
@@ -270,16 +262,12 @@ fn raster_finalize_projection_chunk_sizes_do_not_change_result() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
     ArtifactIo::reset_store();
-    let mut single_store = AuthenticatedRasterTensorStore::new();
-    let single_ref =
-        insert_activation_ref(&mut single_store, "finalize.hidden", &final_hidden_states);
+    let single_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
     let single = run_ref_backed_finalize(1, single_ref, vec![], &source, 1)
         .expect("single-row chunks should run");
 
     ArtifactIo::reset_store();
-    let mut multi_store = AuthenticatedRasterTensorStore::new();
-    let multi_ref =
-        insert_activation_ref(&mut multi_store, "finalize.hidden", &final_hidden_states);
+    let multi_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
     let multi = run_ref_backed_finalize(1, multi_ref, vec![], &source, 2)
         .expect("multi-row chunks should run");
 
@@ -297,9 +285,7 @@ fn ref_backed_finalize_matches_native_deterministic_with_softcap() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 2)
         .expect("ref-backed raster finalize should run");
@@ -326,9 +312,7 @@ fn raster_finalize_rejects_zero_projection_rows_per_tile() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let error = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 0)
         .expect_err("zero rows per tile should fail");
@@ -344,9 +328,7 @@ fn ref_backed_finalize_fails_closed_for_missing_sequence_ref() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
-    let mut source_store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut source_store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let error = run_ref_backed_finalize_with_roots(
         RasterArtifactStoreRoots::default(),
@@ -372,9 +354,7 @@ fn ref_backed_finalize_reports_width_mismatch() {
         Act::from_num(0.5),
     ]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let error = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect_err("width mismatch should fail");
@@ -390,9 +370,7 @@ fn ref_backed_finalize_fails_closed_for_bad_source_root() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let error = main(RasterPrefillFinalizeInputRoots {
         artifact_store_roots: ArtifactIo::export_store_roots(),
@@ -415,9 +393,7 @@ fn ref_backed_finalize_fails_closed_for_missing_cache_roots() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
     let stale_roots = ArtifactIo::export_store_roots();
     let cache = RasterKvCache::from_heads(
         vec![vec![RasterActivationRow::from_acts(vec![Act::from_num(
@@ -428,13 +404,7 @@ fn ref_backed_finalize_fails_closed_for_missing_cache_roots() {
         )])]],
     )
     .expect("cache");
-    let cache_ref = store
-        .insert_kv_cache(
-            RasterTensorId::new("finalize.cache.keys").expect("keys id"),
-            RasterTensorId::new("finalize.cache.values").expect("values id"),
-            cache,
-        )
-        .expect("cache ref");
+    let cache_ref = insert_kv_cache_ref("finalize.cache", cache).expect("cache ref");
 
     let error = run_ref_backed_finalize_with_roots(
         stale_roots,
@@ -458,9 +428,7 @@ fn prefill_finalize_roots_aware_mutation_rejects_stale_builder_root() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
     let state = init_prefill_finalize_state(
         ArtifactIo::export_store_roots(),
         1,
@@ -495,9 +463,7 @@ fn finalize_refs_rejects_overadvanced_projection_cursor() {
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
     let state = init_prefill_finalize_state(
         ArtifactIo::export_store_roots(),
         1,
@@ -526,9 +492,7 @@ fn raster_finalize_uses_internal_det_row_not_public_f32_view() {
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     final_hidden_states.activations = vec![vec![0.0, 1.0]];
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
@@ -568,16 +532,8 @@ fn raster_finalize_preserves_layer_caches_in_decode_state() {
     )
     .expect("cache");
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
-    let cache_ref = store
-        .insert_kv_cache(
-            RasterTensorId::new("finalize.cache.keys").expect("keys id"),
-            RasterTensorId::new("finalize.cache.values").expect("values id"),
-            raster_cache,
-        )
-        .expect("cache ref");
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
+    let cache_ref = insert_kv_cache_ref("finalize.cache", raster_cache).expect("cache ref");
 
     let raster = run_ref_backed_finalize(
         3,
@@ -617,16 +573,8 @@ fn ref_backed_finalize_materializes_public_activation_and_layer_cache() {
         vec![VecDeque::from(vec![vec![Act::from_num(-0.25)]])],
     );
     ArtifactIo::reset_store();
-    let mut store = AuthenticatedRasterTensorStore::new();
-    let final_hidden_states_ref =
-        insert_activation_ref(&mut store, "finalize.hidden", &final_hidden_states);
-    let cache_ref = store
-        .insert_kv_cache(
-            RasterTensorId::new("finalize.cache.keys").expect("keys id"),
-            RasterTensorId::new("finalize.cache.values").expect("values id"),
-            layer_cache,
-        )
-        .expect("cache ref");
+    let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
+    let cache_ref = insert_kv_cache_ref("finalize.cache", layer_cache).expect("cache ref");
 
     let raster = run_ref_backed_finalize(
         1,
@@ -685,7 +633,7 @@ fn proof_shaped_finalize_signatures_stay_ref_backed() {
 
 fn run_ref_backed_finalize(
     prompt_token_count: usize,
-    final_hidden_states_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
+    final_hidden_states_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
     layer_caches: Vec<PrefillLayerCacheSlot>,
     source: &AuthenticatedGemmaPrefillFinalizeSource,
     projection_rows_per_tile: usize,
@@ -703,7 +651,7 @@ fn run_ref_backed_finalize(
 fn run_ref_backed_finalize_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     prompt_token_count: usize,
-    final_hidden_states_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
+    final_hidden_states_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
     layer_caches: Vec<PrefillLayerCacheSlot>,
     source: &AuthenticatedGemmaPrefillFinalizeSource,
     projection_rows_per_tile: usize,
@@ -741,21 +689,64 @@ fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {
 }
 
 fn insert_activation_ref(
-    store: &mut AuthenticatedRasterTensorStore,
     id: &str,
     sequence: &ActivationSequence,
-) -> crate::shared::tensors::raster_row_store::RasterActivationSequenceRef {
+) -> crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef {
     let det_rows = sequence
         .clone_internal()
         .det_values()
         .expect("det activation sequence")
         .to_vec();
-    store
-        .insert_activation_sequence(
-            RasterTensorId::new(id).expect("tensor id"),
-            RasterActivationSequence::from_acts(det_rows),
-        )
+    let artifact_ref =
+        insert_activation_sequence_artifact_ref(id, RasterActivationSequence::from_acts(det_rows))
+            .expect("activation artifact ref");
+    activation_sequence_ref_from_artifact(RasterTensorId::new(id).expect("tensor id"), artifact_ref)
         .expect("activation ref")
+}
+
+fn insert_kv_cache_ref(
+    id_prefix: &str,
+    cache: RasterKvCache,
+) -> Result<crate::shared::tensors::raster_tensor_artifacts::RasterKvCacheRef> {
+    let head_count = cache.head_count();
+    let current_len = cache.current_len();
+    let head_dim = cache
+        .keys()
+        .iter()
+        .chain(cache.values().iter())
+        .find_map(|head| head.first().map(RasterActivationRow::width))
+        .ok_or_else(|| anyhow::anyhow!("KV cache rows are missing"))?;
+    let key_leaves = cache
+        .keys()
+        .iter()
+        .flat_map(|head| head.iter().map(activation_row_leaf))
+        .collect::<Vec<_>>();
+    let value_leaves = cache
+        .values()
+        .iter()
+        .flat_map(|head| head.iter().map(activation_row_leaf))
+        .collect::<Vec<_>>();
+    let keys_name = format!("{id_prefix}.keys");
+    let values_name = format!("{id_prefix}.values");
+    let keys_ref = ArtifactIo::insert_artifact(
+        RasterArtifactId::new(keys_name.clone())?,
+        RasterArtifactMetadata::activation_rows(head_count * current_len, head_dim)?,
+        key_leaves,
+    )?;
+    let values_ref = ArtifactIo::insert_artifact(
+        RasterArtifactId::new(values_name.clone())?,
+        RasterArtifactMetadata::activation_rows(head_count * current_len, head_dim)?,
+        value_leaves,
+    )?;
+    kv_cache_ref_from_artifacts(
+        RasterTensorId::new(keys_name)?,
+        RasterTensorId::new(values_name)?,
+        RasterActivationSequenceArtifactRef::new(keys_ref)?,
+        RasterActivationSequenceArtifactRef::new(values_ref)?,
+        head_count,
+        current_len,
+        head_dim,
+    )
 }
 
 fn assert_signature_omits(source: &str, needle: &str, forbidden: &[&str]) {

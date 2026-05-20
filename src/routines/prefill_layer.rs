@@ -8,16 +8,11 @@ use crate::shared::model::transformer::{
     LayerKvCache,
 };
 use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
-use crate::shared::raster_kernels::transformer::{RasterActivationSequence, RasterKvCache};
-use crate::shared::tensors::raster_row_store::{
-    read_kv_row_from_roots, read_sequence_row_from_roots, AuthenticatedRasterTensorStore,
-    RasterKvRowKind, RasterKvRowRequest, RasterSequenceRowRequest,
-};
 use crate::RasterSizingControls;
 
 use self::raster::utils::{
-    layer_cache_from_raster, materialize_prefill_activation_sequence_from_store,
-    materialize_prefill_layer_cache_from_store, raster_sequence_acts,
+    layer_cache_from_raster, materialize_prefill_activation_sequence_from_roots,
+    materialize_prefill_layer_cache_from_roots, raster_sequence_acts,
 };
 
 pub mod native;
@@ -48,39 +43,6 @@ pub fn run_with_mode(
         ple_inputs,
         execution_mode,
     )
-}
-
-pub fn materialize_prefill_layer_output_refs(
-    store: &AuthenticatedRasterTensorStore,
-    refs: &raster::PrefillLayerOutputRefs,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    // Public/dev compatibility boundary. The proof-shaped prefill path carries
-    // `PrefillLayerOutputRefs` forward and materializes only for public results
-    // and checkpoint payloads.
-    let current_activations =
-        materialize_prefill_activation_sequence_from_store(store, &refs.final_hidden_states_ref)?;
-    let det_activations = raster_sequence_acts(&current_activations);
-    let values = current_activations.to_f32_values();
-    let mut activation_sequence = ActivationSequence::from_internal(
-        InternalActivationSequence::from_det_values(det_activations.clone()),
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
-    );
-    activation_sequence.det_activations_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
-            &det_activations,
-        ),
-    );
-
-    Ok((
-        activation_sequence,
-        refs.layer_caches
-            .iter()
-            .map(|cache| {
-                materialize_prefill_layer_cache_from_store(store, cache)
-                    .map(layer_cache_from_raster)
-            })
-            .collect::<Result<Vec<_>>>()?,
-    ))
 }
 
 pub fn materialize_prefill_layer_output_refs_from_roots(
@@ -130,64 +92,6 @@ pub fn run_raster_refs_from_input_embedding(
         ple_input_manifest_root,
         raster_sizing,
     )
-}
-
-fn materialize_prefill_activation_sequence_from_roots(
-    roots: &RasterArtifactStoreRoots,
-    sequence_ref: &crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
-) -> Result<RasterActivationSequence> {
-    let (row_count, _) = sequence_ref.tensor_ref().shape().sequence_metadata()?;
-    let rows = (0..row_count)
-        .map(|row_idx| {
-            read_sequence_row_from_roots(
-                roots,
-                RasterSequenceRowRequest {
-                    tensor_ref: sequence_ref.clone(),
-                    row_idx,
-                },
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(RasterActivationSequence::from_rows(rows))
-}
-
-fn materialize_prefill_layer_cache_from_roots(
-    roots: &RasterArtifactStoreRoots,
-    cache: &raster::PrefillLayerCacheSlot,
-) -> Result<RasterKvCache> {
-    match cache {
-        raster::PrefillLayerCacheSlot::Empty { num_kv_heads } => {
-            Ok(RasterKvCache::empty(*num_kv_heads))
-        }
-        raster::PrefillLayerCacheSlot::Ref(cache_ref) => {
-            let (head_count, current_len, _) = cache_ref.shape().kv_cache_metadata()?;
-            let mut keys = vec![Vec::with_capacity(current_len); head_count];
-            let mut values = vec![Vec::with_capacity(current_len); head_count];
-            for head_idx in 0..head_count {
-                for token_idx in 0..current_len {
-                    keys[head_idx].push(read_kv_row_from_roots(
-                        roots,
-                        RasterKvRowRequest {
-                            cache_ref: cache_ref.clone(),
-                            row_kind: RasterKvRowKind::Key,
-                            head_idx,
-                            token_idx,
-                        },
-                    )?);
-                    values[head_idx].push(read_kv_row_from_roots(
-                        roots,
-                        RasterKvRowRequest {
-                            cache_ref: cache_ref.clone(),
-                            row_kind: RasterKvRowKind::Value,
-                            head_idx,
-                            token_idx,
-                        },
-                    )?);
-                }
-            }
-            RasterKvCache::from_heads(keys, values)
-        }
-    }
 }
 
 pub(crate) fn run_with_mode_internal(

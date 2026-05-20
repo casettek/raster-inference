@@ -5,7 +5,7 @@ use crate::prefill_layer::raster::PrefillLayerCacheSlot;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
-use crate::shared::tensors::raster_row_store::RasterActivationSequenceRef;
+use crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterPrefillOutputRefs {
@@ -174,7 +174,7 @@ mod tests {
     };
     use crate::shared::numerics::det_num::Act;
     use crate::shared::raster_kernels::transformer::RasterActivationRow;
-    use crate::shared::tensors::raster_row_store::{
+    use crate::shared::tensors::raster_tensor_artifacts::{
         activation_sequence_ref_from_artifact, RasterTensorId,
     };
 

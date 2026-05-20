@@ -10,7 +10,7 @@ use crate::shared::model::transformer::{
     Gemma4TransformerModel, InternalLogits, TransformerDecodeState, TransformerDecodeStepResult,
 };
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
-use crate::shared::tensors::raster_row_store::{
+use crate::shared::tensors::raster_tensor_artifacts::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 use crate::RasterSizingControls;

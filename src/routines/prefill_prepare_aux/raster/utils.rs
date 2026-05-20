@@ -10,14 +10,9 @@ use crate::shared::artifacts::raster_artifact_store::{
 };
 use crate::shared::model::transformer::{ActivationSequence, InternalActivationSequence};
 use crate::shared::raster_kernels::transformer::{RasterActivationRow, RasterActivationSequence};
-use crate::shared::tensors::raster_row_store::AuthenticatedRasterTensorStore;
 
 pub(in super::super) fn reset_artifact_store() {
     ArtifactIo::reset_store();
-}
-
-pub(in super::super) fn tensor_store_snapshot() -> AuthenticatedRasterTensorStore {
-    AuthenticatedRasterTensorStore::new()
 }
 
 pub(in super::super) fn insert_activation_sequence(

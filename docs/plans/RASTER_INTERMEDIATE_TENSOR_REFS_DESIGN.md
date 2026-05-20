@@ -406,7 +406,7 @@ Use an explicit in-memory store argument for row reads and appends.
 Example conceptual shape:
 
 ```text
-AuthenticatedRasterTensorStore
+artifact-root tensor helper surface
   tensors
   builders
 ```

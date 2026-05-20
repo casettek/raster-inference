@@ -6,7 +6,7 @@ use crate::shared::model::transformer::{
     ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerPrefillResult,
 };
 use crate::shared::raster_contracts::pipeline::RasterPrefillOutputRefs;
-use crate::shared::tensors::raster_row_store::RasterActivationSequenceRef;
+use crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef;
 
 pub mod native;
 pub mod raster;

@@ -7,7 +7,7 @@ use crate::shared::model::transformer::{
     ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerDecodeState,
     TransformerPrefillResult, TransformerStateTransitionState,
 };
-use crate::shared::tensors::raster_row_store::{
+use crate::shared::tensors::raster_tensor_artifacts::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 

@@ -11,7 +11,7 @@ use crate::shared::artifacts::raster_artifact_store::{
 };
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
 use crate::shared::raster_kernels::transformer::RasterActivationRow;
-use crate::shared::tensors::raster_row_store::{
+use crate::shared::tensors::raster_tensor_artifacts::{
     activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
 };
 

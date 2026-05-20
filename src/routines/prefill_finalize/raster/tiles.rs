@@ -15,7 +15,7 @@ use crate::shared::raster_kernels::transformer::{
     project_row_with_weights, rms_norm_sequence, validate_projection_rows_per_tile,
     RasterActivationRow, RasterActivationSequence,
 };
-use crate::shared::tensors::raster_row_store::{
+use crate::shared::tensors::raster_tensor_artifacts::{
     append_sequence_row_by_source_name_with_roots,
     finalize_sequence_builder_by_source_name_with_roots, read_sequence_row_from_roots,
     start_sequence_builder_with_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,

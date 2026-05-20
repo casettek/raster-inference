@@ -11,7 +11,7 @@ use crate::shared::model::transformer::TransformerDecodeState;
 use crate::shared::numerics::det_num::Act;
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
 use crate::shared::raster_kernels::transformer::RasterActivationRow;
-use crate::shared::tensors::raster_row_store::{
+use crate::shared::tensors::raster_tensor_artifacts::{
     activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
 };
 use tokenizers::Tokenizer;

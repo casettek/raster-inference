@@ -12,7 +12,6 @@ use crate::shared::raster_contracts::prefill_ple::{
     read_prefill_ple_input_manifest_from_roots, AuthenticatedGemmaPleSource,
     GemmaPleMetadataRequest, RasterPrefillPleInputRefs,
 };
-use crate::shared::tensors::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::RasterSizingControls;
 
 pub mod native;
@@ -189,10 +188,6 @@ pub fn format_native_prefill_prepare_aux_as_raster_checkpoint(
         input_embedding_refs.prompt_token_count,
         per_layer_inputs,
     )?))
-}
-
-pub fn raster_tensor_store_snapshot() -> AuthenticatedRasterTensorStore {
-    raster::utils::tensor_store_snapshot()
 }
 
 pub fn materialize_prefill_ple_input_refs(

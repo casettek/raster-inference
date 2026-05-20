@@ -8,7 +8,7 @@ use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactStoreRoots, RasterSelectedTokenRef, RasterTokenIdSequenceRef,
 };
 use crate::shared::numerics::det_num::{argmax_first, Act};
-use crate::shared::tensors::raster_row_store::{
+use crate::shared::tensors::raster_tensor_artifacts::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 

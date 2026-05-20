@@ -790,7 +790,7 @@ mod tests {
     use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
     use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
     use crate::shared::raster_kernels::transformer::RasterActivationSequence;
-    use crate::shared::tensors::raster_row_store::insert_activation_sequence_artifact_ref;
+    use crate::shared::tensors::raster_tensor_artifacts::insert_activation_sequence_artifact_ref;
     use crate::{
         embed_input_tokens, finalize_decode_transition, run_decode_select_token,
         run_decode_transition, run_inference, run_inference_with_controls, run_output_finalize,

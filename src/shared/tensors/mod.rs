@@ -1,1 +1,1 @@
-pub mod raster_row_store;
+pub mod raster_tensor_artifacts;

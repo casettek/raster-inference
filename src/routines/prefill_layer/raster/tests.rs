@@ -2,7 +2,7 @@ use crate::dsl::prelude::auth_read;
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::prefill_layer::native::deterministic_tiles;
 use crate::prefill_layer::{
-    materialize_prefill_layer_output_refs, run_raster_refs_from_input_embedding,
+    materialize_prefill_layer_output_refs_from_roots, run_raster_refs_from_input_embedding,
 };
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
@@ -17,9 +17,7 @@ use crate::shared::raster_contracts::prefill_layer::{
 };
 use crate::shared::raster_contracts::prefill_ple::store_prefill_ple_input_manifest_with_roots;
 use crate::shared::raster_kernels::transformer::RasterActivationSequence;
-use crate::shared::tensors::raster_row_store::{
-    insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
-};
+use crate::shared::tensors::raster_tensor_artifacts::insert_activation_sequence_artifact_ref;
 use crate::RasterSizingControls;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -103,7 +101,10 @@ fn prefill_layer_main_threads_roots_without_local_tensor_store() {
 
     assert!(main_body.contains("compute_next_prefill_layer_sequence_with_roots"));
     assert!(
-        !main_body.contains("AuthenticatedRasterTensorStore::new()"),
+        !main_body.contains(&format!(
+            "{}::new()",
+            concat!("Authenticated", "RasterTensorStore")
+        )),
         "proof-shaped prefill main must thread artifact roots instead of creating a tensor store"
     );
 }
@@ -520,15 +521,14 @@ fn run_roots_path_with_optional_ple(
     };
     let (artifact_store_roots, ple_input_manifest_root) =
         store_materialized_ple_inputs_with_roots(artifact_store_roots, source, ple_inputs)?;
-    let (_artifact_store_roots, refs) = run_raster_refs_from_input_embedding(
+    let (artifact_store_roots, refs) = run_raster_refs_from_input_embedding(
         artifact_store_roots,
         &input_embedding_refs,
         source,
         ple_input_manifest_root.as_deref(),
         raster_sizing,
     )?;
-    let store = AuthenticatedRasterTensorStore::artifact_backed();
-    materialize_prefill_layer_output_refs(&store, &refs)
+    materialize_prefill_layer_output_refs_from_roots(&artifact_store_roots, &refs)
 }
 
 fn store_materialized_ple_inputs_with_roots(

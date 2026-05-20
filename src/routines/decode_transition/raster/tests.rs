@@ -1,9 +1,6 @@
 use super::{
-    append_decode_kv_cache_ref, compute_next_decode_layer, finalize_decode_layer_state,
-    init_decode_logits_projection, init_decode_transition_state, init_decode_transition_store,
-    main, main_state_refs, materialize_decode_layer_cache_from_store,
-    materialize_decode_layer_caches_from_roots, prepare_next_decode_layer_context,
-    raster_cache_from_layer_cache, register_decode_layer_cache,
+    main, main_state_refs, materialize_decode_layer_caches_from_roots,
+    prepare_next_decode_layer_context, raster_cache_from_layer_cache,
     register_decode_layer_cache_with_roots, run, DecodeLayerCacheSlot,
     RasterDecodeTransitionInputRefs, RasterDecodeTransitionInputRoots,
 };
@@ -23,7 +20,7 @@ use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::{
     RasterActivationRow, RasterAttentionHeadSequence, RasterKvCache,
 };
-use crate::shared::tensors::raster_row_store::{
+use crate::shared::tensors::raster_tensor_artifacts::{
     read_sequence_row_from_roots, RasterSequenceRowRequest, RasterTensorId,
 };
 use crate::RasterSizingControls;
@@ -218,29 +215,6 @@ fn root_backed_main_rejects_missing_selected_token_root() {
 }
 
 #[test]
-fn root_backed_main_threads_roots_without_local_tensor_store() {
-    let source = include_str!("tiles.rs");
-    let main_start = source
-        .find("pub fn main(\n    input_roots: RasterDecodeTransitionInputRoots,")
-        .expect("decode transition main should exist");
-    let after_main = &source[main_start..];
-    let next_sequence = after_main
-        .find("\n#[sequence]\nfn run_basic_decode_layer")
-        .expect("legacy helper should follow root-backed main block");
-    let main_and_root_helpers = &after_main[..next_sequence];
-
-    assert!(main_and_root_helpers.contains("compute_next_decode_layer_with_roots"));
-    assert!(
-        !main_and_root_helpers.contains("init_decode_transition_store"),
-        "proof-shaped decode transition main must thread artifact roots instead of creating a tensor store"
-    );
-    assert!(
-        !main_and_root_helpers.contains("AuthenticatedRasterTensorStore::new()"),
-        "proof-shaped decode transition main must not allocate a local tensor store"
-    );
-}
-
-#[test]
 fn raster_decode_transition_matches_across_projection_and_attention_chunks() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
@@ -294,169 +268,6 @@ fn raster_decode_rejects_zero_sizing_controls() {
     assert!(attention_error
         .to_string()
         .contains("attention KV rows per tile"));
-}
-
-#[test]
-fn decode_recursive_state_serializes_refs_and_builders() {
-    let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
-        .expect("source should build");
-    let decode_state = decode_state_with_cache(2);
-    let mut store = init_decode_transition_store();
-    let state =
-        init_decode_transition_state(&mut store, decode_state, 1, &source, raster_sizing(1))
-            .expect("state should initialize");
-    let encoded = serde_json::to_string(&state).expect("state should serialize");
-
-    assert!(encoded.contains("artifact_store_roots"));
-    assert!(encoded.contains("decode_input_ref"));
-    assert!(encoded.contains("current_activation_ref"));
-    assert!(encoded.contains("original_layer_caches"));
-    assert!(encoded.contains("Ref"));
-    assert!(!encoded.contains("decode_input_activation"));
-    assert!(!encoded.contains("current_activation\":["));
-    assert!(!encoded.contains("\"keys\":[[["));
-    assert!(!encoded.contains("\"values\":[[["));
-
-    let normalized = RasterActivationRow::from_acts(vec![Act::from_num(0.0), Act::from_num(0.0)]);
-    let logits_state =
-        init_decode_logits_projection(&mut store, normalized, &source, 1).expect("logits init");
-    let encoded = serde_json::to_string(&logits_state).expect("logits state should serialize");
-
-    assert!(encoded.contains("output_builder_ref"));
-    assert!(!encoded.contains("logit_bits"));
-}
-
-#[test]
-fn decode_layer_context_serializes_cache_refs_without_materialized_rows() {
-    let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
-        .expect("source should build");
-    let decode_state = decode_state_with_cache(2);
-    let mut store = init_decode_transition_store();
-    let state =
-        init_decode_transition_state(&mut store, decode_state, 1, &source, raster_sizing(1))
-            .expect("state should initialize");
-
-    let context =
-        prepare_next_decode_layer_context(&state, &source).expect("context should prepare");
-    let encoded = serde_json::to_string(&context).expect("context should serialize");
-
-    assert!(encoded.contains("cache_slot"));
-    assert!(encoded.contains("Ref"));
-    assert!(!encoded.contains("\"keys\":[[["));
-    assert!(!encoded.contains("\"values\":[[["));
-    assert!(!encoded.contains("act_bits"));
-    assert_eq!(store.materialization_counts().1, 0);
-}
-
-#[test]
-fn decode_layer_replay_avoids_kv_materialization_until_public_boundary() {
-    let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
-        .expect("source should build");
-    let decode_state = decode_state_with_cache(2);
-    let mut store = init_decode_transition_store();
-    let state =
-        init_decode_transition_state(&mut store, decode_state, 1, &source, raster_sizing(1))
-            .expect("state should initialize");
-    assert_eq!(store.materialization_counts().1, 0);
-
-    let (_done, state) =
-        compute_next_decode_layer(state, &source, &mut store).expect("layer should compute");
-    assert_eq!(
-        store.materialization_counts().1,
-        0,
-        "normal decode layer replay should not materialize full KV caches"
-    );
-
-    finalize_decode_layer_state(&store, state).expect("public layer output should finalize");
-    assert!(
-        store.materialization_counts().1 > 0,
-        "public/cache compatibility boundary should materialize KV caches"
-    );
-}
-
-#[test]
-fn decode_ref_cache_append_handles_empty_and_sliding_windows() {
-    let mut store = init_decode_transition_store();
-    let key_ref = store
-        .insert_attention_heads(
-            RasterTensorId::new("test.empty.key").expect("key id"),
-            heads_from_rows(&[&[7]]),
-        )
-        .expect("key ref");
-    let value_ref = store
-        .insert_attention_heads(
-            RasterTensorId::new("test.empty.value").expect("value id"),
-            heads_from_rows(&[&[8]]),
-        )
-        .expect("value ref");
-    let empty_slot = DecodeLayerCacheSlot::Empty { num_kv_heads: 1 };
-
-    let appended =
-        append_decode_kv_cache_ref(&mut store, empty_slot, key_ref, value_ref, 0, None, 1)
-            .expect("empty append should build ref");
-    let appended = materialize_decode_layer_cache_from_store(&store, &appended).expect("cache");
-    assert_eq!(cache_key_bits(&appended), vec![vec![7]]);
-    assert_eq!(cache_value_bits(&appended), vec![vec![8]]);
-
-    let old_cache = RasterKvCache::from_heads(
-        vec![rows_from_bits(&[1, 2, 3])],
-        vec![rows_from_bits(&[11, 12, 13])],
-    )
-    .expect("old cache");
-    let old_slot =
-        register_decode_layer_cache(&mut store, "test.old", 0, old_cache).expect("old cache slot");
-    let key_ref = store
-        .insert_attention_heads(
-            RasterTensorId::new("test.sliding.key").expect("key id"),
-            heads_from_rows(&[&[4]]),
-        )
-        .expect("key ref");
-    let value_ref = store
-        .insert_attention_heads(
-            RasterTensorId::new("test.sliding.value").expect("value id"),
-            heads_from_rows(&[&[14]]),
-        )
-        .expect("value ref");
-
-    let appended =
-        append_decode_kv_cache_ref(&mut store, old_slot, key_ref, value_ref, 1, Some(2), 1)
-            .expect("sliding append should build ref");
-    let appended = materialize_decode_layer_cache_from_store(&store, &appended).expect("cache");
-    assert_eq!(cache_key_bits(&appended), vec![vec![3, 4]]);
-    assert_eq!(cache_value_bits(&appended), vec![vec![13, 14]]);
-}
-
-#[test]
-fn decode_ref_cache_append_rejects_invalid_shapes() {
-    let mut store = init_decode_transition_store();
-    let key_ref = store
-        .insert_attention_heads(
-            RasterTensorId::new("test.bad.key").expect("key id"),
-            heads_from_rows(&[&[1]]),
-        )
-        .expect("key ref");
-    let value_ref = store
-        .insert_attention_heads(
-            RasterTensorId::new("test.bad.value").expect("value id"),
-            heads_from_rows(&[&[2]]),
-        )
-        .expect("value ref");
-
-    let error = append_decode_kv_cache_ref(
-        &mut store,
-        DecodeLayerCacheSlot::Empty { num_kv_heads: 2 },
-        key_ref,
-        value_ref,
-        0,
-        None,
-        1,
-    )
-    .expect_err("head mismatch should fail");
-
-    assert!(error.to_string().contains("empty cache head count"));
 }
 
 #[test]
