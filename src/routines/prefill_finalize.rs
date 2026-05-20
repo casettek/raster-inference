@@ -5,6 +5,7 @@ use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
     ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerPrefillResult,
 };
+use crate::shared::raster_contracts::pipeline::RasterPrefillOutputRefs;
 use crate::shared::tensors::raster_row_store::RasterActivationSequenceRef;
 
 pub mod native;
@@ -64,4 +65,38 @@ pub fn run_raster_output_refs_with_roots(
         layer_caches,
         projection_rows_per_tile,
     })
+}
+
+pub fn run_raster_pipeline_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    prompt_token_count: usize,
+    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
+    final_hidden_states_ref: RasterActivationSequenceRef,
+    layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    projection_rows_per_tile: usize,
+) -> Result<RasterPrefillOutputRefs> {
+    let output = run_raster_output_refs_with_roots(
+        artifact_store_roots,
+        prompt_token_count,
+        finalize_source,
+        final_hidden_states_ref,
+        layer_caches,
+        projection_rows_per_tile,
+    )?;
+    RasterPrefillOutputRefs::new(
+        output.artifact_store_roots,
+        output.refs.prompt_token_count,
+        output.refs.final_hidden_states_ref,
+        output.refs.layer_caches,
+        output.refs.logits_ref,
+        output.refs.logit_count,
+    )
+}
+
+/// Compatibility boundary: materializes raster prefill refs into the public
+/// `TransformerPrefillResult` shape used by checkpoints and non-ref callers.
+pub fn materialize_raster_output_refs(
+    output: &raster::RasterPrefillFinalizeOutput,
+) -> Result<TransformerPrefillResult> {
+    raster::utils::build_prefill_result_from_root_refs(&output.artifact_store_roots, &output.refs)
 }

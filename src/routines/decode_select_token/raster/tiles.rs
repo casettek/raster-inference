@@ -87,13 +87,7 @@ pub fn init_select_next_token(
     if logits_per_tile == 0 {
         bail!("raster decode select logits per tile must be greater than zero");
     }
-    let (logit_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
-    if logit_count == 0 {
-        bail!("raster decode select token requires at least one canonical logit");
-    }
-    if width != 1 {
-        bail!("raster decode select logits artifact width {width}, expected 1");
-    }
+    let logit_count = decode_select_logit_count(&logits_ref)?;
 
     let best_logit_bits = read_logit_bits(&artifact_store_roots, &logits_ref, 0)?;
     Ok(DecodeSelectArgmaxState {
@@ -144,20 +138,35 @@ fn read_logit_bits(
     logits_ref: &RasterActivationSequenceRef,
     token_idx: usize,
 ) -> Result<i32> {
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    let (row_idx, col_idx) = match (row_count, width) {
+        (_, 1) => (token_idx, 0),
+        (1, _) => (0, token_idx),
+        _ => bail!("raster decode select logits shape {row_count}x{width} must be Nx1 or 1xN"),
+    };
     let row = read_sequence_row_from_roots(
         artifact_store_roots,
         RasterSequenceRowRequest {
             tensor_ref: logits_ref.clone(),
-            row_idx: token_idx,
+            row_idx,
         },
     )?;
-    let [logit_bits] = row.act_bits() else {
-        bail!(
-            "raster decode select logit row {token_idx} has width {}",
-            row.width()
-        );
-    };
-    Ok(*logit_bits)
+    row.act_bits()
+        .get(col_idx)
+        .copied()
+        .ok_or_else(|| anyhow!("raster decode select logit {token_idx} is missing"))
+}
+
+fn decode_select_logit_count(logits_ref: &RasterActivationSequenceRef) -> Result<usize> {
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    match (row_count, width) {
+        (0, _) | (_, 0) => {
+            bail!("raster decode select token requires at least one canonical logit")
+        }
+        (rows, 1) => Ok(rows),
+        (1, cols) => Ok(cols),
+        _ => bail!("raster decode select logits shape {row_count}x{width} must be Nx1 or 1xN"),
+    }
 }
 
 fn candidate_wins(best_logit_bits: i32, candidate_bits: i32) -> bool {
@@ -403,7 +412,7 @@ pub fn finalize_decode_select_refs(
         selected_token_ref,
         full_token_ids_ref,
         generated_token_ids_ref,
-        logit_count: state.logits_ref.tensor_ref().shape().sequence_metadata()?.0,
+        logit_count: decode_select_logit_count(&state.logits_ref)?,
         logits_ref: state.logits_ref,
     })
 }

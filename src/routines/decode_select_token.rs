@@ -9,6 +9,7 @@ use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
     RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
+use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
 use crate::shared::raster_kernels::transformer::RasterActivationRow;
 use crate::shared::tensors::raster_row_store::{
     activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
@@ -90,6 +91,78 @@ pub fn run_raster_with_roots(
     input_roots: raster::RasterDecodeSelectInputRoots,
 ) -> Result<Option<raster::RasterDecodeSelectOutputRefs>> {
     raster::main(input_roots)
+}
+
+/// Refs-first raster path: advances token refs in `RasterDecodeLoopState`
+/// without materializing or mutating host `DecodeState`.
+pub fn run_raster_state(
+    decode_state: RasterDecodeLoopState,
+    max_new_tokens: usize,
+) -> Result<(
+    RasterDecodeLoopState,
+    Option<raster::RasterDecodeSelectOutputRefs>,
+)> {
+    if raster::check_stop_condition(decode_state.generated_token_count, max_new_tokens).is_some() {
+        return Ok((decode_state, None));
+    }
+
+    let input_roots =
+        prepare_raster_decode_select_input_roots_from_state(decode_state.clone(), max_new_tokens);
+    let output = raster::main(input_roots)?.expect("stop condition should have returned earlier");
+    let next_state = RasterDecodeLoopState::new(
+        output.artifact_store_roots.clone(),
+        Some(output.full_token_ids_ref.clone()),
+        output.full_token_ids_ref.token_count(),
+        Some(output.generated_token_ids_ref.clone()),
+        output.generated_token_ids_ref.token_count(),
+        output.logits_ref.clone(),
+        output.logit_count,
+        decode_state.layer_caches,
+        decode_state.position,
+        decode_state.token_count,
+        decode_state.activation_state_ref,
+    )?;
+    Ok((next_state, Some(output)))
+}
+
+pub(crate) fn trace_raster_checkpoint_from_state(
+    decode_state: &RasterDecodeLoopState,
+    selected_next_token: u32,
+    max_new_tokens: usize,
+) -> Result<()> {
+    let decode_state =
+        crate::decode_transition::materialize_decode_state_from_raster_state(decode_state)?;
+    crate::trace::trace_checkpoint(
+        "decode.select_token",
+        &decode_select_checkpoint_state(&decode_state, selected_next_token, max_new_tokens)?,
+    );
+    Ok(())
+}
+
+fn prepare_raster_decode_select_input_roots_from_state(
+    decode_state: RasterDecodeLoopState,
+    max_new_tokens: usize,
+) -> raster::RasterDecodeSelectInputRoots {
+    let source_prefix = format!(
+        "decode.select_token.position_{}.step_{}",
+        decode_state.position, decode_state.generated_token_count
+    );
+    raster::RasterDecodeSelectInputRoots {
+        artifact_store_roots: decode_state.artifact_store_roots,
+        logits_ref: decode_state.current_logits_ref,
+        full_token_ids_ref: decode_state.full_token_ids_ref,
+        full_token_count: decode_state.full_token_count,
+        generated_token_ids_ref: decode_state.generated_token_ids_ref,
+        generated_token_count: decode_state.generated_token_count,
+        max_new_tokens,
+        logits_per_tile: raster::DEFAULT_DECODE_SELECT_LOGITS_PER_TILE,
+        token_ids_per_tile: raster::DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE,
+        output_full_token_ids_source_name: format!("{source_prefix}.output.full_token_ids"),
+        output_generated_token_ids_source_name: format!(
+            "{source_prefix}.output.generated_token_ids"
+        ),
+        output_selected_token_source_name: format!("{source_prefix}.output.selected_token"),
+    }
 }
 
 fn prepare_raster_decode_select_input_roots(

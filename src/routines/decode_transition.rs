@@ -3,8 +3,15 @@ use serde_json::json;
 
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
+use crate::shared::artifacts::raster_artifact_store::{
+    read_token_id_from_ref_roots, RasterSelectedTokenRef, RasterTokenIdSequenceRef,
+};
 use crate::shared::model::transformer::{
-    Gemma4TransformerModel, TransformerDecodeState, TransformerDecodeStepResult,
+    Gemma4TransformerModel, InternalLogits, TransformerDecodeState, TransformerDecodeStepResult,
+};
+use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
+use crate::shared::tensors::raster_row_store::{
+    read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 use crate::RasterSizingControls;
 
@@ -126,6 +133,43 @@ pub fn run_raster_with_roots(
     raster::main(input_roots, source)
 }
 
+/// Refs-first raster path: consumes selected-token/cache refs and returns an
+/// updated `RasterDecodeLoopState` without building `TransformerDecodeStepResult`.
+pub fn run_raster_state(
+    decode_state: RasterDecodeLoopState,
+    selected_token_ref: RasterSelectedTokenRef,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<RasterDecodeLoopState> {
+    let output_source_prefix = format!("decode.transition.position_{}", decode_state.position);
+    let output = raster::main_state_refs(
+        raster::RasterDecodeTransitionInputRefs {
+            artifact_store_roots: decode_state.artifact_store_roots,
+            position: decode_state.position,
+            token_count: decode_state.token_count,
+            layer_caches: decode_state.layer_caches,
+            selected_token_ref,
+            decode_transition_source_root: source.static_source_root(),
+            output_source_prefix,
+            raster_sizing,
+        },
+        source,
+    )?;
+    RasterDecodeLoopState::new(
+        output.artifact_store_roots,
+        decode_state.full_token_ids_ref,
+        decode_state.full_token_count,
+        decode_state.generated_token_ids_ref,
+        decode_state.generated_token_count,
+        output.logits_ref,
+        output.logit_count,
+        output.layer_caches,
+        output.position,
+        output.token_count,
+        Some(output.final_hidden_state_ref),
+    )
+}
+
 pub fn finalize(decode_state: &DecodeState) -> Result<()> {
     crate::trace::trace_checkpoint(
         "decode.finalize",
@@ -143,6 +187,90 @@ pub fn finalize(decode_state: &DecodeState) -> Result<()> {
         }),
     );
     Ok(())
+}
+
+pub(crate) fn finalize_raster_state(decode_state: &RasterDecodeLoopState) -> Result<()> {
+    let decode_state = materialize_decode_state_from_raster_state(decode_state)?;
+    finalize(&decode_state)
+}
+
+pub(crate) fn materialize_decode_state_from_raster_state(
+    decode_state: &RasterDecodeLoopState,
+) -> Result<DecodeState> {
+    let full_token_ids = materialize_token_ids_from_optional_ref(
+        &decode_state.artifact_store_roots,
+        decode_state.full_token_ids_ref.as_ref(),
+    )?;
+    let generated_token_ids = materialize_token_ids_from_optional_ref(
+        &decode_state.artifact_store_roots,
+        decode_state.generated_token_ids_ref.as_ref(),
+    )?;
+    let internal_logits = materialize_internal_logits_from_ref(
+        &decode_state.artifact_store_roots,
+        &decode_state.current_logits_ref,
+    )?;
+    let layer_caches = raster::materialize_decode_layer_caches_from_roots(
+        &decode_state.artifact_store_roots,
+        &decode_state.layer_caches,
+    )?;
+    let mut materialized = DecodeState::new(
+        full_token_ids,
+        internal_logits.clone_f32(),
+        TransformerDecodeState {
+            layer_caches,
+            position: decode_state.position,
+            token_count: decode_state.token_count,
+        },
+    );
+    materialized.generated_token_ids = generated_token_ids;
+    materialized.set_internal_logits(internal_logits);
+    Ok(materialized)
+}
+
+fn materialize_token_ids_from_optional_ref(
+    roots: &crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots,
+    token_ids_ref: Option<&RasterTokenIdSequenceRef>,
+) -> Result<Vec<u32>> {
+    let Some(token_ids_ref) = token_ids_ref else {
+        return Ok(Vec::new());
+    };
+    (0..token_ids_ref.token_count())
+        .map(|token_idx| read_token_id_from_ref_roots(roots, token_ids_ref, token_idx))
+        .collect()
+}
+
+fn materialize_internal_logits_from_ref(
+    roots: &crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots,
+    logits_ref: &RasterActivationSequenceRef,
+) -> Result<InternalLogits> {
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    let det_logits = match (row_count, width) {
+        (_, 1) => (0..row_count)
+            .map(|row_idx| {
+                let row = read_sequence_row_from_roots(
+                    roots,
+                    RasterSequenceRowRequest {
+                        tensor_ref: logits_ref.clone(),
+                        row_idx,
+                    },
+                )?;
+                row.acts()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("raster logits row {row_idx} is empty"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        (1, _) => read_sequence_row_from_roots(
+            roots,
+            RasterSequenceRowRequest {
+                tensor_ref: logits_ref.clone(),
+                row_idx: 0,
+            },
+        )?
+        .acts(),
+        _ => anyhow::bail!("raster logits shape {row_count}x{width} must be Nx1 or 1xN"),
+    };
+    Ok(InternalLogits::from_det_values(det_logits))
 }
 
 fn generated_token_ids_commitment(decode_state: &DecodeState) -> Result<String> {

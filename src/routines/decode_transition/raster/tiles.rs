@@ -82,10 +82,33 @@ pub struct RasterDecodeTransitionInputRoots {
     pub raster_sizing: RasterSizingControls,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterDecodeTransitionInputRefs {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub position: usize,
+    pub token_count: usize,
+    pub layer_caches: Vec<DecodeLayerCacheSlot>,
+    pub selected_token_ref: RasterSelectedTokenRef,
+    pub decode_transition_source_root: String,
+    pub output_source_prefix: String,
+    pub raster_sizing: RasterSizingControls,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RasterDecodeTransitionOutputRefs {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub transition_result: TransformerDecodeStepResult,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterDecodeTransitionOutputStateRefs {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub final_hidden_state_ref: RasterActivationSequenceRef,
+    pub logits_ref: RasterActivationSequenceRef,
+    pub logit_count: usize,
+    pub layer_caches: Vec<DecodeLayerCacheSlot>,
+    pub position: usize,
+    pub token_count: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -885,6 +908,77 @@ pub fn main(
     })
 }
 
+#[sequence]
+pub fn main_state_refs(
+    input_roots: RasterDecodeTransitionInputRefs,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<RasterDecodeTransitionOutputStateRefs> {
+    if input_roots.decode_transition_source_root != source.static_source_root() {
+        bail!(
+            "raster decode transition source root {} does not match input source root {}",
+            source.static_source_root(),
+            input_roots.decode_transition_source_root
+        );
+    }
+    let next_token = call_tile!(
+        read_decode_selected_token,
+        &input_roots.artifact_store_roots,
+        &input_roots.selected_token_ref
+    )?;
+    let (_artifact_store_roots, state) = call_tile!(
+        init_decode_transition_state_from_refs_with_roots,
+        input_roots.artifact_store_roots,
+        input_roots.position,
+        input_roots.token_count,
+        input_roots.layer_caches,
+        next_token,
+        source,
+        input_roots.raster_sizing,
+        input_roots.output_source_prefix
+    )?;
+    let (artifact_store_roots, state) = call_recur_seq!(
+        compute_next_decode_layer_with_roots,
+        (_artifact_store_roots, state),
+        source
+    )?;
+    let final_hidden_state_ref = state.current_activation_ref.clone();
+    let (artifact_store_roots, normalized_ref) = call_tile!(
+        normalize_decode_final_position_ref_with_roots,
+        artifact_store_roots,
+        final_hidden_state_ref.clone(),
+        source,
+        format!("{}.final_norm", state.output_source_prefix)
+    )?;
+    let (artifact_store_roots, logits_ref) = call_seq!(
+        project_ref_with_decode_source_with_roots,
+        artifact_store_roots,
+        normalized_ref,
+        source,
+        DecodeProjectionKind::FinalLogits,
+        call_tile!(decode_projection_row_count, source)?,
+        input_roots.raster_sizing.projection_rows_per_tile,
+        format!("{}.final_logits", state.output_source_prefix),
+        call_tile!(decode_final_logit_softcap_bits, source)?
+    )?;
+    let (layer_caches, position, token_count) =
+        call_tile!(finalize_decode_layer_refs_with_roots, state)?;
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    let logit_count = match (row_count, width) {
+        (rows, 1) => rows,
+        (1, cols) => cols,
+        _ => bail!("raster decode transition logits shape {row_count}x{width} must be Nx1 or 1xN"),
+    };
+    Ok(RasterDecodeTransitionOutputStateRefs {
+        artifact_store_roots,
+        final_hidden_state_ref,
+        logits_ref,
+        logit_count,
+        layer_caches,
+        position,
+        token_count,
+    })
+}
+
 #[tile]
 pub fn init_decode_transition_state_refs_with_roots(
     mut artifact_store_roots: RasterArtifactStoreRoots,
@@ -949,6 +1043,73 @@ pub fn init_decode_transition_state_refs_with_roots(
             next_token,
             position: transformer_decode_state.position,
             token_count: transformer_decode_state.token_count,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            original_layer_caches,
+            updated_layer_caches: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+            projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
+            attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
+            output_source_prefix,
+        },
+    ))
+}
+
+#[tile]
+pub fn init_decode_transition_state_from_refs_with_roots(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    position: usize,
+    token_count: usize,
+    original_layer_caches: Vec<DecodeLayerCacheSlot>,
+    next_token: u32,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
+    output_source_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
+    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    if metadata.layer_count == 0 {
+        bail!("transformer decode requires at least one layer");
+    }
+    if original_layer_caches.len() != metadata.layer_count {
+        bail!(
+            "transformer decode cache count mismatch: {} vs {}",
+            original_layer_caches.len(),
+            metadata.layer_count
+        );
+    }
+
+    let embedded = RasterActivationRow::from_acts(auth_read!(
+        source,
+        GemmaDecodeEmbeddingRowRequest {
+            token_id: next_token
+        },
+    )?);
+    if embedded.width() != metadata.embedding_width {
+        bail!(
+            "decode embedded token width {}, expected {}",
+            embedded.width(),
+            metadata.embedding_width
+        );
+    }
+    let (roots, decode_input_ref) = insert_decode_activation_row_with_roots(
+        &artifact_store_roots,
+        format!("{output_source_prefix}.input.selected_token_embedding"),
+        &embedded,
+    )?;
+    artifact_store_roots = roots;
+
+    Ok((
+        artifact_store_roots.clone(),
+        DecodeTransitionRasterState {
+            artifact_store_roots,
+            decode_input_ref: decode_input_ref.clone(),
+            current_activation_ref: decode_input_ref,
+            next_token,
+            position,
+            token_count,
             next_layer_idx: 0,
             layer_count: metadata.layer_count,
             original_layer_caches,
@@ -2889,6 +3050,32 @@ pub fn finalize_decode_layer_state_with_roots(
     })
 }
 
+#[tile]
+pub fn finalize_decode_layer_refs_with_roots(
+    state: DecodeTransitionRasterState,
+) -> Result<(Vec<DecodeLayerCacheSlot>, usize, usize)> {
+    if state.next_layer_idx != state.layer_count {
+        bail!(
+            "raster decode finalized after {} layers, expected {}",
+            state.next_layer_idx,
+            state.layer_count
+        );
+    }
+    if state.updated_layer_caches.len() != state.layer_count {
+        bail!(
+            "raster decode stored {} layer caches, expected {}",
+            state.updated_layer_caches.len(),
+            state.layer_count
+        );
+    }
+
+    Ok((
+        state.updated_layer_caches,
+        state.position + 1,
+        state.token_count + 1,
+    ))
+}
+
 fn trace_decode_layer_checkpoint_with_roots(
     roots: &RasterArtifactStoreRoots,
     state: &DecodeTransitionRasterState,
@@ -4720,6 +4907,19 @@ fn materialize_decode_layer_cache_from_roots(
             RasterKvCache::from_heads(keys, values)
         }
     }
+}
+
+pub fn materialize_decode_layer_caches_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    layer_caches: &[DecodeLayerCacheSlot],
+) -> Result<Vec<LayerKvCache>> {
+    Ok(layer_caches
+        .iter()
+        .map(|cache| materialize_decode_layer_cache_from_roots(roots, cache))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(layer_cache_from_raster)
+        .collect::<Vec<_>>())
 }
 
 fn materialize_decode_checkpoint_caches_from_roots(

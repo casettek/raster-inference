@@ -5,8 +5,12 @@ use crate::shared::api::input::{InferenceExecutionMode, PromptPreparationState, 
 use crate::shared::api::output::OutputDecodeState;
 use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::{
-    ActivationSequence, Gemma4TransformerModel, TransformerDecodeState,
+    ActivationSequence, Gemma4TransformerModel, InternalActivationSequence, TransformerDecodeState,
     TransformerDecodeStepResult, TransformerPrefillResult, TransformerStateTransitionState,
+};
+use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
+use crate::shared::tensors::raster_row_store::{
+    read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 use crate::trace::{trace_event, trace_scope};
 use crate::RasterSizingControls;
@@ -341,6 +345,86 @@ pub(crate) fn run_output_decode_with_mode_and_raster(
     )
 }
 
+pub(crate) fn run_output_decode_with_raster_state(
+    initial_decode_state: RasterDecodeLoopState,
+    sampling: &SamplingConfig,
+    raster_tokenizer: &AuthenticatedGemmaTokenizer,
+    transformer_model: &Gemma4TransformerModel,
+    raster_sizing: RasterSizingControls,
+) -> Result<OutputDecodeState> {
+    let _trace = trace_scope("decode.run");
+    let max_new_tokens = validate_sampling_config(sampling)?;
+    let mut decode_transition_state_refs = Vec::new();
+    let mut decode_state = initial_decode_state;
+
+    loop {
+        if crate::decode_select_token::raster::check_stop_condition(
+            decode_state.generated_token_count,
+            max_new_tokens,
+        )
+        .is_some()
+        {
+            trace_event("output.detokenize");
+            let mut output_decode_state =
+                crate::output_finalize::run_raster_from_decode_state_refs(
+                    decode_state,
+                    raster_tokenizer,
+                    raster_sizing.output_byte_flush_bytes_per_tile,
+                )?;
+            output_decode_state.decode_transition_states = decode_transition_state_refs
+                .into_iter()
+                .map(|(roots, activation_ref)| {
+                    materialize_activation_sequence_from_ref(&roots, &activation_ref)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(output_decode_state);
+        }
+
+        trace_event("decode.select_token");
+        let (selected_state, select_output) =
+            crate::decode_select_token::run_raster_state(decode_state, max_new_tokens)?;
+        let select_output = select_output.expect("stop condition should have returned earlier");
+        crate::decode_select_token::trace_raster_checkpoint_from_state(
+            &selected_state,
+            select_output.next_token,
+            max_new_tokens,
+        )?;
+
+        trace_event("decode.step");
+        let source =
+            crate::decode_transition::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource::from_model(
+                format!("decode.transition.position_{}", selected_state.position),
+                transformer_model,
+            )?;
+        decode_state = crate::decode_transition::run_raster_state(
+            selected_state,
+            select_output.selected_token_ref,
+            &source,
+            raster_sizing,
+        )?;
+        if let Some(activation_ref) = decode_state.activation_state_ref.clone() {
+            decode_transition_state_refs
+                .push((decode_state.artifact_store_roots.clone(), activation_ref));
+        }
+        crate::decode_transition::finalize_raster_state(&decode_state)?;
+        if crate::trace::reached_terminal_checkpoint_id().is_some() {
+            let materialized_transition_states = decode_transition_state_refs
+                .into_iter()
+                .map(|(roots, activation_ref)| {
+                    materialize_activation_sequence_from_ref(&roots, &activation_ref)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut output_decode_state = build_current_output_decode_state_from_raster_state(
+                &decode_state,
+                raster_tokenizer,
+                raster_sizing,
+            )?;
+            output_decode_state.decode_transition_states = materialized_transition_states;
+            return Ok(output_decode_state);
+        }
+    }
+}
+
 fn run_output_decode_with_mode_internal(
     prompt_token_ids: &[u32],
     initial_transformer_state: &TransformerPrefillResult,
@@ -526,6 +610,37 @@ fn run_output_decode_with_mode_internal(
     }
 }
 
+fn materialize_activation_sequence_from_ref(
+    roots: &crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots,
+    activation_ref: &RasterActivationSequenceRef,
+) -> Result<ActivationSequence> {
+    let (row_count, _) = activation_ref.tensor_ref().shape().sequence_metadata()?;
+    let rows = (0..row_count)
+        .map(|row_idx| {
+            read_sequence_row_from_roots(
+                roots,
+                RasterSequenceRowRequest {
+                    tensor_ref: activation_ref.clone(),
+                    row_idx,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let det_rows = rows.iter().map(|row| row.acts()).collect::<Vec<_>>();
+    let values = rows
+        .iter()
+        .map(|row| row.to_f32_values())
+        .collect::<Vec<_>>();
+    let mut activation_sequence = ActivationSequence::from_internal(
+        InternalActivationSequence::from_det_values(det_rows.clone()),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
+    );
+    activation_sequence.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&det_rows),
+    );
+    Ok(activation_sequence)
+}
+
 fn build_current_output_decode_state(
     decode_state: &crate::shared::api::output::DecodeState,
     tokenizer: &Tokenizer,
@@ -556,6 +671,27 @@ fn build_current_output_decode_state(
         stop_reason: crate::shared::api::output::OutputDecodeStopReason::MaxNewTokens,
         decode_transition_states: Vec::new(),
     })
+}
+
+fn build_current_output_decode_state_from_raster_state(
+    decode_state: &RasterDecodeLoopState,
+    raster_tokenizer: &AuthenticatedGemmaTokenizer,
+    raster_sizing: RasterSizingControls,
+) -> Result<OutputDecodeState> {
+    let generated_token_ids = match decode_state.generated_token_ids_ref.as_ref() {
+        Some(generated_token_ids_ref) => {
+            crate::output_finalize::raster::materialize_token_ids_from_roots(
+                &decode_state.artifact_store_roots,
+                generated_token_ids_ref,
+            )?
+        }
+        None => Vec::new(),
+    };
+    crate::output_finalize::raster::run_with_byte_flush_bytes_per_tile(
+        &generated_token_ids,
+        raster_tokenizer,
+        raster_sizing.output_byte_flush_bytes_per_tile,
+    )
 }
 
 #[cfg(test)]

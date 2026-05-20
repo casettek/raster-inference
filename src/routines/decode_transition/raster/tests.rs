@@ -1,8 +1,11 @@
 use super::{
     append_decode_kv_cache_ref, compute_next_decode_layer, finalize_decode_layer_state,
     init_decode_logits_projection, init_decode_transition_state, init_decode_transition_store,
-    main, materialize_decode_layer_cache_from_store, prepare_next_decode_layer_context,
-    register_decode_layer_cache, run, DecodeLayerCacheSlot, RasterDecodeTransitionInputRoots,
+    main, main_state_refs, materialize_decode_layer_cache_from_store,
+    materialize_decode_layer_caches_from_roots, prepare_next_decode_layer_context,
+    raster_cache_from_layer_cache, register_decode_layer_cache,
+    register_decode_layer_cache_with_roots, run, DecodeLayerCacheSlot,
+    RasterDecodeTransitionInputRefs, RasterDecodeTransitionInputRoots,
 };
 use crate::decode_transition::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource;
 use crate::shared::api::input::InferenceExecutionMode;
@@ -20,7 +23,9 @@ use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::{
     RasterActivationRow, RasterAttentionHeadSequence, RasterKvCache,
 };
-use crate::shared::tensors::raster_row_store::RasterTensorId;
+use crate::shared::tensors::raster_row_store::{
+    read_sequence_row_from_roots, RasterSequenceRowRequest, RasterTensorId,
+};
 use crate::RasterSizingControls;
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
@@ -87,6 +92,104 @@ fn root_backed_main_reads_selected_token_ref() {
     assert_eq!(
         raster.transformer_decode_state,
         deterministic.transformer_decode_state
+    );
+}
+
+#[test]
+fn root_backed_state_main_returns_refs_without_materialized_transition_result() {
+    let (_path, model) = no_ple_model(false);
+    let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
+        .expect("source should build");
+    let decode_state = decode_state_with_cache(1);
+    let (mut roots, selected_token_ref) =
+        selected_token_ref("decode.transition.state.selected", 1).expect("selected token ref");
+    let mut layer_caches = Vec::with_capacity(decode_state.layer_caches.len());
+    for (layer_idx, cache) in decode_state.layer_caches.iter().enumerate() {
+        let raster_cache = raster_cache_from_layer_cache(cache).expect("cache should convert");
+        let (next_roots, cache_slot) = register_decode_layer_cache_with_roots(
+            &roots,
+            "decode.transition.state.original.cache",
+            layer_idx,
+            raster_cache,
+        )
+        .expect("cache should register");
+        roots = next_roots;
+        layer_caches.push(cache_slot);
+    }
+
+    let output = main_state_refs(
+        RasterDecodeTransitionInputRefs {
+            artifact_store_roots: roots,
+            position: decode_state.position,
+            token_count: decode_state.token_count,
+            layer_caches,
+            selected_token_ref,
+            decode_transition_source_root: source.static_source_root(),
+            output_source_prefix: "decode.transition.state".to_string(),
+            raster_sizing: raster_sizing(1),
+        },
+        &source,
+    )
+    .expect("state-backed raster decode should run");
+
+    assert_eq!(output.position, decode_state.position + 1);
+    assert_eq!(output.token_count, decode_state.token_count + 1);
+    assert_eq!(output.layer_caches.len(), decode_state.layer_caches.len());
+    let (row_count, width) = output
+        .logits_ref
+        .tensor_ref()
+        .shape()
+        .sequence_metadata()
+        .expect("logits shape");
+    assert_eq!(row_count, 1);
+    assert!(width > 0);
+
+    let deterministic = crate::decode_transition::run_with_mode(
+        decode_state,
+        1,
+        &model,
+        InferenceExecutionMode::Deterministic,
+    )
+    .expect("deterministic decode should run");
+    let final_hidden_row = read_sequence_row_from_roots(
+        &output.artifact_store_roots,
+        RasterSequenceRowRequest {
+            tensor_ref: output.final_hidden_state_ref.clone(),
+            row_idx: 0,
+        },
+    )
+    .expect("final hidden ref should materialize");
+    assert_eq!(
+        vec![final_hidden_row.acts()],
+        deterministic
+            .activation_state
+            .clone_internal()
+            .det_values()
+            .expect("deterministic activation values")
+    );
+    let logits_row = read_sequence_row_from_roots(
+        &output.artifact_store_roots,
+        RasterSequenceRowRequest {
+            tensor_ref: output.logits_ref.clone(),
+            row_idx: 0,
+        },
+    )
+    .expect("logits ref should materialize");
+    assert_eq!(
+        logits_row.acts(),
+        deterministic
+            .prefill_logits
+            .clone_internal()
+            .det_values()
+            .expect("deterministic logits")
+    );
+    assert_eq!(
+        materialize_decode_layer_caches_from_roots(
+            &output.artifact_store_roots,
+            &output.layer_caches
+        )
+        .expect("cache refs should materialize"),
+        deterministic.transformer_decode_state.layer_caches
     );
 }
 
