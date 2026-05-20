@@ -1,15 +1,15 @@
 use anyhow::{bail, Context, Result};
 
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::gemma_tokenizer::{
+use crate::shared::api::input::{InferenceRequest, ModelSpec};
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
+    token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterArtifactRef,
+    RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
+};
+use crate::shared::model::gemma_tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaBpeState, GemmaNormalizedText, GemmaPreTokenizedText,
     GemmaSpecialTokenAtRequest, GemmaTokenIdRequest, GemmaTokenizerMetadata,
     GemmaTokenizerMetadataRequest, GemmaTokenizerSpec,
-};
-use crate::shared::input::{InferenceRequest, ModelSpec};
-use crate::shared::raster_artifact_store::RasterTokenIdSequenceRef;
-use crate::shared::raster_artifact_store::{
-    RasterArtifactId, RasterArtifactMetadata, RasterArtifactRef, RasterBpePieceSequenceRef,
 };
 
 use super::raster_tiles::{
@@ -286,10 +286,6 @@ fn text_char_leaf(ch: char) -> Vec<u8> {
     let mut buffer = [0; 4];
     let text = ch.encode_utf8(&mut buffer);
     bpe_piece_leaf(text)
-}
-
-pub(super) fn token_id_leaf(token_id: u32) -> Vec<u8> {
-    token_id.to_le_bytes().to_vec()
 }
 
 pub(super) fn bpe_piece_leaf(piece: &str) -> Vec<u8> {

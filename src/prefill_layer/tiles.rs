@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
-use crate::shared::transformer::{
+use crate::shared::model::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
     LayerKvCache,
 };
@@ -41,12 +41,12 @@ pub fn run_text_layers_prefill_with_cache(
         let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, layer_cache) =
-            crate::shared::transformer_kernels::run_gemma4_layer_with_cache(
+            crate::shared::numerics::transformer_kernels::run_gemma4_layer_with_cache(
                 &xs,
                 &resolved_layer,
                 per_layer_input,
                 donor_cache,
-                crate::shared::input::InferenceExecutionMode::Fp32,
+                crate::shared::api::input::InferenceExecutionMode::Fp32,
             )?;
         xs = layer_output.activations;
         layer_caches.push(layer_cache);
@@ -56,7 +56,7 @@ pub fn run_text_layers_prefill_with_cache(
             &json!({
                 "next_layer_idx": layer_idx + 1,
                 "current_activations": xs.clone(),
-                "current_activations_sha256": crate::shared::transformer_kernels::build_activation_commitment(&xs),
+                "current_activations_sha256": crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs),
                 "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
                 "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
             }),
@@ -86,7 +86,7 @@ pub fn run_text_layers_prefill_with_cache(
     Ok((
         ActivationSequence::from_values(
             xs.clone(),
-            crate::shared::transformer_kernels::build_activation_commitment(&xs),
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs),
         ),
         layer_caches,
     ))

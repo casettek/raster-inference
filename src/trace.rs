@@ -288,7 +288,7 @@ pub(crate) fn checkpoint_payload_for_tests() -> Value {
 }
 
 pub fn serialize_layer_caches(
-    layer_caches: &[crate::shared::transformer::LayerKvCache],
+    layer_caches: &[crate::shared::model::transformer::LayerKvCache],
 ) -> Vec<SerializableLayerKvCache> {
     // Trace/checkpoint payloads intentionally keep the existing f32 cache shape.
     // Deterministic mode may carry canonical rows internally, but public trace

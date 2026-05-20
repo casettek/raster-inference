@@ -1,10 +1,10 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-use crate::shared::gemma_tokenizer::AuthenticatedGemmaTokenizer;
-use crate::shared::input::{
+use crate::shared::api::input::{
     InferenceRequest, ModelSpec, PromptPreparationState, RasterPromptPreparationState,
 };
+use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
 use crate::trace::{trace_event, trace_scope};
 
 use self::raster_utils::{

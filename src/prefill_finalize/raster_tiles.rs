@@ -1,28 +1,28 @@
 use anyhow::{anyhow, bail, Result};
 
 use super::raster_utils::build_prefill_result_from_root_refs;
-use crate::raster_authoring::prelude::{
-    auth_read, call_recur_tile, call_tile, call_seq, sequence, tile,
-};
-use crate::shared::det_num::{softcap_act, Act};
-use crate::shared::raster_artifact_store::{
-    RasterArtifactId, RasterArtifactStoreRoots, RasterRoutineOutput,
-};
-use crate::shared::raster_prefill_finalize::{
+use crate::prefill_finalize::authenticated_source::{
     GemmaPrefillFinalizeMetadataRequest, GemmaPrefillFinalizeNormWeightsRequest,
     GemmaPrefillFinalizeProjectionRowRequest, GemmaPrefillFinalizeScalarsRequest,
 };
-use crate::shared::raster_row_store::{
+use crate::raster_authoring::prelude::{
+    auth_read, call_recur_tile, call_seq, call_tile, sequence, tile,
+};
+use crate::shared::artifacts::raster_artifact_store::{
+    RasterArtifactId, RasterArtifactStoreRoots, RasterRoutineOutput,
+};
+use crate::shared::model::transformer::TransformerPrefillResult;
+use crate::shared::numerics::det_num::{softcap_act, Act};
+use crate::shared::raster_kernels::transformer::{
+    project_row_with_weights, rms_norm_sequence, validate_projection_rows_per_tile,
+    RasterActivationRow, RasterActivationSequence,
+};
+use crate::shared::tensors::raster_row_store::{
     append_sequence_row_by_source_name_with_roots,
     finalize_sequence_builder_by_source_name_with_roots, read_sequence_row_from_roots,
     start_sequence_builder_with_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
     RasterTensorId,
 };
-use crate::shared::raster_transformer_kernels::{
-    project_row_with_weights, rms_norm_sequence, validate_projection_rows_per_tile,
-    RasterActivationRow, RasterActivationSequence,
-};
-use crate::shared::transformer::TransformerPrefillResult;
 
 pub const NORMALIZED_FINAL_POSITION_ARTIFACT_NAME: &str =
     "prefill.finalize.normalized_final_position";
@@ -367,20 +367,22 @@ mod tests {
         normalize_final_position_to_artifact, project_next_prefill_logit_chunk,
         RasterPrefillFinalizeInputRoots, NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
     };
+    use crate::prefill_finalize::authenticated_source::AuthenticatedGemmaPrefillFinalizeSource;
     use crate::prefill_layer::raster_tiles::PrefillLayerCacheSlot;
-    use crate::shared::artifact_io::ArtifactIo;
-    use crate::shared::det_num::{Acc, Act, Wgt};
-    use crate::shared::input::InferenceExecutionMode;
-    use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
-    use crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource;
-    use crate::shared::raster_row_store::{AuthenticatedRasterTensorStore, RasterTensorId};
-    use crate::shared::raster_transformer_kernels::{
-        RasterActivationRow, RasterActivationSequence, RasterKvCache,
-    };
-    use crate::shared::transformer::{
+    use crate::shared::api::input::InferenceExecutionMode;
+    use crate::shared::artifacts::artifact_io::ArtifactIo;
+    use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
+    use crate::shared::model::transformer::{
         ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, Gemma4LogitsProjection,
         Gemma4ModelProvenance, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
         InternalActivationSequence, LayerKvCache, MatrixF32,
+    };
+    use crate::shared::numerics::det_num::{Acc, Act, Wgt};
+    use crate::shared::raster_kernels::transformer::{
+        RasterActivationRow, RasterActivationSequence, RasterKvCache,
+    };
+    use crate::shared::tensors::raster_row_store::{
+        AuthenticatedRasterTensorStore, RasterTensorId,
     };
     use anyhow::{Context, Result};
     use std::collections::VecDeque;
@@ -838,7 +840,7 @@ mod tests {
             &state.artifact_store_roots,
             NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
             0,
-            crate::shared::raster_artifact_store::activation_row_leaf(
+            crate::shared::artifacts::raster_artifact_store::activation_row_leaf(
                 &RasterActivationRow::from_acts(vec![Act::from_num(0.0), Act::from_num(0.0)]),
             ),
         )
@@ -1049,11 +1051,11 @@ mod tests {
 
     fn run_ref_backed_finalize(
         prompt_token_count: usize,
-        final_hidden_states_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        final_hidden_states_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         layer_caches: Vec<PrefillLayerCacheSlot>,
         source: &AuthenticatedGemmaPrefillFinalizeSource,
         projection_rows_per_tile: usize,
-    ) -> Result<crate::shared::transformer::TransformerPrefillResult> {
+    ) -> Result<crate::shared::model::transformer::TransformerPrefillResult> {
         run_ref_backed_finalize_with_roots(
             ArtifactIo::export_store_roots(),
             prompt_token_count,
@@ -1067,11 +1069,11 @@ mod tests {
     fn run_ref_backed_finalize_with_roots(
         artifact_store_roots: RasterArtifactStoreRoots,
         prompt_token_count: usize,
-        final_hidden_states_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        final_hidden_states_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         layer_caches: Vec<PrefillLayerCacheSlot>,
         source: &AuthenticatedGemmaPrefillFinalizeSource,
         projection_rows_per_tile: usize,
-    ) -> Result<crate::shared::transformer::TransformerPrefillResult> {
+    ) -> Result<crate::shared::model::transformer::TransformerPrefillResult> {
         let source_ref = source.committed_source_ref()?;
         main(RasterPrefillFinalizeInputRoots {
             artifact_store_roots,
@@ -1087,20 +1089,21 @@ mod tests {
         let internal = InternalActivationSequence::from_det_values(rows.clone());
         let mut sequence = ActivationSequence::from_internal(
             internal,
-            crate::shared::transformer_kernels::build_activation_commitment(
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(
                 &rows
                     .iter()
                     .map(|row| {
                         row.iter()
                             .copied()
-                            .map(crate::shared::det_num::act_to_f32)
+                            .map(crate::shared::numerics::det_num::act_to_f32)
                             .collect()
                     })
                     .collect::<Vec<Vec<_>>>(),
             ),
         );
-        sequence.det_activations_sha256 =
-            Some(crate::shared::transformer_kernels::build_det_activation_commitment(&rows));
+        sequence.det_activations_sha256 = Some(
+            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&rows),
+        );
         sequence
     }
 
@@ -1108,7 +1111,7 @@ mod tests {
         store: &mut AuthenticatedRasterTensorStore,
         id: &str,
         sequence: &ActivationSequence,
-    ) -> crate::shared::raster_row_store::RasterActivationSequenceRef {
+    ) -> crate::shared::tensors::raster_row_store::RasterActivationSequenceRef {
         let det_rows = sequence
             .clone_internal()
             .det_values()

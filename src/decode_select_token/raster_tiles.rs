@@ -1,15 +1,14 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::raster_authoring::prelude::{call_recur_tile, call_tile, sequence, tile};
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::det_num::{argmax_first, Act};
-use crate::shared::output::OutputDecodeStopReason;
-use crate::shared::raster_artifact_store::{
-    read_token_id_from_ref_roots, token_id_leaf, RasterArtifactId,
-    RasterArtifactMetadata, RasterArtifactStoreRoots, RasterSelectedTokenRef,
-    RasterTokenIdSequenceRef,
+use crate::shared::api::output::OutputDecodeStopReason;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
+    read_token_id_from_ref_roots, token_id_leaf, RasterArtifactId, RasterArtifactMetadata,
+    RasterArtifactStoreRoots, RasterSelectedTokenRef, RasterTokenIdSequenceRef,
 };
-use crate::shared::raster_row_store::{
+use crate::shared::numerics::det_num::{argmax_first, Act};
+use crate::shared::tensors::raster_row_store::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 
@@ -473,19 +472,19 @@ mod tests {
         copy_next_full_token_chunk, init_decode_select_append_state, init_select_next_token, main,
         scan_next_token_logit, DecodeSelectArgmaxState, RasterDecodeSelectInputRoots,
     };
-    use crate::shared::artifact_io::ArtifactIo;
-    use crate::shared::det_num::Act;
-    use crate::shared::input::InferenceExecutionMode;
-    use crate::shared::raster_artifact_store::{
+    use crate::shared::api::input::InferenceExecutionMode;
+    use crate::shared::artifacts::artifact_io::ArtifactIo;
+    use crate::shared::artifacts::raster_artifact_store::{
         activation_row_leaf, read_selected_token_from_roots, read_token_id_from_ref_roots,
         token_id_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
         RasterArtifactMetadata, RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
     };
-    use crate::shared::raster_row_store::{
+    use crate::shared::model::transformer::InternalLogits;
+    use crate::shared::numerics::det_num::Act;
+    use crate::shared::raster_kernels::transformer::RasterActivationRow;
+    use crate::shared::tensors::raster_row_store::{
         activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
     };
-    use crate::shared::raster_transformer_kernels::RasterActivationRow;
-    use crate::shared::transformer::InternalLogits;
     use anyhow::Result;
 
     #[test]

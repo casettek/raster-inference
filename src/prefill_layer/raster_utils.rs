@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::raster_prefill_layer::GemmaPrefillLayerMetadata;
-use crate::shared::raster_row_store::{
+use crate::shared::model::transformer::LayerKvCache;
+use crate::shared::raster_contracts::prefill_layer::GemmaPrefillLayerMetadata;
+use crate::shared::raster_kernels::transformer::{RasterActivationSequence, RasterKvCache};
+use crate::shared::tensors::raster_row_store::{
     AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
 };
-use crate::shared::raster_transformer_kernels::{RasterActivationSequence, RasterKvCache};
-use crate::shared::transformer::LayerKvCache;
 
 use super::raster_tiles::PrefillLayerCacheSlot;
 
@@ -122,7 +122,7 @@ pub(super) fn materialize_prefill_layer_caches(
 
 pub(super) fn raster_sequence_acts(
     sequence: &RasterActivationSequence,
-) -> Vec<Vec<crate::shared::det_num::Act>> {
+) -> Vec<Vec<crate::shared::numerics::det_num::Act>> {
     sequence.rows().iter().map(|row| row.acts()).collect()
 }
 

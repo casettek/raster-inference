@@ -3,21 +3,21 @@ use anyhow::{bail, Context, Result};
 use crate::raster_authoring::prelude::{
     call_recur_seq, call_recur_tile, call_tile, sequence, tile,
 };
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::gemma_tokenizer::{
-    AuthenticatedGemmaTokenizer, GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest,
-    GemmaBpeOutput, GemmaBpeState, GemmaTokenIdRequest,
-};
-use crate::shared::input::RasterPromptPreparationState;
-use crate::shared::raster_artifact_store::{
-    RasterArtifactMetadata, RasterArtifactStoreRoots, RasterBpePieceSequenceRef,
+use crate::shared::api::input::RasterPromptPreparationState;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
+    token_id_leaf, RasterArtifactMetadata, RasterArtifactStoreRoots, RasterBpePieceSequenceRef,
     RasterTokenIdSequenceRef,
+};
+use crate::shared::model::gemma_tokenizer::{
+    AuthenticatedGemmaTokenizer, GemmaBpeMergeRequest, GemmaBpeMergedTokenRequest, GemmaBpeOutput,
+    GemmaBpeState, GemmaTokenIdRequest,
 };
 
 use super::raster_utils::{
-    artifact_id, bpe_piece_leaf, read_bpe_pair, read_bpe_piece, token_id_leaf,
-    NORMALIZED_PROMPT_ARTIFACT_NAME, PROMPT_BYTES_ARTIFACT_NAME, PROMPT_TEXT_ARTIFACT_NAME,
-    PROMPT_TOKEN_IDS_ARTIFACT_NAME, RENDERED_PROMPT_ARTIFACT_NAME,
+    artifact_id, bpe_piece_leaf, read_bpe_pair, read_bpe_piece, NORMALIZED_PROMPT_ARTIFACT_NAME,
+    PROMPT_BYTES_ARTIFACT_NAME, PROMPT_TEXT_ARTIFACT_NAME, PROMPT_TOKEN_IDS_ARTIFACT_NAME,
+    RENDERED_PROMPT_ARTIFACT_NAME,
 };
 
 pub const DEFAULT_BPE_PAIRS_PER_TILE: usize = 64;
@@ -653,7 +653,7 @@ pub fn main(
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{Context, Result};
+    use anyhow::Result;
 
     use super::super::raster_utils::{
         bpe_piece_leaf, init_artifact_store, init_bpe_tokenize_prompt, init_tokenize_prompt,
@@ -667,14 +667,15 @@ mod tests {
         bpe_pieces_artifact_name, finalize_next_token_ids, finalize_tokenize_prompt,
         init_token_id_finalization, main, prompt_token_ids_root,
     };
-    use crate::shared::artifact_io::ArtifactIo;
-    use crate::shared::gemma_tokenizer::{
+    use crate::shared::api::input::{MessageRole, ModelSpec, TextDecodingPolicy};
+    use crate::shared::artifacts::artifact_io::ArtifactIo;
+    use crate::shared::artifacts::raster_artifact_store::{
+        self, decode_token_id_leaf, RasterArtifactId, RasterBpePieceSequenceRef,
+        RasterTokenIdSequenceRef,
+    };
+    use crate::shared::model::gemma_tokenizer::{
         AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeOutput,
         GemmaPreTokenizedText, GemmaTokenizerSpec, GemmaVocabEntry,
-    };
-    use crate::shared::input::{MessageRole, ModelSpec, TextDecodingPolicy};
-    use crate::shared::raster_artifact_store::{
-        self, RasterArtifactId, RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
     };
 
     #[test]
@@ -862,13 +863,13 @@ mod tests {
 
     #[test]
     fn run_returns_root_backed_prompt_state() {
-        let request = crate::shared::input::InferenceRequest {
+        let request = crate::shared::api::input::InferenceRequest {
             prompt_bytes: b"ab".to_vec(),
             text_decoding_policy: TextDecodingPolicy::Utf8,
             add_generation_prompt: false,
             add_special_tokens: false,
-            execution_mode: crate::shared::input::InferenceExecutionMode::Deterministic,
-            sampling: crate::shared::input::SamplingConfig::default(),
+            execution_mode: crate::shared::api::input::InferenceExecutionMode::Deterministic,
+            sampling: crate::shared::api::input::SamplingConfig::default(),
         };
         let model = ModelSpec {
             model_id: "gemma-4-test".to_string(),
@@ -948,13 +949,6 @@ mod tests {
                 decode_token_id_leaf(read.payload())
             })
             .collect()
-    }
-
-    fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
-        let bytes: [u8; 4] = payload
-            .try_into()
-            .context("token-id leaf payload must be exactly four bytes")?;
-        Ok(u32::from_le_bytes(bytes))
     }
 
     fn test_tokenizer_source() -> AuthenticatedGemmaTokenizer {

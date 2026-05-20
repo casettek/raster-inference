@@ -5,8 +5,8 @@ use raster_inference::output_finalize::raster_tiles::detokenize_output_tokens;
 use raster_inference::prompt_prepare::raster_tiles::{
     tokenize_prompt, tokenize_prompt_with_controls,
 };
-use raster_inference::shared::gemma_tokenizer::GemmaDecoderMetadataRequest;
-use raster_inference::shared::raster_artifact_store::{self, RasterTokenIdSequenceRef};
+use raster_inference::shared::artifacts::raster_artifact_store::{self, RasterTokenIdSequenceRef};
+use raster_inference::shared::model::gemma_tokenizer::GemmaDecoderMetadataRequest;
 use raster_inference::AuthenticatedGemmaTokenizer;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;

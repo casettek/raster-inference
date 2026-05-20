@@ -1,12 +1,12 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::artifact_io::AuthRead;
-use crate::shared::det_num::{Acc, Act, Wgt};
-use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
-use crate::shared::transformer::{
+use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::model::transformer::{
     Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4ModelProvenance,
     Gemma4TransformerModel,
 };
+use crate::shared::numerics::det_num::{Acc, Act, Wgt};
+use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedGemmaPrefillLayerSource {
@@ -562,12 +562,12 @@ mod tests {
         GemmaPrefillLayerNormWeightsRequest, GemmaPrefillLayerScalarsRequest,
         GemmaPrefillLayerSourceMetadataRequest,
     };
-    use crate::shared::det_num::{Acc, Act, Wgt};
-    use crate::shared::transformer::{
+    use crate::shared::model::transformer::{
         DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights,
         Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleLayerWeights,
         Gemma4TransformerModel, MatrixF32,
     };
+    use crate::shared::numerics::det_num::{Acc, Act, Wgt};
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokenizers::Tokenizer;
 
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::raster_artifact_store::RasterTokenIdSequenceRef;
-use crate::shared::raster_input_embedding::AuthenticatedGemmaInputEmbeddingSource;
-use crate::shared::raster_prefill_ple::AuthenticatedGemmaPleSource;
+use crate::input_embedding::authenticated_source::AuthenticatedGemmaInputEmbeddingSource;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::RasterTokenIdSequenceRef;
+use crate::shared::raster_contracts::prefill_ple::AuthenticatedGemmaPleSource;
 
 pub mod checkpoints;
 pub mod decode_select_token;
@@ -46,24 +46,24 @@ pub use prefill_layer::run_with_mode as run_prefill_layer_with_mode;
 pub use prefill_layer::tiles::{run_text_layers_prefill, run_text_layers_prefill_with_cache};
 pub use prefill_prepare_aux::run as run_prefill_prepare_aux;
 pub use prompt_prepare::run as run_prompt_prepare;
-pub use shared::gemma_tokenizer::{
-    AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeState, GemmaTokenizerSpec,
-    GemmaVocabEntry,
-};
-pub use shared::input::{
+pub use shared::api::input::{
     Gemma4Prompt, InferenceExecutionMode, InferenceRequest, MessageRole, ModelSpec,
     PromptPreparationState, RasterPromptPreparationState, SamplingConfig, TextDecodingPolicy,
     TextMessage,
 };
-pub use shared::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
-pub use shared::transformer::{
+pub use shared::api::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
+pub use shared::model::gemma_tokenizer::{
+    AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeState, GemmaTokenizerSpec,
+    GemmaVocabEntry,
+};
+pub use shared::model::transformer::{
     ActivationSequence, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
     Gemma4PleLayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, PrefillLogits, TransformerDecodeState,
     TransformerDecodeStepResult, TransformerPrefillResult, TransformerStateTransitionState,
 };
-pub use shared::transformer_kernels::{
+pub use shared::numerics::transformer_kernels::{
     append_kv_cache, apply_final_logit_softcapping, apply_final_norm, compute_decode_ple_input,
     compute_prefill_ple_inputs, embed_input_token, embed_input_token_with_mode, embed_input_tokens,
     embed_input_tokens_with_mode, extract_prefill_logits, project_decode_hidden_to_logits,
@@ -293,7 +293,7 @@ pub fn run_inference_with_controls(
             trace::start_inference_trace(&json!({
                 "model_id": model.model_id,
                 "execution_mode": request.execution_mode,
-                "det_num_spec_version": crate::shared::det_num::DET_NUM_SPEC_VERSION,
+                "det_num_spec_version": crate::shared::numerics::det_num::DET_NUM_SPEC_VERSION,
                 "model_provenance": format!("{:?}", transformer_model.provenance),
                 "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
                 "max_new_tokens": request.sampling.max_new_tokens,
@@ -522,7 +522,7 @@ pub fn run_inference_with_controls(
                         }));
                     }
                     let layer_source =
-                    crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
+                    crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
@@ -545,7 +545,7 @@ pub fn run_inference_with_controls(
                         }));
                     }
                     let finalize_source =
-                    crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource::from_model(
+                    crate::prefill_finalize::authenticated_source::AuthenticatedGemmaPrefillFinalizeSource::from_model(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
@@ -558,29 +558,30 @@ pub fn run_inference_with_controls(
                         raster_sizing.projection_rows_per_tile,
                     )?
                 } else {
-                    let ple_inputs =
-                        if let Some(input_embedding_output) = raster_input_embedding_refs.as_ref() {
-                            let ple_source = AuthenticatedGemmaPleSource::from_model(
-                                model.model_id.clone(),
-                                transformer_model,
-                            )?;
-                            prefill_prepare_aux::run_with_input_embedding_checkpoint(
-                                &prompt_preparation.prompt_token_ids,
-                                transformer_model,
-                                &token_embeddings,
-                                request.execution_mode,
-                                input_embedding_output.artifact_store_roots.clone(),
-                                &input_embedding_output.refs,
-                                &ple_source,
-                            )?
-                        } else {
-                            run_prefill_prepare_aux(
-                                &prompt_preparation.prompt_token_ids,
-                                transformer_model,
-                                &token_embeddings,
-                                request.execution_mode,
-                            )?
-                        };
+                    let ple_inputs = if let Some(input_embedding_output) =
+                        raster_input_embedding_refs.as_ref()
+                    {
+                        let ple_source = AuthenticatedGemmaPleSource::from_model(
+                            model.model_id.clone(),
+                            transformer_model,
+                        )?;
+                        prefill_prepare_aux::run_with_input_embedding_checkpoint(
+                            &prompt_preparation.prompt_token_ids,
+                            transformer_model,
+                            &token_embeddings,
+                            request.execution_mode,
+                            input_embedding_output.artifact_store_roots.clone(),
+                            &input_embedding_output.refs,
+                            &ple_source,
+                        )?
+                    } else {
+                        run_prefill_prepare_aux(
+                            &prompt_preparation.prompt_token_ids,
+                            transformer_model,
+                            &token_embeddings,
+                            request.execution_mode,
+                        )?
+                    };
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                         trace::phase_paused(PhaseId::TransformerStateTransition);
                         return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
@@ -801,16 +802,16 @@ mod tests {
         InferenceRunOutcome, MatrixF32, ModelSpec, OutputDecodeStopReason, SamplingConfig,
         TextDecodingPolicy,
     };
-    use crate::shared::det_num::{f32_to_acc, Act, Wgt};
-    use crate::shared::gemma_tokenizer::GemmaAddedToken;
-    use crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource;
-    use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
-    use crate::shared::raster_row_store::insert_activation_sequence_artifact_ref;
-    use crate::shared::raster_transformer_kernels::RasterActivationSequence;
-    use crate::shared::transformer::{
+    use crate::prefill_finalize::authenticated_source::AuthenticatedGemmaPrefillFinalizeSource;
+    use crate::shared::model::gemma_tokenizer::GemmaAddedToken;
+    use crate::shared::model::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4LayerMatrixSource, GemmaEmbeddingTensorSource,
         InternalActivationSequence, InternalLogits,
     };
+    use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
+    use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
+    use crate::shared::raster_kernels::transformer::RasterActivationSequence;
+    use crate::shared::tensors::raster_row_store::insert_activation_sequence_artifact_ref;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
@@ -1066,13 +1067,14 @@ mod tests {
             crate::trace::checkpoint_payload_for_tests()
         });
 
-        crate::shared::artifact_io::ArtifactIo::reset_store();
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
         let input_ref = insert_activation_sequence_artifact_ref(
             "test.prefill.layer.input_embedding",
             RasterActivationSequence::from_acts(input_rows),
         )
         .expect("input embedding activation ref");
-        let input_embedding_roots = crate::shared::artifact_io::ArtifactIo::export_store_roots();
+        let input_embedding_roots =
+            crate::shared::artifacts::artifact_io::ArtifactIo::export_store_roots();
         let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
             source_id: "embedding-fixture".to_string(),
             embedding_source_root: "embedding-root".to_string(),
@@ -1148,13 +1150,14 @@ mod tests {
             crate::trace::checkpoint_payload_for_tests()
         });
 
-        crate::shared::artifact_io::ArtifactIo::reset_store();
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
         let input_ref = insert_activation_sequence_artifact_ref(
             "test.prefill.finalize.input_embedding",
             RasterActivationSequence::from_acts(input_rows),
         )
         .expect("input embedding activation ref");
-        let input_embedding_roots = crate::shared::artifact_io::ArtifactIo::export_store_roots();
+        let input_embedding_roots =
+            crate::shared::artifacts::artifact_io::ArtifactIo::export_store_roots();
         let input_embedding_refs = crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs {
             source_id: "embedding-fixture".to_string(),
             embedding_source_root: "embedding-root".to_string(),
@@ -1217,7 +1220,7 @@ mod tests {
             let mut decode_state = DecodeState::new(
                 vec![7],
                 internal_logits.clone_f32(),
-                crate::shared::transformer::TransformerDecodeState::default(),
+                crate::shared::model::transformer::TransformerDecodeState::default(),
             );
             decode_state.set_internal_logits(internal_logits.clone());
             run_decode_select_token(&mut decode_state, 1, InferenceExecutionMode::Deterministic)
@@ -1230,7 +1233,7 @@ mod tests {
             let mut decode_state = DecodeState::new(
                 vec![7],
                 internal_logits.clone_f32(),
-                crate::shared::transformer::TransformerDecodeState::default(),
+                crate::shared::model::transformer::TransformerDecodeState::default(),
             );
             decode_state.set_internal_logits(internal_logits.clone());
             crate::decode_select_token::run_raster(&mut decode_state, 1)

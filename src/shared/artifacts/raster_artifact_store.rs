@@ -2,8 +2,10 @@ use std::{cell::RefCell, collections::HashMap};
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::merkle::{merkle_proof, merkle_root, verify_merkle_proof, MerkleProof};
-use crate::shared::raster_transformer_kernels::RasterActivationRow;
+use crate::shared::artifacts::merkle::{
+    merkle_proof, merkle_root, verify_merkle_proof, MerkleProof,
+};
+use crate::shared::raster_kernels::transformer::RasterActivationRow;
 
 pub const TOKEN_ID_ARTIFACT_KIND: &str = "token_ids";
 pub const BPE_PIECE_ARTIFACT_KIND: &str = "bpe_pieces";
@@ -1353,23 +1355,10 @@ fn ensure_builder_ref_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::det_num::Act;
+    use crate::shared::numerics::det_num::Act;
 
     fn artifact_id(name: &str) -> RasterArtifactId {
         RasterArtifactId::new(name).expect("artifact id")
-    }
-
-    fn token_id_leaf(token_id: u32) -> Vec<u8> {
-        token_id.to_le_bytes().to_vec()
-    }
-
-    fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
-        if payload.len() != 4 {
-            bail!("token-id leaf payload must be exactly four bytes");
-        }
-        Ok(u32::from_le_bytes(
-            payload.try_into().expect("payload length checked above"),
-        ))
     }
 
     fn bpe_piece_leaf(piece: &str) -> Vec<u8> {

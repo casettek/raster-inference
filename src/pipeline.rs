@@ -1,10 +1,10 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-use crate::shared::gemma_tokenizer::AuthenticatedGemmaTokenizer;
-use crate::shared::input::{InferenceExecutionMode, PromptPreparationState, SamplingConfig};
-use crate::shared::output::OutputDecodeState;
-use crate::shared::transformer::{
+use crate::shared::api::input::{InferenceExecutionMode, PromptPreparationState, SamplingConfig};
+use crate::shared::api::output::OutputDecodeState;
+use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
+use crate::shared::model::transformer::{
     ActivationSequence, Gemma4TransformerModel, TransformerDecodeState,
     TransformerDecodeStepResult, TransformerPrefillResult, TransformerStateTransitionState,
 };
@@ -96,7 +96,7 @@ fn embed_token_ids(
 ) -> Result<ActivationSequence> {
     if let Some(ref embedding_table) = model.embedding_table {
         trace_event("prefill.embed_tokens");
-        crate::shared::transformer_kernels::embed_input_tokens_with_mode(
+        crate::shared::numerics::transformer_kernels::embed_input_tokens_with_mode(
             token_ids,
             embedding_table,
             execution_mode,
@@ -121,7 +121,7 @@ fn embed_token_id_sequence_with_mode(
     execution_mode: InferenceExecutionMode,
 ) -> Result<ActivationSequence> {
     if let Some(ref embedding_table) = model.embedding_table {
-        crate::shared::transformer_kernels::embed_input_tokens_with_mode(
+        crate::shared::numerics::transformer_kernels::embed_input_tokens_with_mode(
             &[token_id],
             embedding_table,
             execution_mode,
@@ -226,11 +226,12 @@ pub fn decode_step_with_mode(
         }
     };
     trace_event("decode.project_to_logits");
-    let final_position = crate::shared::transformer_kernels::select_final_position_internal(
-        &final_hidden_state.activation_state.clone_internal(),
-    )?;
+    let final_position =
+        crate::shared::numerics::transformer_kernels::select_final_position_internal(
+            &final_hidden_state.activation_state.clone_internal(),
+        )?;
     let prefill_logits =
-        crate::shared::transformer_kernels::project_internal_decode_hidden_to_logits(
+        crate::shared::numerics::transformer_kernels::project_internal_decode_hidden_to_logits(
             final_position,
             &model.final_norm_weight,
             model.final_norm_weight_det.as_deref(),
@@ -356,10 +357,10 @@ fn run_output_decode_with_mode_internal(
     let max_new_tokens = validate_sampling_config(sampling)?;
     let mut decode_transition_states = Vec::new();
     let mut latest_raster_generated_tokens: Option<(
-        crate::shared::raster_artifact_store::RasterArtifactStoreRoots,
-        crate::shared::raster_artifact_store::RasterTokenIdSequenceRef,
+        crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots,
+        crate::shared::artifacts::raster_artifact_store::RasterTokenIdSequenceRef,
     )> = None;
-    let mut decode_state = crate::shared::output::DecodeState::new(
+    let mut decode_state = crate::shared::api::output::DecodeState::new(
         prompt_token_ids.to_vec(),
         initial_transformer_state
             .transformer_state
@@ -410,7 +411,7 @@ fn run_output_decode_with_mode_internal(
                                 .to_string(),
                             byte_flush_bytes_per_tile,
                             stop_reason:
-                                crate::shared::output::OutputDecodeStopReason::MaxNewTokens,
+                                crate::shared::api::output::OutputDecodeStopReason::MaxNewTokens,
                         },
                         raster_tokenizer,
                     )?
@@ -433,14 +434,16 @@ fn run_output_decode_with_mode_internal(
             let artifact_store_roots = latest_raster_generated_tokens
                 .as_ref()
                 .map(|(artifact_store_roots, _)| artifact_store_roots.clone())
-                .unwrap_or_else(crate::shared::artifact_io::ArtifactIo::export_store_roots);
+                .unwrap_or_else(
+                    crate::shared::artifacts::artifact_io::ArtifactIo::export_store_roots,
+                );
             Some(
                 crate::decode_select_token::run_raster_refs_with_roots(
                     &mut decode_state,
                     max_new_tokens,
                     artifact_store_roots,
                 )?
-                    .expect("stop condition should have returned earlier"),
+                .expect("stop condition should have returned earlier"),
             )
         } else {
             None
@@ -464,7 +467,7 @@ fn run_output_decode_with_mode_internal(
         let transition_position = transformer_decode_state.position;
         let decode_transition = if raster_decode_transition {
             let source =
-                crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource::from_model(
+                crate::decode_transition::authenticated_source::AuthenticatedGemmaDecodeTransitionSource::from_model(
                     format!("decode.transition.position_{}", transformer_decode_state.position),
                     transformer_model,
                 )?;
@@ -524,7 +527,7 @@ fn run_output_decode_with_mode_internal(
 }
 
 fn build_current_output_decode_state(
-    decode_state: &crate::shared::output::DecodeState,
+    decode_state: &crate::shared::api::output::DecodeState,
     tokenizer: &Tokenizer,
     raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
     raster_sizing: Option<RasterSizingControls>,
@@ -550,7 +553,7 @@ fn build_current_output_decode_state(
         generated_token_ids,
         generated_token_ids_sha256,
         generated_text,
-        stop_reason: crate::shared::output::OutputDecodeStopReason::MaxNewTokens,
+        stop_reason: crate::shared::api::output::OutputDecodeStopReason::MaxNewTokens,
         decode_transition_states: Vec::new(),
     })
 }
@@ -568,12 +571,12 @@ mod tests {
         run_transformer_state_transition_for_token_ids, validate_sampling_config,
     };
     use crate::{
-        shared::{
-            det_num::{act_to_f32, Act},
-            input::InferenceExecutionMode,
-            transformer::{ActivationSequence, DetNumMatrix, InternalActivationSequence},
-            transformer_kernels::{build_activation_commitment, embed_input_tokens},
+        shared::api::input::InferenceExecutionMode,
+        shared::model::transformer::{
+            ActivationSequence, DetNumMatrix, InternalActivationSequence,
         },
+        shared::numerics::det_num::{act_to_f32, Act},
+        shared::numerics::transformer_kernels::{build_activation_commitment, embed_input_tokens},
         EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
         Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
         Gemma4TransformerModel, MatrixF32, PromptPreparationState, SamplingConfig,

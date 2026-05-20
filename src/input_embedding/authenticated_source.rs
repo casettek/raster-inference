@@ -3,16 +3,16 @@ use std::{cell::RefCell, collections::HashMap};
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 
-use crate::shared::artifact_io::AuthRead;
-use crate::shared::det_num::{scale_act, Act};
-use crate::shared::external_artifacts::{
+use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::external_artifacts::{
     register_external_source_leaves, CommittedExternalSource, ExternalSourceId, ExternalSourceRef,
 };
-use crate::shared::raster_transformer_kernels::det_num_tensor_slice_row_wgts;
-use crate::shared::transformer::{
+use crate::shared::model::transformer::{
     DetNumTensorSliceSource, Gemma4ModelProvenance, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource,
 };
+use crate::shared::numerics::det_num::{scale_act, Act};
+use crate::shared::raster_kernels::transformer::det_num_tensor_slice_row_wgts;
 
 const GEMMA_INPUT_EMBEDDING_SOURCE_KIND: &str = "gemma_input_embedding";
 const GEMMA_INPUT_EMBEDDING_SOURCE_DOMAIN: &str =

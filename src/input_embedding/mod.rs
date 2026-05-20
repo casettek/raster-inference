@@ -1,15 +1,19 @@
 use anyhow::Result;
 use serde_json::json;
 
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::input::{InferenceExecutionMode, RasterPromptPreparationState};
-use crate::shared::raster_artifact_store::{RasterArtifactStoreRoots, RasterRoutineOutput};
-use crate::shared::raster_input_embedding::AuthenticatedGemmaInputEmbeddingSource;
-use crate::shared::transformer::{ActivationSequence, Gemma4TransformerModel};
+use crate::shared::api::input::{InferenceExecutionMode, RasterPromptPreparationState};
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
+    RasterArtifactStoreRoots, RasterRoutineOutput,
+};
+use crate::shared::model::transformer::{ActivationSequence, Gemma4TransformerModel};
 
+pub mod authenticated_source;
 pub mod raster_tiles;
 mod raster_utils;
 pub mod tiles;
+
+use self::authenticated_source::AuthenticatedGemmaInputEmbeddingSource;
 
 pub fn run(
     prompt_token_ids: &[u32],
@@ -85,10 +89,10 @@ pub fn materialize_input_embedding_refs(
     let activations = internal.clone_f32();
     let det_activations_sha256 = internal
         .det_values()
-        .map(crate::shared::transformer_kernels::build_det_activation_commitment);
+        .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
     let mut activation_sequence = ActivationSequence::from_internal(
         internal,
-        crate::shared::transformer_kernels::build_activation_commitment(&activations),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&activations),
     );
     activation_sequence.det_activations_sha256 = det_activations_sha256;
     Ok(activation_sequence)
@@ -101,7 +105,7 @@ pub fn format_native_input_embedding_as_raster_checkpoint(
     token_embeddings: &ActivationSequence,
 ) -> Result<raster_tiles::RasterInputEmbeddingOutput> {
     let embedded_prompt_activations_ref = raster_utils::insert_activation_sequence(
-        crate::shared::raster_artifact_store::RasterArtifactId::new(
+        crate::shared::artifacts::raster_artifact_store::RasterArtifactId::new(
             "input.embedding.embedded_prompt",
         )?,
         raster_utils::raster_activation_sequence_from_embedding(token_embeddings)?,
@@ -160,13 +164,13 @@ fn input_embedding_checkpoint_payload(
 #[cfg(test)]
 mod tests {
     use super::{materialize_input_embedding_refs, run_raster_refs};
-    use crate::shared::artifact_io::ArtifactIo;
-    use crate::shared::det_num::Act;
-    use crate::shared::input::RasterPromptPreparationState;
-    use crate::shared::raster_artifact_store::{
+    use crate::input_embedding::authenticated_source::AuthenticatedGemmaInputEmbeddingSource;
+    use crate::shared::api::input::RasterPromptPreparationState;
+    use crate::shared::artifacts::artifact_io::ArtifactIo;
+    use crate::shared::artifacts::raster_artifact_store::{
         RasterArtifactId, RasterArtifactMetadata, RasterTokenIdSequenceRef,
     };
-    use crate::shared::raster_input_embedding::AuthenticatedGemmaInputEmbeddingSource;
+    use crate::shared::numerics::det_num::Act;
 
     #[test]
     fn raster_input_embedding_consumes_prompt_token_root() {

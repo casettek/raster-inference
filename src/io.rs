@@ -12,21 +12,21 @@ use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 use sha2::Digest;
 use tokenizers::Tokenizer;
 
-use crate::shared::det_num::{
-    f32_to_acc, f32_to_act, scale_act, Act, Wgt, DET_NUM_SPEC_VERSION,
-    DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
-};
-use crate::shared::gemma_tokenizer::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::model::gemma_tokenizer::{
     GemmaAddedToken, GemmaBpeMerge, GemmaDecoderMetadata, GemmaTokenizerSpec, GemmaVocabEntry,
 };
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::transformer::{
+use crate::shared::model::transformer::{
     ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
     Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
     Gemma4PleLayerWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource, GemmaTensorSliceSource, InternalActivationRow,
     InternalActivationSequence, MatrixF32, ResolvedGemma4LayerWeights,
     ResolvedGemma4PleLayerWeights,
+};
+use crate::shared::numerics::det_num::{
+    f32_to_acc, f32_to_act, scale_act, Act, Wgt, DET_NUM_SPEC_VERSION,
+    DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
 // use crate::trace::{trace_event, trace_scope};
 
@@ -1188,7 +1188,7 @@ pub fn load_transformer_state_model_from_gemma_model_path<P: AsRef<Path>>(
     let embedding_source = build_embedding_source(&reader, &embedding_tensor_name, hidden_size);
 
     Ok(Gemma4TransformerModel {
-        provenance: crate::shared::transformer::Gemma4ModelProvenance::Fp32,
+        provenance: crate::shared::model::transformer::Gemma4ModelProvenance::Fp32,
         embedding_table: None,
         embedding_source: Some(embedding_source),
         layers,
@@ -1268,7 +1268,7 @@ pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
     };
 
     Ok(Gemma4TransformerModel {
-        provenance: crate::shared::transformer::Gemma4ModelProvenance::DetNumWgt,
+        provenance: crate::shared::model::transformer::Gemma4ModelProvenance::DetNumWgt,
         embedding_table: None,
         embedding_source: Some(embedding_source),
         layers,
@@ -2230,7 +2230,7 @@ pub fn embed_input_tokens_from_gemma_source_with_mode(
     let activations_sha256 = build_activation_commitment(&activations);
     let det_activations_sha256 = internal
         .det_values()
-        .map(crate::shared::transformer_kernels::build_det_activation_commitment);
+        .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
 
     let mut activation_sequence = ActivationSequence::from_internal(internal, activations_sha256);
     activation_sequence.det_activations_sha256 = det_activations_sha256;
@@ -2828,12 +2828,12 @@ mod tests {
         load_transformer_state_model_from_gemma_model_path, parse_gemma_tokenizer_spec_bytes,
         parse_safetensors_metadata,
     };
-    use crate::shared::det_num::{
+    use crate::shared::api::input::InferenceExecutionMode;
+    use crate::shared::model::transformer::DetNumTensorSliceSource;
+    use crate::shared::numerics::det_num::{
         f32_to_act, f32_to_wgt, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
         DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
     };
-    use crate::shared::input::InferenceExecutionMode;
-    use crate::shared::transformer::DetNumTensorSliceSource;
     use crate::{Gemma4AttentionKind, Gemma4LogitsProjection};
     use memmap2::Mmap;
     use safetensors::tensor::{serialize_to_file, TensorView};
@@ -2997,7 +2997,7 @@ mod tests {
         let mmap = unsafe { Mmap::map(&file) }.unwrap();
         let metadata = parse_safetensors_metadata(&mmap, &model_path).unwrap();
         let tensor = metadata.get(tensor_name).unwrap();
-        let source = crate::shared::transformer::GemmaTensorSliceSource {
+        let source = crate::shared::model::transformer::GemmaTensorSliceSource {
             weights_path: model_path,
             dtype: tensor.dtype,
             total_rows: tensor.shape[0],

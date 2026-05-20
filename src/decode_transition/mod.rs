@@ -1,17 +1,19 @@
 use anyhow::Result;
 use serde_json::json;
 
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::output::DecodeState;
-use crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource;
-use crate::shared::transformer::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::api::output::DecodeState;
+use crate::shared::model::transformer::{
     Gemma4TransformerModel, TransformerDecodeState, TransformerDecodeStepResult,
 };
 use crate::RasterSizingControls;
 
+pub mod authenticated_source;
 pub mod deterministic_tiles;
 pub mod raster_tiles;
 pub mod tiles;
+
+use self::authenticated_source::AuthenticatedGemmaDecodeTransitionSource;
 
 pub fn run(
     transformer_decode_state: TransformerDecodeState,
@@ -39,7 +41,7 @@ pub fn run_with_mode(
         token_count,
     } = transformer_decode_state;
     let embedded_token = if let Some(ref embedding_table) = model.embedding_table {
-        crate::shared::transformer_kernels::embed_input_tokens_with_mode(
+        crate::shared::numerics::transformer_kernels::embed_input_tokens_with_mode(
             &[next_token],
             embedding_table,
             execution_mode,
@@ -81,11 +83,12 @@ pub fn run_with_mode(
             )?
         }
     };
-    let final_position = crate::shared::transformer_kernels::select_final_position_internal(
-        &final_hidden_state.activation_state.clone_internal(),
-    )?;
+    let final_position =
+        crate::shared::numerics::transformer_kernels::select_final_position_internal(
+            &final_hidden_state.activation_state.clone_internal(),
+        )?;
     let prefill_logits =
-        crate::shared::transformer_kernels::project_internal_decode_hidden_to_logits(
+        crate::shared::numerics::transformer_kernels::project_internal_decode_hidden_to_logits(
             final_position,
             &model.final_norm_weight,
             model.final_norm_weight_det.as_deref(),
@@ -150,14 +153,14 @@ fn generated_token_ids_commitment(decode_state: &DecodeState) -> Result<String> 
 
 fn current_logits_commitment(decode_state: &DecodeState) -> String {
     let logits = decode_state.clone_internal_logits();
-    crate::shared::transformer_kernels::build_vector_commitment(logits.as_f32_slice())
+    crate::shared::numerics::transformer_kernels::build_vector_commitment(logits.as_f32_slice())
 }
 
 fn current_det_logits_commitment(decode_state: &DecodeState) -> Option<String> {
     let logits = decode_state.clone_internal_logits();
     logits
         .det_values()
-        .map(crate::shared::transformer_kernels::build_det_vector_commitment)
+        .map(crate::shared::numerics::transformer_kernels::build_det_vector_commitment)
 }
 
 #[cfg(test)]
@@ -165,9 +168,9 @@ mod tests {
     use super::{
         current_det_logits_commitment, current_logits_commitment, generated_token_ids_commitment,
     };
-    use crate::shared::det_num::Act;
-    use crate::shared::output::DecodeState;
-    use crate::shared::transformer::{InternalLogits, TransformerDecodeState};
+    use crate::shared::api::output::DecodeState;
+    use crate::shared::model::transformer::{InternalLogits, TransformerDecodeState};
+    use crate::shared::numerics::det_num::Act;
 
     #[test]
     fn decode_finalize_uses_internal_logits_commitment_methodology() {
@@ -184,12 +187,14 @@ mod tests {
         let internal = decode_state.clone_internal_logits();
         assert_eq!(
             current_logits_commitment(&decode_state),
-            crate::shared::transformer_kernels::build_vector_commitment(internal.as_f32_slice())
+            crate::shared::numerics::transformer_kernels::build_vector_commitment(
+                internal.as_f32_slice()
+            )
         );
         assert_eq!(
             current_det_logits_commitment(&decode_state),
             Some(
-                crate::shared::transformer_kernels::build_det_vector_commitment(
+                crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
                     internal.det_values().expect("det logits")
                 )
             )

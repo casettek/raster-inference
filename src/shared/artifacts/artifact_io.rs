@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::shared::raster_artifact_store::{
+use crate::shared::artifacts::raster_artifact_store::{
     self, RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactRead,
     RasterArtifactRef, RasterArtifactStoreRoots,
 };

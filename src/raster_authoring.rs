@@ -1,6 +1,6 @@
 use std::{cell::Cell, marker::PhantomData};
 
-pub use crate::shared::artifact_io::{auth_read, AuthRead};
+pub use crate::shared::artifacts::artifact_io::{auth_read, AuthRead};
 pub use raster_authoring_macros::{sequence, tile};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -155,7 +155,7 @@ macro_rules! external {
 #[macro_export]
 macro_rules! auth_read {
     ($source:expr, $request:expr $(,)?) => {
-        $crate::shared::artifact_io::ArtifactIo::auth_read($source, $request)
+        $crate::shared::artifacts::artifact_io::ArtifactIo::auth_read($source, $request)
     };
 }
 

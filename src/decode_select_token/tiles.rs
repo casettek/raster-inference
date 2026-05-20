@@ -1,8 +1,8 @@
 use anyhow::{bail, Result};
 
-use crate::shared::{
-    det_num::argmax_first, input::InferenceExecutionMode, transformer::InternalLogits,
-};
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::model::transformer::InternalLogits;
+use crate::shared::numerics::det_num::argmax_first;
 
 pub fn select_next_token(logits: &[f32]) -> Result<u32> {
     if logits.is_empty() {
@@ -46,9 +46,9 @@ pub fn append_token(token_ids: &[u32], next_token: u32) -> Vec<u32> {
 pub fn check_stop_condition(
     generated_token_count: usize,
     max_new_tokens: usize,
-) -> Option<crate::shared::output::OutputDecodeStopReason> {
+) -> Option<crate::shared::api::output::OutputDecodeStopReason> {
     (generated_token_count >= max_new_tokens)
-        .then_some(crate::shared::output::OutputDecodeStopReason::MaxNewTokens)
+        .then_some(crate::shared::api::output::OutputDecodeStopReason::MaxNewTokens)
 }
 
 #[cfg(test)]
@@ -56,10 +56,10 @@ mod tests {
     use super::{
         append_token, check_stop_condition, select_next_token, select_next_token_internal,
     };
-    use crate::shared::{
-        det_num::Act, input::InferenceExecutionMode, output::OutputDecodeStopReason,
-        transformer::InternalLogits,
-    };
+    use crate::shared::api::input::InferenceExecutionMode;
+    use crate::shared::api::output::OutputDecodeStopReason;
+    use crate::shared::model::transformer::InternalLogits;
+    use crate::shared::numerics::det_num::Act;
 
     #[test]
     fn select_next_token_returns_highest_logit_token_id() {

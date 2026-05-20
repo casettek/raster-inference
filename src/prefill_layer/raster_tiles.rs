@@ -10,22 +10,17 @@ use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::shared::raster_artifact_store::{
+use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactStoreRoots,
 };
-use crate::shared::raster_prefill_layer::{
+use crate::shared::raster_contracts::prefill_layer::{
     AuthenticatedGemmaPrefillLayerSource, GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind,
     GemmaPrefillLayerMetadata, GemmaPrefillLayerMetadataRequest, GemmaPrefillLayerNormKind,
     GemmaPrefillLayerNormWeightsRequest, GemmaPrefillLayerScalars, GemmaPrefillLayerScalarsRequest,
     GemmaPrefillLayerSourceMetadataRequest,
 };
-use crate::shared::raster_prefill_ple::read_prefill_ple_input_manifest_from_roots;
-use crate::shared::raster_row_store::{
-    activation_sequence_ref_from_artifact, read_sequence_row_from_roots,
-    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
-    RasterKvCacheRef, RasterSequenceRowRequest, RasterTensorId,
-};
-use crate::shared::raster_transformer_kernels::{
+use crate::shared::raster_contracts::prefill_ple::read_prefill_ple_input_manifest_from_roots;
+use crate::shared::raster_kernels::transformer::{
     append_projection_chunk_to_artifact_state, compute_next_attention_artifact_row,
     compute_next_combine_heads_artifact_row, compute_next_head_unary_artifact_row,
     compute_next_kv_cache_artifact_row, compute_next_reshape_heads_artifact_row,
@@ -45,6 +40,11 @@ use crate::shared::raster_transformer_kernels::{
     RasterKvCacheBuildArtifactState, RasterReshapeHeadsArtifactState,
     RasterSequenceBinaryArtifactState, RasterSequenceProjectionArtifactState,
     RasterSequenceUnaryArtifactState,
+};
+use crate::shared::tensors::raster_row_store::{
+    activation_sequence_ref_from_artifact, read_sequence_row_from_roots,
+    AuthenticatedRasterTensorStore, RasterActivationSequenceRef, RasterAttentionHeadsRef,
+    RasterKvCacheRef, RasterSequenceRowRequest, RasterTensorId,
 };
 use crate::trace::{trace_event, trace_scope};
 use crate::RasterSizingControls;
@@ -117,13 +117,13 @@ pub(crate) fn init_prefill_layer_state_from_activation_ref_with_roots(
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerRasterState)> {
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
-    crate::shared::raster_transformer_kernels::validate_attention_kv_rows_per_tile(
+    crate::shared::raster_kernels::transformer::validate_attention_kv_rows_per_tile(
         raster_sizing.attention_kv_rows_per_tile,
     )?;
-    crate::shared::raster_transformer_kernels::validate_sequence_rows_per_tile(
+    crate::shared::raster_kernels::transformer::validate_sequence_rows_per_tile(
         raster_sizing.sequence_rows_per_tile,
     )?;
-    crate::shared::raster_transformer_kernels::validate_head_rows_per_tile(
+    crate::shared::raster_kernels::transformer::validate_head_rows_per_tile(
         raster_sizing.head_rows_per_tile,
     )?;
     ensure_artifact_root_present(&artifact_store_roots, input_activations_ref.root())?;
@@ -386,9 +386,11 @@ fn trace_prefill_layer_checkpoint(
         let current_values = current_activations.to_f32_values();
         let current_det_activations = raster_sequence_acts(&current_activations);
         let current_sha256 =
-            crate::shared::transformer_kernels::build_activation_commitment(&current_values);
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(
+                &current_values,
+            );
         let current_det_sha256 = Some(
-            crate::shared::transformer_kernels::build_det_activation_commitment(
+            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
                 &current_det_activations,
             ),
         );
@@ -407,7 +409,7 @@ fn trace_prefill_layer_checkpoint(
             "current_activations_sha256": current_sha256,
             "det_current_activations_sha256": current_det_sha256,
             "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-            "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
+            "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
             "completed_layer_output_sha256s": completed_layer_output_sha256s,
             "completed_layer_output_det_sha256s": completed_layer_output_det_sha256s,
         }))
@@ -454,7 +456,7 @@ fn trace_prefill_layer_token_checkpoints_with_roots(
                 "token_idx": token_idx,
                 "token_count": token_count,
                 "token_activation": token_activation,
-                "det_token_activation_sha256": crate::shared::transformer_kernels::build_det_vector_commitment(&det_token_activation),
+                "det_token_activation_sha256": crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_token_activation),
             }))
         })? {
             return Ok(true);
@@ -556,7 +558,7 @@ pub fn project_next_prefill_sequence_artifact_rows(
     for row_idx in state.next_projection_row_idx()..end {
         rows.push(auth_read!(
             layer_source,
-            crate::shared::raster_prefill_layer::GemmaPrefillLayerMatrixRowRequest {
+            crate::shared::raster_contracts::prefill_layer::GemmaPrefillLayerMatrixRowRequest {
                 layer_idx,
                 matrix,
                 row_idx,
@@ -600,7 +602,7 @@ pub fn read_prefill_layer_norm_weights(
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer_idx: usize,
     norm: GemmaPrefillLayerNormKind,
-) -> Result<Vec<crate::shared::det_num::Wgt>> {
+) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
     auth_read!(
         layer_source,
         GemmaPrefillLayerNormWeightsRequest { layer_idx, norm }
@@ -669,8 +671,8 @@ pub fn init_prefill_sequence_rms_norm_artifact_state_from_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     output_id: RasterTensorId,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
+    norm_weights: Option<&[crate::shared::numerics::det_num::Wgt]>,
+    eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
     init_sequence_rms_norm_artifact_state_from_ref(
@@ -703,7 +705,7 @@ pub fn init_prefill_sequence_scale_artifact_state_from_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     output_id: RasterTensorId,
-    scalar: Option<crate::shared::det_num::Act>,
+    scalar: Option<crate::shared::numerics::det_num::Act>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterSequenceUnaryArtifactState)> {
     init_sequence_scale_artifact_state_from_ref(
@@ -794,8 +796,8 @@ pub fn init_prefill_head_rms_norm_artifact_state_from_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     output_id: RasterTensorId,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
+    norm_weights: Option<&[crate::shared::numerics::det_num::Wgt]>,
+    eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
     init_head_rms_norm_artifact_state_from_ref(
@@ -813,7 +815,7 @@ pub fn init_prefill_value_rms_norm_artifact_state_from_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     output_id: RasterTensorId,
-    eps: Option<crate::shared::det_num::Acc>,
+    eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
     init_value_rms_norm_artifact_state_from_ref(
@@ -832,7 +834,7 @@ pub fn init_prefill_rope_artifact_state_from_ref(
     output_id: RasterTensorId,
     rotary_dim: usize,
     freq_base_dim: usize,
-    base: Option<crate::shared::det_num::Acc>,
+    base: Option<crate::shared::numerics::det_num::Acc>,
     position_offset: usize,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
@@ -1291,8 +1293,8 @@ fn compute_sequence_rms_norm_artifact_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     id_prefix: String,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
+    norm_weights: Option<&[crate::shared::numerics::det_num::Wgt]>,
+    eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
     let (artifact_store_roots, state) = call_tile!(
@@ -1345,7 +1347,7 @@ fn compute_sequence_scale_artifact_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     id_prefix: String,
-    scalar: Option<crate::shared::det_num::Act>,
+    scalar: Option<crate::shared::numerics::det_num::Act>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
     let (artifact_store_roots, state) = call_tile!(
@@ -1453,8 +1455,8 @@ fn compute_head_rms_norm_artifact_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     id_prefix: String,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
+    norm_weights: Option<&[crate::shared::numerics::det_num::Wgt]>,
+    eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
     let (artifact_store_roots, state) = call_tile!(
@@ -1482,7 +1484,7 @@ fn compute_value_rms_norm_artifact_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     heads_ref: RasterAttentionHeadsRef,
     id_prefix: String,
-    eps: Option<crate::shared::det_num::Acc>,
+    eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
     let (artifact_store_roots, state) = call_tile!(
@@ -1511,7 +1513,7 @@ fn compute_rope_artifact_ref(
     id_prefix: String,
     rotary_dim: usize,
     freq_base_dim: usize,
-    base: Option<crate::shared::det_num::Acc>,
+    base: Option<crate::shared::numerics::det_num::Acc>,
     position_offset: usize,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
@@ -1808,21 +1810,21 @@ mod tests {
         materialize_prefill_layer_output_refs, run_raster_refs_from_input_embedding,
     };
     use crate::raster_authoring::prelude::auth_read;
-    use crate::shared::artifact_io::ArtifactIo;
-    use crate::shared::det_num::{Acc, Act, Wgt};
-    use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
-    use crate::shared::raster_prefill_layer::{
-        AuthenticatedGemmaPrefillLayerSource, GemmaPrefillLayerSourceMetadataRequest,
-    };
-    use crate::shared::raster_prefill_ple::store_prefill_ple_input_manifest_with_roots;
-    use crate::shared::raster_row_store::{
-        insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
-    };
-    use crate::shared::raster_transformer_kernels::RasterActivationSequence;
-    use crate::shared::transformer::{
+    use crate::shared::artifacts::artifact_io::ArtifactIo;
+    use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
+    use crate::shared::model::transformer::{
         ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleLayerWeights,
         Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence, MatrixF32,
+    };
+    use crate::shared::numerics::det_num::{Acc, Act, Wgt};
+    use crate::shared::raster_contracts::prefill_layer::{
+        AuthenticatedGemmaPrefillLayerSource, GemmaPrefillLayerSourceMetadataRequest,
+    };
+    use crate::shared::raster_contracts::prefill_ple::store_prefill_ple_input_manifest_with_roots;
+    use crate::shared::raster_kernels::transformer::RasterActivationSequence;
+    use crate::shared::tensors::raster_row_store::{
+        insert_activation_sequence_artifact_ref, AuthenticatedRasterTensorStore,
     };
     use crate::RasterSizingControls;
     use anyhow::{Context, Result};
@@ -2248,7 +2250,9 @@ mod tests {
             .expect("source should build");
         let input = ActivationSequence::from_values(
             vec![vec![1.0, 0.0]],
-            crate::shared::transformer_kernels::build_activation_commitment(&[vec![1.0, 0.0]]),
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(&[vec![
+                1.0, 0.0,
+            ]]),
         );
 
         let error = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
@@ -2262,7 +2266,7 @@ mod tests {
         rows: Vec<Vec<Act>>,
     ) -> (
         ActivationSequence,
-        Vec<crate::shared::transformer::LayerKvCache>,
+        Vec<crate::shared::model::transformer::LayerKvCache>,
     ) {
         assert_raster_matches_deterministic_with_ple(model, rows, None)
     }
@@ -2273,7 +2277,7 @@ mod tests {
         ple_inputs: Option<&Gemma4PrefillPleInputs>,
     ) -> (
         ActivationSequence,
-        Vec<crate::shared::transformer::LayerKvCache>,
+        Vec<crate::shared::model::transformer::LayerKvCache>,
     ) {
         let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", model)
             .expect("source should build");
@@ -2302,7 +2306,7 @@ mod tests {
         raster_sizing: RasterSizingControls,
     ) -> Result<(
         ActivationSequence,
-        Vec<crate::shared::transformer::LayerKvCache>,
+        Vec<crate::shared::model::transformer::LayerKvCache>,
     )> {
         ArtifactIo::reset_store();
         let input_internal = input.clone_internal();
@@ -2397,12 +2401,12 @@ mod tests {
     ) -> ActivationSequence {
         let mut input = ActivationSequence::from_internal(
             input_internal.clone(),
-            crate::shared::transformer_kernels::build_activation_commitment(
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(
                 input_internal.as_f32_slice(),
             ),
         );
         input.det_activations_sha256 = Some(
-            crate::shared::transformer_kernels::build_det_activation_commitment(
+            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
                 input_internal.det_values().expect("det input"),
             ),
         );

@@ -2,8 +2,8 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use super::tiles::ActivationSequenceWithCache;
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::transformer::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::model::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4TransformerModel, InternalActivationRow,
     InternalActivationSequence, LayerKvCache,
 };
@@ -60,7 +60,7 @@ pub(crate) fn run_text_layers_decode_step_internal(
             layer.kv_shared_layer_index
         ));
         let per_layer_input =
-            crate::shared::transformer_kernels::compute_decode_ple_input_internal(
+            crate::shared::numerics::transformer_kernels::compute_decode_ple_input_internal(
                 token_id,
                 decode_input.clone(),
                 layer_idx,
@@ -73,7 +73,7 @@ pub(crate) fn run_text_layers_decode_step_internal(
         let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, updated_cache) =
-            crate::shared::transformer_kernels::run_gemma4_layer_decode_with_mode_internal(
+            crate::shared::numerics::transformer_kernels::run_gemma4_layer_decode_with_mode_internal(
                 xs,
                 &resolved_layer,
                 per_layer_input,
@@ -86,10 +86,10 @@ pub(crate) fn run_text_layers_decode_step_internal(
         let xs_values = xs.clone_f32();
         let det_current_activation_sha256 = xs
             .det_values()
-            .map(crate::shared::transformer_kernels::build_det_vector_commitment);
+            .map(crate::shared::numerics::transformer_kernels::build_det_vector_commitment);
         updated_layer_caches.push(updated_cache);
         completed_layer_output_sha256s.push(
-            crate::shared::transformer_kernels::build_vector_commitment(&xs_values),
+            crate::shared::numerics::transformer_kernels::build_vector_commitment(&xs_values),
         );
         completed_layer_output_det_sha256s.push(det_current_activation_sha256.clone());
         let mut checkpoint_layer_caches = updated_layer_caches.clone();
@@ -102,13 +102,13 @@ pub(crate) fn run_text_layers_decode_step_internal(
                 "position": position,
                 "next_layer_idx": layer_idx + 1,
                 "decode_input_activation": decode_input_values.clone(),
-                "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&decode_input_values),
-                "det_decode_input_activation_sha256": decode_input.det_values().map(crate::shared::transformer_kernels::build_det_vector_commitment),
+                "decode_input_activation_sha256": crate::shared::numerics::transformer_kernels::build_vector_commitment(&decode_input_values),
+                "det_decode_input_activation_sha256": decode_input.det_values().map(crate::shared::numerics::transformer_kernels::build_det_vector_commitment),
                 "current_activation": xs_values.clone(),
-                "current_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&xs_values),
+                "current_activation_sha256": crate::shared::numerics::transformer_kernels::build_vector_commitment(&xs_values),
                 "det_current_activation_sha256": det_current_activation_sha256,
                 "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
-                "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
+                "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
                 "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
                 "completed_layer_output_det_sha256s": completed_layer_output_det_sha256s.clone(),
             }),
@@ -122,10 +122,10 @@ pub(crate) fn run_text_layers_decode_step_internal(
     };
     let det_activations_sha256 = activation_internal
         .det_values()
-        .map(crate::shared::transformer_kernels::build_det_activation_commitment);
+        .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
     let mut activation_state = ActivationSequence::from_internal(
         activation_internal,
-        crate::shared::transformer_kernels::build_activation_commitment(&[xs_values]),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&[xs_values]),
     );
     activation_state.det_activations_sha256 = det_activations_sha256;
     Ok(ActivationSequenceWithCache {

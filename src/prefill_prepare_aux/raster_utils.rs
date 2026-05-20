@@ -1,15 +1,16 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::merkle::merkle_root;
-use crate::shared::raster_artifact_store::{
-    activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
-    RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
-    RasterTokenIdSequenceRef, TOKEN_ID_ARTIFACT_DOMAIN,
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::merkle::merkle_root;
+use crate::shared::artifacts::raster_artifact_store::{
+    activation_row_leaf, decode_activation_row_leaf, decode_token_id_leaf, token_id_leaf,
+    RasterActivationSequenceArtifactRef, RasterArtifactBuilderRef, RasterArtifactId,
+    RasterArtifactMetadata, RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
+    TOKEN_ID_ARTIFACT_DOMAIN,
 };
-use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
-use crate::shared::raster_transformer_kernels::{RasterActivationRow, RasterActivationSequence};
-use crate::shared::transformer::{ActivationSequence, InternalActivationSequence};
+use crate::shared::model::transformer::{ActivationSequence, InternalActivationSequence};
+use crate::shared::raster_kernels::transformer::{RasterActivationRow, RasterActivationSequence};
+use crate::shared::tensors::raster_row_store::AuthenticatedRasterTensorStore;
 
 pub(super) fn reset_artifact_store() {
     ArtifactIo::reset_store();
@@ -210,19 +211,6 @@ pub(super) fn read_prefill_token_id(
     let read = ArtifactIo::read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
     ArtifactIo::verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
     decode_token_id_leaf(read.payload())
-}
-
-fn token_id_leaf(token_id: u32) -> Vec<u8> {
-    token_id.to_le_bytes().to_vec()
-}
-
-fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
-    if payload.len() != 4 {
-        bail!("token-id leaf payload must be exactly four bytes");
-    }
-    Ok(u32::from_le_bytes(
-        payload.try_into().expect("payload length checked above"),
-    ))
 }
 
 pub(super) fn raster_activation_sequence_from_embedding(

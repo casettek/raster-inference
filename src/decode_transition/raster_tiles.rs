@@ -3,21 +3,7 @@ use std::collections::VecDeque;
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
-use crate::raster_authoring::prelude::{
-    auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
-};
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::det_num::{
-    acc_add_sat, add_sat, attention_score as det_attention_score, attention_softmax_exp_term,
-    attention_softmax_raw_weight, attention_softmax_residual, mac_bits, requantize, softcap_act,
-    Acc, Act,
-};
-use crate::shared::raster_artifact_store::{
-    activation_row_leaf, read_selected_token_from_roots, token_id_leaf,
-    RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
-    RasterArtifactStoreRoots, RasterSelectedTokenRef, RasterTokenIdSequenceRef,
-};
-use crate::shared::raster_decode_transition::{
+use crate::decode_transition::authenticated_source::{
     AuthenticatedGemmaDecodeTransitionSource, GemmaDecodeAttentionKind,
     GemmaDecodeEmbeddingRowRequest, GemmaDecodeFinalNormWeightsRequest,
     GemmaDecodeFinalScalarsRequest, GemmaDecodeLayerMatrixKind, GemmaDecodeLayerMatrixRowRequest,
@@ -27,7 +13,31 @@ use crate::shared::raster_decode_transition::{
     GemmaDecodePleScalarsRequest, GemmaDecodePleTokenEmbeddingRowRequest,
     GemmaDecodeProjectionRowRequest, GemmaDecodeTransitionMetadataRequest,
 };
-use crate::shared::raster_row_store::{
+use crate::raster_authoring::prelude::{
+    auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
+};
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
+    activation_row_leaf, read_selected_token_from_roots, token_id_leaf,
+    RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
+    RasterArtifactStoreRoots, RasterSelectedTokenRef, RasterTokenIdSequenceRef,
+};
+use crate::shared::model::transformer::{
+    ActivationSequence, InternalActivationSequence, InternalLogits, LayerKvCache, PrefillLogits,
+    TransformerDecodeState, TransformerDecodeStepResult,
+};
+use crate::shared::numerics::det_num::{
+    acc_add_sat, add_sat, attention_score as det_attention_score, attention_softmax_exp_term,
+    attention_softmax_raw_weight, attention_softmax_residual, mac_bits, requantize, softcap_act,
+    Acc, Act,
+};
+use crate::shared::raster_kernels::transformer::{
+    add_sequences, apply_rope_to_heads, combine_attention_heads, gelu_sequence, mul_sequences,
+    project_row_with_weights, rms_norm_heads, rms_norm_sequence, scale_sequence,
+    validate_attention_kv_rows_per_tile, validate_projection_rows_per_tile, value_rms_norm_heads,
+    RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
+};
+use crate::shared::tensors::raster_row_store::{
     activation_sequence_ref_from_artifact, append_head_row_by_source_name_with_roots,
     append_sequence_row_by_source_name_with_roots, attention_heads_ref_from_artifact,
     finalize_heads_builder_by_source_name_with_roots,
@@ -38,16 +48,6 @@ use crate::shared::raster_row_store::{
     RasterAttentionHeadsRef, RasterHeadRowRequest, RasterKvCacheBuilderRef, RasterKvCacheRef,
     RasterKvRowKind, RasterKvRowRequest, RasterProjectionOutputBuilderRef,
     RasterSequenceRowRequest, RasterTensorBuilderRef, RasterTensorId,
-};
-use crate::shared::raster_transformer_kernels::{
-    add_sequences, apply_rope_to_heads, combine_attention_heads, gelu_sequence, mul_sequences,
-    project_row_with_weights, rms_norm_heads, rms_norm_sequence, scale_sequence,
-    validate_attention_kv_rows_per_tile, validate_projection_rows_per_tile, value_rms_norm_heads,
-    RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
-};
-use crate::shared::transformer::{
-    ActivationSequence, InternalActivationSequence, InternalLogits, LayerKvCache, PrefillLogits,
-    TransformerDecodeState, TransformerDecodeStepResult,
 };
 use crate::RasterSizingControls;
 
@@ -221,20 +221,20 @@ enum DecodeAttentionPhase {
         next_kv_offset: usize,
     },
     FindSoftmaxMax {
-        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        score_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         next_score_row_idx: usize,
         max_index: Option<usize>,
         max_logit_bits: i32,
     },
     SumSoftmaxExp {
-        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        score_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         next_score_row_idx: usize,
         max_index: usize,
         max_logit_bits: i32,
         sum_exp_bits: i64,
     },
     BuildRawSoftmaxWeights {
-        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        score_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         raw_weight_builder_ref: RasterTensorBuilderRef,
         next_score_row_idx: usize,
         max_index: usize,
@@ -243,14 +243,14 @@ enum DecodeAttentionPhase {
         summed_weight_bits: i32,
     },
     CorrectSoftmaxResidual {
-        raw_weight_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        raw_weight_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         final_weight_builder_ref: RasterTensorBuilderRef,
         next_weight_row_idx: usize,
         max_index: usize,
         residual_bits: i32,
     },
     ApplyValues {
-        weight_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        weight_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         next_kv_offset: usize,
         weighted_sum_acc_bits: Vec<i64>,
     },
@@ -263,20 +263,20 @@ enum DecodeAttentionArtifactPhase {
         next_kv_offset: usize,
     },
     FindSoftmaxMax {
-        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        score_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         next_score_row_idx: usize,
         max_index: Option<usize>,
         max_logit_bits: i32,
     },
     SumSoftmaxExp {
-        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        score_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         next_score_row_idx: usize,
         max_index: usize,
         max_logit_bits: i32,
         sum_exp_bits: i64,
     },
     BuildRawSoftmaxWeights {
-        score_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        score_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         raw_weight_source_name: String,
         next_score_row_idx: usize,
         max_index: usize,
@@ -285,14 +285,14 @@ enum DecodeAttentionArtifactPhase {
         summed_weight_bits: i32,
     },
     CorrectSoftmaxResidual {
-        raw_weight_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        raw_weight_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         final_weight_source_name: String,
         next_weight_row_idx: usize,
         max_index: usize,
         residual_bits: i32,
     },
     ApplyValues {
-        weight_ref: crate::shared::raster_row_store::RasterActivationSequenceRef,
+        weight_ref: crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
         next_kv_offset: usize,
         weighted_sum_acc_bits: Vec<i64>,
     },
@@ -529,10 +529,14 @@ fn update_decode_layer_state(
     let current_activation_values = layer_output.to_f32_values();
     let current_activation_acts = layer_output.acts();
     state.completed_layer_output_sha256s.push(
-        crate::shared::transformer_kernels::build_vector_commitment(&current_activation_values),
+        crate::shared::numerics::transformer_kernels::build_vector_commitment(
+            &current_activation_values,
+        ),
     );
     state.completed_layer_output_det_sha256s.push(Some(
-        crate::shared::transformer_kernels::build_det_vector_commitment(&current_activation_acts),
+        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
+            &current_activation_acts,
+        ),
     ));
     let decode_input =
         read_activation_row_from_ref_roots(&state.artifact_store_roots, &state.decode_input_ref)?;
@@ -562,13 +566,13 @@ fn update_decode_layer_state(
                 "position": state.position,
                 "next_layer_idx": layer_idx + 1,
                 "decode_input_activation": decode_input_values.clone(),
-                "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&decode_input_values),
-                "det_decode_input_activation_sha256": Some(crate::shared::transformer_kernels::build_det_vector_commitment(&decode_input_acts)),
+                "decode_input_activation_sha256": crate::shared::numerics::transformer_kernels::build_vector_commitment(&decode_input_values),
+                "det_decode_input_activation_sha256": Some(crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&decode_input_acts)),
                 "current_activation": current_activation_values,
                 "current_activation_sha256": current_activation_sha256,
                 "det_current_activation_sha256": det_current_activation_sha256,
                 "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
-                "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
+                "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
                 "completed_layer_output_sha256s": state.completed_layer_output_sha256s.clone(),
                 "completed_layer_output_det_sha256s": state.completed_layer_output_det_sha256s.clone(),
             }))
@@ -608,10 +612,11 @@ pub fn finalize_decode_layer_state(
     let internal = InternalActivationSequence::from_det_values(vec![det_row.clone()]);
     let mut activation_state = ActivationSequence::from_internal(
         internal,
-        crate::shared::transformer_kernels::build_activation_commitment(&values),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
     );
-    activation_state.det_activations_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_activation_commitment(&[det_row]));
+    activation_state.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&[det_row]),
+    );
 
     Ok(ActivationSequenceWithCache {
         activation_state,
@@ -757,11 +762,13 @@ pub fn finalize_decode_transition_result(
         .ok_or_else(|| anyhow!("raster decode projection produced no logits row"))?
         .acts();
     let internal_logits = InternalLogits::from_det_values(det_logits.clone());
-    let final_logits_sha256 =
-        crate::shared::transformer_kernels::build_vector_commitment(internal_logits.as_f32_slice());
+    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
+        internal_logits.as_f32_slice(),
+    );
     let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_vector_commitment(&det_logits));
+    prefill_logits.det_final_logits_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
+    );
 
     Ok(TransformerDecodeStepResult {
         transformer_decode_state: TransformerDecodeState {
@@ -1035,10 +1042,14 @@ fn update_decode_layer_state_refs_with_roots(
     let current_activation_values = layer_output.to_f32_values();
     let current_activation_acts = layer_output.acts();
     state.completed_layer_output_sha256s.push(
-        crate::shared::transformer_kernels::build_vector_commitment(&current_activation_values),
+        crate::shared::numerics::transformer_kernels::build_vector_commitment(
+            &current_activation_values,
+        ),
     );
     state.completed_layer_output_det_sha256s.push(Some(
-        crate::shared::transformer_kernels::build_det_vector_commitment(&current_activation_acts),
+        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
+            &current_activation_acts,
+        ),
     ));
     trace_decode_layer_checkpoint_with_roots(&artifact_store_roots, &state, layer_idx)?;
     state.next_layer_idx += 1;
@@ -1789,8 +1800,8 @@ pub fn finalize_decode_row_projection_ref_with_roots(
 fn rms_norm_decode_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
-    norm_weights: &[crate::shared::det_num::Wgt],
-    eps: crate::shared::det_num::Acc,
+    norm_weights: &[crate::shared::numerics::det_num::Wgt],
+    eps: crate::shared::numerics::det_num::Acc,
     label: &str,
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
@@ -1950,7 +1961,7 @@ fn combine_decode_attention_heads_ref_with_roots(
     output_id: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
     let (artifact_store_roots, state) =
-        crate::shared::raster_transformer_kernels::init_combine_heads_artifact_state_from_ref(
+        crate::shared::raster_kernels::transformer::init_combine_heads_artifact_state_from_ref(
             artifact_store_roots,
             heads_ref,
             RasterTensorId::new(output_id)?,
@@ -1959,7 +1970,7 @@ fn combine_decode_attention_heads_ref_with_roots(
     let mut state = state;
     loop {
         let (done, next_roots, next_state) =
-            crate::shared::raster_transformer_kernels::compute_next_combine_heads_artifact_row(
+            crate::shared::raster_kernels::transformer::compute_next_combine_heads_artifact_row(
                 artifact_store_roots,
                 state,
             )?;
@@ -1969,7 +1980,7 @@ fn combine_decode_attention_heads_ref_with_roots(
             break;
         }
     }
-    crate::shared::raster_transformer_kernels::finalize_combine_heads_artifact_state_ref(
+    crate::shared::raster_kernels::transformer::finalize_combine_heads_artifact_state_ref(
         artifact_store_roots,
         state,
     )
@@ -2813,11 +2824,13 @@ fn finalize_decode_transition_result_from_roots(
     let logits_row = read_activation_row_from_ref_roots(artifact_store_roots, &logits_ref)?;
     let det_logits = logits_row.acts();
     let internal_logits = InternalLogits::from_det_values(det_logits.clone());
-    let final_logits_sha256 =
-        crate::shared::transformer_kernels::build_vector_commitment(internal_logits.as_f32_slice());
+    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
+        internal_logits.as_f32_slice(),
+    );
     let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_vector_commitment(&det_logits));
+    prefill_logits.det_final_logits_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
+    );
 
     Ok(TransformerDecodeStepResult {
         transformer_decode_state: TransformerDecodeState {
@@ -2857,10 +2870,11 @@ pub fn finalize_decode_layer_state_with_roots(
     let internal = InternalActivationSequence::from_det_values(vec![det_row.clone()]);
     let mut activation_state = ActivationSequence::from_internal(
         internal,
-        crate::shared::transformer_kernels::build_activation_commitment(&values),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
     );
-    activation_state.det_activations_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_activation_commitment(&[det_row]));
+    activation_state.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&[det_row]),
+    );
 
     Ok(ActivationSequenceWithCache {
         activation_state,
@@ -2910,13 +2924,13 @@ fn trace_decode_layer_checkpoint_with_roots(
                 "position": state.position,
                 "next_layer_idx": layer_idx + 1,
                 "decode_input_activation": decode_input_values.clone(),
-                "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&decode_input_values),
-                "det_decode_input_activation_sha256": Some(crate::shared::transformer_kernels::build_det_vector_commitment(&decode_input_acts)),
+                "decode_input_activation_sha256": crate::shared::numerics::transformer_kernels::build_vector_commitment(&decode_input_values),
+                "det_decode_input_activation_sha256": Some(crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&decode_input_acts)),
                 "current_activation": current_activation_values,
                 "current_activation_sha256": current_activation_sha256,
                 "det_current_activation_sha256": det_current_activation_sha256,
                 "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
-                "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
+                "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
                 "completed_layer_output_sha256s": state.completed_layer_output_sha256s.clone(),
                 "completed_layer_output_det_sha256s": state.completed_layer_output_det_sha256s.clone(),
             }))
@@ -3169,7 +3183,7 @@ fn rms_norm_decode_layer_row(
 fn read_decode_layer_scalars(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer_idx: usize,
-) -> Result<crate::shared::raster_decode_transition::GemmaDecodeLayerScalars> {
+) -> Result<crate::decode_transition::authenticated_source::GemmaDecodeLayerScalars> {
     auth_read!(source, GemmaDecodeLayerScalarsRequest { layer_idx })
 }
 
@@ -3178,7 +3192,7 @@ fn read_decode_layer_norm_weights(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer_idx: usize,
     norm: GemmaDecodeLayerNormKind,
-) -> Result<Vec<crate::shared::det_num::Wgt>> {
+) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
     auth_read!(
         source,
         GemmaDecodeLayerNormWeightsRequest { layer_idx, norm }
@@ -3188,8 +3202,8 @@ fn read_decode_layer_norm_weights(
 #[tile]
 fn rms_norm_decode_row(
     row: &RasterActivationRow,
-    norm_weights: &[crate::shared::det_num::Wgt],
-    eps: crate::shared::det_num::Acc,
+    norm_weights: &[crate::shared::numerics::det_num::Wgt],
+    eps: crate::shared::numerics::det_num::Acc,
     label: &str,
 ) -> Result<RasterActivationRow> {
     first_row(
@@ -3302,8 +3316,8 @@ fn rms_norm_decode_attention_heads(
 #[tile]
 fn rms_norm_decode_heads(
     heads: &RasterAttentionHeadSequence,
-    norm_weights: &[crate::shared::det_num::Wgt],
-    eps: crate::shared::det_num::Acc,
+    norm_weights: &[crate::shared::numerics::det_num::Wgt],
+    eps: crate::shared::numerics::det_num::Acc,
 ) -> Result<RasterAttentionHeadSequence> {
     rms_norm_heads(heads, Some(norm_weights), Some(eps))
 }
@@ -3321,7 +3335,7 @@ fn value_rms_norm_decode_attention_heads(
 #[tile]
 fn value_rms_norm_decode_heads(
     heads: &RasterAttentionHeadSequence,
-    eps: crate::shared::det_num::Acc,
+    eps: crate::shared::numerics::det_num::Acc,
 ) -> Result<RasterAttentionHeadSequence> {
     value_rms_norm_heads(heads, Some(eps))
 }
@@ -3674,14 +3688,14 @@ fn compute_decode_ple_input(
 #[tile]
 fn read_decode_ple_scalars(
     source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<crate::shared::raster_decode_transition::GemmaDecodePleScalars> {
+) -> Result<crate::decode_transition::authenticated_source::GemmaDecodePleScalars> {
     auth_read!(source, GemmaDecodePleScalarsRequest)
 }
 
 #[tile]
 fn read_decode_ple_projection_norm_weights(
     source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<Vec<crate::shared::det_num::Wgt>> {
+) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
     auth_read!(source, GemmaDecodePleProjectionNormWeightsRequest)
 }
 
@@ -3827,7 +3841,7 @@ fn read_decode_projection_row(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     projection_kind: &DecodeProjectionKind,
     row_idx: usize,
-) -> Result<Vec<crate::shared::det_num::Wgt>> {
+) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
     match *projection_kind {
         DecodeProjectionKind::LayerMatrix { layer_idx, matrix } => auth_read!(
             source,
@@ -3873,7 +3887,7 @@ fn reshape_row_heads(
     num_heads: usize,
     head_dim: usize,
 ) -> Result<RasterAttentionHeadSequence> {
-    crate::shared::raster_transformer_kernels::reshape_sequence_heads(
+    crate::shared::raster_kernels::transformer::reshape_sequence_heads(
         &RasterActivationSequence::from_rows(vec![row]),
         num_heads,
         head_dim,
@@ -4307,7 +4321,7 @@ fn read_decode_attention_kv_row(
 
 fn read_decode_attention_scalar_row(
     store: &AuthenticatedRasterTensorStore,
-    tensor_ref: &crate::shared::raster_row_store::RasterActivationSequenceRef,
+    tensor_ref: &crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
     row_idx: usize,
     label: &str,
 ) -> Result<Act> {
@@ -4938,7 +4952,7 @@ fn read_decode_attention_kv_row_from_roots(
 
 fn read_decode_attention_scalar_row_from_roots(
     roots: &RasterArtifactStoreRoots,
-    tensor_ref: &crate::shared::raster_row_store::RasterActivationSequenceRef,
+    tensor_ref: &crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
     row_idx: usize,
     label: &str,
 ) -> Result<Act> {
@@ -5022,23 +5036,23 @@ mod tests {
         main, materialize_decode_layer_cache_from_store, prepare_next_decode_layer_context,
         register_decode_layer_cache, run, DecodeLayerCacheSlot, RasterDecodeTransitionInputRoots,
     };
-    use crate::shared::artifact_io::ArtifactIo;
-    use crate::shared::det_num::{Acc, Act, Wgt};
-    use crate::shared::input::InferenceExecutionMode;
-    use crate::shared::raster_artifact_store::{
+    use crate::decode_transition::authenticated_source::AuthenticatedGemmaDecodeTransitionSource;
+    use crate::shared::api::input::InferenceExecutionMode;
+    use crate::shared::artifacts::artifact_io::ArtifactIo;
+    use crate::shared::artifacts::raster_artifact_store::{
         token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
         RasterSelectedTokenRef, RasterTokenIdSequenceRef,
     };
-    use crate::shared::raster_decode_transition::AuthenticatedGemmaDecodeTransitionSource;
-    use crate::shared::raster_row_store::RasterTensorId;
-    use crate::shared::raster_transformer_kernels::{
-        RasterActivationRow, RasterAttentionHeadSequence, RasterKvCache,
-    };
-    use crate::shared::transformer::{
+    use crate::shared::model::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
         GemmaEmbeddingTensorSource, LayerKvCache, MatrixF32, TransformerDecodeState,
     };
+    use crate::shared::numerics::det_num::{Acc, Act, Wgt};
+    use crate::shared::raster_kernels::transformer::{
+        RasterActivationRow, RasterAttentionHeadSequence, RasterKvCache,
+    };
+    use crate::shared::tensors::raster_row_store::RasterTensorId;
     use crate::RasterSizingControls;
     use anyhow::{Context, Result};
     use std::collections::VecDeque;

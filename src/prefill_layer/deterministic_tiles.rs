@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
-use crate::shared::transformer::{
+use crate::shared::model::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
     InternalActivationSequence, LayerKvCache,
 };
@@ -53,18 +53,18 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
         let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, layer_cache) =
-            crate::shared::transformer_kernels::run_gemma4_layer_with_cache_internal(
+            crate::shared::numerics::transformer_kernels::run_gemma4_layer_with_cache_internal(
                 xs,
                 &resolved_layer,
                 per_layer_input,
                 donor_cache,
-                crate::shared::input::InferenceExecutionMode::Deterministic,
+                crate::shared::api::input::InferenceExecutionMode::Deterministic,
             )?;
         xs = layer_output.clone_internal();
         let xs_values = xs.clone_f32();
         let det_current_activations_sha256 = xs
             .det_values()
-            .map(crate::shared::transformer_kernels::build_det_activation_commitment);
+            .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
         completed_layer_output_det_sha256s.push(layer_output.det_activations_sha256.clone());
@@ -74,10 +74,10 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
                 "execution_mode": "deterministic",
                 "next_layer_idx": layer_idx + 1,
                 "current_activations": xs_values.clone(),
-                "current_activations_sha256": crate::shared::transformer_kernels::build_activation_commitment(&xs_values),
+                "current_activations_sha256": crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs_values),
                 "det_current_activations_sha256": det_current_activations_sha256,
                 "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-                "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
+                "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
                 "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
                 "completed_layer_output_det_sha256s": completed_layer_output_det_sha256s.clone(),
             }),
@@ -87,8 +87,9 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
         let mut reached_terminal_checkpoint = false;
         for (token_idx, token_activation) in xs_values.iter().enumerate() {
             let det_token_activation_sha256 = xs.det_values().and_then(|rows| {
-                rows.get(token_idx)
-                    .map(|row| crate::shared::transformer_kernels::build_det_vector_commitment(row))
+                rows.get(token_idx).map(|row| {
+                    crate::shared::numerics::transformer_kernels::build_det_vector_commitment(row)
+                })
             });
             if crate::trace::trace_checkpoint(
                 &format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}"),
@@ -113,10 +114,10 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
     let xs_values = xs.clone_f32();
     let det_activations_sha256 = xs
         .det_values()
-        .map(crate::shared::transformer_kernels::build_det_activation_commitment);
+        .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
     let mut activation_sequence = ActivationSequence::from_internal(
         xs,
-        crate::shared::transformer_kernels::build_activation_commitment(&xs_values),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs_values),
     );
     activation_sequence.det_activations_sha256 = det_activations_sha256;
     Ok((activation_sequence, layer_caches))

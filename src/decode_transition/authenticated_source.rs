@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::artifact_io::AuthRead;
-use crate::shared::det_num::{scale_act, Acc, Act, Wgt};
-use crate::shared::raster_transformer_kernels::det_num_tensor_slice_row_wgts;
-use crate::shared::transformer::{
+use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::model::transformer::{
     DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
     Gemma4PleMatrixSource, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
 };
+use crate::shared::numerics::det_num::{scale_act, Acc, Act, Wgt};
+use crate::shared::raster_kernels::transformer::det_num_tensor_slice_row_wgts;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedGemmaDecodeTransitionSource {

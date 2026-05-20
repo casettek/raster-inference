@@ -1,15 +1,15 @@
 use anyhow::{bail, Result};
 
+use crate::input_embedding::authenticated_source::{
+    GemmaInputEmbeddingMetadataRequest, GemmaInputEmbeddingRowRequest,
+};
 use crate::raster_authoring::prelude::{call_recur_tile, call_tile, sequence, tile};
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::raster_artifact_store::{
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
     RasterRoutineOutput,
 };
-use crate::shared::raster_input_embedding::{
-    GemmaInputEmbeddingMetadataRequest, GemmaInputEmbeddingRowRequest,
-};
-use crate::shared::raster_transformer_kernels::RasterActivationRow;
+use crate::shared::raster_kernels::transformer::RasterActivationRow;
 
 use super::raster_utils::{
     append_activation_row_by_builder_root_with_roots,

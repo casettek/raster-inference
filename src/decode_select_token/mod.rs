@@ -1,18 +1,18 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::output::DecodeState;
-use crate::shared::raster_artifact_store::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::api::output::DecodeState;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
     activation_row_leaf, read_token_id_from_ref_roots, token_id_leaf,
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
     RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
-use crate::shared::raster_row_store::{
+use crate::shared::raster_kernels::transformer::RasterActivationRow;
+use crate::shared::tensors::raster_row_store::{
     activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
 };
-use crate::shared::raster_transformer_kernels::RasterActivationRow;
 
 pub mod raster_tiles;
 pub mod tiles;
@@ -221,17 +221,15 @@ fn current_det_logits_commitment(decode_state: &DecodeState) -> Option<String> {
     let logits = decode_state.clone_internal_logits();
     logits
         .det_values()
-        .map(crate::shared::transformer_kernels::build_det_vector_commitment)
+        .map(crate::shared::numerics::transformer_kernels::build_det_vector_commitment)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{decode_select_checkpoint_state, run_raster};
-    use crate::shared::{
-        det_num::Act,
-        output::DecodeState,
-        transformer::{InternalLogits, TransformerDecodeState},
-    };
+    use crate::shared::api::output::DecodeState;
+    use crate::shared::model::transformer::{InternalLogits, TransformerDecodeState};
+    use crate::shared::numerics::det_num::Act;
 
     #[test]
     fn run_raster_appends_selected_token_to_decode_state() {
@@ -291,7 +289,7 @@ mod tests {
 
         let payload = decode_select_checkpoint_state(&decode_state, 0, 1).expect("checkpoint");
         let expected_det_commitment =
-            crate::shared::transformer_kernels::build_det_vector_commitment(
+            crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
                 internal.det_values().expect("canonical logits"),
             );
         let expected_public_commitment = crate::trace::sha256_hex(&decode_state.current_logits);

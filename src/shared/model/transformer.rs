@@ -9,8 +9,8 @@ use memmap2::Mmap;
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 
-use crate::shared::det_num::{act_to_f32, f32_to_act, f32_to_wgt, Acc, Act, Wgt};
-use crate::shared::input::InferenceExecutionMode;
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::numerics::det_num::{act_to_f32, f32_to_act, f32_to_wgt, Acc, Act, Wgt};
 
 fn default_embedding_scale() -> f32 {
     1.0

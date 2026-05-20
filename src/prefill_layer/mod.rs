@@ -1,17 +1,17 @@
 use anyhow::Result;
 
 use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
-use crate::shared::raster_prefill_layer::AuthenticatedGemmaPrefillLayerSource;
-use crate::shared::raster_row_store::{
-    read_kv_row_from_roots, read_sequence_row_from_roots, AuthenticatedRasterTensorStore,
-    RasterKvRowKind, RasterKvRowRequest, RasterSequenceRowRequest,
-};
-use crate::shared::raster_transformer_kernels::{RasterActivationSequence, RasterKvCache};
-use crate::shared::transformer::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
+use crate::shared::model::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence,
     LayerKvCache,
+};
+use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
+use crate::shared::raster_kernels::transformer::{RasterActivationSequence, RasterKvCache};
+use crate::shared::tensors::raster_row_store::{
+    read_kv_row_from_roots, read_sequence_row_from_roots, AuthenticatedRasterTensorStore,
+    RasterKvRowKind, RasterKvRowRequest, RasterSequenceRowRequest,
 };
 use crate::RasterSizingControls;
 
@@ -65,10 +65,13 @@ pub fn materialize_prefill_layer_output_refs(
     let values = current_activations.to_f32_values();
     let mut activation_sequence = ActivationSequence::from_internal(
         InternalActivationSequence::from_det_values(det_activations.clone()),
-        crate::shared::transformer_kernels::build_activation_commitment(&values),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
     );
-    activation_sequence.det_activations_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_activation_commitment(&det_activations));
+    activation_sequence.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
+            &det_activations,
+        ),
+    );
 
     Ok((
         activation_sequence,
@@ -95,10 +98,13 @@ pub fn materialize_prefill_layer_output_refs_from_roots(
     let values = current_activations.to_f32_values();
     let mut activation_sequence = ActivationSequence::from_internal(
         InternalActivationSequence::from_det_values(det_activations.clone()),
-        crate::shared::transformer_kernels::build_activation_commitment(&values),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
     );
-    activation_sequence.det_activations_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_activation_commitment(&det_activations));
+    activation_sequence.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
+            &det_activations,
+        ),
+    );
 
     Ok((
         activation_sequence,
@@ -133,7 +139,7 @@ pub fn run_raster_refs_from_input_embedding(
 
 fn materialize_prefill_activation_sequence_from_roots(
     roots: &RasterArtifactStoreRoots,
-    sequence_ref: &crate::shared::raster_row_store::RasterActivationSequenceRef,
+    sequence_ref: &crate::shared::tensors::raster_row_store::RasterActivationSequenceRef,
 ) -> Result<RasterActivationSequence> {
     let (row_count, _) = sequence_ref.tensor_ref().shape().sequence_metadata()?;
     let rows = (0..row_count)

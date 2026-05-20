@@ -5,21 +5,21 @@ use rayon::prelude::*;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::shared::det_num::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::model::transformer::{
+    ActivationSequence, DetNumMatrix, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PrefillPleInputs,
+    Gemma4TransformerModel, GemmaEmbeddingTensorSource, InternalActivationRow,
+    InternalActivationSequence, InternalLogits, LayerKvCache, MatrixF32, PrefillLogits,
+    ResolvedGemma4LayerWeights,
+};
+use crate::shared::numerics::det_num::{
     act_to_f32, act_to_le_bytes, add_sat, attention_score as det_attention_score,
     attention_softmax as det_attention_softmax,
     attention_weighted_sum as det_attention_weighted_sum, f32_to_acc, f32_to_act,
     gelu_pytorch_tanh_act, mac_bits, mul_sat, requantize, rms_norm as det_rms_norm,
     rope_rotate_pairs as det_rope_rotate_pairs, scale_act, softcap_act,
     value_rms_norm as det_value_rms_norm, Acc, Act, Wgt,
-};
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::transformer::{
-    ActivationSequence, DetNumMatrix, EmbeddedTokenSequence, EmbeddingTable, Gemma4AttentionKind,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PrefillPleInputs,
-    Gemma4TransformerModel, GemmaEmbeddingTensorSource, InternalActivationRow,
-    InternalActivationSequence, InternalLogits, LayerKvCache, MatrixF32, PrefillLogits,
-    ResolvedGemma4LayerWeights,
 };
 use crate::trace::trace_scope;
 
@@ -3417,18 +3417,18 @@ mod tests {
         run_text_layers_prefill_with_cache, select_final_position_internal, ActivationRowBuffer,
         ActivationSequenceBuffer, AttentionHeadRowBuffer, AttentionHeadSequenceBuffer,
     };
-    use crate::shared::det_num::{
-        act_to_f32, attention_score, attention_softmax, attention_weighted_sum, f32_to_act,
-        f32_to_wgt, gelu_pytorch_tanh_act, softcap_act, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
-        DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
-    };
-    use crate::shared::input::InferenceExecutionMode;
-    use crate::shared::transformer::{
+    use crate::shared::api::input::InferenceExecutionMode;
+    use crate::shared::model::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
         Gemma4PleLayerWeights, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
         InternalActivationRow, InternalActivationSequence, LayerKvCache, MatrixF32,
         ResolvedGemma4LayerWeights, ResolvedGemma4PleLayerWeights,
+    };
+    use crate::shared::numerics::det_num::{
+        act_to_f32, attention_score, attention_softmax, attention_weighted_sum, f32_to_act,
+        f32_to_wgt, gelu_pytorch_tanh_act, softcap_act, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
+        DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
     };
 
     #[test]
@@ -3547,7 +3547,7 @@ mod tests {
             4,
             4,
             16.0,
-            Some(crate::shared::det_num::f32_to_acc(16.0)),
+            Some(crate::shared::numerics::det_num::f32_to_acc(16.0)),
             1,
             InferenceExecutionMode::Deterministic,
         )
@@ -3693,7 +3693,7 @@ mod tests {
         let quantized_input = input
             .iter()
             .copied()
-            .map(crate::shared::det_num::f32_to_act)
+            .map(crate::shared::numerics::det_num::f32_to_act)
             .collect::<Vec<_>>();
 
         let from_f32 = det_linear_row(&input, &weight).unwrap();
@@ -4904,7 +4904,7 @@ mod tests {
             &[1.0, 1.0],
             Some(&[f32_to_wgt(1.0), f32_to_wgt(1.0)]),
             0.0,
-            Some(crate::shared::det_num::f32_to_acc(0.0)),
+            Some(crate::shared::numerics::det_num::f32_to_acc(0.0)),
             &projection,
             None,
             InferenceExecutionMode::Deterministic,
@@ -4972,7 +4972,9 @@ mod tests {
             .is_some());
         assert_eq!(
             projected[0][0],
-            crate::shared::det_num::act_to_f32(crate::shared::det_num::f32_to_act(2f32.sqrt()))
+            crate::shared::numerics::det_num::act_to_f32(
+                crate::shared::numerics::det_num::f32_to_act(2f32.sqrt())
+            )
         );
         assert_eq!(projected[0][1], 0.0);
     }
@@ -5016,7 +5018,9 @@ mod tests {
         let projected = ple_input.expect("decode ple input should exist");
         assert_eq!(
             projected[0],
-            crate::shared::det_num::act_to_f32(crate::shared::det_num::f32_to_act(2f32.sqrt()))
+            crate::shared::numerics::det_num::act_to_f32(
+                crate::shared::numerics::det_num::f32_to_act(2f32.sqrt())
+            )
         );
         assert_eq!(projected[1], 0.0);
     }
@@ -5057,7 +5061,7 @@ mod tests {
             &layer,
             Some(&ple_global),
             0.0,
-            Some(crate::shared::det_num::f32_to_acc(0.0)),
+            Some(crate::shared::numerics::det_num::f32_to_acc(0.0)),
             InferenceExecutionMode::Deterministic,
         )
         .unwrap()
@@ -5277,7 +5281,7 @@ mod tests {
             &[0.5, 1.0],
             Some(&[f32_to_wgt(0.5), f32_to_wgt(1.0)]),
             0.0,
-            Some(crate::shared::det_num::f32_to_acc(0.0)),
+            Some(crate::shared::numerics::det_num::f32_to_acc(0.0)),
             InferenceExecutionMode::Deterministic,
         )
         .unwrap()
@@ -5300,7 +5304,7 @@ mod tests {
             &[1.0, 1.0],
             Some(&[f32_to_wgt(1.0), f32_to_wgt(1.0)]),
             0.0,
-            Some(crate::shared::det_num::f32_to_acc(0.0)),
+            Some(crate::shared::numerics::det_num::f32_to_acc(0.0)),
             InferenceExecutionMode::Deterministic,
         )
         .unwrap();
@@ -5316,7 +5320,7 @@ mod tests {
         apply_value_rms_norm(
             &mut value_normed,
             0.0,
-            Some(crate::shared::det_num::f32_to_acc(0.0)),
+            Some(crate::shared::numerics::det_num::f32_to_acc(0.0)),
             InferenceExecutionMode::Deterministic,
         )
         .unwrap();
@@ -5423,7 +5427,7 @@ mod tests {
     #[test]
     fn append_kv_cache_keeps_newest_sliding_window_entries_in_order() {
         let cache = append_kv_cache(
-            crate::shared::transformer::LayerKvCache::new(1),
+            crate::shared::model::transformer::LayerKvCache::new(1),
             &[vec![1.0]],
             &[vec![10.0]],
             None,

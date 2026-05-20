@@ -1,16 +1,18 @@
 use anyhow::Result;
 
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
-use crate::shared::raster_prefill_finalize::AuthenticatedGemmaPrefillFinalizeSource;
-use crate::shared::raster_row_store::RasterActivationSequenceRef;
-use crate::shared::transformer::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
+use crate::shared::model::transformer::{
     ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerPrefillResult,
 };
+use crate::shared::tensors::raster_row_store::RasterActivationSequenceRef;
 
+pub mod authenticated_source;
 pub mod raster_tiles;
 mod raster_utils;
 pub mod tiles;
+
+use self::authenticated_source::AuthenticatedGemmaPrefillFinalizeSource;
 
 pub fn run(
     prompt_token_ids: &[u32],

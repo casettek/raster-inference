@@ -1,13 +1,13 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::det_num::{
-    act_to_f32, add_sat, mac_bits, requantize, rms_norm as det_rms_norm, scale_act, Acc, Act, Wgt,
-};
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::transformer::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::model::transformer::{
     ActivationSequence, DetNumMatrix, Gemma4LayerWeights, Gemma4PleGlobalWeights,
     Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationRow,
     InternalActivationSequence, MatrixF32,
+};
+use crate::shared::numerics::det_num::{
+    act_to_f32, add_sat, mac_bits, requantize, rms_norm as det_rms_norm, scale_act, Acc, Act, Wgt,
 };
 
 pub fn run(

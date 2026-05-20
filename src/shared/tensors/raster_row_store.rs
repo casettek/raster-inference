@@ -5,14 +5,14 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 
-use crate::shared::artifact_io::{ArtifactIo, AuthRead};
-use crate::shared::merkle::merkle_root;
-use crate::shared::raster_artifact_store::{
+use crate::shared::artifacts::artifact_io::{ArtifactIo, AuthRead};
+use crate::shared::artifacts::merkle::merkle_root;
+use crate::shared::artifacts::raster_artifact_store::{
     activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
     RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
     ACTIVATION_ROW_ARTIFACT_DOMAIN,
 };
-use crate::shared::raster_transformer_kernels::{
+use crate::shared::raster_kernels::transformer::{
     RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
 };
 
@@ -2066,8 +2066,8 @@ fn ensure_commitment(expected: &str, actual: &str, label: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::raster_authoring::auth_read;
-    use crate::shared::det_num::Act;
-    use crate::shared::transformer_kernels::build_det_activation_commitment;
+    use crate::shared::numerics::det_num::Act;
+    use crate::shared::numerics::transformer_kernels::build_det_activation_commitment;
 
     fn tensor_id(name: &str) -> RasterTensorId {
         RasterTensorId::new(name).expect("tensor id")

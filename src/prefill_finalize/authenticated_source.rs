@@ -3,16 +3,16 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 
-use crate::shared::artifact_io::AuthRead;
-use crate::shared::det_num::{Acc, Act, Wgt};
-use crate::shared::external_artifacts::{
+use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::external_artifacts::{
     register_external_source_leaves, CommittedExternalSource, ExternalSourceId, ExternalSourceRef,
 };
-use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
-use crate::shared::transformer::{
+use crate::shared::model::transformer::{
     DetNumMatrix, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource,
 };
+use crate::shared::numerics::det_num::{Acc, Act, Wgt};
+use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
 
 const GEMMA_PREFILL_FINALIZE_SOURCE_KIND: &str = "gemma_prefill_finalize";
 const GEMMA_PREFILL_FINALIZE_SOURCE_DOMAIN: &str =
@@ -436,11 +436,11 @@ mod tests {
         GemmaPrefillFinalizeNormWeightsRequest, GemmaPrefillFinalizeProjectionKind,
         GemmaPrefillFinalizeProjectionRowRequest, GemmaPrefillFinalizeScalarsRequest,
     };
-    use crate::shared::det_num::{Acc, Wgt};
-    use crate::shared::transformer::{
+    use crate::shared::model::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4LogitsProjection, Gemma4ModelProvenance,
         Gemma4TransformerModel, GemmaEmbeddingTensorSource, MatrixF32,
     };
+    use crate::shared::numerics::det_num::{Acc, Wgt};
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};

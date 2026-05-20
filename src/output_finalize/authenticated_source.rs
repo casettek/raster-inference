@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 
-use crate::shared::artifact_io::AuthRead;
-use crate::shared::raster_artifact_store::{
+use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactMetadata, RasterArtifactRef, RasterArtifactStoreRoots,
 };
 
@@ -803,8 +803,12 @@ pub fn materialize_text_from_roots(
 
     let mut text = String::new();
     for chunk_idx in 0..text_ref.chunk_count() {
-        let read = crate::shared::artifact_io::ArtifactIo::read_leaf(artifact_ref, chunk_idx)?;
-        crate::shared::artifact_io::ArtifactIo::verify_artifact_read(artifact_ref, &read)?;
+        let read =
+            crate::shared::artifacts::artifact_io::ArtifactIo::read_leaf(artifact_ref, chunk_idx)?;
+        crate::shared::artifacts::artifact_io::ArtifactIo::verify_artifact_read(
+            artifact_ref,
+            &read,
+        )?;
         text.push_str(&decode_text_chunk_leaf(read.payload())?);
     }
     let text_commitment = build_text_commitment(&text);
@@ -900,7 +904,7 @@ mod tests {
         AuthenticatedOutputFinalizeStore, AuthenticatedOutputTokenIdsSource, OutputTextBuilderRef,
         OutputTokenIdRequest, OutputTokenIdsMetadataRequest,
     };
-    use crate::shared::artifact_io::AuthRead;
+    use crate::shared::artifacts::artifact_io::AuthRead;
 
     #[test]
     fn token_source_reads_by_index_with_metadata() {

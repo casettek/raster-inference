@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::transformer::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::model::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4TransformerModel, LayerKvCache,
 };
 use crate::trace::trace_scope;
@@ -43,19 +43,20 @@ pub fn run_text_layers_decode_step(
             layer.ple.is_some(),
             layer.kv_shared_layer_index
         ));
-        let per_layer_input = crate::shared::transformer_kernels::compute_decode_ple_input(
-            token_id,
-            input_activation,
-            layer_idx,
-            layer,
-            model.ple_global.as_ref(),
-            model.rms_norm_eps,
-            InferenceExecutionMode::Fp32,
-        )?;
+        let per_layer_input =
+            crate::shared::numerics::transformer_kernels::compute_decode_ple_input(
+                token_id,
+                input_activation,
+                layer_idx,
+                layer,
+                model.ple_global.as_ref(),
+                model.rms_norm_eps,
+                InferenceExecutionMode::Fp32,
+            )?;
         let donor_cache = resolve_decode_donor_cache(layer, &updated_layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;
         let (layer_output, updated_cache) =
-            crate::shared::transformer_kernels::run_gemma4_layer_decode_with_mode(
+            crate::shared::numerics::transformer_kernels::run_gemma4_layer_decode_with_mode(
                 &xs,
                 &resolved_layer,
                 per_layer_input.as_deref(),
@@ -66,9 +67,8 @@ pub fn run_text_layers_decode_step(
             )?;
         xs = layer_output;
         updated_layer_caches.push(updated_cache);
-        completed_layer_output_sha256s.push(
-            crate::shared::transformer_kernels::build_vector_commitment(&xs),
-        );
+        completed_layer_output_sha256s
+            .push(crate::shared::numerics::transformer_kernels::build_vector_commitment(&xs));
         let mut checkpoint_layer_caches = updated_layer_caches.clone();
         checkpoint_layer_caches.extend(layer_caches.iter().skip(layer_idx + 1).cloned());
         crate::trace::trace_checkpoint(
@@ -78,9 +78,9 @@ pub fn run_text_layers_decode_step(
                 "position": position,
                 "next_layer_idx": layer_idx + 1,
                 "decode_input_activation": input_activation,
-                "decode_input_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(input_activation),
+                "decode_input_activation_sha256": crate::shared::numerics::transformer_kernels::build_vector_commitment(input_activation),
                 "current_activation": xs.clone(),
-                "current_activation_sha256": crate::shared::transformer_kernels::build_vector_commitment(&xs),
+                "current_activation_sha256": crate::shared::numerics::transformer_kernels::build_vector_commitment(&xs),
                 "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
                 "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
             }),
@@ -90,7 +90,7 @@ pub fn run_text_layers_decode_step(
     Ok(ActivationSequenceWithCache {
         activation_state: ActivationSequence::from_values(
             vec![xs.clone()],
-            crate::shared::transformer_kernels::build_activation_commitment(&[xs]),
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(&[xs]),
         ),
         layer_caches: updated_layer_caches,
     })

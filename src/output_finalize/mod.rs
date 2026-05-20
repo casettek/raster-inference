@@ -2,9 +2,10 @@ use anyhow::Result;
 use serde_json::json;
 use tokenizers::Tokenizer;
 
-use crate::shared::gemma_tokenizer::AuthenticatedGemmaTokenizer;
-use crate::shared::output::{DecodeState, OutputDecodeState};
+use crate::shared::api::output::{DecodeState, OutputDecodeState};
+use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
 
+pub mod authenticated_source;
 pub mod raster_tiles;
 pub mod tiles;
 
@@ -14,7 +15,7 @@ pub fn run(decode_state: DecodeState, tokenizer: &Tokenizer) -> Result<OutputDec
         tiles::detokenize_output_tokens(tokenizer, &decode_state.generated_token_ids)?;
     let generated_token_ids_sha256 =
         tiles::build_output_decode_commitment(&decode_state.generated_token_ids)?;
-    let stop_reason = crate::shared::output::OutputDecodeStopReason::MaxNewTokens;
+    let stop_reason = crate::shared::api::output::OutputDecodeStopReason::MaxNewTokens;
     crate::trace::trace_checkpoint(
         "output.finalize",
         &json!({
@@ -88,7 +89,7 @@ pub fn run_raster_with_roots(
         &refs.artifact_store_roots,
         &refs.refs.generated_token_ids_ref,
     )?;
-    let generated_text = crate::shared::raster_output_finalize::materialize_text_from_roots(
+    let generated_text = authenticated_source::materialize_text_from_roots(
         &refs.artifact_store_roots,
         &refs.refs.generated_text_ref,
     )?;
@@ -120,10 +121,9 @@ pub fn run_raster_with_roots(
 mod tests {
     use super::{run, run_raster};
     use crate::io::parse_gemma_tokenizer_spec_bytes;
-    use crate::shared::{
-        gemma_tokenizer::AuthenticatedGemmaTokenizer, output::DecodeState,
-        transformer::TransformerDecodeState,
-    };
+    use crate::shared::api::output::DecodeState;
+    use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
+    use crate::shared::model::transformer::TransformerDecodeState;
     use tokenizers::Tokenizer;
 
     #[test]

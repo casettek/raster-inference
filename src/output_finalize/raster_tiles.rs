@@ -1,23 +1,21 @@
 use anyhow::{bail, Context, Result};
 
+use crate::output_finalize::authenticated_source::{
+    build_output_token_ids_commitment, OutputPendingBytesRef, OutputTextRef,
+    OutputTokenIdsCommitmentState, OutputUtf8ValidationState,
+};
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::shared::{
-    artifact_io::ArtifactIo,
-    gemma_tokenizer::{
-        AuthenticatedGemmaTokenizer, GemmaDecodedToken, GemmaDecoderMetadataRequest,
-        GemmaTokenByIdRequest,
-    },
-    output::{OutputDecodeState, OutputDecodeStopReason},
-    raster_artifact_store::{
-        read_token_id_from_ref_roots, token_id_leaf, RasterArtifactId, RasterArtifactStoreRoots,
-        RasterRoutineOutput, RasterTokenIdSequenceRef,
-    },
-    raster_output_finalize::{
-        build_output_token_ids_commitment, OutputPendingBytesRef, OutputTextRef,
-        OutputTokenIdsCommitmentState, OutputUtf8ValidationState,
-    },
+use crate::shared::api::output::{OutputDecodeState, OutputDecodeStopReason};
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
+    read_token_id_from_ref_roots, token_id_leaf, RasterArtifactId, RasterArtifactStoreRoots,
+    RasterRoutineOutput, RasterTokenIdSequenceRef,
+};
+use crate::shared::model::gemma_tokenizer::{
+    AuthenticatedGemmaTokenizer, GemmaDecodedToken, GemmaDecoderMetadataRequest,
+    GemmaTokenByIdRequest,
 };
 
 pub const DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE: usize = 16;
@@ -135,7 +133,7 @@ pub fn init_raster_output_detokenize(
     let (next_roots, _builder) = ArtifactIo::start_builder_with_roots(
         &artifact_store_roots,
         RasterArtifactId::new(input_roots.output_text_source_name.clone())?,
-        crate::shared::raster_output_finalize::output_text_metadata()?,
+        crate::output_finalize::authenticated_source::output_text_metadata()?,
     )?;
     artifact_store_roots = next_roots;
 
@@ -290,7 +288,7 @@ fn append_pending_byte_with_roots(
         let (roots, _builder) = ArtifactIo::start_builder_with_roots(
             &state.artifact_store_roots,
             RasterArtifactId::new(source_name.clone())?,
-            crate::shared::raster_output_finalize::output_pending_bytes_metadata()?,
+            crate::output_finalize::authenticated_source::output_pending_bytes_metadata()?,
         )?;
         state.artifact_store_roots = roots;
         state.pending_bytes_builder_source_name = Some(source_name);
@@ -303,7 +301,7 @@ fn append_pending_byte_with_roots(
         &state.artifact_store_roots,
         &source_name,
         state.pending_bytes_written,
-        crate::shared::raster_output_finalize::pending_byte_leaf(byte),
+        crate::output_finalize::authenticated_source::pending_byte_leaf(byte),
     )?;
     state.artifact_store_roots = roots;
     state.pending_bytes_written += 1;
@@ -441,7 +439,7 @@ fn append_text_chunk_with_roots(
         &state.artifact_store_roots,
         &state.text_builder_source_name,
         state.text_chunk_count,
-        crate::shared::raster_output_finalize::text_chunk_leaf(chunk),
+        crate::output_finalize::authenticated_source::text_chunk_leaf(chunk),
     )?;
     state.artifact_store_roots = roots;
     state.text_chunk_count += 1;
@@ -471,7 +469,7 @@ fn read_pending_byte_from_ref_roots(
     }
     let read = ArtifactIo::read_leaf(artifact_ref, byte_idx)?;
     ArtifactIo::verify_artifact_read(artifact_ref, &read)?;
-    crate::shared::raster_output_finalize::decode_pending_byte_leaf(read.payload())
+    crate::output_finalize::authenticated_source::decode_pending_byte_leaf(read.payload())
 }
 
 fn read_pending_byte_range_from_ref_roots(
@@ -570,7 +568,7 @@ pub fn detokenize_output_tokens_with_byte_flush_bytes_per_tile(
         "output.finalize.detokenize",
     )?;
     let refs = call_seq!(main, input_roots, tokenizer)?;
-    crate::shared::raster_output_finalize::materialize_text_from_roots(
+    crate::output_finalize::authenticated_source::materialize_text_from_roots(
         &refs.artifact_store_roots,
         &refs.refs.generated_text_ref,
     )
@@ -651,7 +649,7 @@ pub fn run_with_byte_flush_bytes_per_tile(
         &refs.artifact_store_roots,
         &refs.refs.generated_token_ids_ref,
     )?;
-    let generated_text = crate::shared::raster_output_finalize::materialize_text_from_roots(
+    let generated_text = crate::output_finalize::authenticated_source::materialize_text_from_roots(
         &refs.artifact_store_roots,
         &refs.refs.generated_text_ref,
     )?;
@@ -692,7 +690,7 @@ pub fn prepare_raster_output_finalize_input_roots(
     let (artifact_store_roots, generated_token_ids_ref) = ArtifactIo::insert_artifact_with_roots(
         &artifact_store_roots,
         RasterArtifactId::new(generated_source_name)?,
-        crate::shared::raster_artifact_store::RasterArtifactMetadata::token_ids(
+        crate::shared::artifacts::raster_artifact_store::RasterArtifactMetadata::token_ids(
             generated_token_ids.len(),
         ),
         leaves,
@@ -725,16 +723,16 @@ mod tests {
         init_raster_output_detokenize, main, materialize_token_ids_from_roots,
         prepare_raster_output_finalize_input_roots, run, DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
     };
+    use crate::output_finalize::authenticated_source::materialize_text_from_roots;
     use crate::raster_authoring::{start_tile_invocation_counting, stop_tile_invocation_counting};
-    use crate::shared::artifact_io::ArtifactIo;
-    use crate::shared::gemma_tokenizer::{
+    use crate::shared::artifacts::artifact_io::ArtifactIo;
+    use crate::shared::artifacts::raster_artifact_store::{
+        token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
+    };
+    use crate::shared::model::gemma_tokenizer::{
         AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaTokenizerSpec,
         GemmaVocabEntry,
     };
-    use crate::shared::raster_artifact_store::{
-        token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
-    };
-    use crate::shared::raster_output_finalize::materialize_text_from_roots;
 
     #[test]
     fn detokenize_output_tokens_returns_empty_text_for_empty_ids() {

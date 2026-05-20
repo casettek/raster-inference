@@ -1,13 +1,13 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::raster_artifact_store::{
-    activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
-    RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
-    RasterTokenIdSequenceRef,
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
+    activation_row_leaf, decode_activation_row_leaf, decode_token_id_leaf,
+    RasterActivationSequenceArtifactRef, RasterArtifactBuilderRef, RasterArtifactId,
+    RasterArtifactMetadata, RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
-use crate::shared::raster_transformer_kernels::{RasterActivationRow, RasterActivationSequence};
-use crate::shared::transformer::{ActivationSequence, InternalActivationSequence};
+use crate::shared::model::transformer::{ActivationSequence, InternalActivationSequence};
+use crate::shared::raster_kernels::transformer::{RasterActivationRow, RasterActivationSequence};
 
 pub(super) fn insert_activation_sequence(
     id: RasterArtifactId,
@@ -144,13 +144,4 @@ fn read_activation_row_from_ref(
         );
     }
     Ok(row)
-}
-
-fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
-    if payload.len() != 4 {
-        bail!("token-id leaf payload must be exactly four bytes");
-    }
-    Ok(u32::from_le_bytes(
-        payload.try_into().expect("payload length checked above"),
-    ))
 }

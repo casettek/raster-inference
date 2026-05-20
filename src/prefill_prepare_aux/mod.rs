@@ -2,17 +2,17 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::input::InferenceExecutionMode;
-use crate::shared::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
-use crate::shared::raster_prefill_ple::{
+use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
+use crate::shared::model::transformer::{
+    ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel,
+};
+use crate::shared::raster_contracts::prefill_ple::{
     read_prefill_ple_input_manifest_from_roots, AuthenticatedGemmaPleSource,
     GemmaPleMetadataRequest, RasterPrefillPleInputRefs,
 };
-use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
-use crate::shared::transformer::{
-    ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel,
-};
+use crate::shared::tensors::raster_row_store::AuthenticatedRasterTensorStore;
 use crate::RasterSizingControls;
 
 pub mod raster_tiles;

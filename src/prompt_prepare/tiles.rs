@@ -3,7 +3,9 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use crate::shared::input::{Gemma4Prompt, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage};
+use crate::shared::api::input::{
+    Gemma4Prompt, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage,
+};
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct TemplateMessage {
@@ -97,7 +99,7 @@ mod tests {
     use super::{
         build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes, render_prompt,
     };
-    use crate::shared::input::{MessageRole, ModelSpec, TextDecodingPolicy};
+    use crate::shared::api::input::{MessageRole, ModelSpec, TextDecodingPolicy};
 
     #[test]
     fn decode_prompt_bytes_preserves_prompt_text() {

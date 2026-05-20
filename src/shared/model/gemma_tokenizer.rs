@@ -6,11 +6,11 @@ use std::{
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
 
-use crate::shared::artifact_io::AuthRead;
-use crate::shared::external_artifacts::{
+use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::external_artifacts::{
     register_external_source_leaves, CommittedExternalSource, ExternalSourceId, ExternalSourceRef,
 };
-use crate::shared::raster_artifact_store::RasterBpePieceSequenceRef;
+use crate::shared::artifacts::raster_artifact_store::RasterBpePieceSequenceRef;
 
 const GEMMA_TOKENIZER_SOURCE_KIND: &str = "gemma_tokenizer";
 const GEMMA_TOKENIZER_SOURCE_DOMAIN: &str = "raster-external-source-gemma-tokenizer-merkle-v1";

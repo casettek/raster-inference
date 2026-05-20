@@ -2,8 +2,10 @@ use std::{cell::RefCell, collections::HashMap};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::shared::artifact_io::AuthRead;
-use crate::shared::merkle::{merkle_proof, merkle_root, verify_merkle_proof, MerkleProof};
+use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::merkle::{
+    merkle_proof, merkle_root, verify_merkle_proof, MerkleProof,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub struct ExternalSourceId {

@@ -4,13 +4,13 @@ use serde_json::json;
 use crate::prefill_finalize::raster_tiles::{
     RasterPrefillFinalizeRefs, PREFILL_LOGITS_ARTIFACT_NAME,
 };
-use crate::shared::raster_artifact_store::RasterArtifactStoreRoots;
-use crate::shared::raster_row_store::{
-    read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
-};
-use crate::shared::transformer::{
+use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
+use crate::shared::model::transformer::{
     ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerDecodeState,
     TransformerPrefillResult, TransformerStateTransitionState,
+};
+use crate::shared::tensors::raster_row_store::{
+    read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 
 pub fn build_prefill_result_from_root_refs(
@@ -25,11 +25,13 @@ pub fn build_prefill_result_from_root_refs(
         crate::prefill_layer::materialize_prefill_layer_output_refs_from_roots(roots, &layer_refs)?;
     let det_logits = materialize_prefill_logits_from_roots(roots, &refs.logits_ref)?;
     let internal_logits = InternalLogits::from_det_values(det_logits.clone());
-    let final_logits_sha256 =
-        crate::shared::transformer_kernels::build_vector_commitment(internal_logits.as_f32_slice());
+    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
+        internal_logits.as_f32_slice(),
+    );
     let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 =
-        Some(crate::shared::transformer_kernels::build_det_vector_commitment(&det_logits));
+    prefill_logits.det_final_logits_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
+    );
 
     build_prefill_result(
         refs.prompt_token_count,
@@ -57,7 +59,7 @@ pub fn build_prefill_result(
             "decode_position": prompt_token_count,
             "decode_token_count": prompt_token_count,
             "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-            "det_layer_caches_sha256": crate::shared::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
+            "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
         }),
     );
 
@@ -77,7 +79,7 @@ pub fn build_prefill_result(
 fn materialize_prefill_logits_from_roots(
     roots: &RasterArtifactStoreRoots,
     logits_ref: &RasterActivationSequenceRef,
-) -> Result<Vec<crate::shared::det_num::Act>> {
+) -> Result<Vec<crate::shared::numerics::det_num::Act>> {
     let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
     if width != 1 {
         bail!(

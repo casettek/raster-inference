@@ -1,15 +1,15 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::shared::artifact_io::{ArtifactIo, AuthRead};
-use crate::shared::det_num::{Acc, Act, Wgt};
-use crate::shared::raster_artifact_store::{
+use crate::shared::artifacts::artifact_io::{ArtifactIo, AuthRead};
+use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
     RasterArtifactStoreRoots,
 };
-use crate::shared::raster_transformer_kernels::det_num_matrix_row_wgts;
-use crate::shared::transformer::{
+use crate::shared::model::transformer::{
     Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
 };
+use crate::shared::numerics::det_num::{Acc, Act, Wgt};
+use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedGemmaPleSource {
@@ -834,10 +834,10 @@ mod tests {
         GemmaPleProjectionNormWeightsRequest, GemmaPleScalars, GemmaPleScalarsRequest,
         GemmaPleTokenEmbeddingRowRequest,
     };
-    use crate::shared::det_num::{Acc, Act, Wgt};
-    use crate::shared::transformer::{
+    use crate::shared::model::transformer::{
         DetNumTensorSliceSource, Gemma4ModelProvenance, Gemma4PleGlobalWeights, MatrixF32,
     };
+    use crate::shared::numerics::det_num::{Acc, Act, Wgt};
     use std::path::{Path, PathBuf};
 
     #[test]

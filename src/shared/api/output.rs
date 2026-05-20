@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::shared::transformer::InternalLogits;
+use crate::shared::model::transformer::InternalLogits;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -15,14 +15,14 @@ pub struct DecodeState {
     pub generated_token_ids: Vec<u32>,
     pub current_logits: Vec<f32>,
     pub(crate) internal_logits: InternalLogits,
-    pub transformer_decode_state: crate::shared::transformer::TransformerDecodeState,
+    pub transformer_decode_state: crate::shared::model::transformer::TransformerDecodeState,
 }
 
 impl DecodeState {
     pub fn new(
         full_token_ids: Vec<u32>,
         current_logits: Vec<f32>,
-        transformer_decode_state: crate::shared::transformer::TransformerDecodeState,
+        transformer_decode_state: crate::shared::model::transformer::TransformerDecodeState,
     ) -> Self {
         Self {
             full_token_ids,
@@ -56,5 +56,5 @@ pub struct OutputDecodeState {
     #[serde(skip_serializing, default)]
     pub stop_reason: OutputDecodeStopReason,
     #[serde(skip_serializing, default)]
-    pub decode_transition_states: Vec<crate::shared::transformer::ActivationSequence>,
+    pub decode_transition_states: Vec<crate::shared::model::transformer::ActivationSequence>,
 }

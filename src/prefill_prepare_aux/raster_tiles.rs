@@ -4,22 +4,24 @@ use crate::input_embedding::raster_tiles::RasterInputEmbeddingRefs;
 use crate::raster_authoring::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::shared::artifact_io::ArtifactIo;
-use crate::shared::det_num::{add_sat, rms_norm as det_rms_norm, scale_act, Acc, Act, Wgt};
-use crate::shared::raster_artifact_store::{
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
     RasterRoutineOutput,
 };
-use crate::shared::raster_prefill_ple::{
+use crate::shared::model::transformer::ActivationSequence;
+use crate::shared::numerics::det_num::{
+    add_sat, rms_norm as det_rms_norm, scale_act, Acc, Act, Wgt,
+};
+use crate::shared::raster_contracts::prefill_ple::{
     store_prefill_ple_input_manifest_with_roots, AuthenticatedGemmaPleSource,
     GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest, GemmaPleModelProjectionRowRequest,
     GemmaPleProjectionNormWeightsRequest, GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
 };
-use crate::shared::raster_transformer_kernels::{
+use crate::shared::raster_kernels::transformer::{
     project_row_with_weights, validate_projection_rows_per_tile, validate_sequence_rows_per_tile,
     RasterActivationRow,
 };
-use crate::shared::transformer::ActivationSequence;
 use crate::RasterSizingControls;
 
 use super::raster_utils::{
@@ -752,7 +754,7 @@ fn init_scaled_token_embedding_sequence_ref(
     token_ids_source_name: &str,
     token_count: usize,
     layer_idx: usize,
-    scale: crate::shared::det_num::Act,
+    scale: crate::shared::numerics::det_num::Act,
     row_width: usize,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleTokenEmbeddingState)> {
     if token_count == 0 {
@@ -826,7 +828,7 @@ fn append_next_scaled_token_embedding_row(
                 .map(|value| {
                     scale_act(
                         value,
-                        crate::shared::det_num::Act::from_bits(state.scale_bits),
+                        crate::shared::numerics::det_num::Act::from_bits(state.scale_bits),
                     )
                 })
                 .collect(),
@@ -865,7 +867,7 @@ fn build_scaled_token_embedding_sequence_ref(
     token_count: usize,
     layer_idx: usize,
     ple_source: &AuthenticatedGemmaPleSource,
-    scale: crate::shared::det_num::Act,
+    scale: crate::shared::numerics::det_num::Act,
     row_width: usize,
 ) -> Result<(
     RasterArtifactStoreRoots,
@@ -996,7 +998,7 @@ fn init_sequence_scale_ref_state(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceArtifactRef,
     output_id: RasterArtifactId,
-    scalar: Option<crate::shared::det_num::Act>,
+    scalar: Option<crate::shared::numerics::det_num::Act>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleSequenceUnaryState)> {
     validate_sequence_rows_per_tile(rows_per_tile)?;
@@ -1028,8 +1030,8 @@ fn init_sequence_rms_norm_ref_state(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceArtifactRef,
     output_id: RasterArtifactId,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
+    norm_weights: Option<&[crate::shared::numerics::det_num::Wgt]>,
+    eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleSequenceUnaryState)> {
     validate_sequence_rows_per_tile(rows_per_tile)?;
@@ -1091,7 +1093,7 @@ fn compute_sequence_scale_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceArtifactRef,
     output_id: RasterArtifactId,
-    scalar: Option<crate::shared::det_num::Act>,
+    scalar: Option<crate::shared::numerics::det_num::Act>,
     rows_per_tile: usize,
 ) -> Result<(
     RasterArtifactStoreRoots,
@@ -1121,8 +1123,8 @@ fn compute_sequence_rms_norm_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceArtifactRef,
     output_id: RasterArtifactId,
-    norm_weights: Option<&[crate::shared::det_num::Wgt]>,
-    eps: Option<crate::shared::det_num::Acc>,
+    norm_weights: Option<&[crate::shared::numerics::det_num::Wgt]>,
+    eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(
     RasterArtifactStoreRoots,
@@ -1338,17 +1340,18 @@ fn compute_next_sequence_binary_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::det_num::{f32_to_acc, Act, Wgt};
-    use crate::shared::raster_prefill_ple::{
-        AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleScalars,
-    };
-    use crate::shared::transformer::{
+    use crate::shared::api::input::InferenceExecutionMode;
+    use crate::shared::model::transformer::{
         ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
         Gemma4PleLayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
         InternalActivationSequence, MatrixF32,
     };
-    use crate::shared::{det_num::act_to_f32, input::InferenceExecutionMode};
+    use crate::shared::numerics::det_num::act_to_f32;
+    use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
+    use crate::shared::raster_contracts::prefill_ple::{
+        AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleScalars,
+    };
     use anyhow::{Context, Result};
     use std::path::PathBuf;
 
@@ -1432,7 +1435,7 @@ mod tests {
         let token_ids_ref = store_prefill_token_ids_artifact(&[0, 1]).expect("token ids ref");
         let activations_ref = insert_activation_sequence(
             RasterArtifactId::new("input.embedding.test.embedded").expect("artifact id"),
-            crate::shared::raster_transformer_kernels::RasterActivationSequence::from_acts(vec![
+            crate::shared::raster_kernels::transformer::RasterActivationSequence::from_acts(vec![
                 vec![Act::from_num(1.0), Act::from_num(0.0)],
                 vec![Act::from_num(0.0), Act::from_num(1.0)],
             ]),
@@ -2077,7 +2080,7 @@ mod tests {
             .collect::<Vec<Vec<f32>>>();
         ActivationSequence::from_internal(
             InternalActivationSequence::from_det_values(rows),
-            crate::shared::transformer_kernels::build_activation_commitment(&values),
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
         )
     }
 

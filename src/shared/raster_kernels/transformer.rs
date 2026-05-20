@@ -3,8 +3,10 @@ use std::fs::File;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::auth_read;
-use crate::shared::artifact_io::AuthRead;
-use crate::shared::det_num::{
+use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
+use crate::shared::model::transformer::{DetNumMatrix, DetNumTensorSliceSource};
+use crate::shared::numerics::det_num::{
     acc_add_sat, act_to_f32, add_sat, attention_score as det_attention_score,
     attention_softmax as det_attention_softmax, attention_softmax_exp_term,
     attention_softmax_raw_weight, attention_softmax_residual,
@@ -12,12 +14,11 @@ use crate::shared::det_num::{
     requantize, rms_norm as det_rms_norm, rope_rotate_pairs, scale_act,
     value_rms_norm as det_value_rms_norm, Acc, Act, Wgt,
 };
-use crate::shared::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
-use crate::shared::raster_prefill_layer::{
+use crate::shared::raster_contracts::prefill_layer::{
     GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMatrixRowRequest,
 };
-use crate::shared::raster_prefill_ple::GemmaPleModelProjectionRowRequest;
-use crate::shared::raster_row_store::{
+use crate::shared::raster_contracts::prefill_ple::GemmaPleModelProjectionRowRequest;
+use crate::shared::tensors::raster_row_store::{
     append_head_row_by_source_name_with_roots, append_sequence_row_by_source_name_with_roots,
     finalize_heads_builder_by_source_name_with_roots,
     finalize_kv_cache_builders_by_source_name_with_roots,
@@ -28,7 +29,6 @@ use crate::shared::raster_row_store::{
     RasterProjectionOutputBuilderRef, RasterSequenceRowRequest, RasterTensorBuilderRef,
     RasterTensorId,
 };
-use crate::shared::transformer::{DetNumMatrix, DetNumTensorSliceSource};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterActivationRow {
@@ -405,7 +405,7 @@ pub struct RasterCombineHeadsArtifactState {
 pub struct RasterKvCacheBuildState {
     key_ref: RasterAttentionHeadsRef,
     value_ref: RasterAttentionHeadsRef,
-    output_builder_ref: crate::shared::raster_row_store::RasterKvCacheBuilderRef,
+    output_builder_ref: crate::shared::tensors::raster_row_store::RasterKvCacheBuilderRef,
     retained_start: usize,
     next_head_idx: usize,
     next_token_idx: usize,
@@ -5318,16 +5318,16 @@ mod tests {
         rms_norm_sequence, scale_sequence, value_rms_norm_heads, RasterActivationRow,
         RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
     };
-    use crate::shared::artifact_io::AuthRead;
-    use crate::shared::det_num::{
+    use crate::shared::artifacts::artifact_io::AuthRead;
+    use crate::shared::numerics::det_num::{
         add_sat, attention_score, attention_softmax, attention_weighted_sum, gelu_pytorch_tanh_act,
         mul_sat, rms_norm, rope_rotate_pairs, scale_act, value_rms_norm, Acc, Act, Wgt,
     };
-    use crate::shared::raster_prefill_layer::{
+    use crate::shared::raster_contracts::prefill_layer::{
         GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMatrixRowRequest,
     };
-    use crate::shared::raster_prefill_ple::GemmaPleModelProjectionRowRequest;
-    use crate::shared::raster_row_store::AuthenticatedRasterTensorStore;
+    use crate::shared::raster_contracts::prefill_ple::GemmaPleModelProjectionRowRequest;
+    use crate::shared::tensors::raster_row_store::AuthenticatedRasterTensorStore;
     use anyhow::{anyhow, Result};
     use std::collections::HashMap;
 

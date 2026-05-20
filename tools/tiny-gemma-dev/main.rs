@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use raster_inference::shared::det_num::{
+use raster_inference::shared::numerics::det_num::{
     f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
     DET_WGT_ARTIFACT_MAGIC,
 };
