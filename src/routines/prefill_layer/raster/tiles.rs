@@ -1,12 +1,5 @@
 use anyhow::{anyhow, bail, Result};
-use serde_json::json;
 
-use super::utils::{
-    layer_caches_from_raster, materialize_prefill_activation_sequence_from_roots,
-    materialize_prefill_layer_caches_from_roots, raster_sequence_acts,
-    resolve_prefill_donor_cache_index, retained_prefill_kv_cache_len,
-    validate_prefill_layer_ple_input_ref,
-};
 use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
@@ -49,6 +42,9 @@ use crate::shared::tensors::raster_tensor_artifacts::{
 };
 use crate::trace::{trace_event, trace_scope};
 use crate::RasterSizingControls;
+
+use super::types::*;
+use super::utils::*;
 
 // Raster execution sequences, ordered from the primary entry point outward.
 
@@ -1672,145 +1668,3 @@ pub(crate) fn init_prefill_layer_state_from_activation_ref_with_roots(
         },
     ))
 }
-
-// Supporting definitions used by the sequences and tiles.
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillLayerRasterState {
-    current_activations_ref: RasterActivationSequenceRef,
-    next_layer_idx: usize,
-    layer_count: usize,
-    layer_caches: Vec<PrefillLayerCacheSlot>,
-    per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
-    completed_layer_output_sha256s: Vec<String>,
-    completed_layer_output_det_sha256s: Vec<Option<String>>,
-    projection_rows_per_tile: usize,
-    attention_kv_rows_per_tile: usize,
-    sequence_rows_per_tile: usize,
-    head_rows_per_tile: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum PrefillLayerCacheSlot {
-    Empty { num_kv_heads: usize },
-    Ref(RasterKvCacheRef),
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillLayerOutputRefs {
-    pub final_hidden_states_ref: RasterActivationSequenceRef,
-    pub layer_caches: Vec<PrefillLayerCacheSlot>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillLayerContext {
-    layer_idx: usize,
-    layer: GemmaPrefillLayerMetadata,
-    donor_cache: Option<PrefillLayerCacheSlot>,
-    per_layer_input: Option<RasterActivationSequenceRef>,
-}
-
-fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) -> Result<()> {
-    if roots.artifacts.iter().any(|entry| entry.root() == root) {
-        return Ok(());
-    }
-    bail!("raster artifact root {root} is not present in the store roots snapshot")
-}
-
-fn trace_prefill_layer_checkpoint(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    state: &PrefillLayerRasterState,
-    layer_idx: usize,
-) -> Result<Option<(String, Option<String>)>> {
-    let mut completed_layer_output = None;
-    let reached = crate::trace::trace_checkpoint_lazy_result("prefill.layer", || {
-        let current_activations = materialize_prefill_activation_sequence_from_roots(
-            artifact_store_roots,
-            &state.current_activations_ref,
-        )?;
-        let current_values = current_activations.to_f32_values();
-        let current_det_activations = raster_sequence_acts(&current_activations);
-        let current_sha256 =
-            crate::shared::numerics::transformer_kernels::build_activation_commitment(
-                &current_values,
-            );
-        let current_det_sha256 = Some(
-            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
-                &current_det_activations,
-            ),
-        );
-        let raster_layer_caches =
-            materialize_prefill_layer_caches_from_roots(artifact_store_roots, &state.layer_caches)?;
-        let layer_caches = layer_caches_from_raster(&raster_layer_caches);
-        let mut completed_layer_output_sha256s = state.completed_layer_output_sha256s.clone();
-        completed_layer_output_sha256s.push(current_sha256.clone());
-        let mut completed_layer_output_det_sha256s =
-            state.completed_layer_output_det_sha256s.clone();
-        completed_layer_output_det_sha256s.push(current_det_sha256.clone());
-        completed_layer_output = Some((current_sha256.clone(), current_det_sha256.clone()));
-        Ok(json!({
-            "execution_mode": "deterministic",
-            "next_layer_idx": layer_idx + 1,
-            "current_activations": current_values,
-            "current_activations_sha256": current_sha256,
-            "det_current_activations_sha256": current_det_sha256,
-            "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-            "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
-            "completed_layer_output_sha256s": completed_layer_output_sha256s,
-            "completed_layer_output_det_sha256s": completed_layer_output_det_sha256s,
-        }))
-    })?;
-    if reached {
-        return Ok(completed_layer_output);
-    }
-    Ok(completed_layer_output)
-}
-
-fn trace_prefill_layer_checkpoint_with_roots(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    state: &PrefillLayerRasterState,
-    layer_idx: usize,
-) -> Result<Option<(String, Option<String>)>> {
-    trace_prefill_layer_checkpoint(artifact_store_roots, state, layer_idx)
-}
-
-fn trace_prefill_layer_token_checkpoints_with_roots(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    state: &PrefillLayerRasterState,
-    layer_idx: usize,
-) -> Result<bool> {
-    let (token_count, _) = state
-        .current_activations_ref
-        .tensor_ref()
-        .shape()
-        .sequence_metadata()?;
-    for token_idx in 0..token_count {
-        let checkpoint_name = format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}");
-        if crate::trace::trace_checkpoint_lazy_result(&checkpoint_name, || {
-            let token_row = read_sequence_row_from_roots(
-                artifact_store_roots,
-                RasterSequenceRowRequest {
-                    tensor_ref: state.current_activations_ref.clone(),
-                    row_idx: token_idx,
-                },
-            )?;
-            let token_activation = token_row.to_f32_values();
-            let det_token_activation = token_row.acts();
-            Ok(json!({
-                "execution_mode": "deterministic",
-                "layer_idx": layer_idx,
-                "token_idx": token_idx,
-                "token_count": token_count,
-                "token_activation": token_activation,
-                "det_token_activation_sha256": crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_token_activation),
-            }))
-        })? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

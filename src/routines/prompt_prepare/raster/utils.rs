@@ -4,7 +4,7 @@ use crate::shared::api::input::{InferenceRequest, ModelSpec};
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterArtifactRef,
-    RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
+    RasterArtifactStoreRoots, RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
 };
 use crate::shared::model::gemma_tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaBpeState, GemmaNormalizedText, GemmaPreTokenizedText,
@@ -229,7 +229,7 @@ pub(in super::super) fn init_bpe_tokenize_prompt(
     ))
 }
 
-pub(in super::super) fn tokenize_prompt(
+pub fn tokenize_prompt(
     prompt_ref: &str,
     tokenizer_ref: &AuthenticatedGemmaTokenizer,
     add_special_tokens: bool,
@@ -243,7 +243,7 @@ pub(in super::super) fn tokenize_prompt(
     )
 }
 
-pub(in super::super) fn tokenize_prompt_with_controls(
+pub fn tokenize_prompt_with_controls(
     prompt_ref: &str,
     tokenizer_ref: &AuthenticatedGemmaTokenizer,
     add_special_tokens: bool,
@@ -395,4 +395,36 @@ pub(in super::super) fn ensure_tokenizer_controls(
 
 pub(in super::super) fn artifact_id(name: impl Into<String>) -> Result<RasterArtifactId> {
     RasterArtifactId::new(name)
+}
+
+pub(in super::super) fn bpe_pieces_artifact_name(iteration: u64) -> String {
+    format!("bpe-pieces-{iteration}")
+}
+
+pub(in super::super) fn bpe_pieces_root(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    iteration: u64,
+) -> Result<&str> {
+    let source_name = bpe_pieces_artifact_name(iteration);
+    artifact_store_roots.artifact_root_for_source_name(&source_name)
+}
+
+pub(in super::super) fn bpe_pieces_builder_root(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    iteration: u64,
+) -> Result<&str> {
+    let source_name = bpe_pieces_artifact_name(iteration);
+    artifact_store_roots.builder_root_for_source_name(&source_name)
+}
+
+pub(in super::super) fn prompt_token_ids_root(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+) -> Result<&str> {
+    artifact_store_roots.artifact_root_for_source_name(PROMPT_TOKEN_IDS_ARTIFACT_NAME)
+}
+
+pub(in super::super) fn prompt_token_ids_builder_root(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+) -> Result<&str> {
+    artifact_store_roots.builder_root_for_source_name(PROMPT_TOKEN_IDS_ARTIFACT_NAME)
 }

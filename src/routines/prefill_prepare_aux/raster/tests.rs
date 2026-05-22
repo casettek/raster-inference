@@ -1,5 +1,7 @@
 use super::*;
 use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::raster_artifact_store::RasterArtifactId;
 use crate::shared::model::transformer::{
     ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
@@ -11,6 +13,7 @@ use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
 use crate::shared::raster_contracts::prefill_ple::{
     AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleScalars,
 };
+use crate::RasterSizingControls;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 

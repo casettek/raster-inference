@@ -1,14 +1,11 @@
 use anyhow::{anyhow, bail, Result};
 
-use super::utils::build_prefill_result_from_root_refs;
 use crate::dsl::prelude::{auth_read, call_recur_tile, call_seq, call_tile, sequence, tile};
 use crate::prefill_finalize::raster::auth_source::{
     GemmaPrefillFinalizeMetadataRequest, GemmaPrefillFinalizeNormWeightsRequest,
     GemmaPrefillFinalizeProjectionRowRequest, GemmaPrefillFinalizeScalarsRequest,
 };
-use crate::shared::artifacts::raster_artifact_store::{
-    RasterArtifactId, RasterArtifactStoreRoots, RasterRoutineOutput,
-};
+use crate::shared::artifacts::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
 use crate::shared::model::transformer::TransformerPrefillResult;
 use crate::shared::numerics::det_num::{softcap_act, Act};
 use crate::shared::raster_kernels::transformer::{
@@ -21,6 +18,9 @@ use crate::shared::tensors::raster_tensor_artifacts::{
     start_sequence_builder_with_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
     RasterTensorId,
 };
+
+use super::types::*;
+use super::utils::*;
 
 // Raster execution sequences, ordered from the primary entry point outward.
 
@@ -292,79 +292,3 @@ pub fn build_prefill_result_from_refs(
 ) -> Result<TransformerPrefillResult> {
     build_prefill_result_from_root_refs(&artifact_store_roots, &refs)
 }
-
-// Supporting definitions used by the sequences and tiles.
-
-pub const NORMALIZED_FINAL_POSITION_ARTIFACT_NAME: &str =
-    "prefill.finalize.normalized_final_position";
-
-pub const PREFILL_LOGITS_ARTIFACT_NAME: &str = "prefill.finalize.logits";
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterPrefillFinalizeInputRoots {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub prompt_token_count: usize,
-    pub finalize_source_root: String,
-    pub final_hidden_states_ref: RasterActivationSequenceRef,
-    pub layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
-    pub projection_rows_per_tile: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterPrefillFinalizeRefs {
-    pub source_id: String,
-    pub finalize_source_root: String,
-    pub prompt_token_count: usize,
-    pub final_hidden_states_ref: RasterActivationSequenceRef,
-    pub layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
-    pub normalized_final_position_ref: RasterActivationSequenceRef,
-    pub logits_ref: RasterActivationSequenceRef,
-    pub logit_count: usize,
-}
-
-pub type RasterPrefillFinalizeOutput = RasterRoutineOutput<RasterPrefillFinalizeRefs>;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillFinalizeRasterState {
-    artifact_store_roots: RasterArtifactStoreRoots,
-    source_id: String,
-    finalize_source_root: String,
-    prompt_token_count: usize,
-    final_hidden_states_ref: RasterActivationSequenceRef,
-    normalized_final_position_ref: Option<RasterActivationSequenceRef>,
-    next_logit_idx: usize,
-    logit_count: usize,
-    hidden_width: usize,
-    softcap_bits: Option<i32>,
-    projection_rows_per_tile: usize,
-}
-
-impl PrefillFinalizeRasterState {
-    fn is_complete(&self) -> bool {
-        self.next_logit_idx >= self.logit_count
-    }
-}
-
-fn validate_layer_cache_roots(
-    roots: &RasterArtifactStoreRoots,
-    layer_caches: &[crate::prefill_layer::raster::PrefillLayerCacheSlot],
-) -> Result<()> {
-    for cache in layer_caches {
-        if let crate::prefill_layer::raster::PrefillLayerCacheSlot::Ref(cache_ref) = cache {
-            ensure_artifact_root_present(roots, cache_ref.keys().det_commitment())?;
-            ensure_artifact_root_present(roots, cache_ref.values().det_commitment())?;
-        }
-    }
-    Ok(())
-}
-
-fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) -> Result<()> {
-    if roots.artifacts.iter().any(|entry| entry.root() == root) {
-        return Ok(());
-    }
-    bail!("raster artifact root {root} is not present in the store roots snapshot")
-}
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

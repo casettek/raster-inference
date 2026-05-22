@@ -107,3 +107,26 @@ fn materialize_prefill_logits_from_roots(
     }
     Ok(logits)
 }
+
+pub(in super::super) fn validate_layer_cache_roots(
+    roots: &RasterArtifactStoreRoots,
+    layer_caches: &[crate::prefill_layer::raster::PrefillLayerCacheSlot],
+) -> Result<()> {
+    for cache in layer_caches {
+        if let crate::prefill_layer::raster::PrefillLayerCacheSlot::Ref(cache_ref) = cache {
+            ensure_artifact_root_present(roots, cache_ref.keys().det_commitment())?;
+            ensure_artifact_root_present(roots, cache_ref.values().det_commitment())?;
+        }
+    }
+    Ok(())
+}
+
+pub(in super::super) fn ensure_artifact_root_present(
+    roots: &RasterArtifactStoreRoots,
+    root: &str,
+) -> Result<()> {
+    if roots.artifacts.iter().any(|entry| entry.root() == root) {
+        return Ok(());
+    }
+    bail!("raster artifact root {root} is not present in the store roots snapshot")
+}

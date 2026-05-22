@@ -3,19 +3,15 @@ use anyhow::{anyhow, bail, Result};
 use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::input_embedding::raster::RasterInputEmbeddingRefs;
-use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
-    RasterRoutineOutput,
 };
-use crate::shared::model::transformer::ActivationSequence;
 use crate::shared::numerics::det_num::{
     add_sat, rms_norm as det_rms_norm, scale_act, Acc, Act, Wgt,
 };
 use crate::shared::raster_contracts::prefill_ple::{
     store_prefill_ple_input_manifest_with_roots, AuthenticatedGemmaPleSource,
-    GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest, GemmaPleModelProjectionRowRequest,
+    GemmaPleLayerMetadataRequest, GemmaPleModelProjectionRowRequest,
     GemmaPleProjectionNormWeightsRequest, GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
 };
 use crate::shared::raster_kernels::transformer::{
@@ -24,12 +20,8 @@ use crate::shared::raster_kernels::transformer::{
 };
 use crate::RasterSizingControls;
 
-use super::utils::{
-    append_sequence_row_by_builder_root_with_roots, finalize_sequence_builder_by_root_with_roots,
-    insert_activation_sequence_with_roots, raster_activation_sequence_from_embedding,
-    read_activation_row_from_ref, read_prefill_token_id, reset_artifact_store,
-    start_sequence_builder_with_roots, store_prefill_token_ids_artifact_with_roots,
-};
+use super::types::*;
+use super::utils::*;
 
 // Raster execution sequences, ordered from the primary entry point outward.
 
@@ -501,7 +493,7 @@ pub fn update_prefill_ple_state_refs(
 }
 
 #[tile]
-fn init_scaled_token_embedding_sequence_ref(
+pub(in super::super) fn init_scaled_token_embedding_sequence_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     token_ids_source_name: &str,
     token_count: usize,
@@ -535,7 +527,7 @@ fn init_scaled_token_embedding_sequence_ref(
 }
 
 #[tile(kind = recursive)]
-fn append_next_scaled_token_embedding_row(
+pub(in super::super) fn append_next_scaled_token_embedding_row(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     mut state: PrefillPleTokenEmbeddingState,
     ple_source: &AuthenticatedGemmaPleSource,
@@ -592,7 +584,7 @@ fn append_next_scaled_token_embedding_row(
 }
 
 #[tile]
-fn finalize_scaled_token_embedding_sequence_ref(
+pub(in super::super) fn finalize_scaled_token_embedding_sequence_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     state: PrefillPleTokenEmbeddingState,
 ) -> Result<(
@@ -1000,349 +992,3 @@ fn finalize_sequence_binary_ref_state(
         .to_string();
     finalize_sequence_builder_by_root_with_roots(&artifact_store_roots, &output_builder_root)
 }
-
-// Supporting definitions used by the sequences and tiles.
-
-#[cfg(test)]
-use super::utils::{insert_activation_sequence, store_prefill_token_ids_artifact};
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillPleRasterState {
-    source_id: String,
-    token_ids_source_name: String,
-    token_count: usize,
-    input_activations_ref: Option<RasterActivationSequenceArtifactRef>,
-    next_layer_idx: usize,
-    layer_count: usize,
-    per_layer_inputs: Vec<Option<RasterActivationSequenceArtifactRef>>,
-    has_ple_global: bool,
-    raster_sizing: RasterSizingControls,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterPrefillPleInputRoots {
-    source_id: String,
-    token_ids_source_name: String,
-    token_count: usize,
-    input_activations_ref: Option<RasterActivationSequenceArtifactRef>,
-    layer_count: usize,
-    has_ple_global: bool,
-    raster_sizing: RasterSizingControls,
-}
-
-pub type RasterPrefillPleOutput = RasterRoutineOutput<Option<String>>;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillPleLayerContext {
-    layer_idx: usize,
-    has_ple: bool,
-    ple_width: Option<usize>,
-    projection_rows: Option<usize>,
-    embedding_scale_bits: Option<i32>,
-    projection_scalar_bits: Option<i32>,
-    input_scale_bits: Option<i32>,
-    rms_norm_eps_bits: Option<i64>,
-    norm_weight_bits: Option<Vec<i32>>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillPleTokenEmbeddingState {
-    token_ids_source_name: String,
-    layer_idx: usize,
-    scale_bits: i32,
-    next_token_idx: usize,
-    token_count: usize,
-    row_width: usize,
-    output_source_name: String,
-}
-
-impl PrefillPleTokenEmbeddingState {
-    fn is_complete(&self) -> bool {
-        self.next_token_idx >= self.token_count
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillPleSequenceProjectionState {
-    input_ref: RasterActivationSequenceArtifactRef,
-    output_source_name: String,
-    current_row_bits: Vec<i32>,
-    next_token_idx: usize,
-    next_projection_row_idx: usize,
-    token_count: usize,
-    input_width: usize,
-    projection_rows: usize,
-    rows_per_tile: usize,
-}
-
-impl PrefillPleSequenceProjectionState {
-    fn is_complete(&self) -> bool {
-        self.next_token_idx >= self.token_count
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-enum PrefillPleSequenceUnaryOp {
-    RmsNorm {
-        norm_weight_bits: Vec<i32>,
-        eps_bits: i64,
-    },
-    Scale {
-        scalar_bits: i32,
-    },
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillPleSequenceUnaryState {
-    input_ref: RasterActivationSequenceArtifactRef,
-    output_source_name: String,
-    op: PrefillPleSequenceUnaryOp,
-    next_row_idx: usize,
-    row_count: usize,
-    width: usize,
-    rows_per_tile: usize,
-}
-
-impl PrefillPleSequenceUnaryState {
-    fn is_complete(&self) -> bool {
-        self.next_row_idx >= self.row_count
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillPleSequenceBinaryState {
-    lhs_ref: RasterActivationSequenceArtifactRef,
-    rhs_ref: RasterActivationSequenceArtifactRef,
-    output_source_name: String,
-    next_row_idx: usize,
-    row_count: usize,
-    width: usize,
-    rows_per_tile: usize,
-}
-
-impl PrefillPleSequenceBinaryState {
-    fn is_complete(&self) -> bool {
-        self.next_row_idx >= self.row_count
-    }
-}
-
-fn artifact_source_name_for_root(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    root: &str,
-) -> Result<String> {
-    Ok(artifact_store_roots
-        .artifact_entry_for_root(root)?
-        .id()
-        .source_name()
-        .to_string())
-}
-
-fn token_ids_root<'a>(
-    artifact_store_roots: &'a RasterArtifactStoreRoots,
-    source_name: &str,
-) -> Result<&'a str> {
-    artifact_store_roots.artifact_root_for_source_name(source_name)
-}
-
-pub fn prepare_raster_prefill_ple_input_roots(
-    token_ids: &[u32],
-    input_activations: &ActivationSequence,
-    ple_source: &AuthenticatedGemmaPleSource,
-    raster_sizing: RasterSizingControls,
-) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
-    reset_artifact_store();
-    let artifact_store_roots = ArtifactIo::export_store_roots();
-    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
-    validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
-    let (artifact_store_roots, token_ids_ref) =
-        store_prefill_token_ids_artifact_with_roots(&artifact_store_roots, token_ids)?;
-    let token_count = token_ids_ref.token_count();
-    let token_ids_source_name = token_ids_ref.id().source_name().to_string();
-    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
-    if !metadata.has_ple_global {
-        return Ok((
-            artifact_store_roots,
-            RasterPrefillPleInputRoots {
-                source_id: metadata.source_id,
-                token_ids_source_name,
-                token_count: token_ids_ref.token_count(),
-                input_activations_ref: None,
-                layer_count: metadata.layer_count,
-                has_ple_global: false,
-                raster_sizing,
-            },
-        ));
-    }
-
-    if metadata.layer_count == 0 {
-        bail!("transformer PLE computation requires at least one layer");
-    }
-    if metadata.token_embedding_layer_count != metadata.layer_count {
-        bail!(
-            "transformer PLE token embedding slice count mismatch: {} vs {}",
-            metadata.token_embedding_layer_count,
-            metadata.layer_count
-        );
-    }
-    if metadata.model_projection_layer_count != metadata.layer_count {
-        bail!(
-            "transformer PLE model projection slice count mismatch: {} vs {}",
-            metadata.model_projection_layer_count,
-            metadata.layer_count
-        );
-    }
-
-    let input_activations = raster_activation_sequence_from_embedding(input_activations)?;
-    if input_activations.is_empty() {
-        bail!("transformer PLE computation requires at least one activation row");
-    }
-    if token_count != input_activations.len() {
-        bail!(
-            "transformer PLE computation requires token ids and activations to have matching lengths"
-        );
-    }
-
-    let first_layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx: 0 })?;
-    let activation_width = input_activations.width()?;
-    if activation_width != first_layer.hidden_width {
-        bail!(
-            "input activations row 0 has width {}, expected {}",
-            activation_width,
-            first_layer.hidden_width
-        );
-    }
-    let (artifact_store_roots, input_activations_ref) = insert_activation_sequence_with_roots(
-        &artifact_store_roots,
-        RasterArtifactId::new("prefill.prepare_aux.input.initial")?,
-        input_activations,
-    )?;
-
-    Ok((
-        artifact_store_roots,
-        RasterPrefillPleInputRoots {
-            source_id: metadata.source_id,
-            token_ids_source_name,
-            token_count: token_ids_ref.token_count(),
-            input_activations_ref: Some(input_activations_ref),
-            layer_count: metadata.layer_count,
-            has_ple_global: true,
-            raster_sizing,
-        },
-    ))
-}
-
-pub fn prepare_raster_prefill_ple_input_roots_from_embedding_refs(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_embedding_refs: &RasterInputEmbeddingRefs,
-    ple_source: &AuthenticatedGemmaPleSource,
-    raster_sizing: RasterSizingControls,
-) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
-    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
-    validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
-    let token_ids_source_name = artifact_source_name_for_root(
-        &artifact_store_roots,
-        &input_embedding_refs.prompt_token_ids_root,
-    )?;
-    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
-    if !metadata.has_ple_global {
-        return Ok((
-            artifact_store_roots,
-            RasterPrefillPleInputRoots {
-                source_id: metadata.source_id,
-                token_ids_source_name,
-                token_count: input_embedding_refs.prompt_token_count,
-                input_activations_ref: None,
-                layer_count: metadata.layer_count,
-                has_ple_global: false,
-                raster_sizing,
-            },
-        ));
-    }
-
-    if metadata.layer_count == 0 {
-        bail!("transformer PLE computation requires at least one layer");
-    }
-    if metadata.token_embedding_layer_count != metadata.layer_count {
-        bail!(
-            "transformer PLE token embedding slice count mismatch: {} vs {}",
-            metadata.token_embedding_layer_count,
-            metadata.layer_count
-        );
-    }
-    if metadata.model_projection_layer_count != metadata.layer_count {
-        bail!(
-            "transformer PLE model projection slice count mismatch: {} vs {}",
-            metadata.model_projection_layer_count,
-            metadata.layer_count
-        );
-    }
-    if input_embedding_refs.prompt_token_count
-        != input_embedding_refs
-            .embedded_prompt_activations_ref
-            .row_count()
-    {
-        bail!("transformer PLE computation requires token ids and activations to have matching lengths");
-    }
-
-    let first_layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx: 0 })?;
-    if input_embedding_refs.embedded_prompt_activations_ref.width() != first_layer.hidden_width {
-        bail!(
-            "input activations row 0 has width {}, expected {}",
-            input_embedding_refs.embedded_prompt_activations_ref.width(),
-            first_layer.hidden_width
-        );
-    }
-    artifact_store_roots
-        .artifact_entry_for_root(input_embedding_refs.embedded_prompt_activations_ref.root())?;
-
-    Ok((
-        artifact_store_roots,
-        RasterPrefillPleInputRoots {
-            source_id: metadata.source_id,
-            token_ids_source_name,
-            token_count: input_embedding_refs.prompt_token_count,
-            input_activations_ref: Some(
-                input_embedding_refs.embedded_prompt_activations_ref.clone(),
-            ),
-            layer_count: metadata.layer_count,
-            has_ple_global: true,
-            raster_sizing,
-        },
-    ))
-}
-
-pub fn run(
-    token_ids: &[u32],
-    input_activations: &ActivationSequence,
-    ple_source: &AuthenticatedGemmaPleSource,
-    raster_sizing: RasterSizingControls,
-) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
-    let (artifact_store_roots, input_roots) = prepare_raster_prefill_ple_input_roots(
-        token_ids,
-        input_activations,
-        ple_source,
-        raster_sizing,
-    )?;
-    main(artifact_store_roots, input_roots, ple_source)
-}
-
-pub fn run_with_input_embedding_refs(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_embedding_refs: &RasterInputEmbeddingRefs,
-    ple_source: &AuthenticatedGemmaPleSource,
-    raster_sizing: RasterSizingControls,
-) -> Result<RasterPrefillPleOutput> {
-    let (artifact_store_roots, input_roots) =
-        prepare_raster_prefill_ple_input_roots_from_embedding_refs(
-            artifact_store_roots,
-            input_embedding_refs,
-            ple_source,
-            raster_sizing,
-        )?;
-    let (artifact_store_roots, refs) = main(artifact_store_roots, input_roots, ple_source)?;
-    Ok(RasterPrefillPleOutput::new(artifact_store_roots, refs))
-}
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

@@ -1,9 +1,9 @@
 use anyhow::Result;
 
-use super::super::super::native::{
+use super::super::native::{
     build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes, render_prompt,
 };
-use super::super::utils::{
+use super::utils::{
     bpe_piece_leaf, init_artifact_store, init_bpe_tokenize_prompt, init_tokenize_prompt,
     prepare_raster_prompt_input_roots, read_bpe_piece, tokenize_prompt,
     tokenize_prompt_with_controls,

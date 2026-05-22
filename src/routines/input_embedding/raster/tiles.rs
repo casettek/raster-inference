@@ -5,17 +5,11 @@ use crate::input_embedding::raster::auth_source::{
     GemmaInputEmbeddingMetadataRequest, GemmaInputEmbeddingRowRequest,
 };
 use crate::shared::artifacts::artifact_io::ArtifactIo;
-use crate::shared::artifacts::raster_artifact_store::{
-    RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
-    RasterRoutineOutput,
-};
+use crate::shared::artifacts::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
 use crate::shared::raster_kernels::transformer::RasterActivationRow;
 
-use super::utils::{
-    append_activation_row_by_builder_root_with_roots,
-    finalize_activation_sequence_builder_by_root_with_roots, read_prompt_token_id,
-    start_activation_sequence_builder_with_roots,
-};
+use super::types::*;
+use super::utils::*;
 
 // Raster execution sequences, ordered from the primary entry point outward.
 
@@ -148,42 +142,4 @@ pub fn finalize_input_embedding_refs(
             embedded_prompt_activations_ref,
         },
     ))
-}
-
-// Supporting definitions used by the sequences and tiles.
-
-const EMBEDDED_PROMPT_ARTIFACT_NAME: &str = "input.embedding.embedded_prompt";
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterInputEmbeddingInputRoots {
-    pub prompt_token_ids_root: String,
-    pub prompt_token_count: usize,
-    pub embedding_source_root: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterInputEmbeddingRefs {
-    pub source_id: String,
-    pub embedding_source_root: String,
-    pub prompt_token_ids_root: String,
-    pub prompt_token_count: usize,
-    pub embedded_prompt_activations_ref: RasterActivationSequenceArtifactRef,
-}
-
-pub type RasterInputEmbeddingOutput = RasterRoutineOutput<RasterInputEmbeddingRefs>;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct InputEmbeddingRasterState {
-    source_id: String,
-    embedding_source_root: String,
-    prompt_token_ids_root: String,
-    prompt_token_count: usize,
-    hidden_size: usize,
-    next_token_idx: usize,
-}
-
-impl InputEmbeddingRasterState {
-    fn is_complete(&self) -> bool {
-        self.next_token_idx >= self.prompt_token_count
-    }
 }

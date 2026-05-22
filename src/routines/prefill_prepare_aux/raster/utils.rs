@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 
+use super::types::*;
+use crate::dsl::prelude::auth_read;
+use crate::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::merkle::merkle_root;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -9,7 +12,14 @@ use crate::shared::artifacts::raster_artifact_store::{
     TOKEN_ID_ARTIFACT_DOMAIN,
 };
 use crate::shared::model::transformer::{ActivationSequence, InternalActivationSequence};
+use crate::shared::raster_contracts::prefill_ple::{
+    AuthenticatedGemmaPleSource, GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest,
+};
+use crate::shared::raster_kernels::transformer::{
+    validate_projection_rows_per_tile, validate_sequence_rows_per_tile,
+};
 use crate::shared::raster_kernels::transformer::{RasterActivationRow, RasterActivationSequence};
+use crate::RasterSizingControls;
 
 pub(in super::super) fn reset_artifact_store() {
     ArtifactIo::reset_store();
@@ -233,4 +243,222 @@ pub(in super::super) fn internal_sequence_from_raster(
             .map(|row| row.acts())
             .collect(),
     )
+}
+
+pub(in super::super) fn artifact_source_name_for_root(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    root: &str,
+) -> Result<String> {
+    Ok(artifact_store_roots
+        .artifact_entry_for_root(root)?
+        .id()
+        .source_name()
+        .to_string())
+}
+
+pub(in super::super) fn token_ids_root<'a>(
+    artifact_store_roots: &'a RasterArtifactStoreRoots,
+    source_name: &str,
+) -> Result<&'a str> {
+    artifact_store_roots.artifact_root_for_source_name(source_name)
+}
+
+pub fn prepare_raster_prefill_ple_input_roots(
+    token_ids: &[u32],
+    input_activations: &ActivationSequence,
+    ple_source: &AuthenticatedGemmaPleSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
+    reset_artifact_store();
+    let artifact_store_roots = ArtifactIo::export_store_roots();
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
+    let (artifact_store_roots, token_ids_ref) =
+        store_prefill_token_ids_artifact_with_roots(&artifact_store_roots, token_ids)?;
+    let token_count = token_ids_ref.token_count();
+    let token_ids_source_name = token_ids_ref.id().source_name().to_string();
+    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
+    if !metadata.has_ple_global {
+        return Ok((
+            artifact_store_roots,
+            RasterPrefillPleInputRoots {
+                source_id: metadata.source_id,
+                token_ids_source_name,
+                token_count: token_ids_ref.token_count(),
+                input_activations_ref: None,
+                layer_count: metadata.layer_count,
+                has_ple_global: false,
+                raster_sizing,
+            },
+        ));
+    }
+
+    if metadata.layer_count == 0 {
+        bail!("transformer PLE computation requires at least one layer");
+    }
+    if metadata.token_embedding_layer_count != metadata.layer_count {
+        bail!(
+            "transformer PLE token embedding slice count mismatch: {} vs {}",
+            metadata.token_embedding_layer_count,
+            metadata.layer_count
+        );
+    }
+    if metadata.model_projection_layer_count != metadata.layer_count {
+        bail!(
+            "transformer PLE model projection slice count mismatch: {} vs {}",
+            metadata.model_projection_layer_count,
+            metadata.layer_count
+        );
+    }
+
+    let input_activations = raster_activation_sequence_from_embedding(input_activations)?;
+    if input_activations.is_empty() {
+        bail!("transformer PLE computation requires at least one activation row");
+    }
+    if token_count != input_activations.len() {
+        bail!(
+            "transformer PLE computation requires token ids and activations to have matching lengths"
+        );
+    }
+
+    let first_layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx: 0 })?;
+    let activation_width = input_activations.width()?;
+    if activation_width != first_layer.hidden_width {
+        bail!(
+            "input activations row 0 has width {}, expected {}",
+            activation_width,
+            first_layer.hidden_width
+        );
+    }
+    let (artifact_store_roots, input_activations_ref) = insert_activation_sequence_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new("prefill.prepare_aux.input.initial")?,
+        input_activations,
+    )?;
+
+    Ok((
+        artifact_store_roots,
+        RasterPrefillPleInputRoots {
+            source_id: metadata.source_id,
+            token_ids_source_name,
+            token_count: token_ids_ref.token_count(),
+            input_activations_ref: Some(input_activations_ref),
+            layer_count: metadata.layer_count,
+            has_ple_global: true,
+            raster_sizing,
+        },
+    ))
+}
+
+pub fn prepare_raster_prefill_ple_input_roots_from_embedding_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_source: &AuthenticatedGemmaPleSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
+    let token_ids_source_name = artifact_source_name_for_root(
+        &artifact_store_roots,
+        &input_embedding_refs.prompt_token_ids_root,
+    )?;
+    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
+    if !metadata.has_ple_global {
+        return Ok((
+            artifact_store_roots,
+            RasterPrefillPleInputRoots {
+                source_id: metadata.source_id,
+                token_ids_source_name,
+                token_count: input_embedding_refs.prompt_token_count,
+                input_activations_ref: None,
+                layer_count: metadata.layer_count,
+                has_ple_global: false,
+                raster_sizing,
+            },
+        ));
+    }
+
+    if metadata.layer_count == 0 {
+        bail!("transformer PLE computation requires at least one layer");
+    }
+    if metadata.token_embedding_layer_count != metadata.layer_count {
+        bail!(
+            "transformer PLE token embedding slice count mismatch: {} vs {}",
+            metadata.token_embedding_layer_count,
+            metadata.layer_count
+        );
+    }
+    if metadata.model_projection_layer_count != metadata.layer_count {
+        bail!(
+            "transformer PLE model projection slice count mismatch: {} vs {}",
+            metadata.model_projection_layer_count,
+            metadata.layer_count
+        );
+    }
+    if input_embedding_refs.prompt_token_count
+        != input_embedding_refs
+            .embedded_prompt_activations_ref
+            .row_count()
+    {
+        bail!("transformer PLE computation requires token ids and activations to have matching lengths");
+    }
+
+    let first_layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx: 0 })?;
+    if input_embedding_refs.embedded_prompt_activations_ref.width() != first_layer.hidden_width {
+        bail!(
+            "input activations row 0 has width {}, expected {}",
+            input_embedding_refs.embedded_prompt_activations_ref.width(),
+            first_layer.hidden_width
+        );
+    }
+    artifact_store_roots
+        .artifact_entry_for_root(input_embedding_refs.embedded_prompt_activations_ref.root())?;
+
+    Ok((
+        artifact_store_roots,
+        RasterPrefillPleInputRoots {
+            source_id: metadata.source_id,
+            token_ids_source_name,
+            token_count: input_embedding_refs.prompt_token_count,
+            input_activations_ref: Some(
+                input_embedding_refs.embedded_prompt_activations_ref.clone(),
+            ),
+            layer_count: metadata.layer_count,
+            has_ple_global: true,
+            raster_sizing,
+        },
+    ))
+}
+
+pub fn run(
+    token_ids: &[u32],
+    input_activations: &ActivationSequence,
+    ple_source: &AuthenticatedGemmaPleSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
+    let (artifact_store_roots, input_roots) = prepare_raster_prefill_ple_input_roots(
+        token_ids,
+        input_activations,
+        ple_source,
+        raster_sizing,
+    )?;
+    super::tiles::main(artifact_store_roots, input_roots, ple_source)
+}
+
+pub fn run_with_input_embedding_refs(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_embedding_refs: &RasterInputEmbeddingRefs,
+    ple_source: &AuthenticatedGemmaPleSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<RasterPrefillPleOutput> {
+    let (artifact_store_roots, input_roots) =
+        prepare_raster_prefill_ple_input_roots_from_embedding_refs(
+            artifact_store_roots,
+            input_embedding_refs,
+            ple_source,
+            raster_sizing,
+        )?;
+    let (artifact_store_roots, refs) =
+        super::tiles::main(artifact_store_roots, input_roots, ple_source)?;
+    Ok(RasterPrefillPleOutput::new(artifact_store_roots, refs))
 }
