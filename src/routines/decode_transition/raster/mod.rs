@@ -8,5 +8,7 @@ pub use types::*;
 pub use utils::*;
 
 #[cfg(test)]
-#[path = "raster/tests.rs"]
+pub(super) use tiles::prepare_next_decode_layer_context;
+
+#[cfg(test)]
 mod tests;

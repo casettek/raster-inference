@@ -4,8 +4,6 @@ pub(super) mod utils;
 
 pub use tiles::*;
 pub use types::*;
-pub use utils::*;
 
 #[cfg(test)]
-#[path = "raster/tests.rs"]
 mod tests;

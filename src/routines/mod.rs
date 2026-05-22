@@ -12,30 +12,21 @@ mod tests {
     const HOSTS: &[(&str, &str)] = &[
         (
             "decode_select_token",
-            include_str!("routines/decode_select_token.rs"),
+            include_str!("decode_select_token/mod.rs"),
         ),
         (
             "decode_transition",
-            include_str!("routines/decode_transition.rs"),
+            include_str!("decode_transition/mod.rs"),
         ),
-        (
-            "input_embedding",
-            include_str!("routines/input_embedding.rs"),
-        ),
-        (
-            "output_finalize",
-            include_str!("routines/output_finalize.rs"),
-        ),
-        (
-            "prefill_finalize",
-            include_str!("routines/prefill_finalize.rs"),
-        ),
-        ("prefill_layer", include_str!("routines/prefill_layer.rs")),
+        ("input_embedding", include_str!("input_embedding/mod.rs")),
+        ("output_finalize", include_str!("output_finalize/mod.rs")),
+        ("prefill_finalize", include_str!("prefill_finalize/mod.rs")),
+        ("prefill_layer", include_str!("prefill_layer/mod.rs")),
         (
             "prefill_prepare_aux",
-            include_str!("routines/prefill_prepare_aux.rs"),
+            include_str!("prefill_prepare_aux/mod.rs"),
         ),
-        ("prompt_prepare", include_str!("routines/prompt_prepare.rs")),
+        ("prompt_prepare", include_str!("prompt_prepare/mod.rs")),
     ];
 
     #[test]

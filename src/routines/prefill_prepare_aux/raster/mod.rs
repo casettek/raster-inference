@@ -13,5 +13,4 @@ pub(super) use tiles::{
 };
 
 #[cfg(test)]
-#[path = "raster/tests.rs"]
 mod tests;

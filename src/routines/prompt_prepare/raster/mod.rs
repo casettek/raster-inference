@@ -1,4 +1,3 @@
-pub mod auth_source;
 mod tiles;
 mod types;
 pub(super) mod utils;
@@ -8,5 +7,4 @@ pub use types::*;
 pub use utils::*;
 
 #[cfg(test)]
-#[path = "raster/tests.rs"]
 mod tests;
