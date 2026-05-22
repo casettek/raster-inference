@@ -53,369 +53,7 @@ use crate::RasterSizingControls;
 
 use super::super::native::ActivationSequenceWithCache;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeTransitionRasterState {
-    artifact_store_roots: RasterArtifactStoreRoots,
-    decode_input_ref: RasterActivationSequenceRef,
-    current_activation_ref: RasterActivationSequenceRef,
-    next_token: u32,
-    position: usize,
-    token_count: usize,
-    next_layer_idx: usize,
-    layer_count: usize,
-    original_layer_caches: Vec<DecodeLayerCacheSlot>,
-    updated_layer_caches: Vec<DecodeLayerCacheSlot>,
-    completed_layer_output_sha256s: Vec<String>,
-    completed_layer_output_det_sha256s: Vec<Option<String>>,
-    projection_rows_per_tile: usize,
-    attention_kv_rows_per_tile: usize,
-    output_source_prefix: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RasterDecodeTransitionInputRoots {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub transformer_decode_state: TransformerDecodeState,
-    pub selected_token_ref: RasterSelectedTokenRef,
-    pub decode_transition_source_root: String,
-    pub output_source_prefix: String,
-    pub raster_sizing: RasterSizingControls,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterDecodeTransitionInputRefs {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub position: usize,
-    pub token_count: usize,
-    pub layer_caches: Vec<DecodeLayerCacheSlot>,
-    pub selected_token_ref: RasterSelectedTokenRef,
-    pub decode_transition_source_root: String,
-    pub output_source_prefix: String,
-    pub raster_sizing: RasterSizingControls,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RasterDecodeTransitionOutputRefs {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub transition_result: TransformerDecodeStepResult,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterDecodeTransitionOutputStateRefs {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub final_hidden_state_ref: RasterActivationSequenceRef,
-    pub logits_ref: RasterActivationSequenceRef,
-    pub logit_count: usize,
-    pub layer_caches: Vec<DecodeLayerCacheSlot>,
-    pub position: usize,
-    pub token_count: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum DecodeLayerCacheSlot {
-    Empty { num_kv_heads: usize },
-    Ref(RasterKvCacheRef),
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeLogitsRasterState {
-    normalized_final_position: RasterActivationRow,
-    next_logit_idx: usize,
-    logit_count: usize,
-    output_builder_ref: RasterProjectionOutputBuilderRef,
-    softcap_bits: Option<i32>,
-    projection_rows_per_tile: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum DecodeProjectionKind {
-    LayerMatrix {
-        layer_idx: usize,
-        matrix: GemmaDecodeLayerMatrixKind,
-    },
-    PleModel {
-        layer_idx: usize,
-    },
-    FinalLogits,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeRowProjectionState {
-    input: RasterActivationRow,
-    projection_kind: DecodeProjectionKind,
-    next_projection_row_idx: usize,
-    projection_rows: usize,
-    input_width: usize,
-    output_builder_ref: RasterProjectionOutputBuilderRef,
-    rows_per_tile: usize,
-    softcap_bits: Option<i32>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeRowProjectionArtifactState {
-    input_ref: RasterActivationSequenceRef,
-    projection_kind: DecodeProjectionKind,
-    output_source_name: String,
-    current_row_bits: Vec<i32>,
-    next_projection_row_idx: usize,
-    projection_rows: usize,
-    input_width: usize,
-    rows_per_tile: usize,
-    softcap_bits: Option<i32>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeAttentionState {
-    query_ref: RasterAttentionHeadsRef,
-    cache_ref: RasterKvCacheRef,
-    output_builder_ref: RasterTensorBuilderRef,
-    phase: DecodeAttentionPhase,
-    attention_id_prefix: String,
-    next_query_head_idx: usize,
-    query_head_count: usize,
-    kv_head_count: usize,
-    kv_groups: usize,
-    key_start: usize,
-    row_count: usize,
-    head_dim: usize,
-    kv_rows_per_tile: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeAttentionArtifactState {
-    query_ref: RasterAttentionHeadsRef,
-    cache_ref: RasterKvCacheRef,
-    output_source_name: String,
-    phase: DecodeAttentionArtifactPhase,
-    attention_id_prefix: String,
-    next_query_head_idx: usize,
-    query_head_count: usize,
-    kv_head_count: usize,
-    kv_groups: usize,
-    key_start: usize,
-    row_count: usize,
-    head_dim: usize,
-    kv_rows_per_tile: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct DecodeLayerContext {
-    layer_idx: usize,
-    layer: GemmaDecodeLayerMetadata,
-    cache_slot: DecodeLayerCacheSlot,
-    donor_cache_slot: Option<DecodeLayerCacheSlot>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeKvCacheAppendState {
-    old_cache_ref: Option<RasterKvCacheRef>,
-    key_ref: RasterAttentionHeadsRef,
-    value_ref: RasterAttentionHeadsRef,
-    output_builder_ref: RasterKvCacheBuilderRef,
-    retained_old_start: usize,
-    retained_old_len: usize,
-    next_head_idx: usize,
-    next_old_offset: usize,
-    head_count: usize,
-    rows_per_tile: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeKvCacheAppendArtifactState {
-    old_cache_ref: Option<RasterKvCacheRef>,
-    key_ref: RasterAttentionHeadsRef,
-    value_ref: RasterAttentionHeadsRef,
-    keys_source_name: String,
-    values_source_name: String,
-    retained_old_start: usize,
-    retained_old_len: usize,
-    next_head_idx: usize,
-    next_old_offset: usize,
-    head_count: usize,
-    current_len: usize,
-    head_dim: usize,
-    rows_per_tile: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-enum DecodeAttentionPhase {
-    CollectScores {
-        score_builder_ref: RasterTensorBuilderRef,
-        next_kv_offset: usize,
-    },
-    FindSoftmaxMax {
-        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        next_score_row_idx: usize,
-        max_index: Option<usize>,
-        max_logit_bits: i32,
-    },
-    SumSoftmaxExp {
-        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        next_score_row_idx: usize,
-        max_index: usize,
-        max_logit_bits: i32,
-        sum_exp_bits: i64,
-    },
-    BuildRawSoftmaxWeights {
-        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        raw_weight_builder_ref: RasterTensorBuilderRef,
-        next_score_row_idx: usize,
-        max_index: usize,
-        max_logit_bits: i32,
-        sum_exp_bits: i64,
-        summed_weight_bits: i32,
-    },
-    CorrectSoftmaxResidual {
-        raw_weight_ref:
-            crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        final_weight_builder_ref: RasterTensorBuilderRef,
-        next_weight_row_idx: usize,
-        max_index: usize,
-        residual_bits: i32,
-    },
-    ApplyValues {
-        weight_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        next_kv_offset: usize,
-        weighted_sum_acc_bits: Vec<i64>,
-    },
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-enum DecodeAttentionArtifactPhase {
-    CollectScores {
-        score_source_name: String,
-        next_kv_offset: usize,
-    },
-    FindSoftmaxMax {
-        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        next_score_row_idx: usize,
-        max_index: Option<usize>,
-        max_logit_bits: i32,
-    },
-    SumSoftmaxExp {
-        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        next_score_row_idx: usize,
-        max_index: usize,
-        max_logit_bits: i32,
-        sum_exp_bits: i64,
-    },
-    BuildRawSoftmaxWeights {
-        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        raw_weight_source_name: String,
-        next_score_row_idx: usize,
-        max_index: usize,
-        max_logit_bits: i32,
-        sum_exp_bits: i64,
-        summed_weight_bits: i32,
-    },
-    CorrectSoftmaxResidual {
-        raw_weight_ref:
-            crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        final_weight_source_name: String,
-        next_weight_row_idx: usize,
-        max_index: usize,
-        residual_bits: i32,
-    },
-    ApplyValues {
-        weight_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
-        next_kv_offset: usize,
-        weighted_sum_acc_bits: Vec<i64>,
-    },
-}
-
-#[tile]
-fn read_decode_selected_token(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    selected_token_ref: &RasterSelectedTokenRef,
-) -> Result<u32> {
-    read_selected_token_from_roots(artifact_store_roots, selected_token_ref)
-}
-
-#[tile]
-fn read_decode_single_activation_row(
-    state: &DecodeTransitionRasterState,
-    activation_ref: &RasterActivationSequenceRef,
-) -> Result<RasterActivationRow> {
-    read_activation_row_from_ref_roots(&state.artifact_store_roots, activation_ref)
-}
-
-#[tile]
-fn prepare_next_decode_layer_context(
-    state: &DecodeTransitionRasterState,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<DecodeLayerContext> {
-    let layer_idx = state.next_layer_idx;
-    let layer = auth_read!(source, GemmaDecodeLayerMetadataRequest { layer_idx })?;
-    let cache_slot = state
-        .original_layer_caches
-        .get(layer_idx)
-        .cloned()
-        .ok_or_else(|| anyhow!("transformer decode cache {layer_idx} missing"))?;
-    let donor_cache_slot =
-        resolve_decode_donor_cache_slot(&state.updated_layer_caches, layer_idx, &layer)?.cloned();
-    Ok(DecodeLayerContext {
-        layer_idx,
-        layer,
-        cache_slot,
-        donor_cache_slot,
-    })
-}
-
-#[tile]
-pub fn normalize_decode_final_position(
-    final_hidden_state: &ActivationSequence,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<RasterActivationRow> {
-    let internal = final_hidden_state.clone_internal();
-    let det_rows = internal.det_values().ok_or_else(|| {
-        anyhow!("deterministic raster decode finalize requires canonical final hidden activations")
-    })?;
-    let final_row = det_rows.last().ok_or_else(|| {
-        anyhow!("transformer final-position selection requires at least one activation row")
-    })?;
-    let norm_weights = auth_read!(source, GemmaDecodeFinalNormWeightsRequest)?;
-    let scalars = auth_read!(source, GemmaDecodeFinalScalarsRequest)?;
-    let normalized = rms_norm_sequence(
-        &RasterActivationSequence::from_rows(vec![RasterActivationRow::from_acts(
-            final_row.clone(),
-        )]),
-        Some(&norm_weights),
-        Some(scalars.rms_norm_eps),
-    )?;
-    first_row(normalized, "deterministic decode final RMSNorm")
-}
-
-#[sequence]
-pub fn run(
-    transformer_decode_state: TransformerDecodeState,
-    next_token: u32,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    raster_sizing: RasterSizingControls,
-) -> Result<TransformerDecodeStepResult> {
-    ArtifactIo::reset_store();
-    let roots = ArtifactIo::export_store_roots();
-    let output_source_prefix = format!(
-        "decode.transition.position_{}.token_count_{}",
-        transformer_decode_state.position, transformer_decode_state.token_count
-    );
-    let (artifact_store_roots, selected_token_ref) = insert_decode_selected_token_with_roots(
-        &roots,
-        format!("{output_source_prefix}.input.selected_token"),
-        next_token,
-    )?;
-    let output = main(
-        RasterDecodeTransitionInputRoots {
-            artifact_store_roots,
-            transformer_decode_state,
-            selected_token_ref,
-            decode_transition_source_root: source.static_source_root(),
-            output_source_prefix,
-            raster_sizing,
-        },
-        source,
-    )?;
-    Ok(output.transition_result)
-}
+// Raster execution sequences, ordered from the primary entry point outward.
 
 #[sequence]
 pub fn main(
@@ -489,221 +127,6 @@ pub fn main(
     })
 }
 
-#[sequence]
-pub fn main_state_refs(
-    input_roots: RasterDecodeTransitionInputRefs,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<RasterDecodeTransitionOutputStateRefs> {
-    if input_roots.decode_transition_source_root != source.static_source_root() {
-        bail!(
-            "raster decode transition source root {} does not match input source root {}",
-            source.static_source_root(),
-            input_roots.decode_transition_source_root
-        );
-    }
-    let next_token = call_tile!(
-        read_decode_selected_token,
-        &input_roots.artifact_store_roots,
-        &input_roots.selected_token_ref
-    )?;
-    let (_artifact_store_roots, state) = call_tile!(
-        init_decode_transition_state_from_refs_with_roots,
-        input_roots.artifact_store_roots,
-        input_roots.position,
-        input_roots.token_count,
-        input_roots.layer_caches,
-        next_token,
-        source,
-        input_roots.raster_sizing,
-        input_roots.output_source_prefix
-    )?;
-    let (artifact_store_roots, state) = call_recur_seq!(
-        compute_next_decode_layer_with_roots,
-        (_artifact_store_roots, state),
-        source
-    )?;
-    let final_hidden_state_ref = state.current_activation_ref.clone();
-    let (artifact_store_roots, normalized_ref) = call_tile!(
-        normalize_decode_final_position_ref_with_roots,
-        artifact_store_roots,
-        final_hidden_state_ref.clone(),
-        source,
-        format!("{}.final_norm", state.output_source_prefix)
-    )?;
-    let (artifact_store_roots, logits_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        normalized_ref,
-        source,
-        DecodeProjectionKind::FinalLogits,
-        call_tile!(decode_projection_row_count, source)?,
-        input_roots.raster_sizing.projection_rows_per_tile,
-        format!("{}.final_logits", state.output_source_prefix),
-        call_tile!(decode_final_logit_softcap_bits, source)?
-    )?;
-    let (layer_caches, position, token_count) =
-        call_tile!(finalize_decode_layer_refs_with_roots, state)?;
-    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
-    let logit_count = match (row_count, width) {
-        (rows, 1) => rows,
-        (1, cols) => cols,
-        _ => bail!("raster decode transition logits shape {row_count}x{width} must be Nx1 or 1xN"),
-    };
-    Ok(RasterDecodeTransitionOutputStateRefs {
-        artifact_store_roots,
-        final_hidden_state_ref,
-        logits_ref,
-        logit_count,
-        layer_caches,
-        position,
-        token_count,
-    })
-}
-
-#[tile]
-pub fn init_decode_transition_state_refs_with_roots(
-    mut artifact_store_roots: RasterArtifactStoreRoots,
-    transformer_decode_state: TransformerDecodeState,
-    next_token: u32,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    raster_sizing: RasterSizingControls,
-    output_source_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
-    validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
-    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
-    if metadata.layer_count == 0 {
-        bail!("transformer decode requires at least one layer");
-    }
-    if transformer_decode_state.layer_caches.len() != metadata.layer_count {
-        bail!(
-            "transformer decode cache count mismatch: {} vs {}",
-            transformer_decode_state.layer_caches.len(),
-            metadata.layer_count
-        );
-    }
-
-    let embedded = RasterActivationRow::from_acts(auth_read!(
-        source,
-        GemmaDecodeEmbeddingRowRequest {
-            token_id: next_token
-        },
-    )?);
-    if embedded.width() != metadata.embedding_width {
-        bail!(
-            "decode embedded token width {}, expected {}",
-            embedded.width(),
-            metadata.embedding_width
-        );
-    }
-    let (roots, decode_input_ref) = insert_decode_activation_row_with_roots(
-        &artifact_store_roots,
-        format!("{output_source_prefix}.input.selected_token_embedding"),
-        &embedded,
-    )?;
-    artifact_store_roots = roots;
-    let mut original_layer_caches = Vec::with_capacity(transformer_decode_state.layer_caches.len());
-    for (layer_idx, cache) in transformer_decode_state.layer_caches.iter().enumerate() {
-        let cache = raster_cache_from_layer_cache(cache)?;
-        let (roots, cache_slot) = register_decode_layer_cache_with_roots(
-            &artifact_store_roots,
-            &format!("{output_source_prefix}.original.cache"),
-            layer_idx,
-            cache,
-        )?;
-        artifact_store_roots = roots;
-        original_layer_caches.push(cache_slot);
-    }
-
-    Ok((
-        artifact_store_roots.clone(),
-        DecodeTransitionRasterState {
-            artifact_store_roots,
-            decode_input_ref: decode_input_ref.clone(),
-            current_activation_ref: decode_input_ref,
-            next_token,
-            position: transformer_decode_state.position,
-            token_count: transformer_decode_state.token_count,
-            next_layer_idx: 0,
-            layer_count: metadata.layer_count,
-            original_layer_caches,
-            updated_layer_caches: Vec::with_capacity(metadata.layer_count),
-            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
-            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
-            projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
-            attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
-            output_source_prefix,
-        },
-    ))
-}
-
-#[tile]
-pub fn init_decode_transition_state_from_refs_with_roots(
-    mut artifact_store_roots: RasterArtifactStoreRoots,
-    position: usize,
-    token_count: usize,
-    original_layer_caches: Vec<DecodeLayerCacheSlot>,
-    next_token: u32,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    raster_sizing: RasterSizingControls,
-    output_source_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
-    validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
-    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
-    if metadata.layer_count == 0 {
-        bail!("transformer decode requires at least one layer");
-    }
-    if original_layer_caches.len() != metadata.layer_count {
-        bail!(
-            "transformer decode cache count mismatch: {} vs {}",
-            original_layer_caches.len(),
-            metadata.layer_count
-        );
-    }
-
-    let embedded = RasterActivationRow::from_acts(auth_read!(
-        source,
-        GemmaDecodeEmbeddingRowRequest {
-            token_id: next_token
-        },
-    )?);
-    if embedded.width() != metadata.embedding_width {
-        bail!(
-            "decode embedded token width {}, expected {}",
-            embedded.width(),
-            metadata.embedding_width
-        );
-    }
-    let (roots, decode_input_ref) = insert_decode_activation_row_with_roots(
-        &artifact_store_roots,
-        format!("{output_source_prefix}.input.selected_token_embedding"),
-        &embedded,
-    )?;
-    artifact_store_roots = roots;
-
-    Ok((
-        artifact_store_roots.clone(),
-        DecodeTransitionRasterState {
-            artifact_store_roots,
-            decode_input_ref: decode_input_ref.clone(),
-            current_activation_ref: decode_input_ref,
-            next_token,
-            position,
-            token_count,
-            next_layer_idx: 0,
-            layer_count: metadata.layer_count,
-            original_layer_caches,
-            updated_layer_caches: Vec::with_capacity(metadata.layer_count),
-            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
-            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
-            projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
-            attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
-            output_source_prefix,
-        },
-    ))
-}
-
 #[sequence(kind = recursive)]
 pub fn compute_next_decode_layer_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
@@ -762,40 +185,120 @@ pub fn compute_next_decode_layer_with_roots(
     )
 }
 
-#[tile]
-fn update_decode_layer_state_refs_with_roots(
+#[sequence]
+fn compute_decode_ple_input_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: DecodeTransitionRasterState,
-    layer_idx: usize,
-    layer_output_ref: RasterActivationSequenceRef,
-    updated_cache: DecodeLayerCacheSlot,
-) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    if layer_idx != state.next_layer_idx {
-        bail!(
-            "cannot update decode layer {layer_idx} while next layer is {}",
-            state.next_layer_idx
-        );
+    token_id: u32,
+    decode_input_ref: RasterActivationSequenceRef,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer: &GemmaDecodeLayerMetadata,
+    projection_rows_per_tile: usize,
+    output_prefix: String,
+) -> Result<(
+    RasterArtifactStoreRoots,
+    Option<RasterActivationSequenceRef>,
+)> {
+    if !layer.has_ple {
+        return Ok((artifact_store_roots, None));
     }
-    let layer_output =
-        read_activation_row_from_ref_roots(&artifact_store_roots, &layer_output_ref)?;
-    state.artifact_store_roots = artifact_store_roots.clone();
-    state.current_activation_ref = layer_output_ref;
-    state.updated_layer_caches.push(updated_cache);
-    let current_activation_values = layer_output.to_f32_values();
-    let current_activation_acts = layer_output.acts();
-    state.completed_layer_output_sha256s.push(
-        crate::shared::numerics::transformer_kernels::build_vector_commitment(
-            &current_activation_values,
-        ),
-    );
-    state.completed_layer_output_det_sha256s.push(Some(
-        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
-            &current_activation_acts,
-        ),
-    ));
-    trace_decode_layer_checkpoint_with_roots(&artifact_store_roots, &state, layer_idx)?;
-    state.next_layer_idx += 1;
-    Ok((false, artifact_store_roots, state))
+
+    let ple_width = call_tile!(decode_ple_input_gate_rows, layer)?;
+    let scalars = call_tile!(read_decode_ple_scalars, source)?;
+    let norm_weights = call_tile!(read_decode_ple_projection_norm_weights, source)?;
+    let embedded = call_tile!(
+        read_decode_ple_token_embedding,
+        source,
+        layer.layer_idx,
+        token_id
+    )?;
+    let embedded = call_tile!(
+        scale_decode_row_optional,
+        &embedded,
+        Some(scalars.embedding_scale)
+    )?;
+    let (artifact_store_roots, embedded_ref) = insert_decode_activation_row_with_roots(
+        &artifact_store_roots,
+        format!("{output_prefix}.token_embedding"),
+        &embedded,
+    )?;
+
+    let (artifact_store_roots, projected_ref) = call_seq!(
+        project_ref_with_decode_source_with_roots,
+        artifact_store_roots,
+        decode_input_ref,
+        source,
+        DecodeProjectionKind::PleModel {
+            layer_idx: layer.layer_idx,
+        },
+        ple_width,
+        projection_rows_per_tile,
+        format!("{output_prefix}.model_projection"),
+        None
+    )?;
+    let (artifact_store_roots, projected_ref) = call_tile!(
+        scale_decode_ref_optional_with_roots,
+        artifact_store_roots,
+        projected_ref,
+        Some(scalars.projection_scalar),
+        format!("{output_prefix}.projection_scaled")
+    )?;
+    let (artifact_store_roots, projected_ref) = call_tile!(
+        rms_norm_decode_ref_with_roots,
+        artifact_store_roots,
+        projected_ref,
+        &norm_weights,
+        scalars.rms_norm_eps,
+        "decode PLE input RMSNorm",
+        format!("{output_prefix}.projection_norm")
+    )?;
+    let (artifact_store_roots, combined_ref) = call_tile!(
+        add_decode_refs_with_roots,
+        artifact_store_roots,
+        embedded_ref,
+        projected_ref,
+        format!("{output_prefix}.combined")
+    )?;
+    let (artifact_store_roots, input_ref) = call_tile!(
+        scale_decode_ref_optional_with_roots,
+        artifact_store_roots,
+        combined_ref,
+        Some(scalars.input_scale),
+        format!("{output_prefix}.scaled")
+    )?;
+    Ok((artifact_store_roots, Some(input_ref)))
+}
+
+#[sequence]
+fn project_ref_with_decode_source_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    projection_kind: DecodeProjectionKind,
+    projection_rows: usize,
+    rows_per_tile: usize,
+    output_id: String,
+    softcap_bits: Option<i32>,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_decode_row_projection_artifact,
+        artifact_store_roots,
+        input_ref,
+        projection_kind,
+        projection_rows,
+        rows_per_tile,
+        RasterTensorId::new(output_id)?,
+        softcap_bits
+    )?;
+    let (artifact_store_roots, state) = call_recur_tile!(
+        project_next_decode_projection_chunk_with_roots,
+        (artifact_store_roots, state),
+        source
+    )?;
+    call_tile!(
+        finalize_decode_row_projection_ref_with_roots,
+        artifact_store_roots,
+        state
+    )
 }
 
 #[sequence]
@@ -927,268 +430,25 @@ fn run_decode_attention_block_with_roots(
 }
 
 #[sequence]
-fn run_decode_mlp_block_with_roots(
+fn rms_norm_decode_layer_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
     source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    rms_norm_eps: Acc,
-    projection_rows_per_tile: usize,
-    output_prefix: String,
+    layer_idx: usize,
+    norm: GemmaDecodeLayerNormKind,
+    output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let residual_ref = input_ref.clone();
-    let norm_weights = call_tile!(
-        read_decode_layer_norm_weights,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::PreFeedForward
-    )?;
-    let (artifact_store_roots, normed_ref) = call_tile!(
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
+    call_tile!(
         rms_norm_decode_ref_with_roots,
         artifact_store_roots,
         input_ref,
-        &norm_weights,
-        rms_norm_eps,
-        "decode MLP pre-feedforward RMSNorm",
-        format!("{output_prefix}.pre_ff_norm")
-    )?;
-    let (artifact_store_roots, gate_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        normed_ref.clone(),
-        source,
-        DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
-            matrix: GemmaDecodeLayerMatrixKind::Gate,
-        },
-        layer.gate_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.gate_proj"),
-        None
-    )?;
-    let (artifact_store_roots, gate_ref) = call_tile!(
-        gelu_decode_ref_with_roots,
-        artifact_store_roots,
-        gate_ref,
-        format!("{output_prefix}.gate_gelu")
-    )?;
-    let (artifact_store_roots, up_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        normed_ref,
-        source,
-        DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
-            matrix: GemmaDecodeLayerMatrixKind::Up,
-        },
-        layer.up_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.up_proj"),
-        None
-    )?;
-    let (artifact_store_roots, ff_hidden_ref) = call_tile!(
-        mul_decode_refs_with_roots,
-        artifact_store_roots,
-        gate_ref,
-        up_ref,
-        format!("{output_prefix}.ff_hidden")
-    )?;
-    let (artifact_store_roots, ff_out_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        ff_hidden_ref,
-        source,
-        DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
-            matrix: GemmaDecodeLayerMatrixKind::Down,
-        },
-        layer.down_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.down_proj"),
-        None
-    )?;
-    let norm_weights = call_tile!(
-        read_decode_layer_norm_weights,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::PostFeedForward
-    )?;
-    let (artifact_store_roots, ff_out_ref) = call_tile!(
-        rms_norm_decode_ref_with_roots,
-        artifact_store_roots,
-        ff_out_ref,
-        &norm_weights,
-        rms_norm_eps,
-        "decode MLP post-feedforward RMSNorm",
-        format!("{output_prefix}.post_ff_norm")
-    )?;
-    call_tile!(
-        add_decode_refs_with_roots,
-        artifact_store_roots,
-        residual_ref,
-        ff_out_ref,
-        format!("{output_prefix}.residual")
-    )
-}
-
-#[sequence]
-fn run_decode_ple_block_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    per_layer_input_ref: RasterActivationSequenceRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    rms_norm_eps: Acc,
-    projection_rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let residual_ref = input_ref.clone();
-    let (artifact_store_roots, gated_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        input_ref,
-        source,
-        DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
-            matrix: GemmaDecodeLayerMatrixKind::PleInputGate,
-        },
-        call_tile!(decode_ple_input_gate_rows, layer)?,
-        projection_rows_per_tile,
-        format!("{output_prefix}.input_gate"),
-        None
-    )?;
-    let (artifact_store_roots, gated_ref) = call_tile!(
-        gelu_decode_ref_with_roots,
-        artifact_store_roots,
-        gated_ref,
-        format!("{output_prefix}.input_gate_gelu")
-    )?;
-    let (artifact_store_roots, gated_ref) = call_tile!(
-        mul_decode_refs_with_roots,
-        artifact_store_roots,
-        gated_ref,
-        per_layer_input_ref,
-        format!("{output_prefix}.gated")
-    )?;
-    let (artifact_store_roots, projected_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        gated_ref,
-        source,
-        DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
-            matrix: GemmaDecodeLayerMatrixKind::PleLayerProjection,
-        },
-        call_tile!(decode_ple_layer_projection_rows, layer)?,
-        projection_rows_per_tile,
-        format!("{output_prefix}.layer_projection"),
-        None
-    )?;
-    let norm_weights = call_tile!(
-        read_decode_layer_norm_weights,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::PlePostInput
-    )?;
-    let (artifact_store_roots, projected_ref) = call_tile!(
-        rms_norm_decode_ref_with_roots,
-        artifact_store_roots,
-        projected_ref,
-        &norm_weights,
-        rms_norm_eps,
-        "decode PLE post-input RMSNorm",
-        format!("{output_prefix}.post_input_norm")
-    )?;
-    call_tile!(
-        add_decode_refs_with_roots,
-        artifact_store_roots,
-        residual_ref,
-        projected_ref,
-        format!("{output_prefix}.residual")
-    )
-}
-
-#[sequence]
-fn compute_decode_ple_input_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    token_id: u32,
-    decode_input_ref: RasterActivationSequenceRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    projection_rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    Option<RasterActivationSequenceRef>,
-)> {
-    if !layer.has_ple {
-        return Ok((artifact_store_roots, None));
-    }
-
-    let ple_width = call_tile!(decode_ple_input_gate_rows, layer)?;
-    let scalars = call_tile!(read_decode_ple_scalars, source)?;
-    let norm_weights = call_tile!(read_decode_ple_projection_norm_weights, source)?;
-    let embedded = call_tile!(
-        read_decode_ple_token_embedding,
-        source,
-        layer.layer_idx,
-        token_id
-    )?;
-    let embedded = call_tile!(
-        scale_decode_row_optional,
-        &embedded,
-        Some(scalars.embedding_scale)
-    )?;
-    let (artifact_store_roots, embedded_ref) = insert_decode_activation_row_with_roots(
-        &artifact_store_roots,
-        format!("{output_prefix}.token_embedding"),
-        &embedded,
-    )?;
-
-    let (artifact_store_roots, projected_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        decode_input_ref,
-        source,
-        DecodeProjectionKind::PleModel {
-            layer_idx: layer.layer_idx,
-        },
-        ple_width,
-        projection_rows_per_tile,
-        format!("{output_prefix}.model_projection"),
-        None
-    )?;
-    let (artifact_store_roots, projected_ref) = call_tile!(
-        scale_decode_ref_optional_with_roots,
-        artifact_store_roots,
-        projected_ref,
-        Some(scalars.projection_scalar),
-        format!("{output_prefix}.projection_scaled")
-    )?;
-    let (artifact_store_roots, projected_ref) = call_tile!(
-        rms_norm_decode_ref_with_roots,
-        artifact_store_roots,
-        projected_ref,
         &norm_weights,
         scalars.rms_norm_eps,
-        "decode PLE input RMSNorm",
-        format!("{output_prefix}.projection_norm")
-    )?;
-    let (artifact_store_roots, combined_ref) = call_tile!(
-        add_decode_refs_with_roots,
-        artifact_store_roots,
-        embedded_ref,
-        projected_ref,
-        format!("{output_prefix}.combined")
-    )?;
-    let (artifact_store_roots, input_ref) = call_tile!(
-        scale_decode_ref_optional_with_roots,
-        artifact_store_roots,
-        combined_ref,
-        Some(scalars.input_scale),
-        format!("{output_prefix}.scaled")
-    )?;
-    Ok((artifact_store_roots, Some(input_ref)))
+        "decode layer RMSNorm",
+        output_source_name
+    )
 }
 
 #[sequence]
@@ -1381,36 +641,837 @@ fn run_decode_attention_with_roots(
 }
 
 #[sequence]
-fn project_ref_with_decode_source_with_roots(
+fn rms_norm_decode_attention_heads_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
+    heads_ref: RasterAttentionHeadsRef,
     source: &AuthenticatedGemmaDecodeTransitionSource,
-    projection_kind: DecodeProjectionKind,
-    projection_rows: usize,
+    layer_idx: usize,
+    norm: GemmaDecodeLayerNormKind,
+    output_source_name: String,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
+    let heads = materialize_attention_heads_from_roots(&artifact_store_roots, &heads_ref)?;
+    let heads = call_tile!(
+        rms_norm_decode_heads,
+        &heads,
+        &norm_weights,
+        scalars.rms_norm_eps
+    )?;
+    insert_attention_heads_with_roots(&artifact_store_roots, output_source_name, heads)
+}
+
+#[sequence]
+fn value_rms_norm_decode_attention_heads_ref_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    heads_ref: RasterAttentionHeadsRef,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    output_source_name: String,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    let heads = materialize_attention_heads_from_roots(&artifact_store_roots, &heads_ref)?;
+    let heads = call_tile!(value_rms_norm_decode_heads, &heads, scalars.rms_norm_eps)?;
+    insert_attention_heads_with_roots(&artifact_store_roots, output_source_name, heads)
+}
+
+#[sequence]
+fn update_decode_attention_cache_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    cache_slot: DecodeLayerCacheSlot,
+    use_donor_cache: bool,
+    k_heads_ref: RasterAttentionHeadsRef,
+    v_heads_ref: RasterAttentionHeadsRef,
+    layer_idx: usize,
+    cache_window: Option<usize>,
     rows_per_tile: usize,
-    output_id: String,
-    softcap_bits: Option<i32>,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
-        init_decode_row_projection_artifact,
+    output_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
+    if use_donor_cache {
+        return Ok((artifact_store_roots, cache_slot));
+    }
+    call_seq!(
+        append_decode_kv_cache_ref_with_roots,
         artifact_store_roots,
-        input_ref,
-        projection_kind,
-        projection_rows,
+        cache_slot,
+        k_heads_ref,
+        v_heads_ref,
+        layer_idx,
+        cache_window,
         rows_per_tile,
-        RasterTensorId::new(output_id)?,
-        softcap_bits
+        output_prefix
+    )
+}
+
+#[sequence]
+fn append_decode_kv_cache_ref_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    cache_slot: DecodeLayerCacheSlot,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    layer_idx: usize,
+    cache_window: Option<usize>,
+    rows_per_tile: usize,
+    output_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_decode_kv_cache_append_state_with_roots,
+        artifact_store_roots,
+        cache_slot,
+        key_ref,
+        value_ref,
+        RasterTensorId::new(format!("{output_prefix}.{layer_idx}.keys"))?,
+        RasterTensorId::new(format!("{output_prefix}.{layer_idx}.values"))?,
+        cache_window,
+        rows_per_tile
     )?;
     let (artifact_store_roots, state) = call_recur_tile!(
-        project_next_decode_projection_chunk_with_roots,
-        (artifact_store_roots, state),
-        source
+        compute_next_decode_kv_cache_append_row_with_roots,
+        (artifact_store_roots, state)
     )?;
     call_tile!(
-        finalize_decode_row_projection_ref_with_roots,
+        finalize_decode_kv_cache_append_state_with_roots,
         artifact_store_roots,
         state
     )
+}
+
+#[sequence]
+fn compute_decode_attention_ref_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    query_ref: RasterAttentionHeadsRef,
+    cache_ref: RasterKvCacheRef,
+    id_prefix: String,
+    attention_window: Option<usize>,
+    kv_rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_decode_attention_artifact_state_from_refs,
+        artifact_store_roots,
+        query_ref,
+        cache_ref,
+        RasterTensorId::new(format!("{id_prefix}.output"))?,
+        id_prefix,
+        attention_window,
+        kv_rows_per_tile
+    )?;
+    let (artifact_store_roots, state) = call_recur_tile!(
+        compute_next_decode_attention_head_with_roots,
+        (artifact_store_roots, state)
+    )?;
+    call_tile!(
+        finalize_decode_attention_state_ref_with_roots,
+        artifact_store_roots,
+        state
+    )
+}
+
+#[sequence]
+fn combine_decode_attention_heads_ref_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    heads_ref: RasterAttentionHeadsRef,
+    output_id: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let (artifact_store_roots, state) =
+        crate::shared::raster_kernels::transformer::init_combine_heads_artifact_state_from_ref(
+            artifact_store_roots,
+            heads_ref,
+            RasterTensorId::new(output_id)?,
+        )?;
+    let mut artifact_store_roots = artifact_store_roots;
+    let mut state = state;
+    loop {
+        let (done, next_roots, next_state) =
+            crate::shared::raster_kernels::transformer::compute_next_combine_heads_artifact_row(
+                artifact_store_roots,
+                state,
+            )?;
+        artifact_store_roots = next_roots;
+        state = next_state;
+        if done {
+            break;
+        }
+    }
+    crate::shared::raster_kernels::transformer::finalize_combine_heads_artifact_state_ref(
+        artifact_store_roots,
+        state,
+    )
+}
+
+#[sequence]
+fn run_decode_mlp_block_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer: &GemmaDecodeLayerMetadata,
+    rms_norm_eps: Acc,
+    projection_rows_per_tile: usize,
+    output_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let residual_ref = input_ref.clone();
+    let norm_weights = call_tile!(
+        read_decode_layer_norm_weights,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::PreFeedForward
+    )?;
+    let (artifact_store_roots, normed_ref) = call_tile!(
+        rms_norm_decode_ref_with_roots,
+        artifact_store_roots,
+        input_ref,
+        &norm_weights,
+        rms_norm_eps,
+        "decode MLP pre-feedforward RMSNorm",
+        format!("{output_prefix}.pre_ff_norm")
+    )?;
+    let (artifact_store_roots, gate_ref) = call_seq!(
+        project_ref_with_decode_source_with_roots,
+        artifact_store_roots,
+        normed_ref.clone(),
+        source,
+        DecodeProjectionKind::LayerMatrix {
+            layer_idx: layer.layer_idx,
+            matrix: GemmaDecodeLayerMatrixKind::Gate,
+        },
+        layer.gate_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("{output_prefix}.gate_proj"),
+        None
+    )?;
+    let (artifact_store_roots, gate_ref) = call_tile!(
+        gelu_decode_ref_with_roots,
+        artifact_store_roots,
+        gate_ref,
+        format!("{output_prefix}.gate_gelu")
+    )?;
+    let (artifact_store_roots, up_ref) = call_seq!(
+        project_ref_with_decode_source_with_roots,
+        artifact_store_roots,
+        normed_ref,
+        source,
+        DecodeProjectionKind::LayerMatrix {
+            layer_idx: layer.layer_idx,
+            matrix: GemmaDecodeLayerMatrixKind::Up,
+        },
+        layer.up_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("{output_prefix}.up_proj"),
+        None
+    )?;
+    let (artifact_store_roots, ff_hidden_ref) = call_tile!(
+        mul_decode_refs_with_roots,
+        artifact_store_roots,
+        gate_ref,
+        up_ref,
+        format!("{output_prefix}.ff_hidden")
+    )?;
+    let (artifact_store_roots, ff_out_ref) = call_seq!(
+        project_ref_with_decode_source_with_roots,
+        artifact_store_roots,
+        ff_hidden_ref,
+        source,
+        DecodeProjectionKind::LayerMatrix {
+            layer_idx: layer.layer_idx,
+            matrix: GemmaDecodeLayerMatrixKind::Down,
+        },
+        layer.down_proj_shape.rows,
+        projection_rows_per_tile,
+        format!("{output_prefix}.down_proj"),
+        None
+    )?;
+    let norm_weights = call_tile!(
+        read_decode_layer_norm_weights,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::PostFeedForward
+    )?;
+    let (artifact_store_roots, ff_out_ref) = call_tile!(
+        rms_norm_decode_ref_with_roots,
+        artifact_store_roots,
+        ff_out_ref,
+        &norm_weights,
+        rms_norm_eps,
+        "decode MLP post-feedforward RMSNorm",
+        format!("{output_prefix}.post_ff_norm")
+    )?;
+    call_tile!(
+        add_decode_refs_with_roots,
+        artifact_store_roots,
+        residual_ref,
+        ff_out_ref,
+        format!("{output_prefix}.residual")
+    )
+}
+
+#[sequence]
+fn run_decode_ple_block_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    per_layer_input_ref: RasterActivationSequenceRef,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer: &GemmaDecodeLayerMetadata,
+    rms_norm_eps: Acc,
+    projection_rows_per_tile: usize,
+    output_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let residual_ref = input_ref.clone();
+    let (artifact_store_roots, gated_ref) = call_seq!(
+        project_ref_with_decode_source_with_roots,
+        artifact_store_roots,
+        input_ref,
+        source,
+        DecodeProjectionKind::LayerMatrix {
+            layer_idx: layer.layer_idx,
+            matrix: GemmaDecodeLayerMatrixKind::PleInputGate,
+        },
+        call_tile!(decode_ple_input_gate_rows, layer)?,
+        projection_rows_per_tile,
+        format!("{output_prefix}.input_gate"),
+        None
+    )?;
+    let (artifact_store_roots, gated_ref) = call_tile!(
+        gelu_decode_ref_with_roots,
+        artifact_store_roots,
+        gated_ref,
+        format!("{output_prefix}.input_gate_gelu")
+    )?;
+    let (artifact_store_roots, gated_ref) = call_tile!(
+        mul_decode_refs_with_roots,
+        artifact_store_roots,
+        gated_ref,
+        per_layer_input_ref,
+        format!("{output_prefix}.gated")
+    )?;
+    let (artifact_store_roots, projected_ref) = call_seq!(
+        project_ref_with_decode_source_with_roots,
+        artifact_store_roots,
+        gated_ref,
+        source,
+        DecodeProjectionKind::LayerMatrix {
+            layer_idx: layer.layer_idx,
+            matrix: GemmaDecodeLayerMatrixKind::PleLayerProjection,
+        },
+        call_tile!(decode_ple_layer_projection_rows, layer)?,
+        projection_rows_per_tile,
+        format!("{output_prefix}.layer_projection"),
+        None
+    )?;
+    let norm_weights = call_tile!(
+        read_decode_layer_norm_weights,
+        source,
+        layer.layer_idx,
+        GemmaDecodeLayerNormKind::PlePostInput
+    )?;
+    let (artifact_store_roots, projected_ref) = call_tile!(
+        rms_norm_decode_ref_with_roots,
+        artifact_store_roots,
+        projected_ref,
+        &norm_weights,
+        rms_norm_eps,
+        "decode PLE post-input RMSNorm",
+        format!("{output_prefix}.post_input_norm")
+    )?;
+    call_tile!(
+        add_decode_refs_with_roots,
+        artifact_store_roots,
+        residual_ref,
+        projected_ref,
+        format!("{output_prefix}.residual")
+    )
+}
+
+#[sequence]
+pub fn run(
+    transformer_decode_state: TransformerDecodeState,
+    next_token: u32,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<TransformerDecodeStepResult> {
+    ArtifactIo::reset_store();
+    let roots = ArtifactIo::export_store_roots();
+    let output_source_prefix = format!(
+        "decode.transition.position_{}.token_count_{}",
+        transformer_decode_state.position, transformer_decode_state.token_count
+    );
+    let (artifact_store_roots, selected_token_ref) = insert_decode_selected_token_with_roots(
+        &roots,
+        format!("{output_source_prefix}.input.selected_token"),
+        next_token,
+    )?;
+    let output = main(
+        RasterDecodeTransitionInputRoots {
+            artifact_store_roots,
+            transformer_decode_state,
+            selected_token_ref,
+            decode_transition_source_root: source.static_source_root(),
+            output_source_prefix,
+            raster_sizing,
+        },
+        source,
+    )?;
+    Ok(output.transition_result)
+}
+
+#[sequence]
+pub fn main_state_refs(
+    input_roots: RasterDecodeTransitionInputRefs,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<RasterDecodeTransitionOutputStateRefs> {
+    if input_roots.decode_transition_source_root != source.static_source_root() {
+        bail!(
+            "raster decode transition source root {} does not match input source root {}",
+            source.static_source_root(),
+            input_roots.decode_transition_source_root
+        );
+    }
+    let next_token = call_tile!(
+        read_decode_selected_token,
+        &input_roots.artifact_store_roots,
+        &input_roots.selected_token_ref
+    )?;
+    let (_artifact_store_roots, state) = call_tile!(
+        init_decode_transition_state_from_refs_with_roots,
+        input_roots.artifact_store_roots,
+        input_roots.position,
+        input_roots.token_count,
+        input_roots.layer_caches,
+        next_token,
+        source,
+        input_roots.raster_sizing,
+        input_roots.output_source_prefix
+    )?;
+    let (artifact_store_roots, state) = call_recur_seq!(
+        compute_next_decode_layer_with_roots,
+        (_artifact_store_roots, state),
+        source
+    )?;
+    let final_hidden_state_ref = state.current_activation_ref.clone();
+    let (artifact_store_roots, normalized_ref) = call_tile!(
+        normalize_decode_final_position_ref_with_roots,
+        artifact_store_roots,
+        final_hidden_state_ref.clone(),
+        source,
+        format!("{}.final_norm", state.output_source_prefix)
+    )?;
+    let (artifact_store_roots, logits_ref) = call_seq!(
+        project_ref_with_decode_source_with_roots,
+        artifact_store_roots,
+        normalized_ref,
+        source,
+        DecodeProjectionKind::FinalLogits,
+        call_tile!(decode_projection_row_count, source)?,
+        input_roots.raster_sizing.projection_rows_per_tile,
+        format!("{}.final_logits", state.output_source_prefix),
+        call_tile!(decode_final_logit_softcap_bits, source)?
+    )?;
+    let (layer_caches, position, token_count) =
+        call_tile!(finalize_decode_layer_refs_with_roots, state)?;
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    let logit_count = match (row_count, width) {
+        (rows, 1) => rows,
+        (1, cols) => cols,
+        _ => bail!("raster decode transition logits shape {row_count}x{width} must be Nx1 or 1xN"),
+    };
+    Ok(RasterDecodeTransitionOutputStateRefs {
+        artifact_store_roots,
+        final_hidden_state_ref,
+        logits_ref,
+        logit_count,
+        layer_caches,
+        position,
+        token_count,
+    })
+}
+
+#[sequence]
+fn rms_norm_decode_layer_row(
+    row: &RasterActivationRow,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    norm: GemmaDecodeLayerNormKind,
+) -> Result<RasterActivationRow> {
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
+    call_tile!(
+        rms_norm_decode_row,
+        row,
+        &norm_weights,
+        scalars.rms_norm_eps,
+        "decode layer RMSNorm"
+    )
+}
+
+#[sequence]
+fn rms_norm_decode_attention_heads(
+    heads: &RasterAttentionHeadSequence,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    norm: GemmaDecodeLayerNormKind,
+) -> Result<RasterAttentionHeadSequence> {
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
+    call_tile!(
+        rms_norm_decode_heads,
+        heads,
+        &norm_weights,
+        scalars.rms_norm_eps
+    )
+}
+
+#[sequence]
+fn value_rms_norm_decode_attention_heads(
+    heads: &RasterAttentionHeadSequence,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+) -> Result<RasterAttentionHeadSequence> {
+    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
+    call_tile!(value_rms_norm_decode_heads, heads, scalars.rms_norm_eps)
+}
+
+// Raster execution tiles, ordered by the sequence calls that reach them.
+
+#[tile]
+fn read_decode_selected_token(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    selected_token_ref: &RasterSelectedTokenRef,
+) -> Result<u32> {
+    read_selected_token_from_roots(artifact_store_roots, selected_token_ref)
+}
+
+#[tile]
+pub fn init_decode_transition_state_refs_with_roots(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    transformer_decode_state: TransformerDecodeState,
+    next_token: u32,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
+    output_source_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
+    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    if metadata.layer_count == 0 {
+        bail!("transformer decode requires at least one layer");
+    }
+    if transformer_decode_state.layer_caches.len() != metadata.layer_count {
+        bail!(
+            "transformer decode cache count mismatch: {} vs {}",
+            transformer_decode_state.layer_caches.len(),
+            metadata.layer_count
+        );
+    }
+
+    let embedded = RasterActivationRow::from_acts(auth_read!(
+        source,
+        GemmaDecodeEmbeddingRowRequest {
+            token_id: next_token
+        },
+    )?);
+    if embedded.width() != metadata.embedding_width {
+        bail!(
+            "decode embedded token width {}, expected {}",
+            embedded.width(),
+            metadata.embedding_width
+        );
+    }
+    let (roots, decode_input_ref) = insert_decode_activation_row_with_roots(
+        &artifact_store_roots,
+        format!("{output_source_prefix}.input.selected_token_embedding"),
+        &embedded,
+    )?;
+    artifact_store_roots = roots;
+    let mut original_layer_caches = Vec::with_capacity(transformer_decode_state.layer_caches.len());
+    for (layer_idx, cache) in transformer_decode_state.layer_caches.iter().enumerate() {
+        let cache = raster_cache_from_layer_cache(cache)?;
+        let (roots, cache_slot) = register_decode_layer_cache_with_roots(
+            &artifact_store_roots,
+            &format!("{output_source_prefix}.original.cache"),
+            layer_idx,
+            cache,
+        )?;
+        artifact_store_roots = roots;
+        original_layer_caches.push(cache_slot);
+    }
+
+    Ok((
+        artifact_store_roots.clone(),
+        DecodeTransitionRasterState {
+            artifact_store_roots,
+            decode_input_ref: decode_input_ref.clone(),
+            current_activation_ref: decode_input_ref,
+            next_token,
+            position: transformer_decode_state.position,
+            token_count: transformer_decode_state.token_count,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            original_layer_caches,
+            updated_layer_caches: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+            projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
+            attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
+            output_source_prefix,
+        },
+    ))
+}
+
+#[tile]
+fn normalize_decode_final_position_ref_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    final_hidden_states_ref: RasterActivationSequenceRef,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    output_source_name: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let final_hidden_state =
+        read_activation_row_from_ref_roots(&artifact_store_roots, &final_hidden_states_ref)?;
+    let norm_weights = auth_read!(source, GemmaDecodeFinalNormWeightsRequest)?;
+    let scalars = auth_read!(source, GemmaDecodeFinalScalarsRequest)?;
+    let normalized = first_row(
+        rms_norm_sequence(
+            &RasterActivationSequence::from_rows(vec![final_hidden_state]),
+            Some(&norm_weights),
+            Some(scalars.rms_norm_eps),
+        )?,
+        "deterministic decode final RMSNorm",
+    )?;
+    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &normalized)
+}
+
+#[tile]
+fn decode_projection_row_count(source: &AuthenticatedGemmaDecodeTransitionSource) -> Result<usize> {
+    Ok(auth_read!(source, GemmaDecodeTransitionMetadataRequest)?.projection_rows)
+}
+
+#[tile]
+fn decode_final_logit_softcap_bits(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<Option<i32>> {
+    Ok(auth_read!(source, GemmaDecodeFinalScalarsRequest)?
+        .final_logit_softcapping
+        .map(Act::to_bits))
+}
+
+#[tile]
+pub fn finalize_decode_layer_state_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    state: DecodeTransitionRasterState,
+) -> Result<ActivationSequenceWithCache> {
+    if state.next_layer_idx != state.layer_count {
+        bail!(
+            "raster decode finalized after {} layers, expected {}",
+            state.next_layer_idx,
+            state.layer_count
+        );
+    }
+    if state.updated_layer_caches.len() != state.layer_count {
+        bail!(
+            "raster decode stored {} layer caches, expected {}",
+            state.updated_layer_caches.len(),
+            state.layer_count
+        );
+    }
+
+    let current_activation =
+        read_activation_row_from_ref_roots(roots, &state.current_activation_ref)?;
+    let det_row = current_activation.acts();
+    let values = vec![current_activation.to_f32_values()];
+    let internal = InternalActivationSequence::from_det_values(vec![det_row.clone()]);
+    let mut activation_state = ActivationSequence::from_internal(
+        internal,
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
+    );
+    activation_state.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&[det_row]),
+    );
+
+    Ok(ActivationSequenceWithCache {
+        activation_state,
+        layer_caches: state
+            .updated_layer_caches
+            .iter()
+            .map(|cache| materialize_decode_layer_cache_from_roots(roots, cache))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(layer_cache_from_raster)
+            .collect(),
+    })
+}
+
+#[tile]
+fn finalize_decode_transition_result_from_roots(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    logits_ref: RasterActivationSequenceRef,
+    transformer_decode_state: TransformerDecodeState,
+    final_hidden_state: ActivationSequence,
+) -> Result<TransformerDecodeStepResult> {
+    let logits_row = read_activation_row_from_ref_roots(artifact_store_roots, &logits_ref)?;
+    let det_logits = logits_row.acts();
+    let internal_logits = InternalLogits::from_det_values(det_logits.clone());
+    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
+        internal_logits.as_f32_slice(),
+    );
+    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
+    prefill_logits.det_final_logits_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
+    );
+
+    Ok(TransformerDecodeStepResult {
+        transformer_decode_state: TransformerDecodeState {
+            layer_caches: transformer_decode_state.layer_caches,
+            position: transformer_decode_state.position + 1,
+            token_count: transformer_decode_state.token_count + 1,
+        },
+        activation_state: final_hidden_state,
+        prefill_logits,
+    })
+}
+
+#[tile]
+fn prepare_next_decode_layer_context(
+    state: &DecodeTransitionRasterState,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<DecodeLayerContext> {
+    let layer_idx = state.next_layer_idx;
+    let layer = auth_read!(source, GemmaDecodeLayerMetadataRequest { layer_idx })?;
+    let cache_slot = state
+        .original_layer_caches
+        .get(layer_idx)
+        .cloned()
+        .ok_or_else(|| anyhow!("transformer decode cache {layer_idx} missing"))?;
+    let donor_cache_slot =
+        resolve_decode_donor_cache_slot(&state.updated_layer_caches, layer_idx, &layer)?.cloned();
+    Ok(DecodeLayerContext {
+        layer_idx,
+        layer,
+        cache_slot,
+        donor_cache_slot,
+    })
+}
+
+#[tile]
+fn update_decode_layer_state_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: DecodeTransitionRasterState,
+    layer_idx: usize,
+    layer_output_ref: RasterActivationSequenceRef,
+    updated_cache: DecodeLayerCacheSlot,
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+    if layer_idx != state.next_layer_idx {
+        bail!(
+            "cannot update decode layer {layer_idx} while next layer is {}",
+            state.next_layer_idx
+        );
+    }
+    let layer_output =
+        read_activation_row_from_ref_roots(&artifact_store_roots, &layer_output_ref)?;
+    state.artifact_store_roots = artifact_store_roots.clone();
+    state.current_activation_ref = layer_output_ref;
+    state.updated_layer_caches.push(updated_cache);
+    let current_activation_values = layer_output.to_f32_values();
+    let current_activation_acts = layer_output.acts();
+    state.completed_layer_output_sha256s.push(
+        crate::shared::numerics::transformer_kernels::build_vector_commitment(
+            &current_activation_values,
+        ),
+    );
+    state.completed_layer_output_det_sha256s.push(Some(
+        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
+            &current_activation_acts,
+        ),
+    ));
+    trace_decode_layer_checkpoint_with_roots(&artifact_store_roots, &state, layer_idx)?;
+    state.next_layer_idx += 1;
+    Ok((false, artifact_store_roots, state))
+}
+
+#[tile]
+fn decode_ple_input_gate_rows(layer: &GemmaDecodeLayerMetadata) -> Result<usize> {
+    Ok(layer
+        .ple_input_gate_shape
+        .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing PLE input gate shape"))?
+        .rows)
+}
+
+#[tile]
+fn read_decode_ple_scalars(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<crate::decode_transition::raster::auth_source::GemmaDecodePleScalars> {
+    auth_read!(source, GemmaDecodePleScalarsRequest)
+}
+
+#[tile]
+fn read_decode_ple_projection_norm_weights(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
+    auth_read!(source, GemmaDecodePleProjectionNormWeightsRequest)
+}
+
+#[tile]
+fn read_decode_ple_token_embedding(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+    token_id: u32,
+) -> Result<RasterActivationRow> {
+    Ok(RasterActivationRow::from_acts(auth_read!(
+        source,
+        GemmaDecodePleTokenEmbeddingRowRequest {
+            layer_idx,
+            token_id,
+        },
+    )?))
+}
+
+#[tile]
+fn scale_decode_row_optional(
+    row: &RasterActivationRow,
+    scalar: Option<Act>,
+) -> Result<RasterActivationRow> {
+    if scalar.is_none() {
+        return Ok(row.clone());
+    }
+    scale_row(row, scalar)
+}
+
+#[tile]
+fn scale_decode_ref_optional_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    scalar: Option<Act>,
+    output_source_name: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    if scalar.is_none() {
+        return Ok((artifact_store_roots, input_ref));
+    }
+    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
+    let row = call_tile!(scale_decode_row_optional, &row, scalar)?;
+    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
+}
+
+#[tile]
+fn rms_norm_decode_ref_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_ref: RasterActivationSequenceRef,
+    norm_weights: &[crate::shared::numerics::det_num::Wgt],
+    eps: crate::shared::numerics::det_num::Acc,
+    label: &str,
+    output_source_name: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
+    let row = call_tile!(rms_norm_decode_row, &row, norm_weights, eps, label)?;
+    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
+}
+
+#[tile]
+fn add_decode_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_source_name: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let lhs = read_activation_row_from_ref_roots(&artifact_store_roots, &lhs_ref)?;
+    let rhs = read_activation_row_from_ref_roots(&artifact_store_roots, &rhs_ref)?;
+    let row = call_tile!(add_decode_rows, &lhs, &rhs)?;
+    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
 }
 
 #[tile]
@@ -1539,91 +1600,39 @@ pub fn finalize_decode_row_projection_ref_with_roots(
 }
 
 #[tile]
-fn rms_norm_decode_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    norm_weights: &[crate::shared::numerics::det_num::Wgt],
-    eps: crate::shared::numerics::det_num::Acc,
-    label: &str,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
-    let row = call_tile!(rms_norm_decode_row, &row, norm_weights, eps, label)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
+fn read_decode_layer_scalars(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    layer_idx: usize,
+) -> Result<crate::decode_transition::raster::auth_source::GemmaDecodeLayerScalars> {
+    auth_read!(source, GemmaDecodeLayerScalarsRequest { layer_idx })
 }
 
-#[sequence]
-fn rms_norm_decode_layer_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
+#[tile]
+fn validate_decode_attention_context(
+    input: &RasterActivationRow,
+    layer: &GemmaDecodeLayerMetadata,
+) -> Result<()> {
+    validate_row_width(input, layer.hidden_size, "decode attention input")?;
+    let kv_groups = layer
+        .num_heads
+        .checked_div(layer.num_kv_heads)
+        .ok_or_else(|| anyhow!("invalid Gemma head configuration"))?;
+    if kv_groups == 0 {
+        bail!("Gemma layer must have at least one KV group");
+    }
+    Ok(())
+}
+
+#[tile]
+fn read_decode_layer_norm_weights(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     layer_idx: usize,
     norm: GemmaDecodeLayerNormKind,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
-    call_tile!(
-        rms_norm_decode_ref_with_roots,
-        artifact_store_roots,
-        input_ref,
-        &norm_weights,
-        scalars.rms_norm_eps,
-        "decode layer RMSNorm",
-        output_source_name
+) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
+    auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest { layer_idx, norm }
     )
-}
-
-#[tile]
-fn scale_decode_ref_optional_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    scalar: Option<Act>,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    if scalar.is_none() {
-        return Ok((artifact_store_roots, input_ref));
-    }
-    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
-    let row = call_tile!(scale_decode_row_optional, &row, scalar)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
-}
-
-#[tile]
-fn add_decode_refs_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    lhs_ref: RasterActivationSequenceRef,
-    rhs_ref: RasterActivationSequenceRef,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let lhs = read_activation_row_from_ref_roots(&artifact_store_roots, &lhs_ref)?;
-    let rhs = read_activation_row_from_ref_roots(&artifact_store_roots, &rhs_ref)?;
-    let row = call_tile!(add_decode_rows, &lhs, &rhs)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
-}
-
-#[tile]
-fn mul_decode_refs_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    lhs_ref: RasterActivationSequenceRef,
-    rhs_ref: RasterActivationSequenceRef,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let lhs = read_activation_row_from_ref_roots(&artifact_store_roots, &lhs_ref)?;
-    let rhs = read_activation_row_from_ref_roots(&artifact_store_roots, &rhs_ref)?;
-    let row = call_tile!(mul_decode_rows, &lhs, &rhs)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
-}
-
-#[tile]
-fn gelu_decode_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
-    let row = call_tile!(gelu_decode_row, &row)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
 }
 
 #[tile]
@@ -1637,41 +1646,6 @@ fn reshape_decode_ref_heads_with_roots(
     let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
     let heads = reshape_row_heads(row, num_heads, head_dim)?;
     insert_attention_heads_with_roots(&artifact_store_roots, source_name, heads)
-}
-
-#[sequence]
-fn rms_norm_decode_attention_heads_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    heads_ref: RasterAttentionHeadsRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    norm: GemmaDecodeLayerNormKind,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
-    let heads = materialize_attention_heads_from_roots(&artifact_store_roots, &heads_ref)?;
-    let heads = call_tile!(
-        rms_norm_decode_heads,
-        &heads,
-        &norm_weights,
-        scalars.rms_norm_eps
-    )?;
-    insert_attention_heads_with_roots(&artifact_store_roots, output_source_name, heads)
-}
-
-#[sequence]
-fn value_rms_norm_decode_attention_heads_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    heads_ref: RasterAttentionHeadsRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let heads = materialize_attention_heads_from_roots(&artifact_store_roots, &heads_ref)?;
-    let heads = call_tile!(value_rms_norm_decode_heads, &heads, scalars.rms_norm_eps)?;
-    insert_attention_heads_with_roots(&artifact_store_roots, output_source_name, heads)
 }
 
 #[tile]
@@ -1696,66 +1670,264 @@ fn apply_decode_rope_to_heads_ref_with_roots(
     insert_attention_heads_with_roots(&artifact_store_roots, output_source_name, heads)
 }
 
-#[sequence]
-fn combine_decode_attention_heads_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    heads_ref: RasterAttentionHeadsRef,
-    output_id: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) =
-        crate::shared::raster_kernels::transformer::init_combine_heads_artifact_state_from_ref(
-            artifact_store_roots,
-            heads_ref,
-            RasterTensorId::new(output_id)?,
-        )?;
-    let mut artifact_store_roots = artifact_store_roots;
-    let mut state = state;
-    loop {
-        let (done, next_roots, next_state) =
-            crate::shared::raster_kernels::transformer::compute_next_combine_heads_artifact_row(
-                artifact_store_roots,
-                state,
-            )?;
-        artifact_store_roots = next_roots;
-        state = next_state;
-        if done {
-            break;
-        }
+#[tile]
+fn resolve_decode_attention_cache_ref(
+    attention_cache_slot: &DecodeLayerCacheSlot,
+) -> Result<RasterKvCacheRef> {
+    match attention_cache_slot {
+        DecodeLayerCacheSlot::Empty { .. } => bail!("decode attention cache is empty"),
+        DecodeLayerCacheSlot::Ref(cache_ref) => Ok(cache_ref.clone()),
     }
-    crate::shared::raster_kernels::transformer::finalize_combine_heads_artifact_state_ref(
-        artifact_store_roots,
-        state,
-    )
 }
 
-#[sequence]
-fn compute_decode_attention_ref_with_roots(
+#[tile]
+fn resolve_decode_attention_window(layer: &GemmaDecodeLayerMetadata) -> Result<Option<usize>> {
+    match layer.attention_kind {
+        GemmaDecodeAttentionKind::Full => Ok(None),
+        GemmaDecodeAttentionKind::Sliding => {
+            Ok(Some(layer.sliding_window.ok_or_else(|| {
+                anyhow!("sliding attention layer is missing a sliding window")
+            })?))
+        }
+    }
+}
+
+#[tile]
+fn rms_norm_decode_heads(
+    heads: &RasterAttentionHeadSequence,
+    norm_weights: &[crate::shared::numerics::det_num::Wgt],
+    eps: crate::shared::numerics::det_num::Acc,
+) -> Result<RasterAttentionHeadSequence> {
+    rms_norm_heads(heads, Some(norm_weights), Some(eps))
+}
+
+#[tile]
+fn value_rms_norm_decode_heads(
+    heads: &RasterAttentionHeadSequence,
+    eps: crate::shared::numerics::det_num::Acc,
+) -> Result<RasterAttentionHeadSequence> {
+    value_rms_norm_heads(heads, Some(eps))
+}
+
+#[tile]
+fn init_decode_kv_cache_append_state_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    query_ref: RasterAttentionHeadsRef,
-    cache_ref: RasterKvCacheRef,
-    id_prefix: String,
-    attention_window: Option<usize>,
-    kv_rows_per_tile: usize,
-) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let (artifact_store_roots, state) = call_tile!(
-        init_decode_attention_artifact_state_from_refs,
-        artifact_store_roots,
-        query_ref,
-        cache_ref,
-        RasterTensorId::new(format!("{id_prefix}.output"))?,
-        id_prefix,
-        attention_window,
-        kv_rows_per_tile
+    cache_slot: DecodeLayerCacheSlot,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    keys_id: RasterTensorId,
+    values_id: RasterTensorId,
+    cache_window: Option<usize>,
+    rows_per_tile: usize,
+) -> Result<(RasterArtifactStoreRoots, DecodeKvCacheAppendArtifactState)> {
+    validate_attention_kv_rows_per_tile(rows_per_tile)?;
+    if cache_window == Some(0) {
+        bail!("decode cache sliding window must retain at least one row");
+    }
+    let (head_count, key_sequence_len, head_dim) = key_ref.tensor_ref().shape().heads_metadata()?;
+    let (value_head_count, value_sequence_len, value_head_dim) =
+        value_ref.tensor_ref().shape().heads_metadata()?;
+    if head_count != value_head_count
+        || key_sequence_len != value_sequence_len
+        || head_dim != value_head_dim
+    {
+        bail!("decode cache append key/value attention heads shape mismatch");
+    }
+    if key_sequence_len != 1 {
+        bail!("decode cache append expects one-token K/V heads, got {key_sequence_len} rows");
+    }
+
+    let (old_cache_ref, old_len) = match cache_slot {
+        DecodeLayerCacheSlot::Empty { num_kv_heads } => {
+            if num_kv_heads != head_count {
+                bail!(
+                    "decode empty cache head count {num_kv_heads}, expected projected {head_count}"
+                );
+            }
+            (None, 0)
+        }
+        DecodeLayerCacheSlot::Ref(cache_ref) => {
+            let (cache_head_count, cache_len, cache_head_dim) =
+                cache_ref.shape().kv_cache_metadata()?;
+            if cache_head_count != head_count {
+                bail!(
+                    "decode cache head count {cache_head_count}, expected projected {head_count}"
+                );
+            }
+            if cache_head_dim != head_dim {
+                bail!("decode cache head width {cache_head_dim}, expected projected {head_dim}");
+            }
+            (Some(cache_ref), cache_len)
+        }
+    };
+
+    let retained_start = cache_window
+        .map(|window| old_len.saturating_add(1).saturating_sub(window))
+        .unwrap_or(0)
+        .min(old_len);
+    let retained_old_len = old_len.saturating_sub(retained_start);
+    let current_len = retained_old_len + 1;
+    let keys_source_name = keys_id.source_name().to_string();
+    let values_source_name = values_id.source_name().to_string();
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&keys_source_name)?,
+        head_count * current_len,
+        head_dim,
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
-        compute_next_decode_attention_head_with_roots,
-        (artifact_store_roots, state)
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&values_source_name)?,
+        head_count * current_len,
+        head_dim,
     )?;
-    call_tile!(
-        finalize_decode_attention_state_ref_with_roots,
+
+    Ok((
         artifact_store_roots,
-        state
-    )
+        DecodeKvCacheAppendArtifactState {
+            old_cache_ref,
+            key_ref,
+            value_ref,
+            keys_source_name,
+            values_source_name,
+            retained_old_start: retained_start,
+            retained_old_len,
+            next_head_idx: 0,
+            next_old_offset: 0,
+            head_count,
+            current_len,
+            head_dim,
+            rows_per_tile,
+        },
+    ))
+}
+
+#[tile(kind = recursive)]
+fn compute_next_decode_kv_cache_append_row_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    mut state: DecodeKvCacheAppendArtifactState,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    DecodeKvCacheAppendArtifactState,
+)> {
+    if state.next_head_idx >= state.head_count {
+        return Ok((true, artifact_store_roots, state));
+    }
+    let mut artifact_store_roots = artifact_store_roots;
+
+    if state.next_old_offset < state.retained_old_len {
+        let old_cache_ref = state.old_cache_ref.as_ref().ok_or_else(|| {
+            anyhow!("decode cache append has retained rows without old cache ref")
+        })?;
+        let end = state
+            .next_old_offset
+            .saturating_add(state.rows_per_tile)
+            .min(state.retained_old_len);
+        for old_offset in state.next_old_offset..end {
+            let input_token_idx = state.retained_old_start + old_offset;
+            let key_row = read_kv_row_from_roots(
+                &artifact_store_roots,
+                RasterKvRowRequest {
+                    cache_ref: old_cache_ref.clone(),
+                    row_kind: RasterKvRowKind::Key,
+                    head_idx: state.next_head_idx,
+                    token_idx: input_token_idx,
+                },
+            )?;
+            let value_row = read_kv_row_from_roots(
+                &artifact_store_roots,
+                RasterKvRowRequest {
+                    cache_ref: old_cache_ref.clone(),
+                    row_kind: RasterKvRowKind::Value,
+                    head_idx: state.next_head_idx,
+                    token_idx: input_token_idx,
+                },
+            )?;
+            artifact_store_roots = append_head_row_by_source_name_with_roots(
+                &artifact_store_roots,
+                &state.keys_source_name,
+                state.next_head_idx,
+                old_offset,
+                state.current_len,
+                key_row,
+            )?;
+            artifact_store_roots = append_head_row_by_source_name_with_roots(
+                &artifact_store_roots,
+                &state.values_source_name,
+                state.next_head_idx,
+                old_offset,
+                state.current_len,
+                value_row,
+            )?;
+        }
+        state.next_old_offset = end;
+        if state.next_old_offset < state.retained_old_len {
+            return Ok((false, artifact_store_roots, state));
+        }
+    }
+
+    let output_token_idx = state.retained_old_len;
+    let key_row = read_head_row_from_roots(
+        &artifact_store_roots,
+        RasterHeadRowRequest {
+            tensor_ref: state.key_ref.clone(),
+            head_idx: state.next_head_idx,
+            token_idx: 0,
+        },
+    )?;
+    let value_row = read_head_row_from_roots(
+        &artifact_store_roots,
+        RasterHeadRowRequest {
+            tensor_ref: state.value_ref.clone(),
+            head_idx: state.next_head_idx,
+            token_idx: 0,
+        },
+    )?;
+    artifact_store_roots = append_head_row_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.keys_source_name,
+        state.next_head_idx,
+        output_token_idx,
+        state.current_len,
+        key_row,
+    )?;
+    artifact_store_roots = append_head_row_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.values_source_name,
+        state.next_head_idx,
+        output_token_idx,
+        state.current_len,
+        value_row,
+    )?;
+    state.next_head_idx += 1;
+    state.next_old_offset = 0;
+    Ok((false, artifact_store_roots, state))
+}
+
+#[tile]
+fn finalize_decode_kv_cache_append_state_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    state: DecodeKvCacheAppendArtifactState,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
+    if state.next_head_idx != state.head_count {
+        bail!(
+            "decode cache append finalized at head {}, expected {} heads",
+            state.next_head_idx,
+            state.head_count
+        );
+    }
+    let (artifact_store_roots, cache_ref) = finalize_kv_cache_builders_by_source_name_with_roots(
+        &artifact_store_roots,
+        &state.keys_source_name,
+        &state.values_source_name,
+        RasterTensorId::new(state.keys_source_name.clone())?,
+        RasterTensorId::new(state.values_source_name.clone())?,
+        state.head_count,
+        state.current_len,
+        state.head_dim,
+    )?;
+    Ok((artifact_store_roots, DecodeLayerCacheSlot::Ref(cache_ref)))
 }
 
 #[tile]
@@ -1823,28 +1995,6 @@ pub fn init_decode_attention_artifact_state_from_refs(
             row_count,
             head_dim,
             kv_rows_per_tile,
-        },
-    ))
-}
-
-fn init_decode_attention_score_phase_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    id_prefix: &str,
-    query_head_idx: usize,
-    visible_row_count: usize,
-) -> Result<(RasterArtifactStoreRoots, DecodeAttentionArtifactPhase)> {
-    let score_source_name = format!("{id_prefix}.scores.head_{query_head_idx}");
-    let artifact_store_roots = start_sequence_builder_with_roots(
-        &artifact_store_roots,
-        RasterArtifactId::new(&score_source_name)?,
-        visible_row_count,
-        1,
-    )?;
-    Ok((
-        artifact_store_roots,
-        DecodeAttentionArtifactPhase::CollectScores {
-            score_source_name,
-            next_kv_offset: 0,
         },
     ))
 }
@@ -2238,397 +2388,105 @@ pub fn finalize_decode_attention_state_ref_with_roots(
     )
 }
 
-#[sequence]
-fn update_decode_attention_cache_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    cache_slot: DecodeLayerCacheSlot,
-    use_donor_cache: bool,
-    k_heads_ref: RasterAttentionHeadsRef,
-    v_heads_ref: RasterAttentionHeadsRef,
-    layer_idx: usize,
-    cache_window: Option<usize>,
-    rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
-    if use_donor_cache {
-        return Ok((artifact_store_roots, cache_slot));
-    }
-    call_seq!(
-        append_decode_kv_cache_ref_with_roots,
-        artifact_store_roots,
-        cache_slot,
-        k_heads_ref,
-        v_heads_ref,
-        layer_idx,
-        cache_window,
-        rows_per_tile,
-        output_prefix
-    )
-}
-
-#[sequence]
-fn append_decode_kv_cache_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    cache_slot: DecodeLayerCacheSlot,
-    key_ref: RasterAttentionHeadsRef,
-    value_ref: RasterAttentionHeadsRef,
-    layer_idx: usize,
-    cache_window: Option<usize>,
-    rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
-    let (artifact_store_roots, state) = call_tile!(
-        init_decode_kv_cache_append_state_with_roots,
-        artifact_store_roots,
-        cache_slot,
-        key_ref,
-        value_ref,
-        RasterTensorId::new(format!("{output_prefix}.{layer_idx}.keys"))?,
-        RasterTensorId::new(format!("{output_prefix}.{layer_idx}.values"))?,
-        cache_window,
-        rows_per_tile
-    )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
-        compute_next_decode_kv_cache_append_row_with_roots,
-        (artifact_store_roots, state)
-    )?;
-    call_tile!(
-        finalize_decode_kv_cache_append_state_with_roots,
-        artifact_store_roots,
-        state
-    )
-}
-
 #[tile]
-fn init_decode_kv_cache_append_state_with_roots(
+fn gelu_decode_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    cache_slot: DecodeLayerCacheSlot,
-    key_ref: RasterAttentionHeadsRef,
-    value_ref: RasterAttentionHeadsRef,
-    keys_id: RasterTensorId,
-    values_id: RasterTensorId,
-    cache_window: Option<usize>,
-    rows_per_tile: usize,
-) -> Result<(RasterArtifactStoreRoots, DecodeKvCacheAppendArtifactState)> {
-    validate_attention_kv_rows_per_tile(rows_per_tile)?;
-    if cache_window == Some(0) {
-        bail!("decode cache sliding window must retain at least one row");
-    }
-    let (head_count, key_sequence_len, head_dim) = key_ref.tensor_ref().shape().heads_metadata()?;
-    let (value_head_count, value_sequence_len, value_head_dim) =
-        value_ref.tensor_ref().shape().heads_metadata()?;
-    if head_count != value_head_count
-        || key_sequence_len != value_sequence_len
-        || head_dim != value_head_dim
-    {
-        bail!("decode cache append key/value attention heads shape mismatch");
-    }
-    if key_sequence_len != 1 {
-        bail!("decode cache append expects one-token K/V heads, got {key_sequence_len} rows");
-    }
-
-    let (old_cache_ref, old_len) = match cache_slot {
-        DecodeLayerCacheSlot::Empty { num_kv_heads } => {
-            if num_kv_heads != head_count {
-                bail!(
-                    "decode empty cache head count {num_kv_heads}, expected projected {head_count}"
-                );
-            }
-            (None, 0)
-        }
-        DecodeLayerCacheSlot::Ref(cache_ref) => {
-            let (cache_head_count, cache_len, cache_head_dim) =
-                cache_ref.shape().kv_cache_metadata()?;
-            if cache_head_count != head_count {
-                bail!(
-                    "decode cache head count {cache_head_count}, expected projected {head_count}"
-                );
-            }
-            if cache_head_dim != head_dim {
-                bail!("decode cache head width {cache_head_dim}, expected projected {head_dim}");
-            }
-            (Some(cache_ref), cache_len)
-        }
-    };
-
-    let retained_start = cache_window
-        .map(|window| old_len.saturating_add(1).saturating_sub(window))
-        .unwrap_or(0)
-        .min(old_len);
-    let retained_old_len = old_len.saturating_sub(retained_start);
-    let current_len = retained_old_len + 1;
-    let keys_source_name = keys_id.source_name().to_string();
-    let values_source_name = values_id.source_name().to_string();
-    let artifact_store_roots = start_sequence_builder_with_roots(
-        &artifact_store_roots,
-        RasterArtifactId::new(&keys_source_name)?,
-        head_count * current_len,
-        head_dim,
-    )?;
-    let artifact_store_roots = start_sequence_builder_with_roots(
-        &artifact_store_roots,
-        RasterArtifactId::new(&values_source_name)?,
-        head_count * current_len,
-        head_dim,
-    )?;
-
-    Ok((
-        artifact_store_roots,
-        DecodeKvCacheAppendArtifactState {
-            old_cache_ref,
-            key_ref,
-            value_ref,
-            keys_source_name,
-            values_source_name,
-            retained_old_start: retained_start,
-            retained_old_len,
-            next_head_idx: 0,
-            next_old_offset: 0,
-            head_count,
-            current_len,
-            head_dim,
-            rows_per_tile,
-        },
-    ))
-}
-
-#[tile(kind = recursive)]
-fn compute_next_decode_kv_cache_append_row_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: DecodeKvCacheAppendArtifactState,
-) -> Result<(
-    bool,
-    RasterArtifactStoreRoots,
-    DecodeKvCacheAppendArtifactState,
-)> {
-    if state.next_head_idx >= state.head_count {
-        return Ok((true, artifact_store_roots, state));
-    }
-    let mut artifact_store_roots = artifact_store_roots;
-
-    if state.next_old_offset < state.retained_old_len {
-        let old_cache_ref = state.old_cache_ref.as_ref().ok_or_else(|| {
-            anyhow!("decode cache append has retained rows without old cache ref")
-        })?;
-        let end = state
-            .next_old_offset
-            .saturating_add(state.rows_per_tile)
-            .min(state.retained_old_len);
-        for old_offset in state.next_old_offset..end {
-            let input_token_idx = state.retained_old_start + old_offset;
-            let key_row = read_kv_row_from_roots(
-                &artifact_store_roots,
-                RasterKvRowRequest {
-                    cache_ref: old_cache_ref.clone(),
-                    row_kind: RasterKvRowKind::Key,
-                    head_idx: state.next_head_idx,
-                    token_idx: input_token_idx,
-                },
-            )?;
-            let value_row = read_kv_row_from_roots(
-                &artifact_store_roots,
-                RasterKvRowRequest {
-                    cache_ref: old_cache_ref.clone(),
-                    row_kind: RasterKvRowKind::Value,
-                    head_idx: state.next_head_idx,
-                    token_idx: input_token_idx,
-                },
-            )?;
-            artifact_store_roots = append_head_row_by_source_name_with_roots(
-                &artifact_store_roots,
-                &state.keys_source_name,
-                state.next_head_idx,
-                old_offset,
-                state.current_len,
-                key_row,
-            )?;
-            artifact_store_roots = append_head_row_by_source_name_with_roots(
-                &artifact_store_roots,
-                &state.values_source_name,
-                state.next_head_idx,
-                old_offset,
-                state.current_len,
-                value_row,
-            )?;
-        }
-        state.next_old_offset = end;
-        if state.next_old_offset < state.retained_old_len {
-            return Ok((false, artifact_store_roots, state));
-        }
-    }
-
-    let output_token_idx = state.retained_old_len;
-    let key_row = read_head_row_from_roots(
-        &artifact_store_roots,
-        RasterHeadRowRequest {
-            tensor_ref: state.key_ref.clone(),
-            head_idx: state.next_head_idx,
-            token_idx: 0,
-        },
-    )?;
-    let value_row = read_head_row_from_roots(
-        &artifact_store_roots,
-        RasterHeadRowRequest {
-            tensor_ref: state.value_ref.clone(),
-            head_idx: state.next_head_idx,
-            token_idx: 0,
-        },
-    )?;
-    artifact_store_roots = append_head_row_by_source_name_with_roots(
-        &artifact_store_roots,
-        &state.keys_source_name,
-        state.next_head_idx,
-        output_token_idx,
-        state.current_len,
-        key_row,
-    )?;
-    artifact_store_roots = append_head_row_by_source_name_with_roots(
-        &artifact_store_roots,
-        &state.values_source_name,
-        state.next_head_idx,
-        output_token_idx,
-        state.current_len,
-        value_row,
-    )?;
-    state.next_head_idx += 1;
-    state.next_old_offset = 0;
-    Ok((false, artifact_store_roots, state))
-}
-
-#[tile]
-fn finalize_decode_kv_cache_append_state_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    state: DecodeKvCacheAppendArtifactState,
-) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
-    if state.next_head_idx != state.head_count {
-        bail!(
-            "decode cache append finalized at head {}, expected {} heads",
-            state.next_head_idx,
-            state.head_count
-        );
-    }
-    let (artifact_store_roots, cache_ref) = finalize_kv_cache_builders_by_source_name_with_roots(
-        &artifact_store_roots,
-        &state.keys_source_name,
-        &state.values_source_name,
-        RasterTensorId::new(state.keys_source_name.clone())?,
-        RasterTensorId::new(state.values_source_name.clone())?,
-        state.head_count,
-        state.current_len,
-        state.head_dim,
-    )?;
-    Ok((artifact_store_roots, DecodeLayerCacheSlot::Ref(cache_ref)))
-}
-
-#[tile]
-fn normalize_decode_final_position_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    final_hidden_states_ref: RasterActivationSequenceRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
+    input_ref: RasterActivationSequenceRef,
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let final_hidden_state =
-        read_activation_row_from_ref_roots(&artifact_store_roots, &final_hidden_states_ref)?;
-    let norm_weights = auth_read!(source, GemmaDecodeFinalNormWeightsRequest)?;
-    let scalars = auth_read!(source, GemmaDecodeFinalScalarsRequest)?;
-    let normalized = first_row(
-        rms_norm_sequence(
-            &RasterActivationSequence::from_rows(vec![final_hidden_state]),
-            Some(&norm_weights),
-            Some(scalars.rms_norm_eps),
-        )?,
-        "deterministic decode final RMSNorm",
-    )?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &normalized)
+    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
+    let row = call_tile!(gelu_decode_row, &row)?;
+    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
 }
 
 #[tile]
-fn decode_projection_row_count(source: &AuthenticatedGemmaDecodeTransitionSource) -> Result<usize> {
-    Ok(auth_read!(source, GemmaDecodeTransitionMetadataRequest)?.projection_rows)
+fn mul_decode_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    lhs_ref: RasterActivationSequenceRef,
+    rhs_ref: RasterActivationSequenceRef,
+    output_source_name: String,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let lhs = read_activation_row_from_ref_roots(&artifact_store_roots, &lhs_ref)?;
+    let rhs = read_activation_row_from_ref_roots(&artifact_store_roots, &rhs_ref)?;
+    let row = call_tile!(mul_decode_rows, &lhs, &rhs)?;
+    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
 }
 
 #[tile]
-fn decode_final_logit_softcap_bits(
+fn decode_ple_layer_projection_rows(layer: &GemmaDecodeLayerMetadata) -> Result<usize> {
+    Ok(layer
+        .ple_layer_projection_shape
+        .ok_or_else(|| {
+            anyhow!("Gemma decode layer metadata is missing PLE layer projection shape")
+        })?
+        .rows)
+}
+
+#[tile]
+pub fn init_decode_transition_state_from_refs_with_roots(
+    mut artifact_store_roots: RasterArtifactStoreRoots,
+    position: usize,
+    token_count: usize,
+    original_layer_caches: Vec<DecodeLayerCacheSlot>,
+    next_token: u32,
     source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<Option<i32>> {
-    Ok(auth_read!(source, GemmaDecodeFinalScalarsRequest)?
-        .final_logit_softcapping
-        .map(Act::to_bits))
-}
+    raster_sizing: RasterSizingControls,
+    output_source_prefix: String,
+) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
+    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    if metadata.layer_count == 0 {
+        bail!("transformer decode requires at least one layer");
+    }
+    if original_layer_caches.len() != metadata.layer_count {
+        bail!(
+            "transformer decode cache count mismatch: {} vs {}",
+            original_layer_caches.len(),
+            metadata.layer_count
+        );
+    }
 
-#[tile]
-fn finalize_decode_transition_result_from_roots(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    logits_ref: RasterActivationSequenceRef,
-    transformer_decode_state: TransformerDecodeState,
-    final_hidden_state: ActivationSequence,
-) -> Result<TransformerDecodeStepResult> {
-    let logits_row = read_activation_row_from_ref_roots(artifact_store_roots, &logits_ref)?;
-    let det_logits = logits_row.acts();
-    let internal_logits = InternalLogits::from_det_values(det_logits.clone());
-    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
-        internal_logits.as_f32_slice(),
-    );
-    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
-    );
-
-    Ok(TransformerDecodeStepResult {
-        transformer_decode_state: TransformerDecodeState {
-            layer_caches: transformer_decode_state.layer_caches,
-            position: transformer_decode_state.position + 1,
-            token_count: transformer_decode_state.token_count + 1,
+    let embedded = RasterActivationRow::from_acts(auth_read!(
+        source,
+        GemmaDecodeEmbeddingRowRequest {
+            token_id: next_token
         },
-        activation_state: final_hidden_state,
-        prefill_logits,
-    })
-}
-
-#[tile]
-pub fn finalize_decode_layer_state_with_roots(
-    roots: &RasterArtifactStoreRoots,
-    state: DecodeTransitionRasterState,
-) -> Result<ActivationSequenceWithCache> {
-    if state.next_layer_idx != state.layer_count {
+    )?);
+    if embedded.width() != metadata.embedding_width {
         bail!(
-            "raster decode finalized after {} layers, expected {}",
-            state.next_layer_idx,
-            state.layer_count
+            "decode embedded token width {}, expected {}",
+            embedded.width(),
+            metadata.embedding_width
         );
     }
-    if state.updated_layer_caches.len() != state.layer_count {
-        bail!(
-            "raster decode stored {} layer caches, expected {}",
-            state.updated_layer_caches.len(),
-            state.layer_count
-        );
-    }
+    let (roots, decode_input_ref) = insert_decode_activation_row_with_roots(
+        &artifact_store_roots,
+        format!("{output_source_prefix}.input.selected_token_embedding"),
+        &embedded,
+    )?;
+    artifact_store_roots = roots;
 
-    let current_activation =
-        read_activation_row_from_ref_roots(roots, &state.current_activation_ref)?;
-    let det_row = current_activation.acts();
-    let values = vec![current_activation.to_f32_values()];
-    let internal = InternalActivationSequence::from_det_values(vec![det_row.clone()]);
-    let mut activation_state = ActivationSequence::from_internal(
-        internal,
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
-    );
-    activation_state.det_activations_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&[det_row]),
-    );
-
-    Ok(ActivationSequenceWithCache {
-        activation_state,
-        layer_caches: state
-            .updated_layer_caches
-            .iter()
-            .map(|cache| materialize_decode_layer_cache_from_roots(roots, cache))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(layer_cache_from_raster)
-            .collect(),
-    })
+    Ok((
+        artifact_store_roots.clone(),
+        DecodeTransitionRasterState {
+            artifact_store_roots,
+            decode_input_ref: decode_input_ref.clone(),
+            current_activation_ref: decode_input_ref,
+            next_token,
+            position,
+            token_count,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            original_layer_caches,
+            updated_layer_caches: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+            projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
+            attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
+            output_source_prefix,
+        },
+    ))
 }
 
 #[tile]
@@ -2654,6 +2512,401 @@ pub fn finalize_decode_layer_refs_with_roots(
         state.updated_layer_caches,
         state.position + 1,
         state.token_count + 1,
+    ))
+}
+
+#[tile]
+fn rms_norm_decode_row(
+    row: &RasterActivationRow,
+    norm_weights: &[crate::shared::numerics::det_num::Wgt],
+    eps: crate::shared::numerics::det_num::Acc,
+    label: &str,
+) -> Result<RasterActivationRow> {
+    first_row(
+        rms_norm_sequence(
+            &RasterActivationSequence::from_rows(vec![row.clone()]),
+            Some(norm_weights),
+            Some(eps),
+        )?,
+        label,
+    )
+}
+
+#[tile]
+fn read_decode_single_activation_row(
+    state: &DecodeTransitionRasterState,
+    activation_ref: &RasterActivationSequenceRef,
+) -> Result<RasterActivationRow> {
+    read_activation_row_from_ref_roots(&state.artifact_store_roots, activation_ref)
+}
+
+#[tile]
+pub fn normalize_decode_final_position(
+    final_hidden_state: &ActivationSequence,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<RasterActivationRow> {
+    let internal = final_hidden_state.clone_internal();
+    let det_rows = internal.det_values().ok_or_else(|| {
+        anyhow!("deterministic raster decode finalize requires canonical final hidden activations")
+    })?;
+    let final_row = det_rows.last().ok_or_else(|| {
+        anyhow!("transformer final-position selection requires at least one activation row")
+    })?;
+    let norm_weights = auth_read!(source, GemmaDecodeFinalNormWeightsRequest)?;
+    let scalars = auth_read!(source, GemmaDecodeFinalScalarsRequest)?;
+    let normalized = rms_norm_sequence(
+        &RasterActivationSequence::from_rows(vec![RasterActivationRow::from_acts(
+            final_row.clone(),
+        )]),
+        Some(&norm_weights),
+        Some(scalars.rms_norm_eps),
+    )?;
+    first_row(normalized, "deterministic decode final RMSNorm")
+}
+
+#[tile]
+fn add_decode_rows(
+    lhs: &RasterActivationRow,
+    rhs: &RasterActivationRow,
+) -> Result<RasterActivationRow> {
+    add_rows(lhs, rhs)
+}
+
+#[tile]
+fn mul_decode_rows(
+    lhs: &RasterActivationRow,
+    rhs: &RasterActivationRow,
+) -> Result<RasterActivationRow> {
+    mul_rows(lhs, rhs)
+}
+
+#[tile]
+fn gelu_decode_row(row: &RasterActivationRow) -> Result<RasterActivationRow> {
+    gelu_row(row)
+}
+
+#[tile]
+fn clone_decode_key_as_value(raw_k: &RasterActivationRow) -> Result<RasterActivationRow> {
+    Ok(raw_k.clone())
+}
+
+#[tile]
+fn reshape_decode_row_heads(
+    row: RasterActivationRow,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<RasterAttentionHeadSequence> {
+    reshape_row_heads(row, num_heads, head_dim)
+}
+
+#[tile]
+fn apply_decode_rope_to_heads(
+    heads: &RasterAttentionHeadSequence,
+    partial_rotary_dim: usize,
+    rope_freq_base_dim: usize,
+    rope_base: Option<Acc>,
+    position: usize,
+) -> Result<RasterAttentionHeadSequence> {
+    apply_rope_to_heads(
+        heads,
+        partial_rotary_dim,
+        rope_freq_base_dim,
+        rope_base,
+        position,
+    )
+}
+
+// Supporting definitions used by the sequences and tiles.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeTransitionRasterState {
+    artifact_store_roots: RasterArtifactStoreRoots,
+    decode_input_ref: RasterActivationSequenceRef,
+    current_activation_ref: RasterActivationSequenceRef,
+    next_token: u32,
+    position: usize,
+    token_count: usize,
+    next_layer_idx: usize,
+    layer_count: usize,
+    original_layer_caches: Vec<DecodeLayerCacheSlot>,
+    updated_layer_caches: Vec<DecodeLayerCacheSlot>,
+    completed_layer_output_sha256s: Vec<String>,
+    completed_layer_output_det_sha256s: Vec<Option<String>>,
+    projection_rows_per_tile: usize,
+    attention_kv_rows_per_tile: usize,
+    output_source_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterDecodeTransitionInputRoots {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub transformer_decode_state: TransformerDecodeState,
+    pub selected_token_ref: RasterSelectedTokenRef,
+    pub decode_transition_source_root: String,
+    pub output_source_prefix: String,
+    pub raster_sizing: RasterSizingControls,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterDecodeTransitionInputRefs {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub position: usize,
+    pub token_count: usize,
+    pub layer_caches: Vec<DecodeLayerCacheSlot>,
+    pub selected_token_ref: RasterSelectedTokenRef,
+    pub decode_transition_source_root: String,
+    pub output_source_prefix: String,
+    pub raster_sizing: RasterSizingControls,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RasterDecodeTransitionOutputRefs {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub transition_result: TransformerDecodeStepResult,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterDecodeTransitionOutputStateRefs {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub final_hidden_state_ref: RasterActivationSequenceRef,
+    pub logits_ref: RasterActivationSequenceRef,
+    pub logit_count: usize,
+    pub layer_caches: Vec<DecodeLayerCacheSlot>,
+    pub position: usize,
+    pub token_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum DecodeLayerCacheSlot {
+    Empty { num_kv_heads: usize },
+    Ref(RasterKvCacheRef),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeLogitsRasterState {
+    normalized_final_position: RasterActivationRow,
+    next_logit_idx: usize,
+    logit_count: usize,
+    output_builder_ref: RasterProjectionOutputBuilderRef,
+    softcap_bits: Option<i32>,
+    projection_rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum DecodeProjectionKind {
+    LayerMatrix {
+        layer_idx: usize,
+        matrix: GemmaDecodeLayerMatrixKind,
+    },
+    PleModel {
+        layer_idx: usize,
+    },
+    FinalLogits,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeRowProjectionState {
+    input: RasterActivationRow,
+    projection_kind: DecodeProjectionKind,
+    next_projection_row_idx: usize,
+    projection_rows: usize,
+    input_width: usize,
+    output_builder_ref: RasterProjectionOutputBuilderRef,
+    rows_per_tile: usize,
+    softcap_bits: Option<i32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeRowProjectionArtifactState {
+    input_ref: RasterActivationSequenceRef,
+    projection_kind: DecodeProjectionKind,
+    output_source_name: String,
+    current_row_bits: Vec<i32>,
+    next_projection_row_idx: usize,
+    projection_rows: usize,
+    input_width: usize,
+    rows_per_tile: usize,
+    softcap_bits: Option<i32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeAttentionState {
+    query_ref: RasterAttentionHeadsRef,
+    cache_ref: RasterKvCacheRef,
+    output_builder_ref: RasterTensorBuilderRef,
+    phase: DecodeAttentionPhase,
+    attention_id_prefix: String,
+    next_query_head_idx: usize,
+    query_head_count: usize,
+    kv_head_count: usize,
+    kv_groups: usize,
+    key_start: usize,
+    row_count: usize,
+    head_dim: usize,
+    kv_rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeAttentionArtifactState {
+    query_ref: RasterAttentionHeadsRef,
+    cache_ref: RasterKvCacheRef,
+    output_source_name: String,
+    phase: DecodeAttentionArtifactPhase,
+    attention_id_prefix: String,
+    next_query_head_idx: usize,
+    query_head_count: usize,
+    kv_head_count: usize,
+    kv_groups: usize,
+    key_start: usize,
+    row_count: usize,
+    head_dim: usize,
+    kv_rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct DecodeLayerContext {
+    layer_idx: usize,
+    layer: GemmaDecodeLayerMetadata,
+    cache_slot: DecodeLayerCacheSlot,
+    donor_cache_slot: Option<DecodeLayerCacheSlot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeKvCacheAppendState {
+    old_cache_ref: Option<RasterKvCacheRef>,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    output_builder_ref: RasterKvCacheBuilderRef,
+    retained_old_start: usize,
+    retained_old_len: usize,
+    next_head_idx: usize,
+    next_old_offset: usize,
+    head_count: usize,
+    rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeKvCacheAppendArtifactState {
+    old_cache_ref: Option<RasterKvCacheRef>,
+    key_ref: RasterAttentionHeadsRef,
+    value_ref: RasterAttentionHeadsRef,
+    keys_source_name: String,
+    values_source_name: String,
+    retained_old_start: usize,
+    retained_old_len: usize,
+    next_head_idx: usize,
+    next_old_offset: usize,
+    head_count: usize,
+    current_len: usize,
+    head_dim: usize,
+    rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum DecodeAttentionPhase {
+    CollectScores {
+        score_builder_ref: RasterTensorBuilderRef,
+        next_kv_offset: usize,
+    },
+    FindSoftmaxMax {
+        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: Option<usize>,
+        max_logit_bits: i32,
+    },
+    SumSoftmaxExp {
+        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+    },
+    BuildRawSoftmaxWeights {
+        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        raw_weight_builder_ref: RasterTensorBuilderRef,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+        summed_weight_bits: i32,
+    },
+    CorrectSoftmaxResidual {
+        raw_weight_ref:
+            crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        final_weight_builder_ref: RasterTensorBuilderRef,
+        next_weight_row_idx: usize,
+        max_index: usize,
+        residual_bits: i32,
+    },
+    ApplyValues {
+        weight_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        next_kv_offset: usize,
+        weighted_sum_acc_bits: Vec<i64>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum DecodeAttentionArtifactPhase {
+    CollectScores {
+        score_source_name: String,
+        next_kv_offset: usize,
+    },
+    FindSoftmaxMax {
+        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: Option<usize>,
+        max_logit_bits: i32,
+    },
+    SumSoftmaxExp {
+        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+    },
+    BuildRawSoftmaxWeights {
+        score_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        raw_weight_source_name: String,
+        next_score_row_idx: usize,
+        max_index: usize,
+        max_logit_bits: i32,
+        sum_exp_bits: i64,
+        summed_weight_bits: i32,
+    },
+    CorrectSoftmaxResidual {
+        raw_weight_ref:
+            crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        final_weight_source_name: String,
+        next_weight_row_idx: usize,
+        max_index: usize,
+        residual_bits: i32,
+    },
+    ApplyValues {
+        weight_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
+        next_kv_offset: usize,
+        weighted_sum_acc_bits: Vec<i64>,
+    },
+}
+
+fn init_decode_attention_score_phase_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    id_prefix: &str,
+    query_head_idx: usize,
+    visible_row_count: usize,
+) -> Result<(RasterArtifactStoreRoots, DecodeAttentionArtifactPhase)> {
+    let score_source_name = format!("{id_prefix}.scores.head_{query_head_idx}");
+    let artifact_store_roots = start_sequence_builder_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(&score_source_name)?,
+        visible_row_count,
+        1,
+    )?;
+    Ok((
+        artifact_store_roots,
+        DecodeAttentionArtifactPhase::CollectScores {
+            score_source_name,
+            next_kv_offset: 0,
+        },
     ))
 }
 
@@ -2705,253 +2958,6 @@ fn trace_decode_layer_checkpoint_with_roots(
         },
     )?;
     Ok(())
-}
-
-#[sequence]
-fn rms_norm_decode_layer_row(
-    row: &RasterActivationRow,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    norm: GemmaDecodeLayerNormKind,
-) -> Result<RasterActivationRow> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
-    call_tile!(
-        rms_norm_decode_row,
-        row,
-        &norm_weights,
-        scalars.rms_norm_eps,
-        "decode layer RMSNorm"
-    )
-}
-
-#[tile]
-fn read_decode_layer_scalars(
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-) -> Result<crate::decode_transition::raster::auth_source::GemmaDecodeLayerScalars> {
-    auth_read!(source, GemmaDecodeLayerScalarsRequest { layer_idx })
-}
-
-#[tile]
-fn read_decode_layer_norm_weights(
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    norm: GemmaDecodeLayerNormKind,
-) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
-    auth_read!(
-        source,
-        GemmaDecodeLayerNormWeightsRequest { layer_idx, norm }
-    )
-}
-
-#[tile]
-fn rms_norm_decode_row(
-    row: &RasterActivationRow,
-    norm_weights: &[crate::shared::numerics::det_num::Wgt],
-    eps: crate::shared::numerics::det_num::Acc,
-    label: &str,
-) -> Result<RasterActivationRow> {
-    first_row(
-        rms_norm_sequence(
-            &RasterActivationSequence::from_rows(vec![row.clone()]),
-            Some(norm_weights),
-            Some(eps),
-        )?,
-        label,
-    )
-}
-
-#[tile]
-fn add_decode_rows(
-    lhs: &RasterActivationRow,
-    rhs: &RasterActivationRow,
-) -> Result<RasterActivationRow> {
-    add_rows(lhs, rhs)
-}
-
-#[tile]
-fn mul_decode_rows(
-    lhs: &RasterActivationRow,
-    rhs: &RasterActivationRow,
-) -> Result<RasterActivationRow> {
-    mul_rows(lhs, rhs)
-}
-
-#[tile]
-fn gelu_decode_row(row: &RasterActivationRow) -> Result<RasterActivationRow> {
-    gelu_row(row)
-}
-
-#[tile]
-fn scale_decode_row_optional(
-    row: &RasterActivationRow,
-    scalar: Option<Act>,
-) -> Result<RasterActivationRow> {
-    if scalar.is_none() {
-        return Ok(row.clone());
-    }
-    scale_row(row, scalar)
-}
-
-#[tile]
-fn decode_ple_input_gate_rows(layer: &GemmaDecodeLayerMetadata) -> Result<usize> {
-    Ok(layer
-        .ple_input_gate_shape
-        .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing PLE input gate shape"))?
-        .rows)
-}
-
-#[tile]
-fn decode_ple_layer_projection_rows(layer: &GemmaDecodeLayerMetadata) -> Result<usize> {
-    Ok(layer
-        .ple_layer_projection_shape
-        .ok_or_else(|| {
-            anyhow!("Gemma decode layer metadata is missing PLE layer projection shape")
-        })?
-        .rows)
-}
-
-#[tile]
-fn validate_decode_attention_context(
-    input: &RasterActivationRow,
-    layer: &GemmaDecodeLayerMetadata,
-) -> Result<()> {
-    validate_row_width(input, layer.hidden_size, "decode attention input")?;
-    let kv_groups = layer
-        .num_heads
-        .checked_div(layer.num_kv_heads)
-        .ok_or_else(|| anyhow!("invalid Gemma head configuration"))?;
-    if kv_groups == 0 {
-        bail!("Gemma layer must have at least one KV group");
-    }
-    Ok(())
-}
-
-#[tile]
-fn clone_decode_key_as_value(raw_k: &RasterActivationRow) -> Result<RasterActivationRow> {
-    Ok(raw_k.clone())
-}
-
-#[tile]
-fn reshape_decode_row_heads(
-    row: RasterActivationRow,
-    num_heads: usize,
-    head_dim: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    reshape_row_heads(row, num_heads, head_dim)
-}
-
-#[sequence]
-fn rms_norm_decode_attention_heads(
-    heads: &RasterAttentionHeadSequence,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    norm: GemmaDecodeLayerNormKind,
-) -> Result<RasterAttentionHeadSequence> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
-    call_tile!(
-        rms_norm_decode_heads,
-        heads,
-        &norm_weights,
-        scalars.rms_norm_eps
-    )
-}
-
-#[tile]
-fn rms_norm_decode_heads(
-    heads: &RasterAttentionHeadSequence,
-    norm_weights: &[crate::shared::numerics::det_num::Wgt],
-    eps: crate::shared::numerics::det_num::Acc,
-) -> Result<RasterAttentionHeadSequence> {
-    rms_norm_heads(heads, Some(norm_weights), Some(eps))
-}
-
-#[sequence]
-fn value_rms_norm_decode_attention_heads(
-    heads: &RasterAttentionHeadSequence,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    call_tile!(value_rms_norm_decode_heads, heads, scalars.rms_norm_eps)
-}
-
-#[tile]
-fn value_rms_norm_decode_heads(
-    heads: &RasterAttentionHeadSequence,
-    eps: crate::shared::numerics::det_num::Acc,
-) -> Result<RasterAttentionHeadSequence> {
-    value_rms_norm_heads(heads, Some(eps))
-}
-
-#[tile]
-fn apply_decode_rope_to_heads(
-    heads: &RasterAttentionHeadSequence,
-    partial_rotary_dim: usize,
-    rope_freq_base_dim: usize,
-    rope_base: Option<Acc>,
-    position: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    apply_rope_to_heads(
-        heads,
-        partial_rotary_dim,
-        rope_freq_base_dim,
-        rope_base,
-        position,
-    )
-}
-
-#[tile]
-fn resolve_decode_attention_cache_ref(
-    attention_cache_slot: &DecodeLayerCacheSlot,
-) -> Result<RasterKvCacheRef> {
-    match attention_cache_slot {
-        DecodeLayerCacheSlot::Empty { .. } => bail!("decode attention cache is empty"),
-        DecodeLayerCacheSlot::Ref(cache_ref) => Ok(cache_ref.clone()),
-    }
-}
-
-#[tile]
-fn resolve_decode_attention_window(layer: &GemmaDecodeLayerMetadata) -> Result<Option<usize>> {
-    match layer.attention_kind {
-        GemmaDecodeAttentionKind::Full => Ok(None),
-        GemmaDecodeAttentionKind::Sliding => {
-            Ok(Some(layer.sliding_window.ok_or_else(|| {
-                anyhow!("sliding attention layer is missing a sliding window")
-            })?))
-        }
-    }
-}
-
-#[tile]
-fn read_decode_ple_scalars(
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<crate::decode_transition::raster::auth_source::GemmaDecodePleScalars> {
-    auth_read!(source, GemmaDecodePleScalarsRequest)
-}
-
-#[tile]
-fn read_decode_ple_projection_norm_weights(
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
-    auth_read!(source, GemmaDecodePleProjectionNormWeightsRequest)
-}
-
-#[tile]
-fn read_decode_ple_token_embedding(
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    token_id: u32,
-) -> Result<RasterActivationRow> {
-    Ok(RasterActivationRow::from_acts(auth_read!(
-        source,
-        GemmaDecodePleTokenEmbeddingRowRequest {
-            layer_idx,
-            token_id,
-        },
-    )?))
 }
 
 fn read_decode_projection_row(

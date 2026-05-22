@@ -17,41 +17,28 @@ use super::utils::{
     start_activation_sequence_builder_with_roots,
 };
 
-const EMBEDDED_PROMPT_ARTIFACT_NAME: &str = "input.embedding.embedded_prompt";
+// Raster execution sequences, ordered from the primary entry point outward.
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterInputEmbeddingInputRoots {
-    pub prompt_token_ids_root: String,
-    pub prompt_token_count: usize,
-    pub embedding_source_root: String,
+#[sequence]
+pub fn main(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_roots: RasterInputEmbeddingInputRoots,
+) -> Result<RasterInputEmbeddingOutput> {
+    let (artifact_store_roots, state) = call_tile!(
+        init_input_embedding_state,
+        artifact_store_roots,
+        input_roots
+    )?;
+    let (artifact_store_roots, state) = call_recur_tile!(
+        append_next_input_embedding_row,
+        (artifact_store_roots, state)
+    )?;
+    let (_artifact_store_roots, refs) =
+        call_tile!(finalize_input_embedding_refs, artifact_store_roots, state)?;
+    Ok(RasterInputEmbeddingOutput::new(_artifact_store_roots, refs))
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterInputEmbeddingRefs {
-    pub source_id: String,
-    pub embedding_source_root: String,
-    pub prompt_token_ids_root: String,
-    pub prompt_token_count: usize,
-    pub embedded_prompt_activations_ref: RasterActivationSequenceArtifactRef,
-}
-
-pub type RasterInputEmbeddingOutput = RasterRoutineOutput<RasterInputEmbeddingRefs>;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct InputEmbeddingRasterState {
-    source_id: String,
-    embedding_source_root: String,
-    prompt_token_ids_root: String,
-    prompt_token_count: usize,
-    hidden_size: usize,
-    next_token_idx: usize,
-}
-
-impl InputEmbeddingRasterState {
-    fn is_complete(&self) -> bool {
-        self.next_token_idx >= self.prompt_token_count
-    }
-}
+// Raster execution tiles, ordered by the sequence calls that reach them.
 
 #[tile]
 pub fn init_input_embedding_state(
@@ -163,21 +150,40 @@ pub fn finalize_input_embedding_refs(
     ))
 }
 
-#[sequence]
-pub fn main(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_roots: RasterInputEmbeddingInputRoots,
-) -> Result<RasterInputEmbeddingOutput> {
-    let (artifact_store_roots, state) = call_tile!(
-        init_input_embedding_state,
-        artifact_store_roots,
-        input_roots
-    )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
-        append_next_input_embedding_row,
-        (artifact_store_roots, state)
-    )?;
-    let (_artifact_store_roots, refs) =
-        call_tile!(finalize_input_embedding_refs, artifact_store_roots, state)?;
-    Ok(RasterInputEmbeddingOutput::new(_artifact_store_roots, refs))
+// Supporting definitions used by the sequences and tiles.
+
+const EMBEDDED_PROMPT_ARTIFACT_NAME: &str = "input.embedding.embedded_prompt";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterInputEmbeddingInputRoots {
+    pub prompt_token_ids_root: String,
+    pub prompt_token_count: usize,
+    pub embedding_source_root: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterInputEmbeddingRefs {
+    pub source_id: String,
+    pub embedding_source_root: String,
+    pub prompt_token_ids_root: String,
+    pub prompt_token_count: usize,
+    pub embedded_prompt_activations_ref: RasterActivationSequenceArtifactRef,
+}
+
+pub type RasterInputEmbeddingOutput = RasterRoutineOutput<RasterInputEmbeddingRefs>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct InputEmbeddingRasterState {
+    source_id: String,
+    embedding_source_root: String,
+    prompt_token_ids_root: String,
+    prompt_token_count: usize,
+    hidden_size: usize,
+    next_token_idx: usize,
+}
+
+impl InputEmbeddingRasterState {
+    fn is_complete(&self) -> bool {
+        self.next_token_idx >= self.prompt_token_count
+    }
 }

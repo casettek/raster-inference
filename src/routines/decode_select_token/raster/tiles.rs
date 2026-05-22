@@ -12,63 +12,43 @@ use crate::shared::tensors::raster_tensor_artifacts::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 
-pub const DEFAULT_DECODE_SELECT_LOGITS_PER_TILE: usize = 32;
-pub const DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE: usize = 64;
+// Raster execution sequences, ordered from the primary entry point outward.
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterDecodeSelectInputRoots {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub logits_ref: RasterActivationSequenceRef,
-    pub full_token_ids_ref: Option<RasterTokenIdSequenceRef>,
-    pub full_token_count: usize,
-    pub generated_token_ids_ref: Option<RasterTokenIdSequenceRef>,
-    pub generated_token_count: usize,
-    pub max_new_tokens: usize,
-    pub logits_per_tile: usize,
-    pub token_ids_per_tile: usize,
-    pub output_full_token_ids_source_name: String,
-    pub output_generated_token_ids_source_name: String,
-    pub output_selected_token_source_name: String,
+#[sequence]
+pub fn main(
+    input_roots: RasterDecodeSelectInputRoots,
+) -> Result<Option<RasterDecodeSelectOutputRefs>> {
+    if call_tile!(
+        check_stop_condition,
+        input_roots.generated_token_count,
+        input_roots.max_new_tokens
+    )
+    .is_some()
+    {
+        return Ok(None);
+    }
+
+    let argmax_state = call_tile!(
+        init_select_next_token,
+        input_roots.artifact_store_roots.clone(),
+        input_roots.logits_ref.clone(),
+        input_roots.logits_per_tile
+    )?;
+    let argmax_state = call_recur_tile!(scan_next_token_logit, argmax_state)?;
+    let next_token = call_tile!(finalize_selected_token, argmax_state)?;
+    let append_state = call_tile!(
+        init_decode_select_append_state,
+        input_roots.artifact_store_roots.clone(),
+        &input_roots,
+        next_token
+    )?;
+    let append_state = call_recur_tile!(copy_next_full_token_chunk, append_state)?;
+    let append_state = call_recur_tile!(copy_next_generated_token_chunk, append_state)?;
+    let append_state = call_tile!(append_selected_token, append_state)?;
+    call_tile!(finalize_decode_select_refs, append_state).map(Some)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeSelectArgmaxState {
-    artifact_store_roots: RasterArtifactStoreRoots,
-    logits_ref: RasterActivationSequenceRef,
-    next_token_idx: usize,
-    logit_count: usize,
-    best_token_id: u32,
-    best_logit_bits: i32,
-    logits_per_tile: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeSelectAppendState {
-    artifact_store_roots: RasterArtifactStoreRoots,
-    full_token_ids_ref: Option<RasterTokenIdSequenceRef>,
-    full_token_count: usize,
-    generated_token_ids_ref: Option<RasterTokenIdSequenceRef>,
-    generated_token_count: usize,
-    next_full_token_idx: usize,
-    next_generated_token_idx: usize,
-    next_token: u32,
-    token_ids_per_tile: usize,
-    output_full_token_ids_source_name: String,
-    output_generated_token_ids_source_name: String,
-    output_selected_token_source_name: String,
-    logits_ref: RasterActivationSequenceRef,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterDecodeSelectOutputRefs {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub next_token: u32,
-    pub selected_token_ref: RasterSelectedTokenRef,
-    pub full_token_ids_ref: RasterTokenIdSequenceRef,
-    pub generated_token_ids_ref: RasterTokenIdSequenceRef,
-    pub logits_ref: RasterActivationSequenceRef,
-    pub logit_count: usize,
-}
+// Raster execution tiles, ordered by the sequence calls that reach them.
 
 #[tile]
 pub fn check_stop_condition(
@@ -131,50 +111,6 @@ pub fn scan_next_token_logit(
     }
 
     Ok((state.next_token_idx >= state.logit_count, state))
-}
-
-fn read_logit_bits(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    logits_ref: &RasterActivationSequenceRef,
-    token_idx: usize,
-) -> Result<i32> {
-    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
-    let (row_idx, col_idx) = match (row_count, width) {
-        (_, 1) => (token_idx, 0),
-        (1, _) => (0, token_idx),
-        _ => bail!("raster decode select logits shape {row_count}x{width} must be Nx1 or 1xN"),
-    };
-    let row = read_sequence_row_from_roots(
-        artifact_store_roots,
-        RasterSequenceRowRequest {
-            tensor_ref: logits_ref.clone(),
-            row_idx,
-        },
-    )?;
-    row.act_bits()
-        .get(col_idx)
-        .copied()
-        .ok_or_else(|| anyhow!("raster decode select logit {token_idx} is missing"))
-}
-
-fn decode_select_logit_count(logits_ref: &RasterActivationSequenceRef) -> Result<usize> {
-    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
-    match (row_count, width) {
-        (0, _) | (_, 0) => {
-            bail!("raster decode select token requires at least one canonical logit")
-        }
-        (rows, 1) => Ok(rows),
-        (1, cols) => Ok(cols),
-        _ => bail!("raster decode select logits shape {row_count}x{width} must be Nx1 or 1xN"),
-    }
-}
-
-fn candidate_wins(best_logit_bits: i32, candidate_bits: i32) -> bool {
-    let candidates = [
-        Act::from_bits(best_logit_bits),
-        Act::from_bits(candidate_bits),
-    ];
-    argmax_first(&candidates) == 1
 }
 
 #[tile]
@@ -417,6 +353,111 @@ pub fn finalize_decode_select_refs(
     })
 }
 
+// Supporting definitions used by the sequences and tiles.
+
+pub const DEFAULT_DECODE_SELECT_LOGITS_PER_TILE: usize = 32;
+
+pub const DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE: usize = 64;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterDecodeSelectInputRoots {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub logits_ref: RasterActivationSequenceRef,
+    pub full_token_ids_ref: Option<RasterTokenIdSequenceRef>,
+    pub full_token_count: usize,
+    pub generated_token_ids_ref: Option<RasterTokenIdSequenceRef>,
+    pub generated_token_count: usize,
+    pub max_new_tokens: usize,
+    pub logits_per_tile: usize,
+    pub token_ids_per_tile: usize,
+    pub output_full_token_ids_source_name: String,
+    pub output_generated_token_ids_source_name: String,
+    pub output_selected_token_source_name: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeSelectArgmaxState {
+    artifact_store_roots: RasterArtifactStoreRoots,
+    logits_ref: RasterActivationSequenceRef,
+    next_token_idx: usize,
+    logit_count: usize,
+    best_token_id: u32,
+    best_logit_bits: i32,
+    logits_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeSelectAppendState {
+    artifact_store_roots: RasterArtifactStoreRoots,
+    full_token_ids_ref: Option<RasterTokenIdSequenceRef>,
+    full_token_count: usize,
+    generated_token_ids_ref: Option<RasterTokenIdSequenceRef>,
+    generated_token_count: usize,
+    next_full_token_idx: usize,
+    next_generated_token_idx: usize,
+    next_token: u32,
+    token_ids_per_tile: usize,
+    output_full_token_ids_source_name: String,
+    output_generated_token_ids_source_name: String,
+    output_selected_token_source_name: String,
+    logits_ref: RasterActivationSequenceRef,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterDecodeSelectOutputRefs {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub next_token: u32,
+    pub selected_token_ref: RasterSelectedTokenRef,
+    pub full_token_ids_ref: RasterTokenIdSequenceRef,
+    pub generated_token_ids_ref: RasterTokenIdSequenceRef,
+    pub logits_ref: RasterActivationSequenceRef,
+    pub logit_count: usize,
+}
+
+fn read_logit_bits(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    logits_ref: &RasterActivationSequenceRef,
+    token_idx: usize,
+) -> Result<i32> {
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    let (row_idx, col_idx) = match (row_count, width) {
+        (_, 1) => (token_idx, 0),
+        (1, _) => (0, token_idx),
+        _ => bail!("raster decode select logits shape {row_count}x{width} must be Nx1 or 1xN"),
+    };
+    let row = read_sequence_row_from_roots(
+        artifact_store_roots,
+        RasterSequenceRowRequest {
+            tensor_ref: logits_ref.clone(),
+            row_idx,
+        },
+    )?;
+    row.act_bits()
+        .get(col_idx)
+        .copied()
+        .ok_or_else(|| anyhow!("raster decode select logit {token_idx} is missing"))
+}
+
+fn decode_select_logit_count(logits_ref: &RasterActivationSequenceRef) -> Result<usize> {
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    match (row_count, width) {
+        (0, _) | (_, 0) => {
+            bail!("raster decode select token requires at least one canonical logit")
+        }
+        (rows, 1) => Ok(rows),
+        (1, cols) => Ok(cols),
+        _ => bail!("raster decode select logits shape {row_count}x{width} must be Nx1 or 1xN"),
+    }
+}
+
+fn candidate_wins(best_logit_bits: i32, candidate_bits: i32) -> bool {
+    let candidates = [
+        Act::from_bits(best_logit_bits),
+        Act::from_bits(candidate_bits),
+    ];
+    argmax_first(&candidates) == 1
+}
+
 fn validate_token_input(
     artifact_store_roots: &RasterArtifactStoreRoots,
     token_ids_ref: Option<&RasterTokenIdSequenceRef>,
@@ -439,40 +480,6 @@ fn validate_token_input(
         (None, 0) => Ok(()),
         (None, _) => bail!("raster decode select {label} token ids root is missing"),
     }
-}
-
-#[sequence]
-pub fn main(
-    input_roots: RasterDecodeSelectInputRoots,
-) -> Result<Option<RasterDecodeSelectOutputRefs>> {
-    if call_tile!(
-        check_stop_condition,
-        input_roots.generated_token_count,
-        input_roots.max_new_tokens
-    )
-    .is_some()
-    {
-        return Ok(None);
-    }
-
-    let argmax_state = call_tile!(
-        init_select_next_token,
-        input_roots.artifact_store_roots.clone(),
-        input_roots.logits_ref.clone(),
-        input_roots.logits_per_tile
-    )?;
-    let argmax_state = call_recur_tile!(scan_next_token_logit, argmax_state)?;
-    let next_token = call_tile!(finalize_selected_token, argmax_state)?;
-    let append_state = call_tile!(
-        init_decode_select_append_state,
-        input_roots.artifact_store_roots.clone(),
-        &input_roots,
-        next_token
-    )?;
-    let append_state = call_recur_tile!(copy_next_full_token_chunk, append_state)?;
-    let append_state = call_recur_tile!(copy_next_generated_token_chunk, append_state)?;
-    let append_state = call_tile!(append_selected_token, append_state)?;
-    call_tile!(finalize_decode_select_refs, append_state).map(Some)
 }
 
 #[cfg(test)]

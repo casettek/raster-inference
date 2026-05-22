@@ -22,54 +22,44 @@ use crate::shared::tensors::raster_tensor_artifacts::{
     RasterTensorId,
 };
 
-pub const NORMALIZED_FINAL_POSITION_ARTIFACT_NAME: &str =
-    "prefill.finalize.normalized_final_position";
-pub const PREFILL_LOGITS_ARTIFACT_NAME: &str = "prefill.finalize.logits";
+// Raster execution sequences, ordered from the primary entry point outward.
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterPrefillFinalizeInputRoots {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub prompt_token_count: usize,
-    pub finalize_source_root: String,
-    pub final_hidden_states_ref: RasterActivationSequenceRef,
-    pub layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
-    pub projection_rows_per_tile: usize,
+#[sequence]
+pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<RasterPrefillFinalizeOutput> {
+    crate::trace::trace_event("prefill.select_final_position");
+    let state = call_tile!(
+        init_prefill_finalize_state,
+        input_roots.artifact_store_roots,
+        input_roots.prompt_token_count,
+        input_roots.finalize_source_root,
+        input_roots.final_hidden_states_ref,
+        &input_roots.layer_caches,
+        input_roots.projection_rows_per_tile
+    )?;
+    let state = call_tile!(normalize_final_position_to_artifact, state)?;
+    crate::trace::trace_event("prefill.project_to_logits");
+    let state = call_recur_tile!(project_next_prefill_logit_chunk, state)?;
+    let (artifact_store_roots, refs) = call_tile!(
+        finalize_prefill_finalize_refs,
+        state,
+        input_roots.layer_caches
+    )?;
+    Ok(RasterPrefillFinalizeOutput::new(artifact_store_roots, refs))
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterPrefillFinalizeRefs {
-    pub source_id: String,
-    pub finalize_source_root: String,
-    pub prompt_token_count: usize,
-    pub final_hidden_states_ref: RasterActivationSequenceRef,
-    pub layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
-    pub normalized_final_position_ref: RasterActivationSequenceRef,
-    pub logits_ref: RasterActivationSequenceRef,
-    pub logit_count: usize,
+#[sequence]
+pub fn materialize_prefill_result_for_api(
+    input_roots: RasterPrefillFinalizeInputRoots,
+) -> Result<TransformerPrefillResult> {
+    let output = call_seq!(main, input_roots)?;
+    call_tile!(
+        build_prefill_result_from_refs,
+        output.artifact_store_roots,
+        output.refs
+    )
 }
 
-pub type RasterPrefillFinalizeOutput = RasterRoutineOutput<RasterPrefillFinalizeRefs>;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillFinalizeRasterState {
-    artifact_store_roots: RasterArtifactStoreRoots,
-    source_id: String,
-    finalize_source_root: String,
-    prompt_token_count: usize,
-    final_hidden_states_ref: RasterActivationSequenceRef,
-    normalized_final_position_ref: Option<RasterActivationSequenceRef>,
-    next_logit_idx: usize,
-    logit_count: usize,
-    hidden_width: usize,
-    softcap_bits: Option<i32>,
-    projection_rows_per_tile: usize,
-}
-
-impl PrefillFinalizeRasterState {
-    fn is_complete(&self) -> bool {
-        self.next_logit_idx >= self.logit_count
-    }
-}
+// Raster execution tiles, ordered by the sequence calls that reach them.
 
 #[tile]
 pub fn init_prefill_finalize_state(
@@ -295,47 +285,64 @@ pub fn finalize_prefill_finalize_refs(
     ))
 }
 
-#[sequence]
-pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<RasterPrefillFinalizeOutput> {
-    crate::trace::trace_event("prefill.select_final_position");
-    let state = call_tile!(
-        init_prefill_finalize_state,
-        input_roots.artifact_store_roots,
-        input_roots.prompt_token_count,
-        input_roots.finalize_source_root,
-        input_roots.final_hidden_states_ref,
-        &input_roots.layer_caches,
-        input_roots.projection_rows_per_tile
-    )?;
-    let state = call_tile!(normalize_final_position_to_artifact, state)?;
-    crate::trace::trace_event("prefill.project_to_logits");
-    let state = call_recur_tile!(project_next_prefill_logit_chunk, state)?;
-    let (artifact_store_roots, refs) = call_tile!(
-        finalize_prefill_finalize_refs,
-        state,
-        input_roots.layer_caches
-    )?;
-    Ok(RasterPrefillFinalizeOutput::new(artifact_store_roots, refs))
-}
-
-#[sequence]
-pub fn materialize_prefill_result_for_api(
-    input_roots: RasterPrefillFinalizeInputRoots,
-) -> Result<TransformerPrefillResult> {
-    let output = call_seq!(main, input_roots)?;
-    call_tile!(
-        build_prefill_result_from_refs,
-        output.artifact_store_roots,
-        output.refs
-    )
-}
-
 #[tile]
 pub fn build_prefill_result_from_refs(
     artifact_store_roots: RasterArtifactStoreRoots,
     refs: RasterPrefillFinalizeRefs,
 ) -> Result<TransformerPrefillResult> {
     build_prefill_result_from_root_refs(&artifact_store_roots, &refs)
+}
+
+// Supporting definitions used by the sequences and tiles.
+
+pub const NORMALIZED_FINAL_POSITION_ARTIFACT_NAME: &str =
+    "prefill.finalize.normalized_final_position";
+
+pub const PREFILL_LOGITS_ARTIFACT_NAME: &str = "prefill.finalize.logits";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterPrefillFinalizeInputRoots {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub prompt_token_count: usize,
+    pub finalize_source_root: String,
+    pub final_hidden_states_ref: RasterActivationSequenceRef,
+    pub layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    pub projection_rows_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterPrefillFinalizeRefs {
+    pub source_id: String,
+    pub finalize_source_root: String,
+    pub prompt_token_count: usize,
+    pub final_hidden_states_ref: RasterActivationSequenceRef,
+    pub layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    pub normalized_final_position_ref: RasterActivationSequenceRef,
+    pub logits_ref: RasterActivationSequenceRef,
+    pub logit_count: usize,
+}
+
+pub type RasterPrefillFinalizeOutput = RasterRoutineOutput<RasterPrefillFinalizeRefs>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PrefillFinalizeRasterState {
+    artifact_store_roots: RasterArtifactStoreRoots,
+    source_id: String,
+    finalize_source_root: String,
+    prompt_token_count: usize,
+    final_hidden_states_ref: RasterActivationSequenceRef,
+    normalized_final_position_ref: Option<RasterActivationSequenceRef>,
+    next_logit_idx: usize,
+    logit_count: usize,
+    hidden_width: usize,
+    softcap_bits: Option<i32>,
+    projection_rows_per_tile: usize,
+}
+
+impl PrefillFinalizeRasterState {
+    fn is_complete(&self) -> bool {
+        self.next_logit_idx >= self.logit_count
+    }
 }
 
 fn validate_layer_cache_roots(

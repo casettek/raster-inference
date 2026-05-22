@@ -16,86 +16,107 @@ use crate::shared::model::gemma_tokenizer::{
     GemmaTokenByIdRequest,
 };
 
-pub const DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE: usize = 16;
-const INVALID_UTF8_REPLACEMENT: &str = "�";
+// Raster execution sequences, ordered from the primary entry point outward.
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterOutputFinalizeInputRoots {
-    pub artifact_store_roots: RasterArtifactStoreRoots,
-    pub generated_token_ids_ref: RasterTokenIdSequenceRef,
-    pub tokenizer_source_root: String,
-    pub output_text_source_name: String,
-    pub pending_bytes_source_prefix: String,
-    pub byte_flush_bytes_per_tile: usize,
-    pub stop_reason: OutputDecodeStopReason,
+#[sequence]
+pub fn main(
+    input_roots: RasterOutputFinalizeInputRoots,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<RasterOutputFinalizeOutput> {
+    detokenize_output_tokens_ref_with_roots(input_roots, tokenizer)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterOutputFinalizeRefs {
-    pub generated_token_ids_ref: RasterTokenIdSequenceRef,
-    pub generated_text_ref: OutputTextRef,
-    pub generated_token_ids_sha256: String,
-    pub generated_token_count: usize,
-    pub stop_reason: OutputDecodeStopReason,
+#[sequence]
+pub fn detokenize_output_tokens_ref_with_roots(
+    input_roots: RasterOutputFinalizeInputRoots,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<RasterOutputFinalizeOutput> {
+    let (_artifact_store_roots, state) = call_tile!(
+        init_raster_output_detokenize,
+        input_roots.artifact_store_roots.clone(),
+        input_roots,
+        tokenizer
+    )?;
+    let state = call_recur_tile!(decode_next_output_token_with_roots, state, tokenizer)?;
+    let (_artifact_store_roots, refs) = call_tile!(finalize_raster_output_detokenize_refs, state)?;
+    Ok(RasterOutputFinalizeOutput::new(_artifact_store_roots, refs))
 }
 
-pub type RasterOutputFinalizeOutput = RasterRoutineOutput<RasterOutputFinalizeRefs>;
+#[sequence]
+pub fn run(
+    generated_token_ids: &[u32],
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<OutputDecodeState> {
+    run_with_byte_flush_bytes_per_tile(
+        generated_token_ids,
+        tokenizer,
+        DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+    )
+}
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterOutputDetokenizeState {
-    artifact_store_roots: RasterArtifactStoreRoots,
-    token_ids_ref: RasterTokenIdSequenceRef,
-    next_token_idx: usize,
-    token_count: usize,
-    tokenizer_source_root: String,
-    text_builder_source_name: String,
-    pending_bytes_source_prefix: String,
-    pending_bytes_builder_source_name: Option<String>,
-    pending_bytes_written: usize,
-    pending_segment_idx: usize,
-    text_chunk_count: usize,
-    text_byte_len: usize,
-    text_char_count: usize,
-    token_commitment: OutputTokenIdsCommitmentState,
-    replacement_pattern: String,
-    replacement_content: String,
-    byte_fallback: bool,
-    phase: RasterOutputDetokenizePhase,
+#[sequence]
+pub fn run_with_byte_flush_bytes_per_tile(
+    generated_token_ids: &[u32],
+    tokenizer: &AuthenticatedGemmaTokenizer,
     byte_flush_bytes_per_tile: usize,
-    stop_reason: OutputDecodeStopReason,
+) -> Result<OutputDecodeState> {
+    ArtifactIo::reset_store();
+    let input_roots = prepare_raster_output_finalize_input_roots(
+        generated_token_ids,
+        tokenizer,
+        byte_flush_bytes_per_tile,
+        "output.finalize",
+    )?;
+    let refs = call_seq!(main, input_roots, tokenizer)?;
+    let generated_token_ids = materialize_token_ids_from_roots(
+        &refs.artifact_store_roots,
+        &refs.refs.generated_token_ids_ref,
+    )?;
+    let generated_text = crate::output_finalize::raster::auth_source::materialize_text_from_roots(
+        &refs.artifact_store_roots,
+        &refs.refs.generated_text_ref,
+    )?;
+    Ok(call_tile!(
+        finalize_output_decode,
+        generated_token_ids,
+        refs.refs.generated_token_ids_sha256,
+        generated_text
+    ))
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-enum RasterOutputDetokenizePhase {
-    ReadNextToken,
-    ValidatePendingBytes {
-        continuation: RasterOutputPendingFlushContinuation,
-        pending_ref: OutputPendingBytesRef,
-        next_byte_idx: usize,
-        validation_state: OutputUtf8ValidationState,
-    },
-    FlushPendingBytes {
-        continuation: RasterOutputPendingFlushContinuation,
-        pending_ref: OutputPendingBytesRef,
-        next_byte_idx: usize,
-        valid_utf8: bool,
-    },
-    Complete,
+#[sequence]
+pub fn detokenize_output_tokens_with_byte_flush_bytes_per_tile(
+    token_ids: &[u32],
+    tokenizer: &AuthenticatedGemmaTokenizer,
+    byte_flush_bytes_per_tile: usize,
+) -> Result<String> {
+    ArtifactIo::reset_store();
+    let input_roots = prepare_raster_output_finalize_input_roots(
+        token_ids,
+        tokenizer,
+        byte_flush_bytes_per_tile,
+        "output.finalize.detokenize",
+    )?;
+    let refs = call_seq!(main, input_roots, tokenizer)?;
+    crate::output_finalize::raster::auth_source::materialize_text_from_roots(
+        &refs.artifact_store_roots,
+        &refs.refs.generated_text_ref,
+    )
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-enum RasterOutputPendingFlushContinuation {
-    ReadNextToken,
-    ReplayCurrentToken,
-    Complete,
+#[sequence]
+pub fn detokenize_output_tokens(
+    token_ids: &[u32],
+    tokenizer: &AuthenticatedGemmaTokenizer,
+) -> Result<String> {
+    detokenize_output_tokens_with_byte_flush_bytes_per_tile(
+        token_ids,
+        tokenizer,
+        DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
+    )
 }
 
-pub fn validate_output_byte_flush_bytes_per_tile(bytes_per_tile: usize) -> Result<()> {
-    if bytes_per_tile == 0 {
-        bail!("raster output byte flush bytes per tile must be greater than zero");
-    }
-    Ok(())
-}
+// Raster execution tiles, ordered by the sequence calls that reach them.
 
 #[tile]
 pub fn init_raster_output_detokenize(
@@ -242,6 +263,155 @@ pub fn decode_next_output_token_with_roots(
         }
         RasterOutputDetokenizePhase::Complete => Ok((true, state)),
     }
+}
+
+#[tile]
+pub fn finalize_raster_output_detokenize_refs(
+    mut state: RasterOutputDetokenizeState,
+) -> Result<(RasterArtifactStoreRoots, RasterOutputFinalizeRefs)> {
+    if state.next_token_idx != state.token_count {
+        bail!(
+            "raster output finalize decoded {} tokens, expected {}",
+            state.next_token_idx,
+            state.token_count
+        );
+    }
+    if state.phase != RasterOutputDetokenizePhase::Complete {
+        bail!("raster output finalize reached incomplete detokenize phase");
+    }
+    if state.pending_bytes_written != 0 || state.pending_bytes_builder_source_name.is_some() {
+        bail!("raster output finalize reached completion with pending bytes");
+    }
+
+    let (roots, text_ref) = ArtifactIo::finalize_builder_by_source_name_with_roots(
+        &state.artifact_store_roots,
+        &state.text_builder_source_name,
+    )?;
+    state.artifact_store_roots = roots;
+    let text_commitment = text_ref.root().to_string();
+    let text_ref = OutputTextRef::from_artifact(
+        text_ref,
+        state.text_byte_len,
+        state.text_char_count,
+        text_commitment,
+    )?;
+    let generated_token_ids_sha256 = state.token_commitment.finish();
+
+    Ok((
+        state.artifact_store_roots.clone(),
+        RasterOutputFinalizeRefs {
+            generated_token_ids_ref: state.token_ids_ref,
+            generated_text_ref: text_ref,
+            generated_token_ids_sha256,
+            generated_token_count: state.token_count,
+            stop_reason: state.stop_reason,
+        },
+    ))
+}
+
+#[tile]
+pub fn finalize_output_decode(
+    generated_token_ids: Vec<u32>,
+    generated_token_ids_sha256: String,
+    generated_text: String,
+) -> OutputDecodeState {
+    OutputDecodeState {
+        generated_token_count: generated_token_ids.len(),
+        generated_token_ids,
+        generated_token_ids_sha256,
+        generated_text,
+        stop_reason: OutputDecodeStopReason::MaxNewTokens,
+        decode_transition_states: Vec::new(),
+    }
+}
+
+#[tile]
+pub fn build_output_decode_commitment(token_ids: &[u32]) -> Result<String> {
+    build_output_token_ids_commitment(token_ids)
+}
+
+// Supporting definitions used by the sequences and tiles.
+
+pub const DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE: usize = 16;
+
+const INVALID_UTF8_REPLACEMENT: &str = "�";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterOutputFinalizeInputRoots {
+    pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub generated_token_ids_ref: RasterTokenIdSequenceRef,
+    pub tokenizer_source_root: String,
+    pub output_text_source_name: String,
+    pub pending_bytes_source_prefix: String,
+    pub byte_flush_bytes_per_tile: usize,
+    pub stop_reason: OutputDecodeStopReason,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterOutputFinalizeRefs {
+    pub generated_token_ids_ref: RasterTokenIdSequenceRef,
+    pub generated_text_ref: OutputTextRef,
+    pub generated_token_ids_sha256: String,
+    pub generated_token_count: usize,
+    pub stop_reason: OutputDecodeStopReason,
+}
+
+pub type RasterOutputFinalizeOutput = RasterRoutineOutput<RasterOutputFinalizeRefs>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RasterOutputDetokenizeState {
+    artifact_store_roots: RasterArtifactStoreRoots,
+    token_ids_ref: RasterTokenIdSequenceRef,
+    next_token_idx: usize,
+    token_count: usize,
+    tokenizer_source_root: String,
+    text_builder_source_name: String,
+    pending_bytes_source_prefix: String,
+    pending_bytes_builder_source_name: Option<String>,
+    pending_bytes_written: usize,
+    pending_segment_idx: usize,
+    text_chunk_count: usize,
+    text_byte_len: usize,
+    text_char_count: usize,
+    token_commitment: OutputTokenIdsCommitmentState,
+    replacement_pattern: String,
+    replacement_content: String,
+    byte_fallback: bool,
+    phase: RasterOutputDetokenizePhase,
+    byte_flush_bytes_per_tile: usize,
+    stop_reason: OutputDecodeStopReason,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum RasterOutputDetokenizePhase {
+    ReadNextToken,
+    ValidatePendingBytes {
+        continuation: RasterOutputPendingFlushContinuation,
+        pending_ref: OutputPendingBytesRef,
+        next_byte_idx: usize,
+        validation_state: OutputUtf8ValidationState,
+    },
+    FlushPendingBytes {
+        continuation: RasterOutputPendingFlushContinuation,
+        pending_ref: OutputPendingBytesRef,
+        next_byte_idx: usize,
+        valid_utf8: bool,
+    },
+    Complete,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum RasterOutputPendingFlushContinuation {
+    ReadNextToken,
+    ReplayCurrentToken,
+    Complete,
+}
+
+pub fn validate_output_byte_flush_bytes_per_tile(bytes_per_tile: usize) -> Result<()> {
+    if bytes_per_tile == 0 {
+        bail!("raster output byte flush bytes per tile must be greater than zero");
+    }
+    Ok(())
 }
 
 fn append_decoded_token_with_roots(
@@ -500,175 +670,12 @@ fn pending_bytes_source_name(state: &RasterOutputDetokenizeState) -> String {
     )
 }
 
-#[tile]
-pub fn finalize_raster_output_detokenize_refs(
-    mut state: RasterOutputDetokenizeState,
-) -> Result<(RasterArtifactStoreRoots, RasterOutputFinalizeRefs)> {
-    if state.next_token_idx != state.token_count {
-        bail!(
-            "raster output finalize decoded {} tokens, expected {}",
-            state.next_token_idx,
-            state.token_count
-        );
-    }
-    if state.phase != RasterOutputDetokenizePhase::Complete {
-        bail!("raster output finalize reached incomplete detokenize phase");
-    }
-    if state.pending_bytes_written != 0 || state.pending_bytes_builder_source_name.is_some() {
-        bail!("raster output finalize reached completion with pending bytes");
-    }
-
-    let (roots, text_ref) = ArtifactIo::finalize_builder_by_source_name_with_roots(
-        &state.artifact_store_roots,
-        &state.text_builder_source_name,
-    )?;
-    state.artifact_store_roots = roots;
-    let text_commitment = text_ref.root().to_string();
-    let text_ref = OutputTextRef::from_artifact(
-        text_ref,
-        state.text_byte_len,
-        state.text_char_count,
-        text_commitment,
-    )?;
-    let generated_token_ids_sha256 = state.token_commitment.finish();
-
-    Ok((
-        state.artifact_store_roots.clone(),
-        RasterOutputFinalizeRefs {
-            generated_token_ids_ref: state.token_ids_ref,
-            generated_text_ref: text_ref,
-            generated_token_ids_sha256,
-            generated_token_count: state.token_count,
-            stop_reason: state.stop_reason,
-        },
-    ))
-}
-
 fn byte_fallback_value(piece: &str) -> Result<Option<u8>> {
     if piece.len() == 6 && piece.starts_with("<0x") && piece.ends_with('>') {
         return Ok(u8::from_str_radix(&piece[3..5], 16).ok());
     }
 
     Ok(None)
-}
-
-#[sequence]
-pub fn detokenize_output_tokens_with_byte_flush_bytes_per_tile(
-    token_ids: &[u32],
-    tokenizer: &AuthenticatedGemmaTokenizer,
-    byte_flush_bytes_per_tile: usize,
-) -> Result<String> {
-    ArtifactIo::reset_store();
-    let input_roots = prepare_raster_output_finalize_input_roots(
-        token_ids,
-        tokenizer,
-        byte_flush_bytes_per_tile,
-        "output.finalize.detokenize",
-    )?;
-    let refs = call_seq!(main, input_roots, tokenizer)?;
-    crate::output_finalize::raster::auth_source::materialize_text_from_roots(
-        &refs.artifact_store_roots,
-        &refs.refs.generated_text_ref,
-    )
-}
-
-#[sequence]
-pub fn detokenize_output_tokens(
-    token_ids: &[u32],
-    tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<String> {
-    detokenize_output_tokens_with_byte_flush_bytes_per_tile(
-        token_ids,
-        tokenizer,
-        DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
-    )
-}
-
-#[sequence]
-pub fn detokenize_output_tokens_ref_with_roots(
-    input_roots: RasterOutputFinalizeInputRoots,
-    tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<RasterOutputFinalizeOutput> {
-    let (_artifact_store_roots, state) = call_tile!(
-        init_raster_output_detokenize,
-        input_roots.artifact_store_roots.clone(),
-        input_roots,
-        tokenizer
-    )?;
-    let state = call_recur_tile!(decode_next_output_token_with_roots, state, tokenizer)?;
-    let (_artifact_store_roots, refs) = call_tile!(finalize_raster_output_detokenize_refs, state)?;
-    Ok(RasterOutputFinalizeOutput::new(_artifact_store_roots, refs))
-}
-
-#[sequence]
-pub fn main(
-    input_roots: RasterOutputFinalizeInputRoots,
-    tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<RasterOutputFinalizeOutput> {
-    detokenize_output_tokens_ref_with_roots(input_roots, tokenizer)
-}
-
-#[tile]
-pub fn build_output_decode_commitment(token_ids: &[u32]) -> Result<String> {
-    build_output_token_ids_commitment(token_ids)
-}
-
-#[tile]
-pub fn finalize_output_decode(
-    generated_token_ids: Vec<u32>,
-    generated_token_ids_sha256: String,
-    generated_text: String,
-) -> OutputDecodeState {
-    OutputDecodeState {
-        generated_token_count: generated_token_ids.len(),
-        generated_token_ids,
-        generated_token_ids_sha256,
-        generated_text,
-        stop_reason: OutputDecodeStopReason::MaxNewTokens,
-        decode_transition_states: Vec::new(),
-    }
-}
-
-#[sequence]
-pub fn run_with_byte_flush_bytes_per_tile(
-    generated_token_ids: &[u32],
-    tokenizer: &AuthenticatedGemmaTokenizer,
-    byte_flush_bytes_per_tile: usize,
-) -> Result<OutputDecodeState> {
-    ArtifactIo::reset_store();
-    let input_roots = prepare_raster_output_finalize_input_roots(
-        generated_token_ids,
-        tokenizer,
-        byte_flush_bytes_per_tile,
-        "output.finalize",
-    )?;
-    let refs = call_seq!(main, input_roots, tokenizer)?;
-    let generated_token_ids = materialize_token_ids_from_roots(
-        &refs.artifact_store_roots,
-        &refs.refs.generated_token_ids_ref,
-    )?;
-    let generated_text = crate::output_finalize::raster::auth_source::materialize_text_from_roots(
-        &refs.artifact_store_roots,
-        &refs.refs.generated_text_ref,
-    )?;
-    Ok(call_tile!(
-        finalize_output_decode,
-        generated_token_ids,
-        refs.refs.generated_token_ids_sha256,
-        generated_text
-    ))
-}
-
-#[sequence]
-pub fn run(
-    generated_token_ids: &[u32],
-    tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<OutputDecodeState> {
-    run_with_byte_flush_bytes_per_tile(
-        generated_token_ids,
-        tokenizer,
-        DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
-    )
 }
 
 pub fn prepare_raster_output_finalize_input_roots(
