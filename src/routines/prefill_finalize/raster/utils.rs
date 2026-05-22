@@ -20,7 +20,10 @@ pub fn build_prefill_result_from_root_refs(
         layer_caches: refs.layer_caches.clone(),
     };
     let (final_hidden_states, layer_caches) =
-        crate::prefill_layer::materialize_prefill_layer_output_refs_from_roots(roots, &layer_refs)?;
+        crate::prefill_layer::materialize_prefill_layer_output_refs_from_roots_for_trace(
+            roots,
+            &layer_refs,
+        )?;
     let det_logits = materialize_prefill_logits_from_roots(roots, &refs.logits_ref)?;
     let internal_logits = InternalLogits::from_det_values(det_logits.clone());
     let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(

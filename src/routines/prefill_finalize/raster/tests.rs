@@ -1,7 +1,8 @@
 use super::{
     finalize_prefill_finalize_refs, init_prefill_finalize_state, main,
-    normalize_final_position_to_artifact, project_next_prefill_logit_chunk,
-    RasterPrefillFinalizeInputRoots, NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
+    materialize_prefill_result_for_api, normalize_final_position_to_artifact,
+    project_next_prefill_logit_chunk, RasterPrefillFinalizeInputRoots,
+    NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
 };
 use crate::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource;
 use crate::prefill_layer::raster::PrefillLayerCacheSlot;
@@ -657,7 +658,7 @@ fn run_ref_backed_finalize_with_roots(
     projection_rows_per_tile: usize,
 ) -> Result<crate::shared::model::transformer::TransformerPrefillResult> {
     let source_ref = source.committed_source_ref()?;
-    main(RasterPrefillFinalizeInputRoots {
+    materialize_prefill_result_for_api(RasterPrefillFinalizeInputRoots {
         artifact_store_roots,
         prompt_token_count,
         finalize_source_root: source_ref.root().to_string(),

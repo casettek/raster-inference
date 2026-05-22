@@ -5,7 +5,6 @@ use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
     ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerPrefillResult,
 };
-use crate::shared::raster_contracts::pipeline::RasterPrefillOutputRefs;
 use crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef;
 
 pub mod native;
@@ -29,7 +28,8 @@ pub fn run(
     )
 }
 
-pub fn run_raster_refs_with_roots(
+#[cfg(test)]
+pub(crate) fn materialize_raster_input_roots_for_api(
     artifact_store_roots: RasterArtifactStoreRoots,
     prompt_token_count: usize,
     finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
@@ -37,6 +37,25 @@ pub fn run_raster_refs_with_roots(
     layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
 ) -> Result<TransformerPrefillResult> {
+    let finalize_source_ref = finalize_source.committed_source_ref()?;
+    raster::materialize_prefill_result_for_api(raster::RasterPrefillFinalizeInputRoots {
+        artifact_store_roots,
+        prompt_token_count,
+        finalize_source_root: finalize_source_ref.root().to_string(),
+        final_hidden_states_ref,
+        layer_caches,
+        projection_rows_per_tile,
+    })
+}
+
+pub fn run_raster(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    prompt_token_count: usize,
+    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
+    final_hidden_states_ref: RasterActivationSequenceRef,
+    layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    projection_rows_per_tile: usize,
+) -> Result<raster::RasterPrefillFinalizeOutput> {
     let finalize_source_ref = finalize_source.committed_source_ref()?;
     raster::main(raster::RasterPrefillFinalizeInputRoots {
         artifact_store_roots,
@@ -48,54 +67,9 @@ pub fn run_raster_refs_with_roots(
     })
 }
 
-pub fn run_raster_output_refs_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    prompt_token_count: usize,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
-    final_hidden_states_ref: RasterActivationSequenceRef,
-    layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
-    projection_rows_per_tile: usize,
-) -> Result<raster::RasterPrefillFinalizeOutput> {
-    let finalize_source_ref = finalize_source.committed_source_ref()?;
-    raster::main_refs(raster::RasterPrefillFinalizeInputRoots {
-        artifact_store_roots,
-        prompt_token_count,
-        finalize_source_root: finalize_source_ref.root().to_string(),
-        final_hidden_states_ref,
-        layer_caches,
-        projection_rows_per_tile,
-    })
-}
-
-pub fn run_raster_pipeline_refs_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    prompt_token_count: usize,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
-    final_hidden_states_ref: RasterActivationSequenceRef,
-    layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
-    projection_rows_per_tile: usize,
-) -> Result<RasterPrefillOutputRefs> {
-    let output = run_raster_output_refs_with_roots(
-        artifact_store_roots,
-        prompt_token_count,
-        finalize_source,
-        final_hidden_states_ref,
-        layer_caches,
-        projection_rows_per_tile,
-    )?;
-    RasterPrefillOutputRefs::new(
-        output.artifact_store_roots,
-        output.refs.prompt_token_count,
-        output.refs.final_hidden_states_ref,
-        output.refs.layer_caches,
-        output.refs.logits_ref,
-        output.refs.logit_count,
-    )
-}
-
 /// Compatibility boundary: materializes raster prefill refs into the public
 /// `TransformerPrefillResult` shape used by checkpoints and non-ref callers.
-pub fn materialize_raster_output_refs(
+pub fn materialize_raster_output_refs_for_api(
     output: &raster::RasterPrefillFinalizeOutput,
 ) -> Result<TransformerPrefillResult> {
     raster::utils::build_prefill_result_from_root_refs(&output.artifact_store_roots, &output.refs)

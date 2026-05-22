@@ -117,25 +117,9 @@ pub fn run_with_mode(
     })
 }
 
-pub fn run_raster(
-    transformer_decode_state: TransformerDecodeState,
-    next_token: u32,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    raster_sizing: RasterSizingControls,
-) -> Result<TransformerDecodeStepResult> {
-    raster::run(transformer_decode_state, next_token, source, raster_sizing)
-}
-
-pub fn run_raster_with_roots(
-    input_roots: raster::RasterDecodeTransitionInputRoots,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<raster::RasterDecodeTransitionOutputRefs> {
-    raster::main(input_roots, source)
-}
-
 /// Refs-first raster path: consumes selected-token/cache refs and returns an
 /// updated `RasterDecodeLoopState` without building `TransformerDecodeStepResult`.
-pub fn run_raster_state(
+pub fn run_raster(
     decode_state: RasterDecodeLoopState,
     selected_token_ref: RasterSelectedTokenRef,
     source: &AuthenticatedGemmaDecodeTransitionSource,
@@ -189,12 +173,12 @@ pub fn finalize(decode_state: &DecodeState) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn finalize_raster_state(decode_state: &RasterDecodeLoopState) -> Result<()> {
-    let decode_state = materialize_decode_state_from_raster_state(decode_state)?;
+pub(crate) fn finalize_raster_state_for_trace(decode_state: &RasterDecodeLoopState) -> Result<()> {
+    let decode_state = materialize_decode_state_from_raster_state_for_trace(decode_state)?;
     finalize(&decode_state)
 }
 
-pub(crate) fn materialize_decode_state_from_raster_state(
+pub(crate) fn materialize_decode_state_from_raster_state_for_trace(
     decode_state: &RasterDecodeLoopState,
 ) -> Result<DecodeState> {
     let full_token_ids = materialize_token_ids_from_optional_ref(

@@ -45,7 +45,7 @@ pub fn run_with_mode(
     )
 }
 
-pub fn materialize_prefill_layer_output_refs_from_roots(
+pub fn materialize_prefill_layer_output_refs_from_roots_for_trace(
     roots: &RasterArtifactStoreRoots,
     refs: &raster::PrefillLayerOutputRefs,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
@@ -78,7 +78,7 @@ pub fn materialize_prefill_layer_output_refs_from_roots(
     ))
 }
 
-pub fn run_raster_refs_from_input_embedding(
+pub fn run_raster(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,

@@ -1,4 +1,4 @@
-use super::{decode_select_checkpoint_state, run_raster, run_raster_state};
+use super::{decode_select_checkpoint_state, materialize_run_raster_for_api, run_raster};
 use crate::shared::api::output::DecodeState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -22,7 +22,7 @@ fn run_raster_appends_selected_token_to_decode_state() {
         Act::from_bits(3),
     ]);
 
-    let selected = run_raster(&mut decode_state, 1)
+    let selected = materialize_run_raster_for_api(&mut decode_state, 1)
         .expect("raster select should run")
         .expect("should select token");
 
@@ -36,7 +36,7 @@ fn run_raster_uses_canonical_logits_over_public_f32_view() {
     let mut decode_state = decode_state_with_logits(vec![Act::from_bits(100), Act::from_bits(1)]);
     decode_state.current_logits = vec![0.0, 1000.0];
 
-    let selected = run_raster(&mut decode_state, 1)
+    let selected = materialize_run_raster_for_api(&mut decode_state, 1)
         .expect("raster select should run")
         .expect("should select token");
 
@@ -49,8 +49,8 @@ fn run_raster_rejects_f32_only_logits_without_mutating_decode_state() {
     let mut decode_state =
         DecodeState::new(vec![7], vec![0.0, 1.0], TransformerDecodeState::default());
 
-    let error =
-        run_raster(&mut decode_state, 1).expect_err("f32-only logits should fail in raster");
+    let error = materialize_run_raster_for_api(&mut decode_state, 1)
+        .expect_err("f32-only logits should fail in raster");
 
     assert!(error.to_string().contains("canonical deterministic logits"));
     assert_eq!(decode_state.full_token_ids, vec![7]);
@@ -94,7 +94,8 @@ fn run_raster_stops_without_requiring_canonical_logits() {
     let mut decode_state =
         DecodeState::new(vec![7], vec![0.0, 1.0], TransformerDecodeState::default());
 
-    let selected = run_raster(&mut decode_state, 0).expect("stop should not inspect logits");
+    let selected = materialize_run_raster_for_api(&mut decode_state, 0)
+        .expect("stop should not inspect logits");
 
     assert_eq!(selected, None);
     assert_eq!(decode_state.full_token_ids, vec![7]);
@@ -127,8 +128,7 @@ fn run_raster_state_threads_refs_without_host_decode_state_mutation() {
     )
     .unwrap();
 
-    let (next_state, output) =
-        run_raster_state(decode_state, 1).expect("raster state select should run");
+    let (next_state, output) = run_raster(decode_state, 1).expect("raster state select should run");
     let output = output.expect("should select token");
 
     assert_eq!(output.next_token, 1);

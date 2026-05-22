@@ -38,7 +38,7 @@ pub fn run_with_input_embedding_checkpoint(
     ple_source: &AuthenticatedGemmaPleSource,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let ple_inputs = native::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
-    let ple_input_refs = format_native_prefill_prepare_aux_as_raster_checkpoint(
+    let ple_input_refs = format_native_prefill_prepare_aux_as_raster_checkpoint_for_trace(
         artifact_store_roots,
         input_embedding_refs,
         ple_source,
@@ -52,85 +52,26 @@ pub fn run_with_input_embedding_checkpoint(
 }
 
 pub fn run_raster(
-    prompt_token_ids: &[u32],
-    ple_source: &AuthenticatedGemmaPleSource,
-    token_embeddings: &ActivationSequence,
-    projection_rows_per_tile: usize,
-) -> Result<Option<Gemma4PrefillPleInputs>> {
-    let ple_input_refs = run_raster_refs(
-        prompt_token_ids,
-        ple_source,
-        token_embeddings,
-        raster_sizing_with_projection_rows(projection_rows_per_tile),
-    )?;
-    let ple_input_refs =
-        prefill_ple_input_refs_from_manifest(ple_input_refs.0, ple_input_refs.1.as_deref())?;
-    let ple_inputs = materialize_prefill_ple_input_refs(ple_input_refs.as_ref())?;
-    Ok(ple_inputs)
-}
-
-fn raster_sizing_with_projection_rows(projection_rows_per_tile: usize) -> RasterSizingControls {
-    RasterSizingControls {
-        projection_rows_per_tile,
-        attention_kv_rows_per_tile:
-            crate::InferenceControls::DEFAULT_RASTER_ATTENTION_KV_ROWS_PER_TILE,
-        sequence_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE,
-        head_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_HEAD_ROWS_PER_TILE,
-        tokenizer_bpe_pairs_per_tile:
-            crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
-        tokenizer_bpe_pieces_per_tile:
-            crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE,
-        output_byte_flush_bytes_per_tile:
-            crate::InferenceControls::DEFAULT_RASTER_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
-    }
-}
-
-pub fn run_raster_refs(
-    prompt_token_ids: &[u32],
-    ple_source: &AuthenticatedGemmaPleSource,
-    token_embeddings: &ActivationSequence,
-    raster_sizing: RasterSizingControls,
-) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
-    let (artifact_store_roots, ple_input_manifest_root) = raster::run(
-        prompt_token_ids,
-        token_embeddings,
-        ple_source,
-        raster_sizing,
-    )?;
-    let ple_input_refs = prefill_ple_input_refs_from_manifest(
-        artifact_store_roots.clone(),
-        ple_input_manifest_root.as_deref(),
-    )?;
-    trace_prefill_prepare_aux_raster_checkpoint(
-        prompt_token_ids,
-        token_embeddings,
-        ple_input_refs.as_ref(),
-    )?;
-    Ok((artifact_store_roots, ple_input_manifest_root))
-}
-
-pub fn run_raster_refs_from_input_embedding(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
-) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
+) -> Result<raster::RasterPrefillPleOutput> {
     let output = raster::run_with_input_embedding_refs(
         artifact_store_roots,
         input_embedding_refs,
         ple_source,
         raster_sizing,
     )?;
-    let (artifact_store_roots, ple_input_manifest_root) = output.into_parts();
     let ple_input_refs = prefill_ple_input_refs_from_manifest(
-        artifact_store_roots.clone(),
-        ple_input_manifest_root.as_deref(),
+        output.artifact_store_roots.clone(),
+        output.refs.as_deref(),
     )?;
     trace_prefill_prepare_aux_raster_checkpoint_from_input_embedding(
         input_embedding_refs,
         ple_input_refs.as_ref(),
     );
-    Ok((artifact_store_roots, ple_input_manifest_root))
+    Ok(output)
 }
 
 pub fn prefill_ple_input_refs_from_manifest(
@@ -146,7 +87,7 @@ pub fn prefill_ple_input_refs_from_manifest(
     ))
 }
 
-pub fn format_native_prefill_prepare_aux_as_raster_checkpoint(
+pub fn format_native_prefill_prepare_aux_as_raster_checkpoint_for_trace(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
@@ -190,7 +131,7 @@ pub fn format_native_prefill_prepare_aux_as_raster_checkpoint(
     )?))
 }
 
-pub fn materialize_prefill_ple_input_refs(
+pub fn materialize_prefill_ple_input_refs_for_trace(
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let Some(ple_input_refs) = ple_input_refs else {
@@ -245,22 +186,6 @@ fn prefill_prepare_aux_checkpoint_payload(
                 .collect::<Vec<_>>()
         }),
     })
-}
-
-fn trace_prefill_prepare_aux_raster_checkpoint(
-    prompt_token_ids: &[u32],
-    token_embeddings: &ActivationSequence,
-    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
-) -> Result<()> {
-    crate::trace::trace_checkpoint_lazy_result("prefill.prepare_aux", || {
-        let ple_inputs = materialize_prefill_ple_input_refs(ple_input_refs)?;
-        Ok(prefill_prepare_aux_checkpoint_payload(
-            prompt_token_ids,
-            token_embeddings,
-            ple_inputs.as_ref(),
-        ))
-    })?;
-    Ok(())
 }
 
 fn trace_prefill_prepare_aux_raster_checkpoint_from_input_embedding(

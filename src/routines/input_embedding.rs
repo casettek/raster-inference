@@ -21,49 +21,7 @@ pub fn run(
     native::run(prompt_token_ids, model, execution_mode)
 }
 
-pub fn run_raster_refs(
-    prompt_preparation: &RasterPromptPreparationState,
-    embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
-) -> Result<raster::RasterInputEmbeddingRefs> {
-    run_raster_refs_with_roots(
-        ArtifactIo::export_store_roots(),
-        prompt_preparation,
-        embedding_source,
-    )
-}
-
-pub fn run_raster_refs_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    prompt_preparation: &RasterPromptPreparationState,
-    embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
-) -> Result<raster::RasterInputEmbeddingRefs> {
-    let embedding_source_ref = embedding_source.committed_source_ref()?;
-    run_raster_refs_for_roots(
-        artifact_store_roots,
-        prompt_preparation.prompt_token_ids_root.clone(),
-        prompt_preparation.prompt_token_count,
-        embedding_source_ref.root().to_string(),
-    )
-}
-
-pub fn run_raster_refs_for_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    prompt_token_ids_root: String,
-    prompt_token_count: usize,
-    embedding_source_root: String,
-) -> Result<raster::RasterInputEmbeddingRefs> {
-    Ok(raster::main(
-        artifact_store_roots,
-        raster::RasterInputEmbeddingInputRoots {
-            prompt_token_ids_root,
-            prompt_token_count,
-            embedding_source_root,
-        },
-    )?
-    .refs)
-}
-
-pub fn run_raster_output_with_roots(
+pub fn run_raster(
     artifact_store_roots: RasterArtifactStoreRoots,
     prompt_preparation: &RasterPromptPreparationState,
     embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
@@ -79,7 +37,7 @@ pub fn run_raster_output_with_roots(
     )
 }
 
-pub fn materialize_input_embedding_refs(
+pub fn materialize_input_embedding_refs_for_trace(
     refs: &raster::RasterInputEmbeddingRefs,
 ) -> Result<ActivationSequence> {
     let sequence = raster::utils::materialize_sequence(&refs.embedded_prompt_activations_ref)?;
@@ -96,7 +54,7 @@ pub fn materialize_input_embedding_refs(
     Ok(activation_sequence)
 }
 
-pub fn format_native_input_embedding_as_raster_checkpoint(
+pub fn format_native_input_embedding_as_raster_checkpoint_for_trace(
     source_id: impl Into<String>,
     embedding_source_root: impl Into<String>,
     prompt_preparation: &RasterPromptPreparationState,

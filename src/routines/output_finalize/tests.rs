@@ -1,4 +1,6 @@
-use super::{run, run_raster, run_raster_from_decode_state_refs};
+use super::{
+    materialize_output_decode_state_for_api, materialize_run_raster_for_api, run, run_raster,
+};
 use crate::io::parse_gemma_tokenizer_spec_bytes;
 use crate::shared::api::output::DecodeState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -28,7 +30,8 @@ fn run_raster_matches_native_for_supported_gemma_decode() {
     let decode_state = decode_state(vec![9, 4, 3], vec![4, 3]);
 
     let native = run(decode_state.clone(), &tokenizer).expect("native finalize should run");
-    let raster = run_raster(decode_state, &tokenizer_source).expect("raster finalize should run");
+    let raster = materialize_run_raster_for_api(decode_state, &tokenizer_source)
+        .expect("raster finalize should run");
 
     assert_eq!(raster.generated_token_ids, native.generated_token_ids);
     assert_eq!(
@@ -47,7 +50,7 @@ fn run_raster_returns_empty_generation_for_zero_tokens() {
             .expect("Gemma tokenizer spec should parse"),
     );
 
-    let output = run_raster(decode_state(vec![9], vec![]), &tokenizer_source)
+    let output = materialize_run_raster_for_api(decode_state(vec![9], vec![]), &tokenizer_source)
         .expect("raster finalize should run");
 
     assert_eq!(output.generated_token_ids, Vec::<u32>::new());
@@ -62,8 +65,9 @@ fn run_raster_surfaces_detokenization_errors() {
             .expect("Gemma tokenizer spec should parse"),
     );
 
-    let error = run_raster(decode_state(vec![9, 99], vec![99]), &tokenizer_source)
-        .expect_err("missing output token should fail");
+    let error =
+        materialize_run_raster_for_api(decode_state(vec![9, 99], vec![99]), &tokenizer_source)
+            .expect_err("missing output token should fail");
 
     assert!(error.to_string().contains("token id 99 is missing"));
 }
@@ -81,8 +85,10 @@ fn run_raster_from_decode_state_refs_consumes_generated_token_ref() {
     let expected = run(host_state.clone(), &tokenizer).expect("native finalize should run");
     let raster_state = raster_decode_state_refs(&host_state).expect("refs should build");
 
-    let output = run_raster_from_decode_state_refs(raster_state, &tokenizer_source, 2)
+    let output_refs = run_raster(raster_state.clone(), &tokenizer_source, 2)
         .expect("raster refs finalize should run");
+    let output = materialize_output_decode_state_for_api(raster_state, output_refs)
+        .expect("raster refs output should materialize");
 
     assert_eq!(output.generated_token_ids, expected.generated_token_ids);
     assert_eq!(output.generated_text, expected.generated_text);
@@ -118,8 +124,10 @@ fn run_raster_from_decode_state_refs_handles_missing_generated_ref_as_empty_outp
         None,
     )?;
 
-    let output = run_raster_from_decode_state_refs(raster_state, &tokenizer_source, 2)
+    let output_refs = run_raster(raster_state.clone(), &tokenizer_source, 2)
         .expect("raster refs finalize should run");
+    let output = materialize_output_decode_state_for_api(raster_state, output_refs)
+        .expect("raster refs output should materialize");
 
     assert_eq!(output.generated_token_ids, Vec::<u32>::new());
     assert_eq!(output.generated_text, "");

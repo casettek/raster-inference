@@ -13,10 +13,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] [--raster] [--raster-decode-only] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--raster] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use raster-authored tiles where implemented. Pass --raster-decode-only with --raster to run deterministic native prefill through prefill.finalize, then use raster output decode. Pass --raster-trace-tiles to print verbose raster progress logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use the single root-backed raster tile inference path. Pass --raster-trace-tiles to print verbose raster progress logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
     );
 }
 
@@ -78,7 +78,6 @@ fn run() -> anyhow::Result<()> {
         commit_checkpoints: cli_args.commit_checkpoints,
         terminal_checkpoint: cli_args.terminal_checkpoint,
         raster: cli_args.raster,
-        raster_decode_only: cli_args.raster_decode_only,
         raster_tokenizer_source,
         raster_projection_rows_per_tile: cli_args.raster_projection_rows_per_tile,
         raster_attention_kv_rows_per_tile: cli_args.raster_attention_kv_rows_per_tile,
@@ -115,7 +114,6 @@ struct CliArgs {
     commit_checkpoints: bool,
     execution_mode: InferenceExecutionMode,
     raster: bool,
-    raster_decode_only: bool,
     raster_trace_tiles: bool,
     raster_projection_rows_per_tile: Option<usize>,
     raster_attention_kv_rows_per_tile: Option<usize>,
@@ -279,8 +277,8 @@ impl CliArgs {
         if positional_args.len() < 5 {
             anyhow::bail!("expected at least 5 positional arguments");
         }
-        if raster_decode_only && !raster {
-            anyhow::bail!("--raster-decode-only requires --raster");
+        if raster_decode_only {
+            anyhow::bail!("--raster-decode-only has been removed; use --raster");
         }
         if raster_projection_rows_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-projection-rows-per-tile requires --raster");
@@ -312,7 +310,6 @@ impl CliArgs {
             commit_checkpoints,
             execution_mode,
             raster,
-            raster_decode_only,
             raster_trace_tiles,
             raster_projection_rows_per_tile,
             raster_attention_kv_rows_per_tile,
@@ -473,7 +470,6 @@ mod tests {
         .expect("cli args should parse");
 
         assert!(args.raster);
-        assert!(!args.raster_decode_only);
         assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
         assert!(!args.raster_trace_tiles);
         assert_eq!(args.raster_projection_rows_per_tile, None);
@@ -482,8 +478,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_raster_decode_only_flag() {
-        let args = CliArgs::parse([
+    fn parse_raster_decode_only_flag_is_removed() {
+        let error = CliArgs::parse([
             "--raster".to_string(),
             "--raster-decode-only".to_string(),
             "model".to_string(),
@@ -492,15 +488,15 @@ mod tests {
             "model-path".to_string(),
             "hello".to_string(),
         ])
-        .expect("cli args should parse");
+        .expect_err("raster decode-only should be removed");
 
-        assert!(args.raster);
-        assert!(args.raster_decode_only);
-        assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
+        assert!(error
+            .to_string()
+            .contains("--raster-decode-only has been removed"));
     }
 
     #[test]
-    fn parse_raster_decode_only_requires_raster() {
+    fn parse_raster_decode_only_without_raster_is_removed() {
         let error = CliArgs::parse([
             "--raster-decode-only".to_string(),
             "model".to_string(),
@@ -509,11 +505,11 @@ mod tests {
             "model-path".to_string(),
             "hello".to_string(),
         ])
-        .expect_err("raster decode-only should require raster");
+        .expect_err("raster decode-only should be removed");
 
         assert!(error
             .to_string()
-            .contains("--raster-decode-only requires --raster"));
+            .contains("--raster-decode-only has been removed"));
     }
 
     #[test]

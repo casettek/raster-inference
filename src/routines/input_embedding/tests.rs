@@ -1,4 +1,4 @@
-use super::{materialize_input_embedding_refs, run_raster_refs};
+use super::{materialize_input_embedding_refs_for_trace, run_raster};
 use crate::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
 use crate::shared::api::input::RasterPromptPreparationState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -29,10 +29,15 @@ fn raster_input_embedding_consumes_prompt_token_root() {
     )
     .expect("embedding source should build");
 
-    let refs =
-        run_raster_refs(&prompt_preparation, &source).expect("raster input embedding should run");
-    let materialized =
-        materialize_input_embedding_refs(&refs).expect("embedding refs should materialize");
+    let output = run_raster(
+        ArtifactIo::export_store_roots(),
+        &prompt_preparation,
+        &source,
+    )
+    .expect("raster input embedding should run");
+    let refs = output.refs;
+    let materialized = materialize_input_embedding_refs_for_trace(&refs)
+        .expect("embedding refs should materialize");
 
     assert_eq!(refs.prompt_token_ids_root, token_ids.root());
     assert_eq!(refs.prompt_token_count, 2);
@@ -67,13 +72,18 @@ fn native_input_embedding_checkpoint_refs_match_raster_refs() {
         Act::from_num(1.0),
     )
     .expect("embedding source should build");
-    let raster_refs =
-        run_raster_refs(&prompt_preparation, &source).expect("raster input embedding should run");
-    let materialized =
-        materialize_input_embedding_refs(&raster_refs).expect("embedding refs should materialize");
+    let raster_refs = run_raster(
+        ArtifactIo::export_store_roots(),
+        &prompt_preparation,
+        &source,
+    )
+    .expect("raster input embedding should run")
+    .refs;
+    let materialized = materialize_input_embedding_refs_for_trace(&raster_refs)
+        .expect("embedding refs should materialize");
 
     ArtifactIo::reset_store();
-    let native_refs = super::format_native_input_embedding_as_raster_checkpoint(
+    let native_refs = super::format_native_input_embedding_as_raster_checkpoint_for_trace(
         "embedding-fixture",
         raster_refs.embedding_source_root.clone(),
         &prompt_preparation,

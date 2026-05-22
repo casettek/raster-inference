@@ -291,57 +291,6 @@ pub fn run_output_decode_with_mode(
         tokenizer,
         transformer_model,
         execution_mode,
-        false,
-        false,
-        None,
-        None,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn run_output_decode_with_mode_and_raster_select(
-    prompt_token_ids: &[u32],
-    initial_transformer_state: &TransformerPrefillResult,
-    sampling: &SamplingConfig,
-    tokenizer: &Tokenizer,
-    transformer_model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
-) -> Result<OutputDecodeState> {
-    run_output_decode_with_mode_internal(
-        prompt_token_ids,
-        initial_transformer_state,
-        sampling,
-        tokenizer,
-        transformer_model,
-        execution_mode,
-        true,
-        false,
-        None,
-        None,
-    )
-}
-
-pub(crate) fn run_output_decode_with_mode_and_raster(
-    prompt_token_ids: &[u32],
-    initial_transformer_state: &TransformerPrefillResult,
-    sampling: &SamplingConfig,
-    tokenizer: &Tokenizer,
-    raster_tokenizer: &AuthenticatedGemmaTokenizer,
-    transformer_model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
-    raster_sizing: RasterSizingControls,
-) -> Result<OutputDecodeState> {
-    run_output_decode_with_mode_internal(
-        prompt_token_ids,
-        initial_transformer_state,
-        sampling,
-        tokenizer,
-        transformer_model,
-        execution_mode,
-        true,
-        true,
-        Some(raster_tokenizer),
-        Some(raster_sizing),
     )
 }
 
@@ -365,11 +314,15 @@ pub(crate) fn run_output_decode_with_raster_state(
         .is_some()
         {
             trace_event("output.detokenize");
+            let output_refs = crate::output_finalize::run_raster(
+                decode_state.clone(),
+                raster_tokenizer,
+                raster_sizing.output_byte_flush_bytes_per_tile,
+            )?;
             let mut output_decode_state =
-                crate::output_finalize::run_raster_from_decode_state_refs(
+                crate::output_finalize::materialize_output_decode_state_for_api(
                     decode_state,
-                    raster_tokenizer,
-                    raster_sizing.output_byte_flush_bytes_per_tile,
+                    output_refs,
                 )?;
             output_decode_state.decode_transition_states = decode_transition_state_refs
                 .into_iter()
@@ -382,7 +335,7 @@ pub(crate) fn run_output_decode_with_raster_state(
 
         trace_event("decode.select_token");
         let (selected_state, select_output) =
-            crate::decode_select_token::run_raster_state(decode_state, max_new_tokens)?;
+            crate::decode_select_token::run_raster(decode_state, max_new_tokens)?;
         let select_output = select_output.expect("stop condition should have returned earlier");
         crate::decode_select_token::trace_raster_checkpoint_from_state(
             &selected_state,
@@ -396,7 +349,7 @@ pub(crate) fn run_output_decode_with_raster_state(
                 format!("decode.transition.position_{}", selected_state.position),
                 transformer_model,
             )?;
-        decode_state = crate::decode_transition::run_raster_state(
+        decode_state = crate::decode_transition::run_raster(
             selected_state,
             select_output.selected_token_ref,
             &source,
@@ -406,7 +359,7 @@ pub(crate) fn run_output_decode_with_raster_state(
             decode_transition_state_refs
                 .push((decode_state.artifact_store_roots.clone(), activation_ref));
         }
-        crate::decode_transition::finalize_raster_state(&decode_state)?;
+        crate::decode_transition::finalize_raster_state_for_trace(&decode_state)?;
         if crate::trace::reached_terminal_checkpoint_id().is_some() {
             let materialized_transition_states = decode_transition_state_refs
                 .into_iter()
@@ -432,18 +385,10 @@ fn run_output_decode_with_mode_internal(
     tokenizer: &Tokenizer,
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
-    raster_select_token: bool,
-    raster_decode_transition: bool,
-    raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
-    raster_sizing: Option<RasterSizingControls>,
 ) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
     let mut decode_transition_states = Vec::new();
-    let mut latest_raster_generated_tokens: Option<(
-        crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots,
-        crate::shared::artifacts::raster_artifact_store::RasterTokenIdSequenceRef,
-    )> = None;
     let mut decode_state = crate::shared::api::output::DecodeState::new(
         prompt_token_ids.to_vec(),
         initial_transformer_state
@@ -461,149 +406,38 @@ fn run_output_decode_with_mode_internal(
     );
 
     loop {
-        let stop_condition = if raster_select_token {
-            crate::decode_select_token::raster::check_stop_condition(
-                decode_state.generated_token_ids.len(),
-                max_new_tokens,
-            )
-        } else {
-            crate::decode_select_token::native::check_stop_condition(
-                decode_state.generated_token_ids.len(),
-                max_new_tokens,
-            )
-        };
-        if stop_condition.is_some() {
+        if crate::decode_select_token::native::check_stop_condition(
+            decode_state.generated_token_ids.len(),
+            max_new_tokens,
+        )
+        .is_some()
+        {
             trace_event("output.detokenize");
-            let mut output_decode_state = if let Some(raster_tokenizer) = raster_tokenizer {
-                let byte_flush_bytes_per_tile = raster_sizing
-                    .expect("raster output finalize requires sizing controls")
-                    .output_byte_flush_bytes_per_tile;
-                if let Some((artifact_store_roots, generated_token_ids_ref)) =
-                    latest_raster_generated_tokens.take()
-                {
-                    crate::output_finalize::run_raster_with_roots(
-                        decode_state,
-                        crate::output_finalize::raster::RasterOutputFinalizeInputRoots {
-                            artifact_store_roots,
-                            generated_token_ids_ref,
-                            tokenizer_source_root: raster_tokenizer
-                                .committed_source_ref()?
-                                .root()
-                                .to_string(),
-                            output_text_source_name: "output.finalize.output.text".to_string(),
-                            pending_bytes_source_prefix: "output.finalize.output.pending_bytes"
-                                .to_string(),
-                            byte_flush_bytes_per_tile,
-                            stop_reason:
-                                crate::shared::api::output::OutputDecodeStopReason::MaxNewTokens,
-                        },
-                        raster_tokenizer,
-                    )?
-                } else {
-                    crate::output_finalize::run_raster_with_byte_flush_bytes_per_tile(
-                        decode_state,
-                        raster_tokenizer,
-                        byte_flush_bytes_per_tile,
-                    )?
-                }
-            } else {
-                crate::output_finalize::run(decode_state, tokenizer)?
-            };
+            let mut output_decode_state = crate::output_finalize::run(decode_state, tokenizer)?;
             output_decode_state.decode_transition_states = decode_transition_states;
             return Ok(output_decode_state);
         }
 
         trace_event("decode.select_token");
-        let raster_select_output = if raster_select_token {
-            let artifact_store_roots = latest_raster_generated_tokens
-                .as_ref()
-                .map(|(artifact_store_roots, _)| artifact_store_roots.clone())
-                .unwrap_or_else(
-                    crate::shared::artifacts::artifact_io::ArtifactIo::export_store_roots,
-                );
-            Some(
-                crate::decode_select_token::run_raster_refs_with_roots(
-                    &mut decode_state,
-                    max_new_tokens,
-                    artifact_store_roots,
-                )?
-                .expect("stop condition should have returned earlier"),
-            )
-        } else {
-            None
-        };
-        if let Some(output) = raster_select_output.as_ref() {
-            latest_raster_generated_tokens = Some((
-                output.artifact_store_roots.clone(),
-                output.generated_token_ids_ref.clone(),
-            ));
-        }
-        let next_token = match raster_select_output.as_ref() {
-            Some(output) => output.next_token,
-            None => {
-                crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
-                    .expect("stop condition should have returned earlier")
-            }
-        };
+        let next_token =
+            crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
+                .expect("stop condition should have returned earlier");
 
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
-        let transition_position = transformer_decode_state.position;
-        let decode_transition = if raster_decode_transition {
-            let source =
-                crate::decode_transition::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource::from_model(
-                    format!("decode.transition.position_{}", transformer_decode_state.position),
-                    transformer_model,
-                )?;
-            if let Some(select_output) = raster_select_output {
-                let transition_output = crate::decode_transition::run_raster_with_roots(
-                    crate::decode_transition::raster::RasterDecodeTransitionInputRoots {
-                        artifact_store_roots: select_output.artifact_store_roots,
-                        transformer_decode_state,
-                        selected_token_ref: select_output.selected_token_ref,
-                        decode_transition_source_root: source.static_source_root(),
-                        output_source_prefix: format!(
-                            "decode.transition.position_{}",
-                            transition_position
-                        ),
-                        raster_sizing: raster_sizing
-                            .expect("raster decode transition requires sizing controls"),
-                    },
-                    &source,
-                )?;
-                if let Some((artifact_store_roots, _generated_token_ids_ref)) =
-                    latest_raster_generated_tokens.as_mut()
-                {
-                    *artifact_store_roots = transition_output.artifact_store_roots.clone();
-                }
-                transition_output.transition_result
-            } else {
-                crate::decode_transition::run_raster(
-                    transformer_decode_state,
-                    next_token,
-                    &source,
-                    raster_sizing.expect("raster decode transition requires sizing controls"),
-                )?
-            }
-        } else {
-            crate::decode_transition::run_with_mode(
-                transformer_decode_state,
-                next_token,
-                transformer_model,
-                execution_mode,
-            )?
-        };
+        let decode_transition = crate::decode_transition::run_with_mode(
+            transformer_decode_state,
+            next_token,
+            transformer_model,
+            execution_mode,
+        )?;
         decode_transition_states.push(decode_transition.activation_state.clone());
         decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
         crate::decode_transition::finalize(&decode_state)?;
         if crate::trace::reached_terminal_checkpoint_id().is_some() {
-            let mut output_decode_state = build_current_output_decode_state(
-                &decode_state,
-                tokenizer,
-                raster_tokenizer,
-                raster_sizing,
-            )?;
+            let mut output_decode_state =
+                build_current_output_decode_state(&decode_state, tokenizer)?;
             output_decode_state.decode_transition_states = decode_transition_states;
             return Ok(output_decode_state);
         }
@@ -644,19 +478,7 @@ fn materialize_activation_sequence_from_ref(
 fn build_current_output_decode_state(
     decode_state: &crate::shared::api::output::DecodeState,
     tokenizer: &Tokenizer,
-    raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
-    raster_sizing: Option<RasterSizingControls>,
 ) -> Result<OutputDecodeState> {
-    if let Some(raster_tokenizer) = raster_tokenizer {
-        return crate::output_finalize::raster::run_with_byte_flush_bytes_per_tile(
-            &decode_state.generated_token_ids,
-            raster_tokenizer,
-            raster_sizing
-                .expect("raster output finalize requires sizing controls")
-                .output_byte_flush_bytes_per_tile,
-        );
-    }
-
     let generated_token_ids = decode_state.generated_token_ids.clone();
     let generated_text =
         crate::output_finalize::native::detokenize_output_tokens(tokenizer, &generated_token_ids)?;
@@ -701,8 +523,7 @@ mod tests {
     use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
     use super::{
-        decode_step, decode_step_with_mode, run_output_decode,
-        run_output_decode_with_mode_and_raster_select, run_prefill_pass,
+        decode_step, decode_step_with_mode, run_output_decode, run_prefill_pass,
         run_prefill_pass_with_mode, run_transformer_state_transition,
         run_transformer_state_transition_for_token_ids, validate_sampling_config,
     };
@@ -750,74 +571,6 @@ mod tests {
         assert!(output_decode_state.generated_token_ids.is_empty());
         assert_eq!(output_decode_state.generated_text, "");
         assert!(output_decode_state.decode_transition_states.is_empty());
-    }
-
-    #[test]
-    fn run_output_decode_with_raster_select_preserves_zero_token_short_circuit() {
-        let tokenizer = test_tokenizer();
-        let model = test_decode_model();
-        let prompt_token_ids = vec![1];
-        let prompt_preparation_state = PromptPreparationState {
-            prompt_text: "prompt".to_string(),
-            prompt_token_ids: prompt_token_ids.clone(),
-            prompt_token_ids_sha256: "unused-for-output_decode".to_string(),
-        };
-        let token_embeddings =
-            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
-        let prefill =
-            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
-
-        let output_decode_state = run_output_decode_with_mode_and_raster_select(
-            &prompt_token_ids,
-            &prefill,
-            &SamplingConfig {
-                max_new_tokens: Some(0),
-                temperature: Some(1.0),
-                top_k: None,
-                top_p: None,
-            },
-            &tokenizer,
-            &model,
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("zero-token raster select should not require canonical logits");
-
-        assert!(output_decode_state.generated_token_ids.is_empty());
-        assert_eq!(output_decode_state.generated_text, "");
-        assert!(output_decode_state.decode_transition_states.is_empty());
-    }
-
-    #[test]
-    fn run_output_decode_with_raster_select_requires_canonical_logits_when_selecting() {
-        let tokenizer = test_tokenizer();
-        let model = test_decode_model();
-        let prompt_token_ids = vec![1];
-        let prompt_preparation_state = PromptPreparationState {
-            prompt_text: "prompt".to_string(),
-            prompt_token_ids: prompt_token_ids.clone(),
-            prompt_token_ids_sha256: "unused-for-output_decode".to_string(),
-        };
-        let token_embeddings =
-            embed_input_tokens(&prompt_token_ids, model.embedding_table.as_ref().unwrap()).unwrap();
-        let prefill =
-            run_prefill_pass(&prompt_preparation_state, &model, &token_embeddings).unwrap();
-
-        let error = run_output_decode_with_mode_and_raster_select(
-            &prompt_token_ids,
-            &prefill,
-            &SamplingConfig {
-                max_new_tokens: Some(1),
-                temperature: Some(1.0),
-                top_k: None,
-                top_p: None,
-            },
-            &tokenizer,
-            &model,
-            InferenceExecutionMode::Fp32,
-        )
-        .expect_err("raster select should reject f32-only prefill logits");
-
-        assert!(error.to_string().contains("canonical deterministic logits"));
     }
 
     #[test]

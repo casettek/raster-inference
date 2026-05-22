@@ -44,7 +44,6 @@ pub struct InferenceControls {
     pub commit_checkpoints: bool,
     pub terminal_checkpoint: Option<String>,
     pub raster: bool,
-    pub raster_decode_only: bool,
     pub raster_tokenizer_source: Option<AuthenticatedGemmaTokenizer>,
     pub raster_projection_rows_per_tile: Option<usize>,
     pub raster_attention_kv_rows_per_tile: Option<usize>,
@@ -225,13 +224,10 @@ pub fn run_inference_with_controls(
     let terminal_checkpoint = controls.terminal_checkpoint_spec()?;
     trace::with_terminal_checkpoint(terminal_checkpoint.clone(), || {
         trace::with_checkpointing_enabled(controls.commit_checkpoints, || {
-            if controls.raster_decode_only && !controls.raster {
-                anyhow::bail!("raster decode-only inference requires raster tile inference");
-            }
             if controls.raster && request.execution_mode != InferenceExecutionMode::Deterministic {
                 anyhow::bail!("raster tile inference requires deterministic execution");
             }
-            let use_raster_prefill = controls.raster && !controls.raster_decode_only;
+            let use_raster_prefill = controls.raster;
             let use_raster_decode = controls.raster;
             let raster_sizing_controls = if controls.raster {
                 Some(controls.raster_sizing_controls()?)
@@ -250,8 +246,7 @@ pub fn run_inference_with_controls(
                 "terminal_checkpoint": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.checkpoint_id()),
                 "terminal_checkpoint_occurrence": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.occurrence()),
                 "commit_checkpoints": controls.commit_checkpoints,
-                "tile_dsl_mode": if use_raster_prefill { "raster" } else if use_raster_decode { "raster_decode_only" } else { "native" },
-                "raster_decode_only": controls.raster_decode_only,
+                "tile_dsl_mode": if use_raster_prefill { "raster" } else { "native" },
                 "raster_sizing_controls": raster_sizing_controls,
             }));
             if use_raster_decode {
@@ -261,7 +256,7 @@ pub fn run_inference_with_controls(
                 let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
                     "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
                 )?;
-                prompt_prepare::format_native_prompt_as_raster_checkpoint(
+                prompt_prepare::format_native_prompt_as_raster_checkpoint_for_trace(
                     request,
                     model,
                     tokenizer_source,
@@ -280,14 +275,12 @@ pub fn run_inference_with_controls(
                     let raster_sizing_controls = raster_sizing_controls
                         .as_ref()
                         .expect("raster sizing controls should be validated");
-                    let raster_prompt_preparation =
-                        prompt_prepare::run_raster_with_tokenizer_controls(
-                            request,
-                            model,
-                            tokenizer_source,
-                            raster_sizing_controls.tokenizer_bpe_pairs_per_tile,
-                            raster_sizing_controls.tokenizer_bpe_pieces_per_tile,
-                        )?;
+                    let raster_prompt_preparation = prompt_prepare::run_raster(
+                        request,
+                        model,
+                        tokenizer_source,
+                        *raster_sizing_controls,
+                    )?;
                     trace::trace_checkpoint(
                         "prompt.prepare",
                         &json!({
@@ -369,14 +362,15 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let input_embedding_output = input_embedding::run_raster_output_with_roots(
+                    let input_embedding_output = input_embedding::run_raster(
                         raster_prompt_preparation_roots,
                         raster_prompt_preparation,
                         &embedding_source,
                     )?;
-                    let token_embeddings = input_embedding::materialize_input_embedding_refs(
-                        &input_embedding_output.refs,
-                    )?;
+                    let token_embeddings =
+                        input_embedding::materialize_input_embedding_refs_for_trace(
+                            &input_embedding_output.refs,
+                        )?;
                     (token_embeddings, Some(input_embedding_output))
                 } else {
                     let token_embeddings = input_embedding::run(
@@ -393,7 +387,7 @@ pub fn run_inference_with_controls(
                                     transformer_model,
                                 )?;
                             let embedding_source_ref = embedding_source.committed_source_ref()?;
-                            input_embedding::format_native_input_embedding_as_raster_checkpoint(
+                            input_embedding::format_native_input_embedding_as_raster_checkpoint_for_trace(
                                 model.model_id.clone(),
                                 embedding_source_ref.root().to_string(),
                                 raster_prompt_preparation,
@@ -454,13 +448,13 @@ pub fn run_inference_with_controls(
                     let input_embedding_output = raster_input_embedding_refs
                         .as_ref()
                         .expect("raster prefill requires raster input embedding refs");
-                    let (layer_roots, ple_input_manifest_root) =
-                        prefill_prepare_aux::run_raster_refs_from_input_embedding(
-                            input_embedding_output.artifact_store_roots.clone(),
-                            &input_embedding_output.refs,
-                            &ple_source,
-                            raster_sizing,
-                        )?;
+                    let ple_output = prefill_prepare_aux::run_raster(
+                        input_embedding_output.artifact_store_roots.clone(),
+                        &input_embedding_output.refs,
+                        &ple_source,
+                        raster_sizing,
+                    )?;
+                    let (layer_roots, ple_input_manifest_root) = ple_output.into_parts();
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                         trace::phase_paused(PhaseId::TransformerStateTransition);
                         return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
@@ -476,14 +470,13 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let (layer_roots, layer_refs) =
-                        prefill_layer::run_raster_refs_from_input_embedding(
-                            layer_roots,
-                            &input_embedding_output.refs,
-                            &layer_source,
-                            ple_input_manifest_root.as_deref(),
-                            raster_sizing,
-                        )?;
+                    let (layer_roots, layer_refs) = prefill_layer::run_raster(
+                        layer_roots,
+                        &input_embedding_output.refs,
+                        &layer_source,
+                        ple_input_manifest_root.as_deref(),
+                        raster_sizing,
+                    )?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                         trace::phase_paused(PhaseId::TransformerStateTransition);
                         return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
@@ -499,7 +492,7 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
-                    let prefill_output = prefill_finalize::run_raster_output_refs_with_roots(
+                    let prefill_output = prefill_finalize::run_raster(
                         layer_roots,
                         prompt_preparation.prompt_token_ids.len(),
                         &finalize_source,
@@ -533,7 +526,7 @@ pub fn run_inference_with_controls(
                         prompt_preparation.prompt_token_ids.len(),
                         Some(prefill_output.refs.final_hidden_states_ref.clone()),
                     )?);
-                    prefill_finalize::materialize_raster_output_refs(&prefill_output)?
+                    prefill_finalize::materialize_raster_output_refs_for_api(&prefill_output)?
                 } else {
                     let ple_inputs = if let Some(input_embedding_output) =
                         raster_input_embedding_refs.as_ref()
@@ -619,20 +612,6 @@ pub fn run_inference_with_controls(
                         &request.sampling,
                         tokenizer_source,
                         transformer_model,
-                        raster_sizing_controls.expect("raster sizing controls should be validated"),
-                    )?
-                } else if use_raster_decode {
-                    let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
-                        "raster tile inference requires an authenticated Gemma tokenizer",
-                    )?;
-                    pipeline::run_output_decode_with_mode_and_raster(
-                        &prompt_preparation.prompt_token_ids,
-                        &prefill,
-                        &request.sampling,
-                        tokenizer,
-                        tokenizer_source,
-                        transformer_model,
-                        request.execution_mode,
                         raster_sizing_controls.expect("raster sizing controls should be validated"),
                     )?
                 } else {
@@ -941,7 +920,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prompt.prepare".to_string()),
                 raster: false,
-                raster_decode_only: false,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -998,7 +976,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prompt.prepare".to_string()),
                 raster: false,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(tokenizer_source.clone()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1010,8 +987,15 @@ mod tests {
             },
         )
         .expect("deterministic inference should stop after prompt prepare");
-        let expected = crate::prompt_prepare::run_raster(&request, &model, &tokenizer_source)
-            .expect("raster prompt prepare should run");
+        let expected = crate::prompt_prepare::run_raster(
+            &request,
+            &model,
+            &tokenizer_source,
+            InferenceControls::default()
+                .raster_sizing_controls()
+                .expect("default sizing"),
+        )
+        .expect("raster prompt prepare should run");
 
         match paused {
             InferenceRunOutcome::RasterPromptPrepared(state) => {
@@ -1079,7 +1063,7 @@ mod tests {
         .expect("prefill layer source");
         let raster_payload = crate::trace::with_checkpointing_enabled(true, || {
             crate::trace::start_inference_trace(&json!({ "test": "raster-prefill-layer" }));
-            crate::prefill_layer::run_raster_refs_from_input_embedding(
+            crate::prefill_layer::run_raster(
                 input_embedding_roots.clone(),
                 &input_embedding_refs,
                 &layer_source,
@@ -1167,18 +1151,17 @@ mod tests {
         .expect("prefill finalize source");
         let raster_payload = crate::trace::with_checkpointing_enabled(true, || {
             crate::trace::start_inference_trace(&json!({ "test": "raster-prefill-finalize" }));
-            let (layer_roots, layer_refs) =
-                crate::prefill_layer::run_raster_refs_from_input_embedding(
-                    input_embedding_roots.clone(),
-                    &input_embedding_refs,
-                    &layer_source,
-                    None,
-                    InferenceControls::default()
-                        .raster_sizing_controls()
-                        .expect("default sizing"),
-                )
-                .expect("raster prefill layer should run");
-            crate::prefill_finalize::run_raster_refs_with_roots(
+            let (layer_roots, layer_refs) = crate::prefill_layer::run_raster(
+                input_embedding_roots.clone(),
+                &input_embedding_refs,
+                &layer_source,
+                None,
+                InferenceControls::default()
+                    .raster_sizing_controls()
+                    .expect("default sizing"),
+            )
+            .expect("raster prefill layer should run");
+            crate::prefill_finalize::materialize_raster_input_roots_for_api(
                 layer_roots,
                 token_ids.len(),
                 &finalize_source,
@@ -1226,7 +1209,7 @@ mod tests {
                 crate::shared::model::transformer::TransformerDecodeState::default(),
             );
             decode_state.set_internal_logits(internal_logits.clone());
-            crate::decode_select_token::run_raster(&mut decode_state, 1)
+            crate::decode_select_token::materialize_run_raster_for_api(&mut decode_state, 1)
                 .expect("raster decode select should run");
             crate::trace::checkpoint_payload_for_tests()
         });
@@ -1265,7 +1248,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("input.embedding".to_string()),
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1326,7 +1308,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.prepare_aux".to_string()),
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1387,7 +1368,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.layer".to_string()),
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1443,7 +1423,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.layer:2".to_string()),
                 raster: false,
-                raster_decode_only: false,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1495,7 +1474,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1520,72 +1498,6 @@ mod tests {
             }
             InferenceRunOutcome::Completed(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
                 panic!("expected paused raster inference")
-            }
-        }
-    }
-
-    #[test]
-    fn run_inference_with_controls_raster_decode_only_can_pause_after_prefill_finalize() {
-        let tokenizer = test_tokenizer();
-        let model = test_model_spec();
-        let transformer_fixture = deterministic_no_ple_model_fixture();
-        let request = InferenceRequest {
-            prompt_bytes: b"prompt".to_vec(),
-            text_decoding_policy: TextDecodingPolicy::Utf8,
-            add_generation_prompt: false,
-            add_special_tokens: false,
-            execution_mode: InferenceExecutionMode::Deterministic,
-            sampling: SamplingConfig {
-                max_new_tokens: Some(2),
-                temperature: Some(1.0),
-                top_k: None,
-                top_p: None,
-            },
-        };
-
-        let paused = run_inference_with_controls(
-            &request,
-            &model,
-            &tokenizer,
-            &transformer_fixture.model,
-            &InferenceControls {
-                commit_checkpoints: false,
-                terminal_checkpoint: Some("prefill.finalize".to_string()),
-                raster: true,
-                raster_decode_only: true,
-                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
-                raster_projection_rows_per_tile: Some(2),
-                raster_attention_kv_rows_per_tile: None,
-                raster_sequence_rows_per_tile: None,
-                raster_head_rows_per_tile: None,
-                raster_tokenizer_bpe_pairs_per_tile: None,
-                raster_tokenizer_bpe_pieces_per_tile: None,
-                raster_output_byte_flush_bytes_per_tile: None,
-            },
-        )
-        .expect("hybrid raster inference should pause after prefill finalize");
-
-        match paused {
-            InferenceRunOutcome::Paused(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "prefill.finalize");
-                assert_eq!(
-                    state.raster_tile_invocations,
-                    Some(0),
-                    "decode-only raster should not invoke raster tiles before decode"
-                );
-                let transformer_state = state
-                    .transformer_state_transition
-                    .expect("transformer phase should be present");
-                assert_eq!(transformer_state.activation_states.len(), 1);
-                assert!(transformer_state
-                    .prefill_logits
-                    .det_final_logits_sha256
-                    .is_some());
-                assert!(state.output_decode.is_none());
-            }
-            InferenceRunOutcome::Completed(_) => panic!("expected paused hybrid raster inference"),
-            InferenceRunOutcome::RasterPromptPrepared(_) => {
-                panic!("expected paused hybrid raster inference")
             }
         }
     }
@@ -1618,7 +1530,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1679,7 +1590,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("decode.finalize".to_string()),
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1705,68 +1615,6 @@ mod tests {
             }
             InferenceRunOutcome::Completed(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
                 panic!("expected paused raster inference")
-            }
-        }
-    }
-
-    #[test]
-    fn run_inference_with_controls_raster_decode_only_runs_raster_decode() {
-        let tokenizer = test_tokenizer();
-        let model = test_model_spec();
-        let transformer_fixture = deterministic_no_ple_model_fixture();
-        let request = InferenceRequest {
-            prompt_bytes: b"prompt".to_vec(),
-            text_decoding_policy: TextDecodingPolicy::Utf8,
-            add_generation_prompt: false,
-            add_special_tokens: false,
-            execution_mode: InferenceExecutionMode::Deterministic,
-            sampling: SamplingConfig {
-                max_new_tokens: Some(2),
-                temperature: Some(1.0),
-                top_k: None,
-                top_p: None,
-            },
-        };
-
-        let outcome = run_inference_with_controls(
-            &request,
-            &model,
-            &tokenizer,
-            &transformer_fixture.model,
-            &InferenceControls {
-                commit_checkpoints: false,
-                terminal_checkpoint: None,
-                raster: true,
-                raster_decode_only: true,
-                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
-                raster_projection_rows_per_tile: Some(2),
-                raster_attention_kv_rows_per_tile: None,
-                raster_sequence_rows_per_tile: None,
-                raster_head_rows_per_tile: None,
-                raster_tokenizer_bpe_pairs_per_tile: None,
-                raster_tokenizer_bpe_pieces_per_tile: None,
-                raster_output_byte_flush_bytes_per_tile: None,
-            },
-        )
-        .expect("hybrid raster inference should complete");
-
-        match outcome {
-            InferenceRunOutcome::Completed(state) => {
-                assert_eq!(state.output_decode.generated_token_ids, vec![0, 0]);
-                assert_eq!(
-                    state.output_decode.generated_text,
-                    "raster-helloraster-hello"
-                );
-                assert_eq!(state.output_decode.generated_token_count, 2);
-                assert_eq!(state.output_decode.decode_transition_states.len(), 2);
-                assert!(
-                    state.raster_tile_invocations.expect("tile count") > 0,
-                    "decode-only raster should count raster decode tiles"
-                );
-            }
-            InferenceRunOutcome::Paused(_) => panic!("expected completed hybrid raster inference"),
-            InferenceRunOutcome::RasterPromptPrepared(_) => {
-                panic!("expected completed hybrid raster inference")
             }
         }
     }
@@ -1807,7 +1655,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1861,7 +1708,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("output.finalize".to_string()),
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1883,127 +1729,6 @@ mod tests {
             }
             InferenceRunOutcome::Completed(_) | InferenceRunOutcome::RasterPromptPrepared(_) => {
                 panic!("expected paused raster inference")
-            }
-        }
-    }
-
-    #[test]
-    fn run_inference_with_controls_raster_decode_only_can_pause_after_output_finalize() {
-        let tokenizer = test_tokenizer();
-        let model = test_model_spec();
-        let transformer_fixture = deterministic_no_ple_model_fixture();
-        let request = InferenceRequest {
-            prompt_bytes: b"prompt".to_vec(),
-            text_decoding_policy: TextDecodingPolicy::Utf8,
-            add_generation_prompt: false,
-            add_special_tokens: false,
-            execution_mode: InferenceExecutionMode::Deterministic,
-            sampling: SamplingConfig {
-                max_new_tokens: Some(1),
-                temperature: Some(1.0),
-                top_k: None,
-                top_p: None,
-            },
-        };
-
-        let paused = run_inference_with_controls(
-            &request,
-            &model,
-            &tokenizer,
-            &transformer_fixture.model,
-            &InferenceControls {
-                commit_checkpoints: false,
-                terminal_checkpoint: Some("output.finalize".to_string()),
-                raster: true,
-                raster_decode_only: true,
-                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
-                raster_projection_rows_per_tile: Some(2),
-                raster_attention_kv_rows_per_tile: None,
-                raster_sequence_rows_per_tile: None,
-                raster_head_rows_per_tile: None,
-                raster_tokenizer_bpe_pairs_per_tile: None,
-                raster_tokenizer_bpe_pieces_per_tile: None,
-                raster_output_byte_flush_bytes_per_tile: None,
-            },
-        )
-        .expect("hybrid raster inference should pause after output finalize");
-
-        match paused {
-            InferenceRunOutcome::Paused(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "output.finalize");
-                assert!(
-                    state.raster_tile_invocations.expect("tile count") > 0,
-                    "hybrid raster inference should count output decode tiles"
-                );
-                let output_decode = state
-                    .output_decode
-                    .expect("output decode state should be present");
-                assert_eq!(output_decode.generated_token_ids, vec![0]);
-                assert_eq!(output_decode.generated_text, "raster-hello");
-                assert_eq!(output_decode.generated_token_count, 1);
-            }
-            InferenceRunOutcome::Completed(_) => panic!("expected paused hybrid raster inference"),
-            InferenceRunOutcome::RasterPromptPrepared(_) => {
-                panic!("expected paused hybrid raster inference")
-            }
-        }
-    }
-
-    #[test]
-    fn run_inference_with_controls_raster_decode_only_can_pause_after_decode_finalize() {
-        let tokenizer = test_tokenizer();
-        let model = test_model_spec();
-        let transformer_fixture = deterministic_no_ple_model_fixture();
-        let request = InferenceRequest {
-            prompt_bytes: b"prompt".to_vec(),
-            text_decoding_policy: TextDecodingPolicy::Utf8,
-            add_generation_prompt: false,
-            add_special_tokens: false,
-            execution_mode: InferenceExecutionMode::Deterministic,
-            sampling: SamplingConfig {
-                max_new_tokens: Some(2),
-                temperature: Some(1.0),
-                top_k: None,
-                top_p: None,
-            },
-        };
-
-        let paused = run_inference_with_controls(
-            &request,
-            &model,
-            &tokenizer,
-            &transformer_fixture.model,
-            &InferenceControls {
-                commit_checkpoints: false,
-                terminal_checkpoint: Some("decode.finalize".to_string()),
-                raster: true,
-                raster_decode_only: true,
-                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
-                raster_projection_rows_per_tile: Some(2),
-                raster_attention_kv_rows_per_tile: None,
-                raster_sequence_rows_per_tile: None,
-                raster_head_rows_per_tile: None,
-                raster_tokenizer_bpe_pairs_per_tile: None,
-                raster_tokenizer_bpe_pieces_per_tile: None,
-                raster_output_byte_flush_bytes_per_tile: None,
-            },
-        )
-        .expect("hybrid raster inference should pause after decode finalize");
-
-        match paused {
-            InferenceRunOutcome::Paused(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "decode.finalize");
-                let output_decode = state
-                    .output_decode
-                    .expect("partial output decode state should be present");
-                assert_eq!(output_decode.generated_token_ids, vec![0]);
-                assert_eq!(output_decode.generated_text, "raster-hello");
-                assert_eq!(output_decode.generated_token_count, 1);
-                assert_eq!(output_decode.decode_transition_states.len(), 1);
-            }
-            InferenceRunOutcome::Completed(_) => panic!("expected paused hybrid raster inference"),
-            InferenceRunOutcome::RasterPromptPrepared(_) => {
-                panic!("expected paused hybrid raster inference")
             }
         }
     }
@@ -2036,7 +1761,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -2048,32 +1772,6 @@ mod tests {
             },
         )
         .expect_err("raster inference should reject fp32 requests");
-
-        assert!(error
-            .to_string()
-            .contains("requires deterministic execution"));
-
-        let error = run_inference_with_controls(
-            &request,
-            &model,
-            &tokenizer,
-            &transformer_model,
-            &InferenceControls {
-                commit_checkpoints: false,
-                terminal_checkpoint: None,
-                raster: true,
-                raster_decode_only: true,
-                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
-                raster_projection_rows_per_tile: None,
-                raster_attention_kv_rows_per_tile: None,
-                raster_sequence_rows_per_tile: None,
-                raster_head_rows_per_tile: None,
-                raster_tokenizer_bpe_pairs_per_tile: None,
-                raster_tokenizer_bpe_pieces_per_tile: None,
-                raster_output_byte_flush_bytes_per_tile: None,
-            },
-        )
-        .expect_err("raster decode-only inference should reject fp32 requests");
 
         assert!(error
             .to_string()
@@ -2108,7 +1806,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -2152,7 +1849,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(0),
                 raster_attention_kv_rows_per_tile: None,
@@ -2196,7 +1892,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: Some(0),
@@ -2240,7 +1935,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -2284,7 +1978,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
-                raster_decode_only: false,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -2361,7 +2054,6 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
                 raster: false,
-                raster_decode_only: false,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: Some(0),
                 raster_attention_kv_rows_per_tile: None,

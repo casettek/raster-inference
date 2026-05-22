@@ -296,9 +296,7 @@ pub fn finalize_prefill_finalize_refs(
 }
 
 #[sequence]
-pub fn main_refs(
-    input_roots: RasterPrefillFinalizeInputRoots,
-) -> Result<RasterPrefillFinalizeOutput> {
+pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<RasterPrefillFinalizeOutput> {
     crate::trace::trace_event("prefill.select_final_position");
     let state = call_tile!(
         init_prefill_finalize_state,
@@ -321,8 +319,10 @@ pub fn main_refs(
 }
 
 #[sequence]
-pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<TransformerPrefillResult> {
-    let output = call_seq!(main_refs, input_roots)?;
+pub fn materialize_prefill_result_for_api(
+    input_roots: RasterPrefillFinalizeInputRoots,
+) -> Result<TransformerPrefillResult> {
+    let output = call_seq!(main, input_roots)?;
     call_tile!(
         build_prefill_result_from_refs,
         output.artifact_store_roots,

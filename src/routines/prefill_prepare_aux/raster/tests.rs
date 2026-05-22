@@ -346,9 +346,10 @@ fn prefill_ple_state_serializes_refs_not_activation_rows() {
     )
     .expect("read manifest")
     .expect("PLE refs");
-    let finalized = crate::prefill_prepare_aux::materialize_prefill_ple_input_refs(Some(&refs))
-        .expect("materialize refs")
-        .expect("PLE inputs");
+    let finalized =
+        crate::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(&refs))
+            .expect("materialize refs")
+            .expect("PLE inputs");
     let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
     assert_eq!(finalized.per_layer_inputs, native.per_layer_inputs);
 }
@@ -380,9 +381,10 @@ fn prefill_ple_ref_manifest_serializes_refs_not_activation_rows() {
     assert!(encoded.contains("per_layer_inputs"));
     assert!(!encoded.contains("act_bits"));
 
-    let materialized = crate::prefill_prepare_aux::materialize_prefill_ple_input_refs(Some(&refs))
-        .expect("materialize refs")
-        .expect("PLE inputs");
+    let materialized =
+        crate::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(&refs))
+            .expect("materialize refs")
+            .expect("PLE inputs");
     let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
     assert_eq!(materialized.per_layer_inputs, native.per_layer_inputs);
 }
@@ -695,7 +697,7 @@ fn run_materialized_with_sizing(
         artifact_store_roots,
         manifest_root.as_deref(),
     )?;
-    crate::prefill_prepare_aux::materialize_prefill_ple_input_refs(refs.as_ref())
+    crate::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(refs.as_ref())
 }
 
 fn native_prefill_ple_inputs(

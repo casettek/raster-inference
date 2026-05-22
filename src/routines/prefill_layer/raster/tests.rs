@@ -2,7 +2,7 @@ use crate::dsl::prelude::auth_read;
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::prefill_layer::native::deterministic_tiles;
 use crate::prefill_layer::{
-    materialize_prefill_layer_output_refs_from_roots, run_raster_refs_from_input_embedding,
+    materialize_prefill_layer_output_refs_from_roots_for_trace, run_raster,
 };
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
@@ -521,14 +521,14 @@ fn run_roots_path_with_optional_ple(
     };
     let (artifact_store_roots, ple_input_manifest_root) =
         store_materialized_ple_inputs_with_roots(artifact_store_roots, source, ple_inputs)?;
-    let (artifact_store_roots, refs) = run_raster_refs_from_input_embedding(
+    let (artifact_store_roots, refs) = run_raster(
         artifact_store_roots,
         &input_embedding_refs,
         source,
         ple_input_manifest_root.as_deref(),
         raster_sizing,
     )?;
-    materialize_prefill_layer_output_refs_from_roots(&artifact_store_roots, &refs)
+    materialize_prefill_layer_output_refs_from_roots_for_trace(&artifact_store_roots, &refs)
 }
 
 fn store_materialized_ple_inputs_with_roots(

@@ -1,16 +1,22 @@
-use anyhow::{anyhow, Result};
+#[cfg(test)]
+use anyhow::anyhow;
+use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
+#[cfg(test)]
 use crate::shared::artifacts::artifact_io::ArtifactIo;
+#[cfg(test)]
 use crate::shared::artifacts::raster_artifact_store::{
     activation_row_leaf, read_token_id_from_ref_roots, token_id_leaf,
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
     RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
+#[cfg(test)]
 use crate::shared::raster_kernels::transformer::RasterActivationRow;
+#[cfg(test)]
 use crate::shared::tensors::raster_tensor_artifacts::{
     activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
 };
@@ -41,22 +47,28 @@ pub fn run(
     Ok(Some(next_token))
 }
 
-pub fn run_raster(decode_state: &mut DecodeState, max_new_tokens: usize) -> Result<Option<u32>> {
-    Ok(run_raster_refs(decode_state, max_new_tokens)?.map(|output| output.next_token))
+#[cfg(test)]
+pub(crate) fn materialize_run_raster_for_api(
+    decode_state: &mut DecodeState,
+    max_new_tokens: usize,
+) -> Result<Option<u32>> {
+    Ok(run_raster_refs_for_api(decode_state, max_new_tokens)?.map(|output| output.next_token))
 }
 
-pub fn run_raster_refs(
+#[cfg(test)]
+pub(crate) fn run_raster_refs_for_api(
     decode_state: &mut DecodeState,
     max_new_tokens: usize,
 ) -> Result<Option<raster::RasterDecodeSelectOutputRefs>> {
-    run_raster_refs_with_roots(
+    run_raster_refs_with_roots_for_api(
         decode_state,
         max_new_tokens,
         ArtifactIo::export_store_roots(),
     )
 }
 
-pub fn run_raster_refs_with_roots(
+#[cfg(test)]
+pub(crate) fn run_raster_refs_with_roots_for_api(
     decode_state: &mut DecodeState,
     max_new_tokens: usize,
     artifact_store_roots: RasterArtifactStoreRoots,
@@ -87,15 +99,9 @@ pub fn run_raster_refs_with_roots(
     Ok(Some(output))
 }
 
-pub fn run_raster_with_roots(
-    input_roots: raster::RasterDecodeSelectInputRoots,
-) -> Result<Option<raster::RasterDecodeSelectOutputRefs>> {
-    raster::main(input_roots)
-}
-
 /// Refs-first raster path: advances token refs in `RasterDecodeLoopState`
 /// without materializing or mutating host `DecodeState`.
-pub fn run_raster_state(
+pub fn run_raster(
     decode_state: RasterDecodeLoopState,
     max_new_tokens: usize,
 ) -> Result<(
@@ -131,7 +137,9 @@ pub(crate) fn trace_raster_checkpoint_from_state(
     max_new_tokens: usize,
 ) -> Result<()> {
     let decode_state =
-        crate::decode_transition::materialize_decode_state_from_raster_state(decode_state)?;
+        crate::decode_transition::materialize_decode_state_from_raster_state_for_trace(
+            decode_state,
+        )?;
     crate::trace::trace_checkpoint(
         "decode.select_token",
         &decode_select_checkpoint_state(&decode_state, selected_next_token, max_new_tokens)?,
@@ -165,6 +173,7 @@ fn prepare_raster_decode_select_input_roots_from_state(
     }
 }
 
+#[cfg(test)]
 fn prepare_raster_decode_select_input_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     decode_state: &DecodeState,
@@ -207,6 +216,7 @@ fn prepare_raster_decode_select_input_roots(
     })
 }
 
+#[cfg(test)]
 fn insert_token_ids_artifact_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     source_name: String,
@@ -228,6 +238,7 @@ fn insert_token_ids_artifact_with_roots(
     ))
 }
 
+#[cfg(test)]
 fn insert_logits_artifact_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     source_name: String,
@@ -258,6 +269,7 @@ fn insert_logits_artifact_with_roots(
     Ok((artifact_store_roots, logits_ref))
 }
 
+#[cfg(test)]
 fn materialize_token_ids(
     artifact_store_roots: &RasterArtifactStoreRoots,
     token_ids_ref: &RasterTokenIdSequenceRef,

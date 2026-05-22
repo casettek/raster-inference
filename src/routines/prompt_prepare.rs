@@ -18,6 +18,7 @@ use self::raster::utils::{
     PROMPT_BYTES_ARTIFACT_DOMAIN, PROMPT_BYTES_ARTIFACT_KIND, PROMPT_TEXT_ARTIFACT_DOMAIN,
     PROMPT_TEXT_ARTIFACT_KIND, RENDERED_PROMPT_ARTIFACT_DOMAIN, RENDERED_PROMPT_ARTIFACT_KIND,
 };
+use crate::RasterSizingControls;
 
 pub mod native;
 pub mod raster;
@@ -47,7 +48,7 @@ pub fn run(
     })
 }
 
-pub fn format_native_prompt_as_raster_checkpoint(
+pub fn format_native_prompt_as_raster_checkpoint_for_trace(
     request: &InferenceRequest,
     model: &ModelSpec,
     tokenizer: &AuthenticatedGemmaTokenizer,
@@ -103,29 +104,14 @@ pub fn run_raster(
     request: &InferenceRequest,
     model: &ModelSpec,
     tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<raster::RasterPromptPreparationResult> {
-    run_raster_with_tokenizer_controls(
-        request,
-        model,
-        tokenizer,
-        raster::DEFAULT_BPE_PAIRS_PER_TILE,
-        raster::DEFAULT_BPE_PIECES_PER_TILE,
-    )
-}
-
-pub fn run_raster_with_tokenizer_controls(
-    request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &AuthenticatedGemmaTokenizer,
-    bpe_pairs_per_tile: usize,
-    bpe_pieces_per_tile: usize,
+    raster_sizing: RasterSizingControls,
 ) -> Result<raster::RasterPromptPreparationResult> {
     let prepared_inputs = prepare_raster_prompt_input_roots(
         request,
         model,
         tokenizer,
-        bpe_pairs_per_tile,
-        bpe_pieces_per_tile,
+        raster_sizing.tokenizer_bpe_pairs_per_tile,
+        raster_sizing.tokenizer_bpe_pieces_per_tile,
     )?;
     raster::main(
         prepared_inputs.artifact_store_roots,
