@@ -17,7 +17,6 @@ pub struct RasterDecodeSelectInputRoots {
     pub full_token_count: usize,
     pub generated_token_ids_ref: Option<RasterTokenIdSequenceRef>,
     pub generated_token_count: usize,
-    pub max_new_tokens: usize,
     pub logits_per_tile: usize,
     pub token_ids_per_tile: usize,
     pub output_full_token_ids_source_name: String,
@@ -27,13 +26,17 @@ pub struct RasterDecodeSelectInputRoots {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct DecodeSelectArgmaxState {
-    pub(in super::super) artifact_store_roots: RasterArtifactStoreRoots,
-    pub(in super::super) logits_ref: RasterActivationSequenceRef,
+    pub(in super::super) input_roots: RasterDecodeSelectInputRoots,
     pub(in super::super) next_token_idx: usize,
     pub(in super::super) logit_count: usize,
     pub(in super::super) best_token_id: u32,
     pub(in super::super) best_logit_bits: i32,
-    pub(in super::super) logits_per_tile: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DecodeSelectSelectedState {
+    pub(in super::super) input_roots: RasterDecodeSelectInputRoots,
+    pub(in super::super) next_token: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

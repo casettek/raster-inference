@@ -79,12 +79,8 @@ pub(crate) fn run_raster_refs_with_roots_for_api(
         return Ok(None);
     }
 
-    let input_roots = prepare_raster_decode_select_input_roots(
-        artifact_store_roots,
-        decode_state,
-        max_new_tokens,
-    )?;
-    let output = raster::main(input_roots)?.expect("stop condition should have returned earlier");
+    let input_roots = prepare_raster_decode_select_input_roots(artifact_store_roots, decode_state)?;
+    let output = raster::main(input_roots)?;
 
     decode_state.full_token_ids =
         materialize_token_ids(&output.artifact_store_roots, &output.full_token_ids_ref)?;
@@ -112,9 +108,8 @@ pub fn run_raster(
         return Ok((decode_state, None));
     }
 
-    let input_roots =
-        prepare_raster_decode_select_input_roots_from_state(decode_state.clone(), max_new_tokens);
-    let output = raster::main(input_roots)?.expect("stop condition should have returned earlier");
+    let input_roots = prepare_raster_decode_select_input_roots_from_state(decode_state.clone());
+    let output = raster::main(input_roots)?;
     let next_state = RasterDecodeLoopState::new(
         output.artifact_store_roots.clone(),
         Some(output.full_token_ids_ref.clone()),
@@ -149,7 +144,6 @@ pub(crate) fn trace_raster_checkpoint_from_state(
 
 fn prepare_raster_decode_select_input_roots_from_state(
     decode_state: RasterDecodeLoopState,
-    max_new_tokens: usize,
 ) -> raster::RasterDecodeSelectInputRoots {
     let source_prefix = format!(
         "decode.select_token.position_{}.step_{}",
@@ -162,7 +156,6 @@ fn prepare_raster_decode_select_input_roots_from_state(
         full_token_count: decode_state.full_token_count,
         generated_token_ids_ref: decode_state.generated_token_ids_ref,
         generated_token_count: decode_state.generated_token_count,
-        max_new_tokens,
         logits_per_tile: raster::DEFAULT_DECODE_SELECT_LOGITS_PER_TILE,
         token_ids_per_tile: raster::DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE,
         output_full_token_ids_source_name: format!("{source_prefix}.output.full_token_ids"),
@@ -177,7 +170,6 @@ fn prepare_raster_decode_select_input_roots_from_state(
 fn prepare_raster_decode_select_input_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     decode_state: &DecodeState,
-    max_new_tokens: usize,
 ) -> Result<raster::RasterDecodeSelectInputRoots> {
     let position = decode_state.transformer_decode_state.position;
     let generated_count = decode_state.generated_token_ids.len();
@@ -205,7 +197,6 @@ fn prepare_raster_decode_select_input_roots(
         full_token_count: decode_state.full_token_ids.len(),
         generated_token_ids_ref,
         generated_token_count: decode_state.generated_token_ids.len(),
-        max_new_tokens,
         logits_per_tile: raster::DEFAULT_DECODE_SELECT_LOGITS_PER_TILE,
         token_ids_per_tile: raster::DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE,
         output_full_token_ids_source_name: format!("{source_prefix}.output.full_token_ids"),

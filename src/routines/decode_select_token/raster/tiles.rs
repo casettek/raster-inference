@@ -1,13 +1,12 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::dsl::prelude::{call_recur_tile, call_tile, sequence, tile};
+use crate::dsl::prelude::{call_recur_tile, call_seq, call_tile, sequence, tile};
 use crate::shared::api::output::OutputDecodeStopReason;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     read_token_id_from_ref_roots, token_id_leaf, RasterArtifactId, RasterArtifactMetadata,
-    RasterArtifactStoreRoots, RasterSelectedTokenRef, RasterTokenIdSequenceRef,
+    RasterSelectedTokenRef, RasterTokenIdSequenceRef,
 };
-use crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef;
 
 use super::types::*;
 use super::utils::*;
@@ -15,37 +14,29 @@ use super::utils::*;
 // Raster execution sequences, ordered from the primary entry point outward.
 
 #[sequence]
-pub fn main(
-    input_roots: RasterDecodeSelectInputRoots,
-) -> Result<Option<RasterDecodeSelectOutputRefs>> {
-    if call_tile!(
-        check_stop_condition,
-        input_roots.generated_token_count,
-        input_roots.max_new_tokens
-    )
-    .is_some()
-    {
-        return Ok(None);
-    }
+pub fn main(input_roots: RasterDecodeSelectInputRoots) -> Result<RasterDecodeSelectOutputRefs> {
+    let selected_state = call_seq!(select_next_token_from_logits, input_roots)?;
+    call_seq!(append_selected_token_refs, selected_state)
+}
 
-    let argmax_state = call_tile!(
-        init_select_next_token,
-        input_roots.artifact_store_roots.clone(),
-        input_roots.logits_ref.clone(),
-        input_roots.logits_per_tile
-    )?;
+#[sequence]
+fn select_next_token_from_logits(
+    input_roots: RasterDecodeSelectInputRoots,
+) -> Result<DecodeSelectSelectedState> {
+    let argmax_state = call_tile!(init_select_next_token, input_roots)?;
     let argmax_state = call_recur_tile!(scan_next_token_logit, argmax_state)?;
-    let next_token = call_tile!(finalize_selected_token, argmax_state)?;
-    let append_state = call_tile!(
-        init_decode_select_append_state,
-        input_roots.artifact_store_roots.clone(),
-        &input_roots,
-        next_token
-    )?;
+    call_tile!(finalize_selected_token, argmax_state)
+}
+
+#[sequence]
+fn append_selected_token_refs(
+    selected_state: DecodeSelectSelectedState,
+) -> Result<RasterDecodeSelectOutputRefs> {
+    let append_state = call_tile!(init_decode_select_append_state, selected_state)?;
     let append_state = call_recur_tile!(copy_next_full_token_chunk, append_state)?;
     let append_state = call_recur_tile!(copy_next_generated_token_chunk, append_state)?;
     let append_state = call_tile!(append_selected_token, append_state)?;
-    call_tile!(finalize_decode_select_refs, append_state).map(Some)
+    call_tile!(finalize_decode_select_refs, append_state)
 }
 
 // Raster execution tiles, ordered by the sequence calls that reach them.
@@ -60,24 +51,24 @@ pub fn check_stop_condition(
 
 #[tile]
 pub fn init_select_next_token(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    logits_ref: RasterActivationSequenceRef,
-    logits_per_tile: usize,
+    input_roots: RasterDecodeSelectInputRoots,
 ) -> Result<DecodeSelectArgmaxState> {
-    if logits_per_tile == 0 {
+    if input_roots.logits_per_tile == 0 {
         bail!("raster decode select logits per tile must be greater than zero");
     }
-    let logit_count = decode_select_logit_count(&logits_ref)?;
+    let logit_count = decode_select_logit_count(&input_roots.logits_ref)?;
 
-    let best_logit_bits = read_logit_bits(&artifact_store_roots, &logits_ref, 0)?;
+    let best_logit_bits = read_logit_bits(
+        &input_roots.artifact_store_roots,
+        &input_roots.logits_ref,
+        0,
+    )?;
     Ok(DecodeSelectArgmaxState {
-        artifact_store_roots,
-        logits_ref,
+        input_roots,
         next_token_idx: 1,
         logit_count,
         best_token_id: 0,
         best_logit_bits,
-        logits_per_tile,
     })
 }
 
@@ -88,18 +79,18 @@ pub fn scan_next_token_logit(
     if argmax_state.next_token_idx >= argmax_state.logit_count {
         return Ok((true, argmax_state));
     }
-    if argmax_state.logits_per_tile == 0 {
+    if argmax_state.input_roots.logits_per_tile == 0 {
         bail!("raster decode select logits per tile must be greater than zero");
     }
 
     let end = argmax_state
         .next_token_idx
-        .saturating_add(argmax_state.logits_per_tile)
+        .saturating_add(argmax_state.input_roots.logits_per_tile)
         .min(argmax_state.logit_count);
     while argmax_state.next_token_idx < end {
         let candidate_bits = read_logit_bits(
-            &argmax_state.artifact_store_roots,
-            &argmax_state.logits_ref,
+            &argmax_state.input_roots.artifact_store_roots,
+            &argmax_state.input_roots.logits_ref,
             argmax_state.next_token_idx,
         )?;
         if candidate_wins(argmax_state.best_logit_bits, candidate_bits) {
@@ -117,7 +108,9 @@ pub fn scan_next_token_logit(
 }
 
 #[tile]
-pub fn finalize_selected_token(argmax_state: DecodeSelectArgmaxState) -> Result<u32> {
+pub fn finalize_selected_token(
+    argmax_state: DecodeSelectArgmaxState,
+) -> Result<DecodeSelectSelectedState> {
     if argmax_state.logit_count == 0 {
         bail!("raster decode select token cannot finalize empty logits");
     }
@@ -128,15 +121,21 @@ pub fn finalize_selected_token(argmax_state: DecodeSelectArgmaxState) -> Result<
             argmax_state.logit_count
         );
     }
-    Ok(argmax_state.best_token_id)
+    Ok(DecodeSelectSelectedState {
+        input_roots: argmax_state.input_roots,
+        next_token: argmax_state.best_token_id,
+    })
 }
 
 #[tile]
 pub fn init_decode_select_append_state(
-    mut artifact_store_roots: RasterArtifactStoreRoots,
-    input_roots: &RasterDecodeSelectInputRoots,
-    next_token: u32,
+    selected_state: DecodeSelectSelectedState,
 ) -> Result<DecodeSelectAppendState> {
+    let DecodeSelectSelectedState {
+        input_roots,
+        next_token,
+    } = selected_state;
+    let mut artifact_store_roots = input_roots.artifact_store_roots;
     if input_roots.token_ids_per_tile == 0 {
         bail!("raster decode select token ids per tile must be greater than zero");
     }

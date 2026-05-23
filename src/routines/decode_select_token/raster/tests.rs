@@ -1,8 +1,10 @@
 use super::{
-    copy_next_full_token_chunk, init_decode_select_append_state, init_select_next_token, main,
-    scan_next_token_logit, DecodeSelectArgmaxState, RasterDecodeSelectInputRoots,
+    check_stop_condition, copy_next_full_token_chunk, init_decode_select_append_state,
+    init_select_next_token, main, scan_next_token_logit, DecodeSelectArgmaxState,
+    DecodeSelectSelectedState, RasterDecodeSelectInputRoots,
 };
 use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::api::output::OutputDecodeStopReason;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     activation_row_leaf, read_selected_token_from_roots, read_token_id_from_ref_roots,
@@ -28,16 +30,13 @@ fn main_selects_highest_logit_and_appends_token_refs() {
             Act::from_bits(7),
             Act::from_bits(3),
         ],
-        1,
         2,
         1,
         "basic",
     )
     .expect("input roots");
 
-    let output = main(input)
-        .expect("raster select should run")
-        .expect("should select token");
+    let output = main(input).expect("raster select should run");
 
     assert_eq!(output.next_token, 2);
     assert_eq!(output.selected_token_ref.token_ids_ref().token_count(), 1);
@@ -69,14 +68,11 @@ fn main_breaks_equal_logits_by_lowest_token_id() {
         vec![Act::from_bits(1), Act::from_bits(5), Act::from_bits(5)],
         1,
         1,
-        1,
         "ties",
     )
     .expect("input roots");
 
-    let output = main(input)
-        .expect("raster select should run")
-        .expect("should select token");
+    let output = main(input).expect("raster select should run");
 
     assert_eq!(output.next_token, 1);
 }
@@ -90,16 +86,14 @@ fn main_matches_native_deterministic_selection() {
         Act::from_bits(7),
     ];
     let internal = InternalLogits::from_det_values(det_logits.clone());
-    let input = input_roots(vec![10], vec![], det_logits, 1, 1, 1, "native").expect("input roots");
+    let input = input_roots(vec![10], vec![], det_logits, 1, 1, "native").expect("input roots");
 
     let native = crate::decode_select_token::native::select_next_token_internal(
         &internal,
         InferenceExecutionMode::Deterministic,
     )
     .expect("native deterministic selection should run");
-    let output = main(input)
-        .expect("raster select should run")
-        .expect("should select token");
+    let output = main(input).expect("raster select should run");
 
     assert_eq!(output.next_token, native);
 }
@@ -111,15 +105,13 @@ fn chunk_sizes_do_not_change_output() {
             vec![1, 2],
             vec![2],
             (0..40).map(Act::from_bits).collect(),
-            4,
             1,
             1,
             "single",
         )
         .expect("single input roots"),
     )
-    .expect("single chunk should run")
-    .expect("single chunk should select");
+    .expect("single chunk should run");
     let single_full_tokens =
         materialize_token_ids(&single.artifact_store_roots, &single.full_token_ids_ref)
             .expect("single full tokens");
@@ -133,15 +125,13 @@ fn chunk_sizes_do_not_change_output() {
             vec![1, 2],
             vec![2],
             (0..40).map(Act::from_bits).collect(),
-            4,
             11,
             8,
             "multi",
         )
         .expect("multi input roots"),
     )
-    .expect("multi chunk should run")
-    .expect("multi chunk should select");
+    .expect("multi chunk should run");
 
     assert_eq!(single.next_token, multi.next_token);
     assert_eq!(
@@ -162,21 +152,17 @@ fn states_serialize_refs_and_cursors_not_payloads() {
         vec![9, 4],
         vec![4],
         vec![Act::from_bits(1), Act::from_bits(3)],
-        2,
         1,
         1,
         "compact",
     )
     .expect("input roots");
-    let argmax_state = init_select_next_token(
-        input.artifact_store_roots.clone(),
-        input.logits_ref.clone(),
-        input.logits_per_tile,
-    )
-    .expect("argmax init");
-    let append_state =
-        init_decode_select_append_state(input.artifact_store_roots.clone(), &input, 1)
-            .expect("append init");
+    let argmax_state = init_select_next_token(input.clone()).expect("argmax init");
+    let append_state = init_decode_select_append_state(DecodeSelectSelectedState {
+        input_roots: input,
+        next_token: 1,
+    })
+    .expect("append init");
 
     let encoded_argmax = serde_json::to_string(&argmax_state).expect("serialize argmax");
     let encoded_append = serde_json::to_string(&append_state).expect("serialize append");
@@ -202,17 +188,13 @@ fn missing_logits_root_fails_closed() {
         vec![Act::from_bits(1), Act::from_bits(2)],
         1,
         1,
-        1,
         "missing",
     )
     .expect("input roots");
 
-    let error = init_select_next_token(
-        RasterArtifactStoreRoots::default(),
-        input.logits_ref,
-        input.logits_per_tile,
-    )
-    .expect_err("missing root should fail");
+    let mut input = input;
+    input.artifact_store_roots = RasterArtifactStoreRoots::default();
+    let error = init_select_next_token(input).expect_err("missing root should fail");
 
     assert!(error.to_string().contains("not present"));
 }
@@ -225,12 +207,14 @@ fn stale_builder_roots_fail_closed() {
         vec![Act::from_bits(1), Act::from_bits(2)],
         1,
         1,
-        1,
         "stale",
     )
     .expect("input roots");
-    let state = init_decode_select_append_state(input.artifact_store_roots.clone(), &input, 1)
-        .expect("append init");
+    let state = init_decode_select_append_state(DecodeSelectSelectedState {
+        input_roots: input,
+        next_token: 1,
+    })
+    .expect("append init");
     ArtifactIo::append_leaf_by_builder_source_name_with_roots(
         &state.artifact_store_roots,
         &state.output_full_token_ids_source_name,
@@ -252,13 +236,10 @@ fn selected_token_ref_fails_closed_with_missing_roots() {
         vec![Act::from_bits(1), Act::from_bits(9)],
         1,
         1,
-        1,
         "selected-missing",
     )
     .expect("input roots");
-    let output = main(input)
-        .expect("raster select should run")
-        .expect("should select token");
+    let output = main(input).expect("raster select should run");
 
     let error = read_selected_token_from_roots(
         &RasterArtifactStoreRoots::default(),
@@ -271,21 +252,10 @@ fn selected_token_ref_fails_closed_with_missing_roots() {
 
 #[test]
 fn stop_condition_does_not_inspect_logits_or_start_builders() {
-    let mut input = input_roots(
-        vec![1],
-        vec![2],
-        vec![Act::from_bits(1), Act::from_bits(2)],
-        1,
-        1,
-        1,
-        "stop",
-    )
-    .expect("input roots");
-    input.artifact_store_roots = RasterArtifactStoreRoots::default();
-
-    let output = main(input).expect("stop should not inspect roots");
-
-    assert_eq!(output, None);
+    assert_eq!(
+        check_stop_condition(1, 1),
+        Some(OutputDecodeStopReason::MaxNewTokens)
+    );
 }
 
 #[test]
@@ -294,7 +264,6 @@ fn zero_chunk_sizes_fail() {
         vec![1],
         vec![],
         vec![Act::from_bits(1), Act::from_bits(2)],
-        1,
         0,
         1,
         "zero-logits",
@@ -307,7 +276,6 @@ fn zero_chunk_sizes_fail() {
         vec![1],
         vec![],
         vec![Act::from_bits(1), Act::from_bits(2)],
-        1,
         1,
         0,
         "zero-tokens",
@@ -323,20 +291,17 @@ fn scan_next_token_logit_bounds_work_per_recursive_step() {
         vec![1],
         vec![],
         (0..40).map(Act::from_bits).collect(),
-        1,
         7,
         1,
         "bounds",
     )
     .expect("input roots");
     let state = DecodeSelectArgmaxState {
-        artifact_store_roots: input.artifact_store_roots,
-        logits_ref: input.logits_ref,
+        input_roots: input,
         next_token_idx: 1,
         logit_count: 40,
         best_token_id: 0,
         best_logit_bits: 0,
-        logits_per_tile: 7,
     };
 
     let (done, state) = scan_next_token_logit(state).expect("scan chunk should succeed");
@@ -351,7 +316,6 @@ fn input_roots(
     full_token_ids: Vec<u32>,
     generated_token_ids: Vec<u32>,
     logits: Vec<Act>,
-    max_new_tokens: usize,
     logits_per_tile: usize,
     token_ids_per_tile: usize,
     source_prefix: &str,
@@ -378,7 +342,6 @@ fn input_roots(
         full_token_count: full_token_ids.len(),
         generated_token_ids_ref,
         generated_token_count: generated_token_ids.len(),
-        max_new_tokens,
         logits_per_tile,
         token_ids_per_tile,
         output_full_token_ids_source_name: format!("{source_prefix}.output.full"),
