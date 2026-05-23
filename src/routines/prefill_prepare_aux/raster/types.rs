@@ -32,16 +32,33 @@ pub struct RasterPrefillPleInputRoots {
 pub type RasterPrefillPleOutput = RasterRoutineOutput<Option<String>>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct PrefillPleLayerContext {
+pub(in super::super) enum PrefillPleLayerStep {
+    Complete {
+        ple_state: PrefillPleRasterState,
+    },
+    Skip {
+        ple_state: PrefillPleRasterState,
+        layer_idx: usize,
+    },
+    Compute(PrefillPleLayerComputeState),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(in super::super) struct PrefillPleLayerComputeState {
+    pub(in super::super) ple_state: PrefillPleRasterState,
     pub(in super::super) layer_idx: usize,
-    pub(in super::super) has_ple: bool,
-    pub(in super::super) ple_width: Option<usize>,
-    pub(in super::super) projection_rows: Option<usize>,
+    pub(in super::super) input_activations_ref: RasterActivationSequenceArtifactRef,
+    pub(in super::super) ple_width: usize,
+    pub(in super::super) projection_rows: usize,
     pub(in super::super) embedding_scale_bits: Option<i32>,
     pub(in super::super) projection_scalar_bits: Option<i32>,
     pub(in super::super) input_scale_bits: Option<i32>,
     pub(in super::super) rms_norm_eps_bits: Option<i64>,
     pub(in super::super) norm_weight_bits: Option<Vec<i32>>,
+    pub(in super::super) embedded_ref: Option<RasterActivationSequenceArtifactRef>,
+    pub(in super::super) projected_ref: Option<RasterActivationSequenceArtifactRef>,
+    pub(in super::super) combined_ref: Option<RasterActivationSequenceArtifactRef>,
+    pub(in super::super) layer_input_ref: Option<RasterActivationSequenceArtifactRef>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -61,6 +78,9 @@ impl PrefillPleTokenEmbeddingState {
     }
 }
 
+pub(in super::super) type PrefillPleLayerTokenEmbeddingStep =
+    PrefillPleLayerSubstep<PrefillPleTokenEmbeddingState>;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillPleSequenceProjectionState {
     pub(in super::super) input_ref: RasterActivationSequenceArtifactRef,
@@ -79,6 +99,9 @@ impl PrefillPleSequenceProjectionState {
         self.next_token_idx >= self.token_count
     }
 }
+
+pub(in super::super) type PrefillPleLayerProjectionStep =
+    PrefillPleLayerSubstep<PrefillPleSequenceProjectionState>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(in super::super) enum PrefillPleSequenceUnaryOp {
@@ -108,6 +131,9 @@ impl PrefillPleSequenceUnaryState {
     }
 }
 
+pub(in super::super) type PrefillPleLayerUnaryStep =
+    PrefillPleLayerSubstep<PrefillPleSequenceUnaryState>;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillPleSequenceBinaryState {
     pub(in super::super) lhs_ref: RasterActivationSequenceArtifactRef,
@@ -123,4 +149,16 @@ impl PrefillPleSequenceBinaryState {
     pub(in super::super) fn is_complete(&self) -> bool {
         self.next_row_idx >= self.row_count
     }
+}
+
+pub(in super::super) type PrefillPleLayerBinaryStep =
+    PrefillPleLayerSubstep<PrefillPleSequenceBinaryState>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(in super::super) enum PrefillPleLayerSubstep<T> {
+    Noop(PrefillPleLayerStep),
+    Compute {
+        compute_state: PrefillPleLayerComputeState,
+        operation_state: T,
+    },
 }

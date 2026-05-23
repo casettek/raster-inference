@@ -29,6 +29,137 @@ fn ref_backed_prepare_aux_helpers_do_not_hide_completion_loops() {
 }
 
 #[test]
+fn prefill_prepare_aux_sequences_are_branch_free_orchestration() {
+    let source = include_str!("tiles.rs");
+    let violations = branch_free_sequence_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "prefill_prepare_aux sequences must be straight-line tile/sequence calls: {violations:?}"
+    );
+}
+
+#[test]
+fn branch_free_sequence_guard_rejects_inline_branches() {
+    let source = r#"
+#[sequence]
+fn assigned_branch() -> Result<()> {
+    let next = if true { call_tile!(a)? } else { call_tile!(b)? };
+    call_tile!(finish, next)
+}
+
+#[sequence]
+fn nested_match() -> Result<()> {
+    let state = call_tile!(start)?;
+    let next = match state { State::Done => state };
+    call_tile!(finish, next)
+}
+"#;
+    let violations = branch_free_sequence_violations(source);
+
+    assert!(
+        violations.iter().any(|violation| violation.contains("if")),
+        "guard should reject assigned `if` branches: {violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("match")),
+        "guard should reject assigned `match` branches: {violations:?}"
+    );
+}
+
+fn raster_sequence_bodies(source: &str) -> Vec<(String, String)> {
+    let mut bodies = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(attribute_offset) = source[search_start..].find("#[sequence") {
+        let attribute_start = search_start + attribute_offset;
+        let fn_start = attribute_start
+            + source[attribute_start..]
+                .find("fn ")
+                .expect("sequence attribute should be followed by a function")
+            + "fn ".len();
+        let name_end = fn_start
+            + source[fn_start..]
+                .find('(')
+                .expect("sequence function should have a parameter list");
+        let sequence_name = source[fn_start..name_end].trim().to_string();
+        let body_start = name_end
+            + source[name_end..]
+                .find('{')
+                .expect("sequence function should have a body");
+        let mut depth = 0usize;
+        let mut body_end = body_start;
+
+        for (offset, character) in source[body_start..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        bodies.push((sequence_name, source[body_start + 1..body_end].to_string()));
+        search_start = body_end + 1;
+    }
+
+    bodies
+}
+
+fn branch_free_sequence_violations(source: &str) -> Vec<String> {
+    let sequence_bodies = raster_sequence_bodies(source);
+    assert!(
+        !sequence_bodies.is_empty(),
+        "source should have sequence bodies to validate"
+    );
+    let control_flow_tokens = ["if", "return", "match", "for", "while", "loop"];
+    let inline_logic_fragments = [
+        "ok_or_else",
+        "RasterArtifactId::new",
+        "format!(",
+        "Some(",
+        ".clone()",
+        "Act::from_bits",
+        "Acc::from_bits",
+        ".collect()",
+    ];
+    let mut violations = Vec::new();
+
+    for (sequence_name, sequence_body) in sequence_bodies {
+        let tokenized = sequence_body
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '_' {
+                    character
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>();
+
+        for token in tokenized.split_whitespace() {
+            if control_flow_tokens.contains(&token) {
+                violations.push(format!("`{sequence_name}` contains `{token}`"));
+            }
+        }
+        for forbidden_fragment in inline_logic_fragments {
+            if sequence_body.contains(forbidden_fragment) {
+                violations.push(format!("`{sequence_name}` contains `{forbidden_fragment}`"));
+            }
+        }
+    }
+
+    violations
+}
+
+#[test]
 fn scaled_token_embedding_rows_advance_one_recursive_step_at_a_time() {
     let fixture = PleFixture::single_layer().expect("fixture should build");
     reset_artifact_store();
@@ -358,6 +489,52 @@ fn prefill_ple_state_serializes_refs_not_activation_rows() {
 }
 
 #[test]
+fn prefill_ple_layer_steps_serialize_refs_not_activation_rows() {
+    let fixture = PleFixture::single_layer().expect("fixture should build");
+    let token_ids = [0, 1];
+    let input = activation_sequence(vec![
+        vec![Act::from_num(1.0), Act::from_num(0.5)],
+        vec![Act::from_num(-1.0), Act::from_num(2.0)],
+    ]);
+    let (artifact_store_roots, input_roots) = prepare_raster_prefill_ple_input_roots(
+        &token_ids,
+        &input,
+        &fixture.source,
+        raster_sizing_with_projection_rows(1),
+    )
+    .expect("prepare input roots");
+    let (artifact_store_roots, ple_state) =
+        init_prefill_ple_state(artifact_store_roots, input_roots).expect("init state");
+    let (artifact_store_roots, layer_step) =
+        init_prefill_ple_layer_step(artifact_store_roots, ple_state, &fixture.source)
+            .expect("init layer step");
+    let layer_step = prepare_prefill_ple_layer_compute_inputs(layer_step, &fixture.source)
+        .expect("prepare compute inputs");
+
+    let encoded = serde_json::to_string(&layer_step).expect("serialize layer step");
+    let decoded: PrefillPleLayerStep =
+        serde_json::from_str(&encoded).expect("deserialize layer step");
+    assert_eq!(decoded, layer_step);
+    assert!(encoded.contains("input_activations_ref"));
+    assert!(encoded.contains("token_ids_source_name"));
+    assert!(!encoded.contains("[0,1]"));
+    assert!(!encoded.contains("act_bits"));
+
+    let (_artifact_store_roots, token_embedding_step) =
+        init_scaled_token_embedding_layer_step(artifact_store_roots, layer_step)
+            .expect("init token embedding layer step");
+    let encoded =
+        serde_json::to_string(&token_embedding_step).expect("serialize token embedding step");
+    let decoded: PrefillPleLayerTokenEmbeddingStep =
+        serde_json::from_str(&encoded).expect("deserialize token embedding step");
+    assert_eq!(decoded, token_embedding_step);
+    assert!(encoded.contains("output_source_name"));
+    assert!(encoded.contains("token_ids_source_name"));
+    assert!(!encoded.contains("[0,1]"));
+    assert!(!encoded.contains("act_bits"));
+}
+
+#[test]
 fn prefill_ple_ref_manifest_serializes_refs_not_activation_rows() {
     let fixture = PleFixture::single_layer().expect("fixture should build");
     let token_ids = [0, 1];
@@ -459,6 +636,52 @@ fn mixed_ple_and_non_ple_layers_match_native_layout() {
         .is_some());
     assert!(raster.clone_layer_internal(1).is_none());
     assert!(native.clone_layer_internal(1).is_none());
+}
+
+#[test]
+fn skipped_layer_can_flow_into_later_ple_layer() {
+    let fixture = PleFixture::new(
+        vec![false, true],
+        vec![
+            vec![
+                vec![Act::from_num(0.0), Act::from_num(0.0)],
+                vec![Act::from_num(0.0), Act::from_num(0.0)],
+            ],
+            vec![
+                vec![Act::from_num(0.25), Act::from_num(-0.5)],
+                vec![Act::from_num(1.0), Act::from_num(0.5)],
+            ],
+        ],
+        vec![
+            vec![
+                vec![Wgt::from_num(1.0), Wgt::from_num(0.0)],
+                vec![Wgt::from_num(0.0), Wgt::from_num(1.0)],
+            ],
+            vec![
+                vec![Wgt::from_num(0.5), Wgt::from_num(1.0)],
+                vec![Wgt::from_num(-1.0), Wgt::from_num(0.25)],
+            ],
+        ],
+    )
+    .expect("fixture should build");
+    let token_ids = [0, 1];
+    let input = activation_sequence(vec![
+        vec![Act::from_num(1.0), Act::from_num(0.5)],
+        vec![Act::from_num(-1.0), Act::from_num(2.0)],
+    ]);
+
+    let (raster, native) = compare_raster_and_native(&fixture, &token_ids, &input);
+
+    assert_eq!(raster.per_layer_inputs, native.per_layer_inputs);
+    assert_eq!(raster.per_layer_inputs.len(), 2);
+    assert!(raster.per_layer_inputs[0].is_none());
+    assert!(raster.per_layer_inputs[1].is_some());
+    assert!(raster.clone_layer_internal(0).is_none());
+    assert!(raster
+        .clone_layer_internal(1)
+        .expect("layer 1")
+        .det_values()
+        .is_some());
 }
 
 #[test]

@@ -18,7 +18,6 @@ use crate::shared::raster_kernels::transformer::{
     project_row_with_weights, validate_projection_rows_per_tile, validate_sequence_rows_per_tile,
     RasterActivationRow,
 };
-use crate::RasterSizingControls;
 
 use super::types::*;
 use super::utils::*;
@@ -52,311 +51,197 @@ pub fn compute_next_prefill_ple_layer_sequence(
     ple_state: PrefillPleRasterState,
     ple_source: &AuthenticatedGemmaPleSource,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleRasterState)> {
-    if !ple_state.has_ple_global || ple_state.next_layer_idx >= ple_state.layer_count {
-        return Ok((true, artifact_store_roots, ple_state));
-    }
-
-    let (artifact_store_roots, context) = call_tile!(
-        prepare_next_prefill_ple_context,
-        artifact_store_roots,
-        &ple_state,
-        ple_source
-    )?;
-    crate::trace::trace_event(format!(
-        "progress prefill.prepare_aux layer={}/{} ple={} tokens={}",
-        context.layer_idx + 1,
-        ple_state.layer_count,
-        context.has_ple,
-        ple_state.token_count
-    ));
-
-    if !context.has_ple {
-        return call_tile!(
-            update_prefill_ple_state_refs,
-            artifact_store_roots,
-            ple_state,
-            context.layer_idx,
-            None
-        );
-    }
-
-    let input_activations_ref = ple_state
-        .input_activations_ref
-        .as_ref()
-        .ok_or_else(|| anyhow!("raster PLE state is missing input activation ref"))?
-        .clone();
-    let (artifact_store_roots, layer_input_ref) = call_seq!(
-        run_prefill_ple_layer_sequence_ref,
-        artifact_store_roots,
-        &ple_state.token_ids_source_name,
-        ple_state.token_count,
-        input_activations_ref,
-        ple_source,
-        &context,
-        ple_state.raster_sizing
-    )?;
-
-    call_tile!(
-        update_prefill_ple_state_refs,
+    let (artifact_store_roots, layer_step) = call_tile!(
+        init_prefill_ple_layer_step,
         artifact_store_roots,
         ple_state,
-        context.layer_idx,
-        Some(layer_input_ref)
-    )
-}
-
-#[sequence]
-fn run_prefill_ple_layer_sequence_ref(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    token_ids_source_name: &str,
-    token_count: usize,
-    input_activations_ref: RasterActivationSequenceArtifactRef,
-    ple_source: &AuthenticatedGemmaPleSource,
-    context: &PrefillPleLayerContext,
-    raster_sizing: RasterSizingControls,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceArtifactRef,
-)> {
-    let layer_idx = context.layer_idx;
-    let embedding_scale = Act::from_bits(context.embedding_scale_bits.ok_or_else(|| {
-        anyhow!("Gemma PLE layer {layer_idx} is missing embedding scale metadata")
-    })?);
-    let projection_scalar = Act::from_bits(context.projection_scalar_bits.ok_or_else(|| {
-        anyhow!("Gemma PLE layer {layer_idx} is missing projection scalar metadata")
-    })?);
-    let input_scale =
-        Act::from_bits(context.input_scale_bits.ok_or_else(|| {
-            anyhow!("Gemma PLE layer {layer_idx} is missing input scale metadata")
-        })?);
-    let rms_norm_eps = Acc::from_bits(context.rms_norm_eps_bits.ok_or_else(|| {
-        anyhow!("Gemma PLE layer {layer_idx} is missing RMSNorm epsilon metadata")
-    })?);
-    let norm_weights = context
-        .norm_weight_bits
-        .as_ref()
-        .ok_or_else(|| anyhow!("Gemma PLE layer {layer_idx} is missing norm weights"))?
-        .iter()
-        .map(|bits| Wgt::from_bits(*bits))
-        .collect::<Vec<_>>();
-    let ple_width = context
-        .ple_width
-        .ok_or_else(|| anyhow!("Gemma PLE layer {layer_idx} is missing token embedding width"))?;
-    let projection_rows = context.projection_rows.ok_or_else(|| {
-        anyhow!("Gemma PLE layer {layer_idx} is missing model projection row metadata")
-    })?;
-    let (artifact_store_roots, embedded_ref) = call_seq!(
-        build_scaled_token_embedding_sequence_ref,
-        artifact_store_roots,
-        token_ids_source_name,
-        token_count,
-        layer_idx,
-        ple_source,
-        embedding_scale,
-        ple_width
+        ple_source
     )?;
-    let (artifact_store_roots, projected_ref) = call_seq!(
-        project_ple_sequence_with_source_ref,
+    let (artifact_store_roots, layer_step) = call_seq!(
+        run_prefill_ple_layer_step_sequence_ref,
         artifact_store_roots,
-        input_activations_ref.clone(),
-        ple_source,
-        layer_idx,
-        projection_rows,
-        raster_sizing.projection_rows_per_tile,
-        RasterArtifactId::new(format!("prefill.prepare_aux.projected.{layer_idx}"))?
-    )?;
-    let (artifact_store_roots, projected_ref) = call_seq!(
-        compute_sequence_scale_ref,
-        artifact_store_roots,
-        projected_ref,
-        RasterArtifactId::new(format!("prefill.prepare_aux.projected.scaled.{layer_idx}"))?,
-        Some(projection_scalar),
-        raster_sizing.sequence_rows_per_tile
-    )?;
-    let (artifact_store_roots, projected_ref) = call_seq!(
-        compute_sequence_rms_norm_ref,
-        artifact_store_roots,
-        projected_ref,
-        RasterArtifactId::new(format!("prefill.prepare_aux.projected.normed.{layer_idx}"))?,
-        Some(norm_weights.as_slice()),
-        Some(rms_norm_eps),
-        raster_sizing.sequence_rows_per_tile
-    )?;
-    let (artifact_store_roots, combined_ref) = call_seq!(
-        compute_sequence_add_ref,
-        artifact_store_roots,
-        embedded_ref,
-        projected_ref,
-        RasterArtifactId::new(format!("prefill.prepare_aux.combined.{layer_idx}"))?,
-        raster_sizing.sequence_rows_per_tile
-    )?;
-    call_seq!(
-        compute_sequence_scale_ref,
-        artifact_store_roots,
-        combined_ref,
-        RasterArtifactId::new(format!("prefill.prepare_aux.per_layer_input.{layer_idx}"))?,
-        Some(input_scale),
-        raster_sizing.sequence_rows_per_tile
-    )
-}
-
-#[sequence]
-fn build_scaled_token_embedding_sequence_ref(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    token_ids_source_name: &str,
-    token_count: usize,
-    layer_idx: usize,
-    ple_source: &AuthenticatedGemmaPleSource,
-    scale: crate::shared::numerics::det_num::Act,
-    row_width: usize,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceArtifactRef,
-)> {
-    let (artifact_store_roots, token_embedding_state) = call_tile!(
-        init_scaled_token_embedding_sequence_ref,
-        artifact_store_roots,
-        token_ids_source_name,
-        token_count,
-        layer_idx,
-        scale,
-        row_width
-    )?;
-    let (artifact_store_roots, token_embedding_state) = call_recur_tile!(
-        append_next_scaled_token_embedding_row,
-        (artifact_store_roots, token_embedding_state),
+        layer_step,
         ple_source
     )?;
     call_tile!(
-        finalize_scaled_token_embedding_sequence_ref,
+        finalize_prefill_ple_layer_step,
         artifact_store_roots,
-        token_embedding_state
+        layer_step
     )
 }
 
 #[sequence]
-fn project_ple_sequence_with_source_ref(
+fn run_prefill_ple_layer_step_sequence_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceArtifactRef,
+    layer_step: PrefillPleLayerStep,
     ple_source: &AuthenticatedGemmaPleSource,
-    layer_idx: usize,
-    projection_rows: usize,
-    projection_rows_per_tile: usize,
-    output_id: RasterArtifactId,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceArtifactRef,
-)> {
-    let (artifact_store_roots, projection_state) = call_tile!(
-        init_ple_sequence_projection_from_ref,
-        artifact_store_roots,
-        input_ref,
-        output_id,
-        projection_rows,
-        projection_rows_per_tile
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    let layer_step = call_tile!(
+        prepare_prefill_ple_layer_compute_inputs,
+        layer_step,
+        ple_source
     )?;
-    let (artifact_store_roots, projection_state) = call_recur_tile!(
-        project_next_ple_sequence_rows,
-        (artifact_store_roots, projection_state),
-        ple_source,
-        layer_idx
-    )?;
-    call_tile!(
-        finalize_ple_sequence_projection_ref,
+    let (artifact_store_roots, layer_step) = call_seq!(
+        build_scaled_token_embedding_for_layer_step,
         artifact_store_roots,
-        projection_state
+        layer_step,
+        ple_source
+    )?;
+    let (artifact_store_roots, layer_step) = call_seq!(
+        project_prefill_ple_input_for_layer_step,
+        artifact_store_roots,
+        layer_step,
+        ple_source
+    )?;
+    let (artifact_store_roots, layer_step) = call_seq!(
+        scale_prefill_ple_projection_for_layer_step,
+        artifact_store_roots,
+        layer_step
+    )?;
+    let (artifact_store_roots, layer_step) = call_seq!(
+        normalize_prefill_ple_projection_for_layer_step,
+        artifact_store_roots,
+        layer_step
+    )?;
+    let (artifact_store_roots, layer_step) = call_seq!(
+        add_prefill_ple_embedding_and_projection_for_layer_step,
+        artifact_store_roots,
+        layer_step
+    )?;
+    call_seq!(
+        scale_prefill_ple_combined_input_for_layer_step,
+        artifact_store_roots,
+        layer_step
     )
 }
 
 #[sequence]
-fn compute_sequence_scale_ref(
+fn build_scaled_token_embedding_for_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceArtifactRef,
-    output_id: RasterArtifactId,
-    scalar: Option<crate::shared::numerics::det_num::Act>,
-    rows_per_tile: usize,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceArtifactRef,
-)> {
-    let (artifact_store_roots, unary_state) = call_tile!(
-        init_sequence_scale_ref_state,
+    layer_step: PrefillPleLayerStep,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    let (artifact_store_roots, token_embedding_step) = call_tile!(
+        init_scaled_token_embedding_layer_step,
         artifact_store_roots,
-        input_ref,
-        output_id,
-        scalar,
-        rows_per_tile
+        layer_step
     )?;
-    let (artifact_store_roots, unary_state) = call_recur_tile!(
-        compute_next_sequence_unary_ref,
-        (artifact_store_roots, unary_state)
+    let (artifact_store_roots, token_embedding_step) = call_recur_tile!(
+        append_next_scaled_token_embedding_layer_step_row,
+        (artifact_store_roots, token_embedding_step),
+        ple_source
     )?;
     call_tile!(
-        finalize_sequence_unary_ref_state,
+        finalize_scaled_token_embedding_layer_step,
         artifact_store_roots,
-        unary_state
+        token_embedding_step
     )
 }
 
 #[sequence]
-fn compute_sequence_rms_norm_ref(
+fn project_prefill_ple_input_for_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceArtifactRef,
-    output_id: RasterArtifactId,
-    norm_weights: Option<&[crate::shared::numerics::det_num::Wgt]>,
-    eps: Option<crate::shared::numerics::det_num::Acc>,
-    rows_per_tile: usize,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceArtifactRef,
-)> {
-    let (artifact_store_roots, unary_state) = call_tile!(
-        init_sequence_rms_norm_ref_state,
+    layer_step: PrefillPleLayerStep,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    let (artifact_store_roots, projection_step) = call_tile!(
+        init_project_prefill_ple_layer_step,
         artifact_store_roots,
-        input_ref,
-        output_id,
-        norm_weights,
-        eps,
-        rows_per_tile
+        layer_step
     )?;
-    let (artifact_store_roots, unary_state) = call_recur_tile!(
-        compute_next_sequence_unary_ref,
-        (artifact_store_roots, unary_state)
+    let (artifact_store_roots, projection_step) = call_recur_tile!(
+        project_next_prefill_ple_layer_step_rows,
+        (artifact_store_roots, projection_step),
+        ple_source
     )?;
     call_tile!(
-        finalize_sequence_unary_ref_state,
+        finalize_project_prefill_ple_layer_step,
         artifact_store_roots,
-        unary_state
+        projection_step
     )
 }
 
 #[sequence]
-fn compute_sequence_add_ref(
+fn scale_prefill_ple_projection_for_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
-    lhs_ref: RasterActivationSequenceArtifactRef,
-    rhs_ref: RasterActivationSequenceArtifactRef,
-    output_id: RasterArtifactId,
-    rows_per_tile: usize,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceArtifactRef,
-)> {
-    let (artifact_store_roots, binary_state) = call_tile!(
-        init_sequence_add_ref_state,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    let (artifact_store_roots, unary_step) = call_tile!(
+        init_scale_prefill_ple_projection_layer_step,
         artifact_store_roots,
-        lhs_ref,
-        rhs_ref,
-        output_id,
-        rows_per_tile
+        layer_step
     )?;
-    let (artifact_store_roots, binary_state) = call_recur_tile!(
-        compute_next_sequence_binary_ref,
-        (artifact_store_roots, binary_state)
+    let (artifact_store_roots, unary_step) = call_recur_tile!(
+        compute_next_prefill_ple_layer_unary_step,
+        (artifact_store_roots, unary_step)
     )?;
     call_tile!(
-        finalize_sequence_binary_ref_state,
+        finalize_scale_prefill_ple_projection_layer_step,
         artifact_store_roots,
-        binary_state
+        unary_step
+    )
+}
+
+#[sequence]
+fn normalize_prefill_ple_projection_for_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    let (artifact_store_roots, unary_step) = call_tile!(
+        init_normalize_prefill_ple_projection_layer_step,
+        artifact_store_roots,
+        layer_step
+    )?;
+    let (artifact_store_roots, unary_step) = call_recur_tile!(
+        compute_next_prefill_ple_layer_unary_step,
+        (artifact_store_roots, unary_step)
+    )?;
+    call_tile!(
+        finalize_normalize_prefill_ple_projection_layer_step,
+        artifact_store_roots,
+        unary_step
+    )
+}
+
+#[sequence]
+fn add_prefill_ple_embedding_and_projection_for_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    let (artifact_store_roots, binary_step) = call_tile!(
+        init_add_prefill_ple_layer_step,
+        artifact_store_roots,
+        layer_step
+    )?;
+    let (artifact_store_roots, binary_step) = call_recur_tile!(
+        compute_next_prefill_ple_layer_binary_step,
+        (artifact_store_roots, binary_step)
+    )?;
+    call_tile!(
+        finalize_add_prefill_ple_layer_step,
+        artifact_store_roots,
+        binary_step
+    )
+}
+
+#[sequence]
+fn scale_prefill_ple_combined_input_for_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    let (artifact_store_roots, unary_step) = call_tile!(
+        init_scale_prefill_ple_combined_input_layer_step,
+        artifact_store_roots,
+        layer_step
+    )?;
+    let (artifact_store_roots, unary_step) = call_recur_tile!(
+        compute_next_prefill_ple_layer_unary_step,
+        (artifact_store_roots, unary_step)
+    )?;
+    call_tile!(
+        finalize_scale_prefill_ple_combined_input_layer_step,
+        artifact_store_roots,
+        unary_step
     )
 }
 
@@ -410,67 +295,118 @@ pub fn finalize_prefill_ple_input_refs(
 }
 
 #[tile]
-pub fn prepare_next_prefill_ple_context(
+pub(in super::super) fn init_prefill_ple_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
-    ple_state: &PrefillPleRasterState,
+    ple_state: PrefillPleRasterState,
     ple_source: &AuthenticatedGemmaPleSource,
-) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerContext)> {
-    if !ple_state.has_ple_global {
-        bail!("cannot prepare PLE layer context without global PLE weights");
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    if !ple_state.has_ple_global || ple_state.next_layer_idx >= ple_state.layer_count {
+        return Ok((
+            artifact_store_roots,
+            PrefillPleLayerStep::Complete { ple_state },
+        ));
     }
-    if ple_state.next_layer_idx >= ple_state.layer_count {
-        bail!(
-            "cannot prepare PLE layer {} after completing {} layers",
-            ple_state.next_layer_idx,
-            ple_state.layer_count
-        );
-    }
+
     let layer_idx = ple_state.next_layer_idx;
     let layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx })?;
+    crate::trace::trace_event(format!(
+        "progress prefill.prepare_aux layer={}/{} ple={} tokens={}",
+        layer_idx + 1,
+        ple_state.layer_count,
+        layer.has_ple,
+        ple_state.token_count
+    ));
+
     if !layer.has_ple {
         return Ok((
             artifact_store_roots,
-            PrefillPleLayerContext {
+            PrefillPleLayerStep::Skip {
+                ple_state,
                 layer_idx,
-                has_ple: false,
-                ple_width: None,
-                projection_rows: None,
-                embedding_scale_bits: None,
-                projection_scalar_bits: None,
-                input_scale_bits: None,
-                rms_norm_eps_bits: None,
-                norm_weight_bits: None,
             },
         ));
     }
 
-    ple_state
+    let input_activations_ref = ple_state
         .input_activations_ref
         .as_ref()
-        .ok_or_else(|| anyhow!("raster PLE state is missing input activation ref"))?;
+        .ok_or_else(|| anyhow!("raster PLE state is missing input activation ref"))?
+        .clone();
     let projection_rows = layer.model_projection_rows.ok_or_else(|| {
         anyhow!("Gemma PLE layer {layer_idx} is missing model projection row metadata")
     })?;
-    let scalars = auth_read!(ple_source, GemmaPleScalarsRequest)?;
-    let norm_weights = auth_read!(ple_source, GemmaPleProjectionNormWeightsRequest)?;
     let ple_width = layer
         .ple_width
         .ok_or_else(|| anyhow!("Gemma PLE layer {layer_idx} is missing token embedding width"))?;
 
     Ok((
         artifact_store_roots,
-        PrefillPleLayerContext {
+        PrefillPleLayerStep::Compute(PrefillPleLayerComputeState {
+            ple_state,
             layer_idx,
-            has_ple: true,
-            ple_width: Some(ple_width),
-            projection_rows: Some(projection_rows),
-            embedding_scale_bits: Some(scalars.embedding_scale.to_bits()),
-            projection_scalar_bits: Some(scalars.projection_scalar.to_bits()),
-            input_scale_bits: Some(scalars.input_scale.to_bits()),
-            rms_norm_eps_bits: Some(scalars.rms_norm_eps.to_bits()),
-            norm_weight_bits: Some(norm_weights.iter().map(|weight| weight.to_bits()).collect()),
-        },
+            input_activations_ref,
+            ple_width,
+            projection_rows,
+            embedding_scale_bits: None,
+            projection_scalar_bits: None,
+            input_scale_bits: None,
+            rms_norm_eps_bits: None,
+            norm_weight_bits: None,
+            embedded_ref: None,
+            projected_ref: None,
+            combined_ref: None,
+            layer_input_ref: None,
+        }),
     ))
+}
+
+#[tile]
+pub(in super::super) fn prepare_prefill_ple_layer_compute_inputs(
+    layer_step: PrefillPleLayerStep,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<PrefillPleLayerStep> {
+    match layer_step {
+        PrefillPleLayerStep::Compute(mut compute_state) => {
+            let scalars = auth_read!(ple_source, GemmaPleScalarsRequest)?;
+            let norm_weights = auth_read!(ple_source, GemmaPleProjectionNormWeightsRequest)?;
+            compute_state.embedding_scale_bits = Some(scalars.embedding_scale.to_bits());
+            compute_state.projection_scalar_bits = Some(scalars.projection_scalar.to_bits());
+            compute_state.input_scale_bits = Some(scalars.input_scale.to_bits());
+            compute_state.rms_norm_eps_bits = Some(scalars.rms_norm_eps.to_bits());
+            compute_state.norm_weight_bits =
+                Some(norm_weights.iter().map(|weight| weight.to_bits()).collect());
+            Ok(PrefillPleLayerStep::Compute(compute_state))
+        }
+        layer_step => Ok(layer_step),
+    }
+}
+
+#[tile]
+fn finalize_prefill_ple_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleRasterState)> {
+    match layer_step {
+        PrefillPleLayerStep::Complete { ple_state } => Ok((true, artifact_store_roots, ple_state)),
+        PrefillPleLayerStep::Skip {
+            ple_state,
+            layer_idx,
+        } => update_prefill_ple_state_refs(artifact_store_roots, ple_state, layer_idx, None),
+        PrefillPleLayerStep::Compute(mut compute_state) => {
+            let layer_input_ref = compute_state.layer_input_ref.take().ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} did not produce a per-layer input ref",
+                    compute_state.layer_idx
+                )
+            })?;
+            update_prefill_ple_state_refs(
+                artifact_store_roots,
+                compute_state.ple_state,
+                compute_state.layer_idx,
+                Some(layer_input_ref),
+            )
+        }
+    }
 }
 
 #[tile]
@@ -493,6 +429,544 @@ pub fn update_prefill_ple_state_refs(
         artifact_store_roots,
         ple_state,
     ))
+}
+
+#[tile]
+pub(in super::super) fn init_scaled_token_embedding_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerTokenEmbeddingStep)> {
+    match layer_step {
+        PrefillPleLayerStep::Compute(compute_state) => {
+            let embedding_scale_bits = compute_state.embedding_scale_bits.ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing embedding scale metadata",
+                    compute_state.layer_idx
+                )
+            })?;
+            let (artifact_store_roots, token_embedding_state) =
+                init_scaled_token_embedding_sequence_ref(
+                    artifact_store_roots,
+                    &compute_state.ple_state.token_ids_source_name,
+                    compute_state.ple_state.token_count,
+                    compute_state.layer_idx,
+                    Act::from_bits(embedding_scale_bits),
+                    compute_state.ple_width,
+                )?;
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerTokenEmbeddingStep::Compute {
+                    compute_state,
+                    operation_state: token_embedding_state,
+                },
+            ))
+        }
+        layer_step => Ok((
+            artifact_store_roots,
+            PrefillPleLayerTokenEmbeddingStep::Noop(layer_step),
+        )),
+    }
+}
+
+#[tile(kind = recursive)]
+fn append_next_scaled_token_embedding_layer_step_row(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    token_embedding_step: PrefillPleLayerTokenEmbeddingStep,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    PrefillPleLayerTokenEmbeddingStep,
+)> {
+    match token_embedding_step {
+        PrefillPleLayerTokenEmbeddingStep::Noop(layer_step) => Ok((
+            true,
+            artifact_store_roots,
+            PrefillPleLayerTokenEmbeddingStep::Noop(layer_step),
+        )),
+        PrefillPleLayerTokenEmbeddingStep::Compute {
+            compute_state,
+            operation_state: token_embedding_state,
+        } => {
+            let (done, artifact_store_roots, token_embedding_state) =
+                append_next_scaled_token_embedding_row(
+                    artifact_store_roots,
+                    token_embedding_state,
+                    ple_source,
+                )?;
+            Ok((
+                done,
+                artifact_store_roots,
+                PrefillPleLayerTokenEmbeddingStep::Compute {
+                    compute_state,
+                    operation_state: token_embedding_state,
+                },
+            ))
+        }
+    }
+}
+
+#[tile]
+fn finalize_scaled_token_embedding_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    token_embedding_step: PrefillPleLayerTokenEmbeddingStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    match token_embedding_step {
+        PrefillPleLayerTokenEmbeddingStep::Noop(layer_step) => {
+            Ok((artifact_store_roots, layer_step))
+        }
+        PrefillPleLayerTokenEmbeddingStep::Compute {
+            mut compute_state,
+            operation_state: token_embedding_state,
+        } => {
+            let (artifact_store_roots, embedded_ref) =
+                finalize_scaled_token_embedding_sequence_ref(
+                    artifact_store_roots,
+                    token_embedding_state,
+                )?;
+            compute_state.embedded_ref = Some(embedded_ref);
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerStep::Compute(compute_state),
+            ))
+        }
+    }
+}
+
+#[tile]
+fn init_project_prefill_ple_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerProjectionStep)> {
+    match layer_step {
+        PrefillPleLayerStep::Compute(compute_state) => {
+            let output_id = RasterArtifactId::new(format!(
+                "prefill.prepare_aux.projected.{}",
+                compute_state.layer_idx
+            ))?;
+            let (artifact_store_roots, projection_state) = init_ple_sequence_projection_from_ref(
+                artifact_store_roots,
+                compute_state.input_activations_ref.clone(),
+                output_id,
+                compute_state.projection_rows,
+                compute_state
+                    .ple_state
+                    .raster_sizing
+                    .projection_rows_per_tile,
+            )?;
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerProjectionStep::Compute {
+                    compute_state,
+                    operation_state: projection_state,
+                },
+            ))
+        }
+        layer_step => Ok((
+            artifact_store_roots,
+            PrefillPleLayerProjectionStep::Noop(layer_step),
+        )),
+    }
+}
+
+#[tile(kind = recursive)]
+fn project_next_prefill_ple_layer_step_rows(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    projection_step: PrefillPleLayerProjectionStep,
+    ple_source: &AuthenticatedGemmaPleSource,
+) -> Result<(
+    bool,
+    RasterArtifactStoreRoots,
+    PrefillPleLayerProjectionStep,
+)> {
+    match projection_step {
+        PrefillPleLayerProjectionStep::Noop(layer_step) => Ok((
+            true,
+            artifact_store_roots,
+            PrefillPleLayerProjectionStep::Noop(layer_step),
+        )),
+        PrefillPleLayerProjectionStep::Compute {
+            compute_state,
+            operation_state: projection_state,
+        } => {
+            let layer_idx = compute_state.layer_idx;
+            let (done, artifact_store_roots, projection_state) = project_next_ple_sequence_rows(
+                artifact_store_roots,
+                projection_state,
+                ple_source,
+                layer_idx,
+            )?;
+            Ok((
+                done,
+                artifact_store_roots,
+                PrefillPleLayerProjectionStep::Compute {
+                    compute_state,
+                    operation_state: projection_state,
+                },
+            ))
+        }
+    }
+}
+
+#[tile]
+fn finalize_project_prefill_ple_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    projection_step: PrefillPleLayerProjectionStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    match projection_step {
+        PrefillPleLayerProjectionStep::Noop(layer_step) => Ok((artifact_store_roots, layer_step)),
+        PrefillPleLayerProjectionStep::Compute {
+            mut compute_state,
+            operation_state: projection_state,
+        } => {
+            let (artifact_store_roots, projected_ref) =
+                finalize_ple_sequence_projection_ref(artifact_store_roots, projection_state)?;
+            compute_state.projected_ref = Some(projected_ref);
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerStep::Compute(compute_state),
+            ))
+        }
+    }
+}
+
+#[tile]
+fn init_scale_prefill_ple_projection_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerUnaryStep)> {
+    match layer_step {
+        PrefillPleLayerStep::Compute(compute_state) => {
+            let projected_ref = compute_state.projected_ref.clone().ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing projected activation ref",
+                    compute_state.layer_idx
+                )
+            })?;
+            let projection_scalar_bits = compute_state.projection_scalar_bits.ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing projection scalar metadata",
+                    compute_state.layer_idx
+                )
+            })?;
+            let output_id = RasterArtifactId::new(format!(
+                "prefill.prepare_aux.projected.scaled.{}",
+                compute_state.layer_idx
+            ))?;
+            let (artifact_store_roots, unary_state) = init_sequence_scale_ref_state(
+                artifact_store_roots,
+                projected_ref,
+                output_id,
+                Some(Act::from_bits(projection_scalar_bits)),
+                compute_state.ple_state.raster_sizing.sequence_rows_per_tile,
+            )?;
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerUnaryStep::Compute {
+                    compute_state,
+                    operation_state: unary_state,
+                },
+            ))
+        }
+        layer_step => Ok((
+            artifact_store_roots,
+            PrefillPleLayerUnaryStep::Noop(layer_step),
+        )),
+    }
+}
+
+#[tile(kind = recursive)]
+fn compute_next_prefill_ple_layer_unary_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    unary_step: PrefillPleLayerUnaryStep,
+) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleLayerUnaryStep)> {
+    match unary_step {
+        PrefillPleLayerUnaryStep::Noop(layer_step) => Ok((
+            true,
+            artifact_store_roots,
+            PrefillPleLayerUnaryStep::Noop(layer_step),
+        )),
+        PrefillPleLayerUnaryStep::Compute {
+            compute_state,
+            operation_state: unary_state,
+        } => {
+            let (done, artifact_store_roots, unary_state) =
+                compute_next_sequence_unary_ref(artifact_store_roots, unary_state)?;
+            Ok((
+                done,
+                artifact_store_roots,
+                PrefillPleLayerUnaryStep::Compute {
+                    compute_state,
+                    operation_state: unary_state,
+                },
+            ))
+        }
+    }
+}
+
+#[tile]
+fn finalize_scale_prefill_ple_projection_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    unary_step: PrefillPleLayerUnaryStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    finalize_prefill_ple_layer_unary_step(
+        artifact_store_roots,
+        unary_step,
+        |compute_state, output_ref| {
+            compute_state.projected_ref = Some(output_ref);
+        },
+    )
+}
+
+#[tile]
+fn init_normalize_prefill_ple_projection_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerUnaryStep)> {
+    match layer_step {
+        PrefillPleLayerStep::Compute(compute_state) => {
+            let projected_ref = compute_state.projected_ref.clone().ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing scaled projected activation ref",
+                    compute_state.layer_idx
+                )
+            })?;
+            let norm_weight_bits = compute_state.norm_weight_bits.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing norm weights",
+                    compute_state.layer_idx
+                )
+            })?;
+            let norm_weights = norm_weight_bits
+                .iter()
+                .copied()
+                .map(Wgt::from_bits)
+                .collect::<Vec<_>>();
+            let rms_norm_eps_bits = compute_state.rms_norm_eps_bits.ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing RMSNorm epsilon metadata",
+                    compute_state.layer_idx
+                )
+            })?;
+            let output_id = RasterArtifactId::new(format!(
+                "prefill.prepare_aux.projected.normed.{}",
+                compute_state.layer_idx
+            ))?;
+            let (artifact_store_roots, unary_state) = init_sequence_rms_norm_ref_state(
+                artifact_store_roots,
+                projected_ref,
+                output_id,
+                Some(norm_weights.as_slice()),
+                Some(Acc::from_bits(rms_norm_eps_bits)),
+                compute_state.ple_state.raster_sizing.sequence_rows_per_tile,
+            )?;
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerUnaryStep::Compute {
+                    compute_state,
+                    operation_state: unary_state,
+                },
+            ))
+        }
+        layer_step => Ok((
+            artifact_store_roots,
+            PrefillPleLayerUnaryStep::Noop(layer_step),
+        )),
+    }
+}
+
+#[tile]
+fn finalize_normalize_prefill_ple_projection_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    unary_step: PrefillPleLayerUnaryStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    finalize_prefill_ple_layer_unary_step(
+        artifact_store_roots,
+        unary_step,
+        |compute_state, output_ref| {
+            compute_state.projected_ref = Some(output_ref);
+        },
+    )
+}
+
+#[tile]
+fn init_add_prefill_ple_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerBinaryStep)> {
+    match layer_step {
+        PrefillPleLayerStep::Compute(compute_state) => {
+            let embedded_ref = compute_state.embedded_ref.clone().ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing embedded activation ref",
+                    compute_state.layer_idx
+                )
+            })?;
+            let projected_ref = compute_state.projected_ref.clone().ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing normalized projected activation ref",
+                    compute_state.layer_idx
+                )
+            })?;
+            let output_id = RasterArtifactId::new(format!(
+                "prefill.prepare_aux.combined.{}",
+                compute_state.layer_idx
+            ))?;
+            let (artifact_store_roots, binary_state) = init_sequence_add_ref_state(
+                artifact_store_roots,
+                embedded_ref,
+                projected_ref,
+                output_id,
+                compute_state.ple_state.raster_sizing.sequence_rows_per_tile,
+            )?;
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerBinaryStep::Compute {
+                    compute_state,
+                    operation_state: binary_state,
+                },
+            ))
+        }
+        layer_step => Ok((
+            artifact_store_roots,
+            PrefillPleLayerBinaryStep::Noop(layer_step),
+        )),
+    }
+}
+
+#[tile(kind = recursive)]
+fn compute_next_prefill_ple_layer_binary_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    binary_step: PrefillPleLayerBinaryStep,
+) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleLayerBinaryStep)> {
+    match binary_step {
+        PrefillPleLayerBinaryStep::Noop(layer_step) => Ok((
+            true,
+            artifact_store_roots,
+            PrefillPleLayerBinaryStep::Noop(layer_step),
+        )),
+        PrefillPleLayerBinaryStep::Compute {
+            compute_state,
+            operation_state: binary_state,
+        } => {
+            let (done, artifact_store_roots, binary_state) =
+                compute_next_sequence_binary_ref(artifact_store_roots, binary_state)?;
+            Ok((
+                done,
+                artifact_store_roots,
+                PrefillPleLayerBinaryStep::Compute {
+                    compute_state,
+                    operation_state: binary_state,
+                },
+            ))
+        }
+    }
+}
+
+#[tile]
+fn finalize_add_prefill_ple_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    binary_step: PrefillPleLayerBinaryStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    match binary_step {
+        PrefillPleLayerBinaryStep::Noop(layer_step) => Ok((artifact_store_roots, layer_step)),
+        PrefillPleLayerBinaryStep::Compute {
+            mut compute_state,
+            operation_state: binary_state,
+        } => {
+            let (artifact_store_roots, combined_ref) =
+                finalize_sequence_binary_ref_state(artifact_store_roots, binary_state)?;
+            compute_state.combined_ref = Some(combined_ref);
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerStep::Compute(compute_state),
+            ))
+        }
+    }
+}
+
+#[tile]
+fn init_scale_prefill_ple_combined_input_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_step: PrefillPleLayerStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerUnaryStep)> {
+    match layer_step {
+        PrefillPleLayerStep::Compute(compute_state) => {
+            let combined_ref = compute_state.combined_ref.clone().ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing combined activation ref",
+                    compute_state.layer_idx
+                )
+            })?;
+            let input_scale_bits = compute_state.input_scale_bits.ok_or_else(|| {
+                anyhow!(
+                    "Gemma PLE layer {} is missing input scale metadata",
+                    compute_state.layer_idx
+                )
+            })?;
+            let output_id = RasterArtifactId::new(format!(
+                "prefill.prepare_aux.per_layer_input.{}",
+                compute_state.layer_idx
+            ))?;
+            let (artifact_store_roots, unary_state) = init_sequence_scale_ref_state(
+                artifact_store_roots,
+                combined_ref,
+                output_id,
+                Some(Act::from_bits(input_scale_bits)),
+                compute_state.ple_state.raster_sizing.sequence_rows_per_tile,
+            )?;
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerUnaryStep::Compute {
+                    compute_state,
+                    operation_state: unary_state,
+                },
+            ))
+        }
+        layer_step => Ok((
+            artifact_store_roots,
+            PrefillPleLayerUnaryStep::Noop(layer_step),
+        )),
+    }
+}
+
+#[tile]
+fn finalize_scale_prefill_ple_combined_input_layer_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    unary_step: PrefillPleLayerUnaryStep,
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    finalize_prefill_ple_layer_unary_step(
+        artifact_store_roots,
+        unary_step,
+        |compute_state, output_ref| {
+            compute_state.layer_input_ref = Some(output_ref);
+        },
+    )
+}
+
+fn finalize_prefill_ple_layer_unary_step(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    unary_step: PrefillPleLayerUnaryStep,
+    update_compute_state: impl FnOnce(
+        &mut PrefillPleLayerComputeState,
+        RasterActivationSequenceArtifactRef,
+    ),
+) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
+    match unary_step {
+        PrefillPleLayerUnaryStep::Noop(layer_step) => Ok((artifact_store_roots, layer_step)),
+        PrefillPleLayerUnaryStep::Compute {
+            mut compute_state,
+            operation_state: unary_state,
+        } => {
+            let (artifact_store_roots, output_ref) =
+                finalize_sequence_unary_ref_state(artifact_store_roots, unary_state)?;
+            update_compute_state(&mut compute_state, output_ref);
+            Ok((
+                artifact_store_roots,
+                PrefillPleLayerStep::Compute(compute_state),
+            ))
+        }
+    }
 }
 
 #[tile]
