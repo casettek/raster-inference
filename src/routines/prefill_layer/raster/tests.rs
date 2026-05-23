@@ -49,6 +49,282 @@ fn ref_backed_prefill_helpers_do_not_hide_completion_loops() {
 }
 
 #[test]
+fn prefill_layer_sequences_are_branch_free_orchestration() {
+    let source = include_str!("tiles.rs");
+    let violations = branch_free_sequence_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "prefill_layer sequences must be straight-line tile/sequence calls: {violations:?}"
+    );
+}
+
+#[test]
+fn prefill_layer_tiles_do_not_call_tiles_or_sequences() {
+    let source = include_str!("tiles.rs");
+    let violations = tile_call_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "prefill_layer tiles must not invoke tile/sequence calls: {violations:?}"
+    );
+}
+
+#[test]
+fn prefill_layer_tiles_do_not_directly_call_authored_functions() {
+    let source = include_str!("tiles.rs");
+    let violations = tile_authored_call_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "prefill_layer tiles must not directly invoke authored tile/sequence functions: {violations:?}"
+    );
+}
+
+#[test]
+fn prefill_layer_tiles_rs_contains_only_authored_functions() {
+    let source = include_str!("tiles.rs");
+    let violations = unauthored_function_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "every function in prefill_layer tiles.rs must be immediately authored as a tile or sequence: {violations:?}"
+    );
+}
+
+#[test]
+fn branch_free_sequence_guard_rejects_inline_branches() {
+    let source = r#"
+#[sequence]
+fn assigned_branch() -> Result<()> {
+    let next = if true { call_tile!(a)? } else { call_tile!(b)? };
+    call_tile!(finish, next)
+}
+
+#[sequence]
+fn nested_match() -> Result<()> {
+    let state = call_tile!(start)?;
+    let next = match state { State::Done => state };
+    call_tile!(finish, next)
+}
+"#;
+    let violations = branch_free_sequence_violations(source);
+
+    assert!(
+        violations.iter().any(|violation| violation.contains("if")),
+        "guard should reject assigned `if` branches: {violations:?}"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("match")),
+        "guard should reject assigned `match` branches: {violations:?}"
+    );
+}
+
+#[test]
+fn authored_function_guard_rejects_plain_functions() {
+    let source = r#"
+#[tile]
+fn authored_tile() -> Result<()> {
+    Ok(())
+}
+
+fn plain_helper() -> Result<()> {
+    Ok(())
+}
+"#;
+    let violations = unauthored_function_violations(source);
+
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("plain_helper")),
+        "guard should reject plain helper functions: {violations:?}"
+    );
+}
+
+fn raster_sequence_bodies(source: &str) -> Vec<(String, String)> {
+    attributed_function_bodies(source, "#[sequence")
+}
+
+fn raster_tile_bodies(source: &str) -> Vec<(String, String)> {
+    attributed_function_bodies(source, "#[tile")
+}
+
+fn attributed_function_bodies(source: &str, attribute: &str) -> Vec<(String, String)> {
+    let mut bodies = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(attribute_offset) = source[search_start..].find(attribute) {
+        let attribute_start = search_start + attribute_offset;
+        let fn_start = attribute_start
+            + source[attribute_start..]
+                .find("fn ")
+                .expect("sequence attribute should be followed by a function")
+            + "fn ".len();
+        let name_end = fn_start
+            + source[fn_start..]
+                .find('(')
+                .expect("sequence function should have a parameter list");
+        let sequence_name = source[fn_start..name_end].trim().to_string();
+        let body_start = name_end
+            + source[name_end..]
+                .find('{')
+                .expect("sequence function should have a body");
+        let mut depth = 0usize;
+        let mut body_end = body_start;
+
+        for (offset, character) in source[body_start..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        bodies.push((sequence_name, source[body_start + 1..body_end].to_string()));
+        search_start = body_end + 1;
+    }
+
+    bodies
+}
+
+fn tile_call_violations(source: &str) -> Vec<String> {
+    let tile_bodies = raster_tile_bodies(source);
+    assert!(
+        !tile_bodies.is_empty(),
+        "source should have tile bodies to validate"
+    );
+    let forbidden_fragments = [
+        "call_tile!",
+        "call_seq!",
+        "call_recur_tile!",
+        "call_recur_seq!",
+    ];
+    let mut violations = Vec::new();
+
+    for (tile_name, tile_body) in tile_bodies {
+        for forbidden_fragment in forbidden_fragments {
+            if tile_body.contains(forbidden_fragment) {
+                violations.push(format!("`{tile_name}` contains `{forbidden_fragment}`"));
+            }
+        }
+    }
+
+    violations
+}
+
+fn tile_authored_call_violations(source: &str) -> Vec<String> {
+    let authored_names = attributed_function_bodies(source, "#[")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    let tile_bodies = raster_tile_bodies(source);
+    let mut violations = Vec::new();
+
+    for (tile_name, tile_body) in tile_bodies {
+        for authored_name in &authored_names {
+            if authored_name == &tile_name {
+                continue;
+            }
+            let call_fragment = format!("{authored_name}(");
+            if tile_body.contains(&call_fragment) {
+                violations.push(format!("`{tile_name}` directly calls `{authored_name}`"));
+            }
+        }
+    }
+
+    violations
+}
+
+fn unauthored_function_violations(source: &str) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut violations = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("pub(crate) fn "))
+        {
+            continue;
+        }
+
+        let previous = index
+            .checked_sub(1)
+            .and_then(|previous_index| lines.get(previous_index))
+            .map(|line| line.trim_start())
+            .unwrap_or_default();
+        if !(previous.starts_with("#[sequence") || previous.starts_with("#[tile")) {
+            let function_name = trimmed
+                .split_once("fn ")
+                .and_then(|(_, rest)| rest.split_once('('))
+                .map(|(name, _)| name.trim())
+                .unwrap_or(trimmed);
+            violations.push(format!("`{function_name}` is not immediately authored"));
+        }
+    }
+
+    violations
+}
+
+fn branch_free_sequence_violations(source: &str) -> Vec<String> {
+    let sequence_bodies = raster_sequence_bodies(source);
+    assert!(
+        !sequence_bodies.is_empty(),
+        "source should have sequence bodies to validate"
+    );
+    let control_flow_tokens = ["if", "return", "match", "for", "while", "loop"];
+    let inline_logic_fragments = [
+        "ok_or_else",
+        "RasterArtifactId::new",
+        "RasterTensorId::new",
+        "::new",
+        "format!(",
+        "Some(",
+        ".clone()",
+        ".",
+        "Act::from_bits",
+        "Acc::from_bits",
+        ".collect()",
+    ];
+    let mut violations = Vec::new();
+
+    for (sequence_name, sequence_body) in sequence_bodies {
+        let tokenized = sequence_body
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '_' {
+                    character
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>();
+
+        for token in tokenized.split_whitespace() {
+            if control_flow_tokens.contains(&token) {
+                violations.push(format!("`{sequence_name}` contains `{token}`"));
+            }
+        }
+        for forbidden_fragment in inline_logic_fragments {
+            if sequence_body.contains(forbidden_fragment) {
+                violations.push(format!("`{sequence_name}` contains `{forbidden_fragment}`"));
+            }
+        }
+    }
+
+    violations
+}
+
+#[test]
 fn authored_prefill_layer_surfaces_do_not_accept_materialized_stage_inputs() {
     let source = include_str!("tiles.rs");
     let materialized_ple_type = concat!("Gemma4", "PrefillPleInputs");

@@ -4,16 +4,222 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use super::types::*;
+use crate::dsl::prelude::auth_read;
+use crate::shared::artifacts::raster_artifact_store::RasterActivationSequenceArtifactRef;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::LayerKvCache;
-use crate::shared::raster_contracts::prefill_layer::GemmaPrefillLayerMetadata;
-use crate::shared::raster_kernels::transformer::{RasterActivationSequence, RasterKvCache};
-use crate::shared::tensors::raster_tensor_artifacts::{
-    read_kv_row_from_roots, read_sequence_row_from_roots, RasterActivationSequenceRef,
-    RasterAttentionHeadsRef, RasterKvRowKind, RasterKvRowRequest, RasterSequenceRowRequest,
+use crate::shared::raster_contracts::prefill_layer::{
+    AuthenticatedGemmaPrefillLayerSource, GemmaPrefillLayerMetadata,
+    GemmaPrefillLayerMetadataRequest, GemmaPrefillLayerSourceMetadataRequest,
 };
+use crate::shared::raster_contracts::prefill_ple::read_prefill_ple_input_manifest_from_roots;
+use crate::shared::raster_kernels::transformer::{
+    validate_projection_rows_per_tile, RasterActivationSequence, RasterKvCache,
+};
+use crate::shared::tensors::raster_tensor_artifacts::{
+    activation_sequence_ref_from_artifact, read_kv_row_from_roots, read_sequence_row_from_roots,
+    RasterActivationSequenceRef, RasterAttentionHeadsRef, RasterKvRowKind, RasterKvRowRequest,
+    RasterSequenceRowRequest, RasterTensorId,
+};
+use crate::RasterSizingControls;
 
 use super::PrefillLayerCacheSlot;
+
+pub(in super::super) fn prepare_next_prefill_layer_context(
+    layer_state: &PrefillLayerRasterState,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+) -> Result<PrefillLayerContext> {
+    if layer_state.next_layer_idx >= layer_state.layer_count {
+        bail!(
+            "cannot prepare prefill layer {} after completing {} layers",
+            layer_state.next_layer_idx,
+            layer_state.layer_count
+        );
+    }
+
+    let layer_idx = layer_state.next_layer_idx;
+    let layer = auth_read!(layer_source, GemmaPrefillLayerMetadataRequest { layer_idx })?;
+    let donor_cache =
+        resolve_prefill_donor_cache_index(&layer_state.layer_caches, layer_idx, &layer)?
+            .map(|donor_idx| {
+                layer_state.layer_caches.get(donor_idx).cloned().ok_or_else(|| {
+                anyhow!("transformer prefill donor cache {donor_idx} missing for layer {layer_idx}")
+            })
+            })
+            .transpose()?;
+    let per_layer_input = layer_state
+        .per_layer_inputs
+        .get(layer_idx)
+        .and_then(Option::as_ref)
+        .cloned();
+    validate_prefill_layer_ple_input_ref(
+        &layer_state.current_activations_ref,
+        &layer,
+        per_layer_input.as_ref(),
+    )?;
+
+    Ok(PrefillLayerContext {
+        layer_idx,
+        layer,
+        donor_cache,
+        per_layer_input,
+    })
+}
+
+pub(in super::super) fn update_prefill_layer_state_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    mut layer_state: PrefillLayerRasterState,
+    layer_idx: usize,
+    layer_output_ref: RasterActivationSequenceRef,
+    layer_cache: PrefillLayerCacheSlot,
+) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
+    if layer_idx != layer_state.next_layer_idx {
+        bail!(
+            "cannot update prefill layer {layer_idx} while next layer is {}",
+            layer_state.next_layer_idx
+        );
+    }
+
+    layer_state.current_activations_ref = layer_output_ref;
+    layer_state.layer_caches.push(layer_cache);
+
+    let completed_layer_output =
+        trace_prefill_layer_checkpoint_with_roots(&artifact_store_roots, &layer_state, layer_idx)?;
+    if let Some((sha256, det_sha256)) = completed_layer_output {
+        layer_state.completed_layer_output_sha256s.push(sha256);
+        layer_state
+            .completed_layer_output_det_sha256s
+            .push(det_sha256);
+    }
+
+    if trace_prefill_layer_token_checkpoints_with_roots(
+        &artifact_store_roots,
+        &layer_state,
+        layer_idx,
+    )? {
+        layer_state.next_layer_idx += 1;
+        layer_state.layer_count = layer_state.next_layer_idx;
+        return Ok((true, artifact_store_roots, layer_state));
+    }
+    layer_state.next_layer_idx += 1;
+    Ok((false, artifact_store_roots, layer_state))
+}
+
+pub(in super::super) fn init_prefill_layer_state_from_activation_ref_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    input_activations_ref: RasterActivationSequenceArtifactRef,
+    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    ple_input_manifest_root: Option<&str>,
+    raster_sizing: RasterSizingControls,
+) -> Result<(RasterArtifactStoreRoots, PrefillLayerRasterState)> {
+    validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
+    crate::shared::raster_kernels::transformer::validate_attention_kv_rows_per_tile(
+        raster_sizing.attention_kv_rows_per_tile,
+    )?;
+    crate::shared::raster_kernels::transformer::validate_sequence_rows_per_tile(
+        raster_sizing.sequence_rows_per_tile,
+    )?;
+    crate::shared::raster_kernels::transformer::validate_head_rows_per_tile(
+        raster_sizing.head_rows_per_tile,
+    )?;
+    ensure_artifact_root_present(&artifact_store_roots, input_activations_ref.root())?;
+    let metadata = auth_read!(layer_source, GemmaPrefillLayerSourceMetadataRequest)?;
+    if metadata.layer_count == 0 {
+        bail!("transformer prefill requires at least one layer");
+    }
+
+    if input_activations_ref.row_count() == 0 {
+        bail!("transformer layer execution requires at least one activation row");
+    }
+    let first_layer = auth_read!(
+        layer_source,
+        GemmaPrefillLayerMetadataRequest { layer_idx: 0 }
+    )?;
+    if input_activations_ref.width() != first_layer.hidden_size {
+        bail!(
+            "transformer layer input width {}, expected {}",
+            input_activations_ref.width(),
+            first_layer.hidden_size
+        );
+    }
+    let token_count = input_activations_ref.row_count();
+    let current_activations_ref = activation_sequence_ref_from_artifact(
+        RasterTensorId::new(format!(
+            "prefill.layer.current.initial.{}",
+            input_activations_ref.root()
+        ))?,
+        input_activations_ref,
+    )?;
+
+    let ple_input_refs = ple_input_manifest_root
+        .map(|root| {
+            read_prefill_ple_input_manifest_from_roots(&artifact_store_roots, root)?
+                .into_prefill_ple_input_refs(artifact_store_roots.clone())
+        })
+        .transpose()?;
+    let per_layer_inputs = match ple_input_refs.as_ref() {
+        Some(ple_input_refs) => {
+            if ple_input_refs.source_id() != metadata.source_id {
+                bail!(
+                    "raster PLE input refs source {} does not match prefill layer source {}",
+                    ple_input_refs.source_id(),
+                    metadata.source_id
+                );
+            }
+            if ple_input_refs.layer_count() != metadata.layer_count {
+                bail!(
+                    "raster PLE input refs contain {} layers, expected {}",
+                    ple_input_refs.layer_count(),
+                    metadata.layer_count
+                );
+            }
+            if ple_input_refs.token_count() != token_count {
+                bail!(
+                    "raster PLE input refs contain {} tokens, expected {token_count}",
+                    ple_input_refs.token_count()
+                );
+            }
+            ple_input_refs
+                .per_layer_inputs()
+                .iter()
+                .enumerate()
+                .map(|(layer_idx, input_ref)| {
+                    input_ref
+                        .as_ref()
+                        .map(|input_ref| {
+                            ensure_artifact_root_present(&artifact_store_roots, input_ref.root())?;
+                            activation_sequence_ref_from_artifact(
+                                RasterTensorId::new(format!(
+                                    "prefill.layer.per_layer_input.{layer_idx}.{}",
+                                    input_ref.root()
+                                ))?,
+                                input_ref.clone(),
+                            )
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        None => vec![None; metadata.layer_count],
+    };
+
+    Ok((
+        artifact_store_roots,
+        PrefillLayerRasterState {
+            current_activations_ref,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            layer_caches: Vec::with_capacity(metadata.layer_count),
+            per_layer_inputs,
+            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+            projection_rows_per_tile: raster_sizing.projection_rows_per_tile,
+            attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
+            sequence_rows_per_tile: raster_sizing.sequence_rows_per_tile,
+            head_rows_per_tile: raster_sizing.head_rows_per_tile,
+        },
+    ))
+}
 
 pub(in super::super) fn validate_prefill_layer_ple_input_ref(
     current_activations_ref: &RasterActivationSequenceRef,
@@ -298,4 +504,29 @@ pub(in super::super) fn trace_prefill_layer_token_checkpoints_with_roots(
         }
     }
     Ok(false)
+}
+
+pub(in super::super) fn active_prefill_layer_work(
+    work: PrefillLayerArtifactWork,
+) -> Result<Box<PrefillLayerActiveWork>> {
+    match work {
+        PrefillLayerArtifactWork::Active(work) => Ok(work),
+        PrefillLayerArtifactWork::Passthrough(_) => {
+            bail!("prefill layer artifact work unexpectedly skipped")
+        }
+    }
+}
+
+pub(in super::super) fn require_activation_ref(
+    value: Option<RasterActivationSequenceRef>,
+    description: &str,
+) -> Result<RasterActivationSequenceRef> {
+    value.ok_or_else(|| anyhow!("prefill layer artifact work is missing {description}"))
+}
+
+pub(in super::super) fn require_heads_ref(
+    value: Option<RasterAttentionHeadsRef>,
+    description: &str,
+) -> Result<RasterAttentionHeadsRef> {
+    value.ok_or_else(|| anyhow!("prefill layer artifact work is missing {description}"))
 }
