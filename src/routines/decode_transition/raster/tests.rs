@@ -1,7 +1,6 @@
 use super::{
     main, main_state_refs, materialize_decode_layer_caches_from_roots,
-    prepare_next_decode_layer_context, raster_cache_from_layer_cache,
-    register_decode_layer_cache_with_roots, run, DecodeLayerCacheSlot,
+    raster_cache_from_layer_cache, register_decode_layer_cache_with_roots, run,
     RasterDecodeTransitionInputRefs, RasterDecodeTransitionInputRoots,
 };
 use crate::decode_transition::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource;
@@ -21,13 +20,57 @@ use crate::shared::raster_kernels::transformer::{
     RasterActivationRow, RasterAttentionHeadSequence, RasterKvCache,
 };
 use crate::shared::tensors::raster_tensor_artifacts::{
-    read_sequence_row_from_roots, RasterSequenceRowRequest, RasterTensorId,
+    read_sequence_row_from_roots, RasterSequenceRowRequest,
 };
 use crate::RasterSizingControls;
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+#[test]
+fn decode_transition_sequences_are_branch_free_orchestration() {
+    let source = include_str!("tiles.rs");
+    let violations = branch_free_sequence_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "decode_transition sequences must be straight-line tile/sequence calls: {violations:?}"
+    );
+}
+
+#[test]
+fn decode_transition_tiles_do_not_call_tiles_or_sequences() {
+    let source = include_str!("tiles.rs");
+    let violations = tile_call_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "decode_transition tiles must not invoke tile/sequence calls: {violations:?}"
+    );
+}
+
+#[test]
+fn decode_transition_tiles_do_not_directly_call_authored_functions() {
+    let source = include_str!("tiles.rs");
+    let violations = tile_authored_call_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "decode_transition tiles must not directly invoke authored tile/sequence functions: {violations:?}"
+    );
+}
+
+#[test]
+fn decode_transition_tiles_rs_contains_only_authored_functions() {
+    let source = include_str!("tiles.rs");
+    let violations = unauthored_function_violations(source);
+
+    assert!(
+        violations.is_empty(),
+        "decode_transition tiles.rs should keep helper code in utils.rs, not plain functions: {violations:?}"
+    );
+}
 
 #[test]
 fn raster_decode_transition_matches_deterministic_no_ple() {
@@ -680,4 +723,185 @@ fn det_source(
         col_offset: 0,
         col_count: cols,
     }
+}
+
+fn raster_sequence_bodies(source: &str) -> Vec<(String, String)> {
+    attributed_function_bodies(source, "#[sequence")
+}
+
+fn raster_tile_bodies(source: &str) -> Vec<(String, String)> {
+    attributed_function_bodies(source, "#[tile")
+}
+
+fn attributed_function_bodies(source: &str, attribute: &str) -> Vec<(String, String)> {
+    let mut bodies = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(attribute_offset) = source[search_start..].find(attribute) {
+        let attribute_start = search_start + attribute_offset;
+        let fn_start = attribute_start
+            + source[attribute_start..]
+                .find("fn ")
+                .expect("attribute should be followed by a function")
+            + "fn ".len();
+        let name_end = fn_start
+            + source[fn_start..]
+                .find('(')
+                .expect("authored function should have a parameter list");
+        let function_name = source[fn_start..name_end].trim().to_string();
+        let body_start = name_end
+            + source[name_end..]
+                .find('{')
+                .expect("authored function should have a body");
+        let mut depth = 0usize;
+        let mut body_end = body_start;
+
+        for (offset, character) in source[body_start..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        bodies.push((function_name, source[body_start + 1..body_end].to_string()));
+        search_start = body_end + 1;
+    }
+
+    bodies
+}
+
+fn tile_call_violations(source: &str) -> Vec<String> {
+    let tile_bodies = raster_tile_bodies(source);
+    assert!(
+        !tile_bodies.is_empty(),
+        "source should have tile bodies to validate"
+    );
+    let forbidden_fragments = [
+        "call_tile!",
+        "call_seq!",
+        "call_recur_tile!",
+        "call_recur_seq!",
+    ];
+    let mut violations = Vec::new();
+
+    for (tile_name, tile_body) in tile_bodies {
+        for forbidden_fragment in forbidden_fragments {
+            if tile_body.contains(forbidden_fragment) {
+                violations.push(format!("`{tile_name}` contains `{forbidden_fragment}`"));
+            }
+        }
+    }
+
+    violations
+}
+
+fn tile_authored_call_violations(source: &str) -> Vec<String> {
+    let authored_names = attributed_function_bodies(source, "#[")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    let tile_bodies = raster_tile_bodies(source);
+    let mut violations = Vec::new();
+
+    for (tile_name, tile_body) in tile_bodies {
+        for authored_name in &authored_names {
+            if authored_name == &tile_name {
+                continue;
+            }
+            let call_fragment = format!("{authored_name}(");
+            if tile_body.contains(&call_fragment) {
+                violations.push(format!("`{tile_name}` directly calls `{authored_name}`"));
+            }
+        }
+    }
+
+    violations
+}
+
+fn unauthored_function_violations(source: &str) -> Vec<String> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut violations = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub fn ")
+            || trimmed.starts_with("pub(in ")
+            || trimmed.starts_with("pub(crate) fn "))
+        {
+            continue;
+        }
+
+        let previous = index
+            .checked_sub(1)
+            .and_then(|previous_index| lines.get(previous_index))
+            .map(|line| line.trim_start())
+            .unwrap_or_default();
+        if !(previous.starts_with("#[sequence") || previous.starts_with("#[tile")) {
+            let function_name = trimmed
+                .split_once("fn ")
+                .and_then(|(_, rest)| rest.split_once('('))
+                .map(|(name, _)| name.trim())
+                .unwrap_or(trimmed);
+            violations.push(format!("`{function_name}` is not immediately authored"));
+        }
+    }
+
+    violations
+}
+
+fn branch_free_sequence_violations(source: &str) -> Vec<String> {
+    let sequence_bodies = raster_sequence_bodies(source);
+    assert!(
+        !sequence_bodies.is_empty(),
+        "source should have sequence bodies to validate"
+    );
+    let control_flow_tokens = ["if", "return", "match", "for", "while", "loop"];
+    let inline_logic_fragments = [
+        "ok_or_else",
+        "RasterArtifactId::new",
+        "RasterTensorId::new",
+        "::new",
+        "format!(",
+        "Some(",
+        ".clone()",
+        ".",
+        "Act::from_bits",
+        "Acc::from_bits",
+        ".collect()",
+    ];
+    let mut violations = Vec::new();
+
+    for (sequence_name, sequence_body) in sequence_bodies {
+        let tokenized = sequence_body
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '_' {
+                    character
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>();
+
+        for token in tokenized.split_whitespace() {
+            if control_flow_tokens.contains(&token) {
+                violations.push(format!("`{sequence_name}` contains `{token}`"));
+            }
+        }
+        for forbidden_fragment in inline_logic_fragments {
+            if sequence_body.contains(forbidden_fragment) {
+                violations.push(format!("`{sequence_name}` contains `{forbidden_fragment}`"));
+            }
+        }
+    }
+
+    violations
 }

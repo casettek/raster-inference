@@ -1,10 +1,11 @@
 use crate::decode_transition::raster::auth_source::{
-    GemmaDecodeLayerMatrixKind, GemmaDecodeLayerMetadata,
+    GemmaDecodeLayerMatrixKind, GemmaDecodeLayerMetadata, GemmaDecodePleScalars,
 };
 use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactStoreRoots, RasterSelectedTokenRef,
 };
 use crate::shared::model::transformer::{TransformerDecodeState, TransformerDecodeStepResult};
+use crate::shared::numerics::det_num::Wgt;
 use crate::shared::raster_kernels::transformer::RasterActivationRow;
 use crate::shared::tensors::raster_tensor_artifacts::{
     RasterActivationSequenceRef, RasterAttentionHeadsRef, RasterKvCacheBuilderRef,
@@ -165,6 +166,105 @@ pub(in super::super) struct DecodeLayerContext {
     pub(in super::super) layer: GemmaDecodeLayerMetadata,
     pub(in super::super) cache_slot: DecodeLayerCacheSlot,
     pub(in super::super) donor_cache_slot: Option<DecodeLayerCacheSlot>,
+}
+
+pub(in super::super) enum DecodeLayerWork {
+    Complete(DecodeTransitionRasterState),
+    Active(DecodeActiveLayerWork),
+}
+
+pub(in super::super) struct DecodeActiveLayerWork {
+    pub(in super::super) decode_state: DecodeTransitionRasterState,
+    pub(in super::super) layer_idx: usize,
+    pub(in super::super) layer: GemmaDecodeLayerMetadata,
+    pub(in super::super) cache_slot: DecodeLayerCacheSlot,
+    pub(in super::super) donor_cache_slot: Option<DecodeLayerCacheSlot>,
+    pub(in super::super) per_layer_input_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) attention_normed_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) q_projected_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) k_projected_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) v_projected_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) q_heads_ref: Option<RasterAttentionHeadsRef>,
+    pub(in super::super) k_heads_ref: Option<RasterAttentionHeadsRef>,
+    pub(in super::super) v_heads_ref: Option<RasterAttentionHeadsRef>,
+    pub(in super::super) attention_heads_ref: Option<RasterAttentionHeadsRef>,
+    pub(in super::super) attention_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) attention_output_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) xs_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) mlp_normed_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) mlp_gate_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) mlp_up_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) mlp_hidden_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) mlp_out_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) ple_gate_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) ple_projected_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) layer_output_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) updated_cache: Option<DecodeLayerCacheSlot>,
+    pub(in super::super) output_prefix: String,
+}
+
+pub(in super::super) enum DecodePleInputWork {
+    Skip(DecodeLayerWork),
+    Active {
+        work: DecodeActiveLayerWork,
+        scalars: GemmaDecodePleScalars,
+        norm_weights: Vec<Wgt>,
+        embedded_ref: RasterActivationSequenceRef,
+        projected_ref: Option<RasterActivationSequenceRef>,
+        output_prefix: String,
+    },
+}
+
+pub(in super::super) enum DecodeProjectionContinuation {
+    PleInput(DecodePleInputWork),
+    FinalLogits(DecodeTransitionFinalWork),
+    LayerAttentionQuery(DecodeLayerWork),
+    LayerAttentionKey(DecodeLayerWork),
+    LayerAttentionValue(DecodeLayerWork),
+    LayerAttentionOutput(DecodeLayerWork),
+    LayerMlpGate(DecodeLayerWork),
+    LayerMlpUp(DecodeLayerWork),
+    LayerMlpDown(DecodeLayerWork),
+    LayerPleGate(DecodeLayerWork),
+    LayerPleOutput(DecodeLayerWork),
+}
+
+pub(in super::super) enum DecodeProjectionWork {
+    Skip {
+        continuation: DecodeProjectionContinuation,
+    },
+    Active {
+        continuation: DecodeProjectionContinuation,
+        state: DecodeRowProjectionArtifactState,
+    },
+}
+
+pub(in super::super) enum DecodeKvCacheAppendWork {
+    Skip(DecodeLayerWork),
+    Active {
+        work: DecodeLayerWork,
+        state: DecodeKvCacheAppendArtifactState,
+    },
+}
+
+pub(in super::super) enum DecodeAttentionWork {
+    Skip(DecodeLayerWork),
+    Active {
+        work: DecodeLayerWork,
+        state: DecodeAttentionArtifactState,
+    },
+}
+
+pub(in super::super) struct DecodeTransitionFinalWork {
+    pub(in super::super) artifact_store_roots: RasterArtifactStoreRoots,
+    pub(in super::super) final_hidden_state_ref: RasterActivationSequenceRef,
+    pub(in super::super) normalized_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) logits_ref: Option<RasterActivationSequenceRef>,
+    pub(in super::super) output_source_prefix: String,
+    pub(in super::super) projection_rows_per_tile: usize,
+    pub(in super::super) layer_caches: Vec<DecodeLayerCacheSlot>,
+    pub(in super::super) position: usize,
+    pub(in super::super) token_count: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

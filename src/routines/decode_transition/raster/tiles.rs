@@ -18,18 +18,17 @@ use crate::shared::artifacts::raster_artifact_store::{
     RasterSelectedTokenRef,
 };
 use crate::shared::model::transformer::{
-    ActivationSequence, InternalActivationSequence, InternalLogits, PrefillLogits,
-    TransformerDecodeState, TransformerDecodeStepResult,
+    ActivationSequence, InternalActivationSequence, TransformerDecodeState,
+    TransformerDecodeStepResult,
 };
 use crate::shared::numerics::det_num::{
     acc_add_sat, add_sat, attention_score as det_attention_score, attention_softmax_exp_term,
-    attention_softmax_raw_weight, attention_softmax_residual, mac_bits, requantize, softcap_act,
-    Acc, Act,
+    attention_softmax_raw_weight, attention_softmax_residual, mac_bits, requantize, Acc, Act,
 };
 use crate::shared::raster_kernels::transformer::{
-    apply_rope_to_heads, project_row_with_weights, rms_norm_heads, rms_norm_sequence,
-    validate_attention_kv_rows_per_tile, validate_projection_rows_per_tile, value_rms_norm_heads,
-    RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence,
+    apply_rope_to_heads, rms_norm_heads, rms_norm_sequence, validate_attention_kv_rows_per_tile,
+    validate_projection_rows_per_tile, value_rms_norm_heads, RasterActivationRow,
+    RasterActivationSequence, RasterAttentionHeadSequence,
 };
 use crate::shared::tensors::raster_tensor_artifacts::{
     append_head_row_by_source_name_with_roots, append_sequence_row_by_source_name_with_roots,
@@ -54,71 +53,27 @@ pub fn main(
     input_roots: RasterDecodeTransitionInputRoots,
     source: &AuthenticatedGemmaDecodeTransitionSource,
 ) -> Result<RasterDecodeTransitionOutputRefs> {
-    if input_roots.decode_transition_source_root != source.static_source_root() {
-        bail!(
-            "raster decode transition source root {} does not match input source root {}",
-            source.static_source_root(),
-            input_roots.decode_transition_source_root
-        );
-    }
-    let next_token = call_tile!(
-        read_decode_selected_token,
-        &input_roots.artifact_store_roots,
-        &input_roots.selected_token_ref
-    )?;
     let (_artifact_store_roots, decode_state) = call_tile!(
-        init_decode_transition_state_refs_with_roots,
-        input_roots.artifact_store_roots,
-        input_roots.transformer_decode_state.clone(),
-        next_token,
-        source,
-        input_roots.raster_sizing,
-        input_roots.output_source_prefix
+        init_decode_transition_state_refs_from_input_roots,
+        input_roots,
+        source
     )?;
     let (artifact_store_roots, decode_state) = call_recur_seq!(
         compute_next_decode_layer_with_roots,
         (_artifact_store_roots, decode_state),
         source
     )?;
-    let final_hidden_states_ref = decode_state.current_activation_ref.clone();
-    let (artifact_store_roots, normalized_ref) = call_tile!(
-        normalize_decode_final_position_ref_with_roots,
+    let final_work = call_tile!(
+        init_decode_transition_final_work_with_roots,
         artifact_store_roots,
-        final_hidden_states_ref,
-        source,
-        format!("{}.final_norm", decode_state.output_source_prefix)
-    )?;
-    let (artifact_store_roots, logits_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        normalized_ref,
-        source,
-        DecodeProjectionKind::FinalLogits,
-        call_tile!(decode_projection_row_count, source)?,
-        input_roots.raster_sizing.projection_rows_per_tile,
-        format!("{}.final_logits", decode_state.output_source_prefix),
-        call_tile!(decode_final_logit_softcap_bits, source)?
-    )?;
-    let layer_output = call_tile!(
-        finalize_decode_layer_state_with_roots,
-        &artifact_store_roots,
         decode_state
     )?;
-    let transition_result = call_tile!(
-        finalize_decode_transition_result_from_roots,
-        &artifact_store_roots,
-        logits_ref,
-        TransformerDecodeState {
-            layer_caches: layer_output.layer_caches,
-            position: input_roots.transformer_decode_state.position,
-            token_count: input_roots.transformer_decode_state.token_count,
-        },
-        layer_output.activation_state
+    let final_work = call_seq!(
+        compute_decode_final_logits_work_with_roots,
+        final_work,
+        source
     )?;
-    Ok(RasterDecodeTransitionOutputRefs {
-        artifact_store_roots,
-        transition_result,
-    })
+    call_tile!(finalize_decode_transition_output_refs, final_work)
 }
 
 #[sequence(kind = recursive)]
@@ -127,142 +82,78 @@ pub fn compute_next_decode_layer_with_roots(
     decode_state: DecodeTransitionRasterState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
 ) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    if decode_state.next_layer_idx >= decode_state.layer_count {
-        return Ok((true, artifact_store_roots, decode_state));
-    }
-
-    let context = call_tile!(prepare_next_decode_layer_context, &decode_state, source)?;
-    let _trace = crate::trace::trace_scope(format!(
-        "decode.layer.det layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
-        decode_state.next_token,
-        decode_state.position,
-        context.layer.attention_kind,
-        context.layer.has_ple,
-        context.layer.kv_shared_layer_index,
-        layer_idx = context.layer_idx
-    ));
-    let (artifact_store_roots, per_layer_input_ref) = call_seq!(
-        compute_decode_ple_input_with_roots,
-        artifact_store_roots,
-        decode_state.next_token,
-        decode_state.decode_input_ref.clone(),
-        source,
-        &context.layer,
-        decode_state.projection_rows_per_tile,
-        format!(
-            "{}.layer_{}.ple.input",
-            decode_state.output_source_prefix, context.layer_idx
-        )
-    )?;
-    let (artifact_store_roots, layer_output_ref, updated_cache) = call_seq!(
-        run_basic_decode_layer_with_roots,
-        artifact_store_roots,
-        decode_state.current_activation_ref.clone(),
-        source,
-        &context.layer,
-        context.cache_slot,
-        context.donor_cache_slot.as_ref(),
-        per_layer_input_ref,
-        decode_state.position,
-        decode_state.projection_rows_per_tile,
-        decode_state.attention_kv_rows_per_tile,
-        format!(
-            "{}.layer_{}",
-            decode_state.output_source_prefix, context.layer_idx
-        )
-    )?;
-
-    call_tile!(
-        update_decode_layer_state_refs_with_roots,
+    let (artifact_store_roots, layer_work) = call_tile!(
+        init_next_decode_layer_work,
         artifact_store_roots,
         decode_state,
-        context.layer_idx,
-        layer_output_ref,
-        updated_cache
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        run_decode_layer_work_with_roots,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    call_tile!(
+        finalize_next_decode_layer_work,
+        artifact_store_roots,
+        layer_work
     )
 }
 
 #[sequence]
-fn compute_decode_ple_input_with_roots(
+fn run_decode_layer_work_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    token_id: u32,
-    decode_input_ref: RasterActivationSequenceRef,
+    layer_work: DecodeLayerWork,
     source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    projection_rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    Option<RasterActivationSequenceRef>,
-)> {
-    if !layer.has_ple {
-        return Ok((artifact_store_roots, None));
-    }
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, layer_work) = call_seq!(
+        compute_decode_ple_input_work_with_roots,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    call_seq!(
+        run_basic_decode_layer_work_with_roots,
+        artifact_store_roots,
+        layer_work,
+        source
+    )
+}
 
-    let ple_width = call_tile!(decode_ple_input_gate_rows, layer)?;
-    let scalars = call_tile!(read_decode_ple_scalars, source)?;
-    let norm_weights = call_tile!(read_decode_ple_projection_norm_weights, source)?;
-    let embedded = call_tile!(
-        read_decode_ple_token_embedding,
-        source,
-        layer.layer_idx,
-        token_id
-    )?;
-    let embedded = call_tile!(
-        scale_decode_row_optional,
-        &embedded,
-        Some(scalars.embedding_scale)
-    )?;
-    let (artifact_store_roots, embedded_ref) = insert_decode_activation_row_with_roots(
-        &artifact_store_roots,
-        format!("{output_prefix}.token_embedding"),
-        &embedded,
-    )?;
-
-    let (artifact_store_roots, projected_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
+#[sequence]
+fn compute_decode_ple_input_work_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, ple_work) = call_tile!(
+        init_decode_ple_input_work,
         artifact_store_roots,
-        decode_input_ref,
-        source,
-        DecodeProjectionKind::PleModel {
-            layer_idx: layer.layer_idx,
-        },
-        ple_width,
-        projection_rows_per_tile,
-        format!("{output_prefix}.model_projection"),
-        None
+        layer_work,
+        source
     )?;
-    let (artifact_store_roots, projected_ref) = call_tile!(
-        scale_decode_ref_optional_with_roots,
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_ple_input_work,
         artifact_store_roots,
-        projected_ref,
-        Some(scalars.projection_scalar),
-        format!("{output_prefix}.projection_scaled")
+        ple_work
     )?;
-    let (artifact_store_roots, projected_ref) = call_tile!(
-        rms_norm_decode_ref_with_roots,
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
         artifact_store_roots,
-        projected_ref,
-        &norm_weights,
-        scalars.rms_norm_eps,
-        "decode PLE input RMSNorm",
-        format!("{output_prefix}.projection_norm")
+        projection_work,
+        source
     )?;
-    let (artifact_store_roots, combined_ref) = call_tile!(
-        add_decode_refs_with_roots,
+    let (artifact_store_roots, ple_work) = call_tile!(
+        finalize_project_decode_ple_input_work,
         artifact_store_roots,
-        embedded_ref,
-        projected_ref,
-        format!("{output_prefix}.combined")
+        continuation
     )?;
-    let (artifact_store_roots, input_ref) = call_tile!(
-        scale_decode_ref_optional_with_roots,
+    call_tile!(
+        finalize_decode_ple_input_work,
         artifact_store_roots,
-        combined_ref,
-        Some(scalars.input_scale),
-        format!("{output_prefix}.scaled")
-    )?;
-    Ok((artifact_store_roots, Some(input_ref)))
+        ple_work
+    )
 }
 
 #[sequence]
@@ -283,7 +174,7 @@ fn project_ref_with_decode_source_with_roots(
         projection_kind,
         projection_rows,
         rows_per_tile,
-        RasterTensorId::new(output_id)?,
+        output_id,
         softcap_bits
     )?;
     let (artifact_store_roots, projection_state) = call_recur_tile!(
@@ -299,484 +190,1207 @@ fn project_ref_with_decode_source_with_roots(
 }
 
 #[sequence]
-fn run_basic_decode_layer_with_roots(
+fn project_decode_projection_work_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
+    projection_work: DecodeProjectionWork,
     source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    cache_slot: DecodeLayerCacheSlot,
-    donor_cache_slot: Option<&DecodeLayerCacheSlot>,
-    per_layer_input_ref: Option<RasterActivationSequenceRef>,
-    position: usize,
-    projection_rows_per_tile: usize,
-    attention_kv_rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceRef,
-    DecodeLayerCacheSlot,
-)> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer.layer_idx)?;
-    let (artifact_store_roots, xs_ref, updated_cache) = call_seq!(
-        run_decode_attention_block_with_roots,
-        artifact_store_roots,
-        input_ref,
-        source,
-        layer,
-        cache_slot,
-        donor_cache_slot,
-        position,
-        projection_rows_per_tile,
-        attention_kv_rows_per_tile,
-        format!("{output_prefix}.attention_block")
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionContinuation)> {
+    let (artifact_store_roots, projection_work) = call_recur_tile!(
+        project_next_decode_projection_work_chunk_with_roots,
+        (artifact_store_roots, projection_work),
+        source
     )?;
-    let (artifact_store_roots, xs_ref) = call_seq!(
-        run_decode_mlp_block_with_roots,
-        artifact_store_roots,
-        xs_ref,
-        source,
-        layer,
-        scalars.rms_norm_eps,
-        projection_rows_per_tile,
-        format!("{output_prefix}.mlp")
-    )?;
-    let (artifact_store_roots, xs_ref) = if let Some(per_layer_input_ref) = per_layer_input_ref {
-        call_seq!(
-            run_decode_ple_block_with_roots,
-            artifact_store_roots,
-            xs_ref,
-            per_layer_input_ref,
-            source,
-            layer,
-            scalars.rms_norm_eps,
-            projection_rows_per_tile,
-            format!("{output_prefix}.ple")
-        )?
-    } else {
-        (artifact_store_roots, xs_ref)
-    };
-    let (artifact_store_roots, xs_ref) = call_tile!(
-        scale_decode_ref_optional_with_roots,
-        artifact_store_roots,
-        xs_ref,
-        scalars.layer_scalar,
-        format!("{output_prefix}.scaled")
-    )?;
-
-    Ok((artifact_store_roots, xs_ref, updated_cache))
-}
-
-#[sequence]
-fn run_decode_attention_block_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    cache_slot: DecodeLayerCacheSlot,
-    donor_cache_slot: Option<&DecodeLayerCacheSlot>,
-    position: usize,
-    projection_rows_per_tile: usize,
-    attention_kv_rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceRef,
-    DecodeLayerCacheSlot,
-)> {
-    let input = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
-    call_tile!(validate_decode_attention_context, &input, layer)?;
-    let (artifact_store_roots, normed_ref) = call_seq!(
-        rms_norm_decode_layer_ref_with_roots,
-        artifact_store_roots,
-        input_ref.clone(),
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::InputLayer,
-        format!("{output_prefix}.input_norm")
-    )?;
-    let (artifact_store_roots, attention_output_ref, updated_cache) = call_seq!(
-        run_decode_attention_with_roots,
-        artifact_store_roots,
-        normed_ref,
-        source,
-        layer,
-        cache_slot,
-        donor_cache_slot,
-        position,
-        projection_rows_per_tile,
-        attention_kv_rows_per_tile,
-        format!("{output_prefix}.attention")
-    )?;
-    let (artifact_store_roots, attention_output_ref) = call_seq!(
-        rms_norm_decode_layer_ref_with_roots,
-        artifact_store_roots,
-        attention_output_ref,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::PostAttention,
-        format!("{output_prefix}.post_attention_norm")
-    )?;
-    let (artifact_store_roots, xs_ref) = call_tile!(
-        add_decode_refs_with_roots,
-        artifact_store_roots,
-        input_ref,
-        attention_output_ref,
-        format!("{output_prefix}.residual")
-    )?;
-    Ok((artifact_store_roots, xs_ref, updated_cache))
-}
-
-#[sequence]
-fn rms_norm_decode_layer_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    norm: GemmaDecodeLayerNormKind,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
     call_tile!(
-        rms_norm_decode_ref_with_roots,
+        finalize_decode_projection_work_with_roots,
         artifact_store_roots,
-        input_ref,
+        projection_work
+    )
+}
+
+#[sequence]
+fn compute_decode_final_logits_work_with_roots(
+    final_work: DecodeTransitionFinalWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<DecodeTransitionFinalWork> {
+    let final_work = call_tile!(normalize_decode_final_work_with_roots, final_work, source)?;
+    let (artifact_store_roots, projection_work) =
+        call_tile!(init_decode_final_logits_projection_work, final_work, source)?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_final_logits_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn run_basic_decode_layer_work_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, layer_work) = call_tile!(
+        prepare_basic_decode_layer_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        normalize_decode_attention_input_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_attention_query_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_attention_key_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_attention_value_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        reshape_decode_attention_query_heads_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        reshape_decode_attention_key_heads_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        reshape_decode_attention_value_heads_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        normalize_decode_attention_query_heads_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        normalize_decode_attention_key_heads_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        normalize_decode_attention_value_heads_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        rope_decode_attention_query_heads_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        rope_decode_attention_key_heads_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        update_decode_attention_cache_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        compute_decode_attention_scores_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        combine_decode_attention_heads_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_attention_output_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        normalize_decode_attention_output_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        add_decode_attention_residual_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        normalize_decode_mlp_input_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_mlp_gate_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) =
+        call_tile!(gelu_decode_mlp_gate_work, artifact_store_roots, layer_work)?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_mlp_up_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        multiply_decode_mlp_hidden_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_mlp_down_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        normalize_decode_mlp_output_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        add_decode_mlp_residual_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_ple_gate_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) =
+        call_tile!(gelu_decode_ple_gate_work, artifact_store_roots, layer_work)?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        multiply_decode_ple_input_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, layer_work) = call_seq!(
+        project_decode_ple_output_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        normalize_decode_ple_output_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )?;
+    let (artifact_store_roots, layer_work) = call_tile!(
+        add_decode_ple_residual_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    call_tile!(
+        scale_decode_layer_output_work,
+        artifact_store_roots,
+        layer_work,
+        source
+    )
+}
+
+#[sequence]
+fn project_decode_attention_query_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_attention_query_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn project_decode_attention_key_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_attention_key_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn project_decode_attention_value_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_attention_value_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn update_decode_attention_cache_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, cache_work) = call_tile!(
+        init_update_decode_attention_cache_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, cache_work) = call_recur_tile!(
+        compute_next_decode_kv_cache_append_work_row_with_roots,
+        (artifact_store_roots, cache_work)
+    )?;
+    call_tile!(
+        finalize_update_decode_attention_cache_work,
+        artifact_store_roots,
+        cache_work
+    )
+}
+
+#[sequence]
+fn compute_decode_attention_scores_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, attention_work) = call_tile!(
+        init_compute_decode_attention_scores_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, attention_work) = call_recur_tile!(
+        compute_next_decode_attention_work_head_with_roots,
+        (artifact_store_roots, attention_work)
+    )?;
+    call_tile!(
+        finalize_compute_decode_attention_scores_work,
+        artifact_store_roots,
+        attention_work
+    )
+}
+
+#[sequence]
+fn project_decode_attention_output_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_attention_output_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn project_decode_mlp_gate_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_mlp_gate_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn project_decode_mlp_up_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_mlp_up_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn project_decode_mlp_down_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_mlp_down_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn project_decode_ple_gate_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_ple_gate_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+fn project_decode_ple_output_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let (artifact_store_roots, projection_work) = call_tile!(
+        init_project_decode_ple_output_work,
+        artifact_store_roots,
+        layer_work
+    )?;
+    let (artifact_store_roots, continuation) = call_seq!(
+        project_decode_projection_work_with_roots,
+        artifact_store_roots,
+        projection_work,
+        source
+    )?;
+    call_tile!(
+        finalize_decode_layer_projection_work,
+        artifact_store_roots,
+        continuation
+    )
+}
+
+#[sequence]
+pub fn run(
+    transformer_decode_state: TransformerDecodeState,
+    next_token: u32,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+    raster_sizing: RasterSizingControls,
+) -> Result<TransformerDecodeStepResult> {
+    let input_roots = call_tile!(
+        init_decode_transition_run_input_roots,
+        transformer_decode_state,
+        next_token,
+        source,
+        raster_sizing
+    )?;
+    let output = call_seq!(main, input_roots, source)?;
+    call_tile!(finalize_decode_transition_run_output, output)
+}
+
+#[sequence]
+pub fn main_state_refs(
+    input_roots: RasterDecodeTransitionInputRefs,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<RasterDecodeTransitionOutputStateRefs> {
+    let (_artifact_store_roots, decode_state) = call_tile!(
+        init_decode_transition_state_from_input_refs,
+        input_roots,
+        source
+    )?;
+    let (artifact_store_roots, decode_state) = call_recur_seq!(
+        compute_next_decode_layer_with_roots,
+        (_artifact_store_roots, decode_state),
+        source
+    )?;
+    let final_work = call_tile!(
+        init_decode_transition_final_work_with_roots,
+        artifact_store_roots,
+        decode_state
+    )?;
+    let final_work = call_seq!(
+        compute_decode_final_logits_work_with_roots,
+        final_work,
+        source
+    )?;
+    call_tile!(finalize_decode_transition_output_state_refs, final_work)
+}
+
+// Raster execution tiles, ordered by the sequence calls that reach them.
+
+#[tile]
+fn prepare_basic_decode_layer_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let input = read_activation_row_from_ref_roots(
+        &artifact_store_roots,
+        &work.decode_state.current_activation_ref,
+    )?;
+    validate_row_width(&input, work.layer.hidden_size, "decode attention input")?;
+    let kv_groups = work
+        .layer
+        .num_heads
+        .checked_div(work.layer.num_kv_heads)
+        .ok_or_else(|| anyhow!("invalid Gemma head configuration"))?;
+    if kv_groups == 0 {
+        bail!("Gemma layer must have at least one KV group");
+    }
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn normalize_decode_attention_input_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let norm_weights = auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest {
+            layer_idx: work.layer_idx,
+            norm: GemmaDecodeLayerNormKind::InputLayer
+        }
+    )?;
+    let (artifact_store_roots, output_ref) = rms_norm_decode_ref(
+        artifact_store_roots,
+        work.decode_state.current_activation_ref.clone(),
         &norm_weights,
         scalars.rms_norm_eps,
         "decode layer RMSNorm",
-        output_source_name
-    )
+        format!("{}.attention_block.input_norm", work.output_prefix),
+    )?;
+    work.attention_normed_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
 }
 
-#[sequence]
-fn run_decode_attention_with_roots(
+#[tile]
+fn init_project_decode_attention_query_work(
     artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    cache_slot: DecodeLayerCacheSlot,
-    donor_cache_slot: Option<&DecodeLayerCacheSlot>,
-    position: usize,
-    projection_rows_per_tile: usize,
-    attention_kv_rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(
-    RasterArtifactStoreRoots,
-    RasterActivationSequenceRef,
-    DecodeLayerCacheSlot,
-)> {
-    let (artifact_store_roots, q_projected_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerAttentionQuery(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
         artifact_store_roots,
-        input_ref.clone(),
-        source,
+        require_decode_activation_ref(
+            work.attention_normed_ref.clone(),
+            "attention input norm ref",
+        )?,
         DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
+            layer_idx: work.layer_idx,
             matrix: GemmaDecodeLayerMatrixKind::Query,
         },
-        layer.q_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.q_proj"),
-        None
+        work.layer.q_proj_shape.rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.attention_block.attention.q_proj", work.output_prefix),
+        None,
     )?;
-    let (artifact_store_roots, raw_k_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
+    Ok((
         artifact_store_roots,
-        input_ref.clone(),
-        source,
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerAttentionQuery(
+                DecodeLayerWork::Active(work),
+            ),
+            state,
+        },
+    ))
+}
+
+#[tile]
+fn init_project_decode_attention_key_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerAttentionKey(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
+        artifact_store_roots,
+        require_decode_activation_ref(
+            work.attention_normed_ref.clone(),
+            "attention input norm ref",
+        )?,
         DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
+            layer_idx: work.layer_idx,
             matrix: GemmaDecodeLayerMatrixKind::Key,
         },
-        layer.k_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.k_proj"),
-        None
+        work.layer.k_proj_shape.rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.attention_block.attention.k_proj", work.output_prefix),
+        None,
     )?;
-    let (artifact_store_roots, raw_v_ref) = if layer.has_v_proj {
-        call_seq!(
-            project_ref_with_decode_source_with_roots,
-            artifact_store_roots,
-            input_ref,
-            source,
-            DecodeProjectionKind::LayerMatrix {
-                layer_idx: layer.layer_idx,
-                matrix: GemmaDecodeLayerMatrixKind::Value,
-            },
-            layer
-                .v_proj_shape
-                .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing v_proj shape"))?
-                .rows,
-            projection_rows_per_tile,
-            format!("{output_prefix}.v_proj"),
-            None
-        )?
-    } else if layer.attention_k_eq_v {
-        (artifact_store_roots, raw_k_ref.clone())
-    } else {
-        bail!("Gemma layer is missing v_proj without attention_k_eq_v enabled");
-    };
-
-    let (artifact_store_roots, q_heads_ref) = call_tile!(
-        reshape_decode_ref_heads_with_roots,
+    Ok((
         artifact_store_roots,
-        q_projected_ref,
-        format!("{output_prefix}.q_heads"),
-        layer.num_heads,
-        layer.head_dim
-    )?;
-    let (artifact_store_roots, k_heads_ref) = call_tile!(
-        reshape_decode_ref_heads_with_roots,
-        artifact_store_roots,
-        raw_k_ref,
-        format!("{output_prefix}.k_heads"),
-        layer.num_kv_heads,
-        layer.head_dim
-    )?;
-    let (artifact_store_roots, v_heads_ref) = call_tile!(
-        reshape_decode_ref_heads_with_roots,
-        artifact_store_roots,
-        raw_v_ref,
-        format!("{output_prefix}.v_heads"),
-        layer.num_kv_heads,
-        layer.head_dim
-    )?;
-    let (artifact_store_roots, q_heads_ref) = call_seq!(
-        rms_norm_decode_attention_heads_ref_with_roots,
-        artifact_store_roots,
-        q_heads_ref,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::Query,
-        format!("{output_prefix}.q_norm")
-    )?;
-    let (artifact_store_roots, k_heads_ref) = call_seq!(
-        rms_norm_decode_attention_heads_ref_with_roots,
-        artifact_store_roots,
-        k_heads_ref,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::Key,
-        format!("{output_prefix}.k_norm")
-    )?;
-    let (artifact_store_roots, v_heads_ref) = call_seq!(
-        value_rms_norm_decode_attention_heads_ref_with_roots,
-        artifact_store_roots,
-        v_heads_ref,
-        source,
-        layer.layer_idx,
-        format!("{output_prefix}.v_norm")
-    )?;
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer.layer_idx)?;
-    let (artifact_store_roots, q_heads_ref) = call_tile!(
-        apply_decode_rope_to_heads_ref_with_roots,
-        artifact_store_roots,
-        q_heads_ref,
-        layer.partial_rotary_dim,
-        layer.rope_freq_base_dim,
-        scalars.rope_base,
-        position,
-        format!("{output_prefix}.q_rope")
-    )?;
-    let (artifact_store_roots, k_heads_ref) = call_tile!(
-        apply_decode_rope_to_heads_ref_with_roots,
-        artifact_store_roots,
-        k_heads_ref,
-        layer.partial_rotary_dim,
-        layer.rope_freq_base_dim,
-        scalars.rope_base,
-        position,
-        format!("{output_prefix}.k_rope")
-    )?;
-
-    let (artifact_store_roots, updated_cache_slot) = call_seq!(
-        update_decode_attention_cache_with_roots,
-        artifact_store_roots,
-        cache_slot,
-        donor_cache_slot.is_some(),
-        k_heads_ref,
-        v_heads_ref,
-        layer.layer_idx,
-        layer.cache_sliding_window,
-        attention_kv_rows_per_tile,
-        format!("{output_prefix}.updated_cache")
-    )?;
-    let attention_cache_slot = donor_cache_slot.unwrap_or(&updated_cache_slot);
-    let attention_cache_ref = call_tile!(resolve_decode_attention_cache_ref, attention_cache_slot)?;
-    let attention_window = call_tile!(resolve_decode_attention_window, layer)?;
-    let (artifact_store_roots, attention_heads_ref) = call_seq!(
-        compute_decode_attention_ref_with_roots,
-        artifact_store_roots,
-        q_heads_ref,
-        attention_cache_ref,
-        format!("{output_prefix}.scores"),
-        attention_window,
-        attention_kv_rows_per_tile
-    )?;
-    let (artifact_store_roots, attention_ref) = call_seq!(
-        combine_decode_attention_heads_ref_with_roots,
-        artifact_store_roots,
-        attention_heads_ref,
-        format!("{output_prefix}.combined")
-    )?;
-    let (artifact_store_roots, projected_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        attention_ref,
-        source,
-        DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
-            matrix: GemmaDecodeLayerMatrixKind::Output,
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerAttentionKey(DecodeLayerWork::Active(
+                work,
+            )),
+            state,
         },
-        layer.o_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.o_proj"),
-        None
-    )?;
-
-    Ok((artifact_store_roots, projected_ref, updated_cache_slot))
+    ))
 }
 
-#[sequence]
-fn rms_norm_decode_attention_heads_ref_with_roots(
+#[tile]
+fn init_project_decode_attention_value_work(
     artifact_store_roots: RasterArtifactStoreRoots,
-    heads_ref: RasterAttentionHeadsRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    norm: GemmaDecodeLayerNormKind,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
-    let heads = materialize_attention_heads_from_roots(&artifact_store_roots, &heads_ref)?;
-    let heads = call_tile!(
-        rms_norm_decode_heads,
-        &heads,
-        &norm_weights,
-        scalars.rms_norm_eps
-    )?;
-    insert_attention_heads_with_roots(&artifact_store_roots, output_source_name, heads)
-}
-
-#[sequence]
-fn value_rms_norm_decode_attention_heads_ref_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    heads_ref: RasterAttentionHeadsRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    output_source_name: String,
-) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let heads = materialize_attention_heads_from_roots(&artifact_store_roots, &heads_ref)?;
-    let heads = call_tile!(value_rms_norm_decode_heads, &heads, scalars.rms_norm_eps)?;
-    insert_attention_heads_with_roots(&artifact_store_roots, output_source_name, heads)
-}
-
-#[sequence]
-fn update_decode_attention_cache_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    cache_slot: DecodeLayerCacheSlot,
-    use_donor_cache: bool,
-    k_heads_ref: RasterAttentionHeadsRef,
-    v_heads_ref: RasterAttentionHeadsRef,
-    layer_idx: usize,
-    cache_window: Option<usize>,
-    rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
-    if use_donor_cache {
-        return Ok((artifact_store_roots, cache_slot));
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerAttentionValue(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    if !work.layer.has_v_proj {
+        if work.layer.attention_k_eq_v {
+            work.v_projected_ref = Some(require_decode_activation_ref(
+                work.k_projected_ref.clone(),
+                "key projection ref",
+            )?);
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerAttentionValue(
+                        DecodeLayerWork::Active(work),
+                    ),
+                },
+            ));
+        }
+        bail!("Gemma layer is missing v_proj without attention_k_eq_v enabled");
     }
-    call_seq!(
-        append_decode_kv_cache_ref_with_roots,
+    let projection_rows = work
+        .layer
+        .v_proj_shape
+        .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing v_proj shape"))?
+        .rows;
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
         artifact_store_roots,
-        cache_slot,
-        k_heads_ref,
-        v_heads_ref,
-        layer_idx,
-        cache_window,
-        rows_per_tile,
-        output_prefix
-    )
+        require_decode_activation_ref(
+            work.attention_normed_ref.clone(),
+            "attention input norm ref",
+        )?,
+        DecodeProjectionKind::LayerMatrix {
+            layer_idx: work.layer_idx,
+            matrix: GemmaDecodeLayerMatrixKind::Value,
+        },
+        projection_rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.attention_block.attention.v_proj", work.output_prefix),
+        None,
+    )?;
+    Ok((
+        artifact_store_roots,
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerAttentionValue(
+                DecodeLayerWork::Active(work),
+            ),
+            state,
+        },
+    ))
 }
 
-#[sequence]
-fn append_decode_kv_cache_ref_with_roots(
+#[tile]
+fn finalize_decode_layer_projection_work(
     artifact_store_roots: RasterArtifactStoreRoots,
-    cache_slot: DecodeLayerCacheSlot,
-    key_ref: RasterAttentionHeadsRef,
-    value_ref: RasterAttentionHeadsRef,
-    layer_idx: usize,
-    cache_window: Option<usize>,
-    rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
-    let (artifact_store_roots, kv_cache_append_state) = call_tile!(
-        init_decode_kv_cache_append_state_with_roots,
-        artifact_store_roots,
-        cache_slot,
-        key_ref,
-        value_ref,
-        RasterTensorId::new(format!("{output_prefix}.{layer_idx}.keys"))?,
-        RasterTensorId::new(format!("{output_prefix}.{layer_idx}.values"))?,
-        cache_window,
-        rows_per_tile
-    )?;
-    let (artifact_store_roots, kv_cache_append_state) = call_recur_tile!(
-        compute_next_decode_kv_cache_append_row_with_roots,
-        (artifact_store_roots, kv_cache_append_state)
-    )?;
-    call_tile!(
-        finalize_decode_kv_cache_append_state_with_roots,
-        artifact_store_roots,
-        kv_cache_append_state
-    )
+    continuation: DecodeProjectionContinuation,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    match continuation {
+        DecodeProjectionContinuation::LayerAttentionQuery(work)
+        | DecodeProjectionContinuation::LayerAttentionKey(work)
+        | DecodeProjectionContinuation::LayerAttentionValue(work)
+        | DecodeProjectionContinuation::LayerAttentionOutput(work)
+        | DecodeProjectionContinuation::LayerMlpGate(work)
+        | DecodeProjectionContinuation::LayerMlpUp(work)
+        | DecodeProjectionContinuation::LayerMlpDown(work)
+        | DecodeProjectionContinuation::LayerPleGate(work)
+        | DecodeProjectionContinuation::LayerPleOutput(work) => Ok((artifact_store_roots, work)),
+        _ => bail!("decode layer projection returned unexpected continuation"),
+    }
 }
 
-#[sequence]
-fn compute_decode_attention_ref_with_roots(
+#[tile]
+fn reshape_decode_attention_query_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
-    query_ref: RasterAttentionHeadsRef,
-    cache_ref: RasterKvCacheRef,
-    id_prefix: String,
-    attention_window: Option<usize>,
-    kv_rows_per_tile: usize,
-) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let (artifact_store_roots, attention_state) = call_tile!(
-        init_decode_attention_artifact_state_from_refs,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let row = read_activation_row_from_ref_roots(
+        &artifact_store_roots,
+        &require_decode_activation_ref(work.q_projected_ref.clone(), "query projection ref")?,
+    )?;
+    let heads = reshape_row_heads(row, work.layer.num_heads, work.layer.head_dim)?;
+    let (artifact_store_roots, output_ref) = insert_attention_heads_with_roots(
+        &artifact_store_roots,
+        format!("{}.attention_block.attention.q_heads", work.output_prefix),
+        heads,
+    )?;
+    work.q_heads_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn reshape_decode_attention_key_heads_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let row = read_activation_row_from_ref_roots(
+        &artifact_store_roots,
+        &require_decode_activation_ref(work.k_projected_ref.clone(), "key projection ref")?,
+    )?;
+    let heads = reshape_row_heads(row, work.layer.num_kv_heads, work.layer.head_dim)?;
+    let (artifact_store_roots, output_ref) = insert_attention_heads_with_roots(
+        &artifact_store_roots,
+        format!("{}.attention_block.attention.k_heads", work.output_prefix),
+        heads,
+    )?;
+    work.k_heads_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn reshape_decode_attention_value_heads_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let row = read_activation_row_from_ref_roots(
+        &artifact_store_roots,
+        &require_decode_activation_ref(work.v_projected_ref.clone(), "value projection ref")?,
+    )?;
+    let heads = reshape_row_heads(row, work.layer.num_kv_heads, work.layer.head_dim)?;
+    let (artifact_store_roots, output_ref) = insert_attention_heads_with_roots(
+        &artifact_store_roots,
+        format!("{}.attention_block.attention.v_heads", work.output_prefix),
+        heads,
+    )?;
+    work.v_heads_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn normalize_decode_attention_query_heads_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let norm_weights = auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest {
+            layer_idx: work.layer_idx,
+            norm: GemmaDecodeLayerNormKind::Query
+        }
+    )?;
+    let heads = materialize_attention_heads_from_roots(
+        &artifact_store_roots,
+        &require_decode_heads_ref(work.q_heads_ref.clone(), "query heads ref")?,
+    )?;
+    let heads = rms_norm_heads(&heads, Some(&norm_weights), Some(scalars.rms_norm_eps))?;
+    let (artifact_store_roots, output_ref) = insert_attention_heads_with_roots(
+        &artifact_store_roots,
+        format!("{}.attention_block.attention.q_norm", work.output_prefix),
+        heads,
+    )?;
+    work.q_heads_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn normalize_decode_attention_key_heads_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let norm_weights = auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest {
+            layer_idx: work.layer_idx,
+            norm: GemmaDecodeLayerNormKind::Key
+        }
+    )?;
+    let heads = materialize_attention_heads_from_roots(
+        &artifact_store_roots,
+        &require_decode_heads_ref(work.k_heads_ref.clone(), "key heads ref")?,
+    )?;
+    let heads = rms_norm_heads(&heads, Some(&norm_weights), Some(scalars.rms_norm_eps))?;
+    let (artifact_store_roots, output_ref) = insert_attention_heads_with_roots(
+        &artifact_store_roots,
+        format!("{}.attention_block.attention.k_norm", work.output_prefix),
+        heads,
+    )?;
+    work.k_heads_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn normalize_decode_attention_value_heads_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let heads = materialize_attention_heads_from_roots(
+        &artifact_store_roots,
+        &require_decode_heads_ref(work.v_heads_ref.clone(), "value heads ref")?,
+    )?;
+    let heads = value_rms_norm_heads(&heads, Some(scalars.rms_norm_eps))?;
+    let (artifact_store_roots, output_ref) = insert_attention_heads_with_roots(
+        &artifact_store_roots,
+        format!("{}.attention_block.attention.v_norm", work.output_prefix),
+        heads,
+    )?;
+    work.v_heads_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn rope_decode_attention_query_heads_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let heads = materialize_attention_heads_from_roots(
+        &artifact_store_roots,
+        &require_decode_heads_ref(work.q_heads_ref.clone(), "query heads ref")?,
+    )?;
+    let heads = apply_rope_to_heads(
+        &heads,
+        work.layer.partial_rotary_dim,
+        work.layer.rope_freq_base_dim,
+        scalars.rope_base,
+        work.decode_state.position,
+    )?;
+    let (artifact_store_roots, output_ref) = insert_attention_heads_with_roots(
+        &artifact_store_roots,
+        format!("{}.attention_block.attention.q_rope", work.output_prefix),
+        heads,
+    )?;
+    work.q_heads_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn rope_decode_attention_key_heads_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let heads = materialize_attention_heads_from_roots(
+        &artifact_store_roots,
+        &require_decode_heads_ref(work.k_heads_ref.clone(), "key heads ref")?,
+    )?;
+    let heads = apply_rope_to_heads(
+        &heads,
+        work.layer.partial_rotary_dim,
+        work.layer.rope_freq_base_dim,
+        scalars.rope_base,
+        work.decode_state.position,
+    )?;
+    let (artifact_store_roots, output_ref) = insert_attention_heads_with_roots(
+        &artifact_store_roots,
+        format!("{}.attention_block.attention.k_rope", work.output_prefix),
+        heads,
+    )?;
+    work.k_heads_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn init_update_decode_attention_cache_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeKvCacheAppendWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeKvCacheAppendWork::Skip(layer_work),
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    if work.donor_cache_slot.is_some() {
+        work.updated_cache = Some(work.cache_slot.clone());
+        return Ok((
+            artifact_store_roots,
+            DecodeKvCacheAppendWork::Skip(DecodeLayerWork::Active(work)),
+        ));
+    }
+    let state = init_decode_kv_cache_append_artifact_work_state(
+        artifact_store_roots.clone(),
+        work.cache_slot.clone(),
+        require_decode_heads_ref(work.k_heads_ref.clone(), "key heads ref")?,
+        require_decode_heads_ref(work.v_heads_ref.clone(), "value heads ref")?,
+        RasterTensorId::new(format!(
+            "{}.attention_block.attention.updated_cache.{}.keys",
+            work.output_prefix, work.layer_idx
+        ))?,
+        RasterTensorId::new(format!(
+            "{}.attention_block.attention.updated_cache.{}.values",
+            work.output_prefix, work.layer_idx
+        ))?,
+        work.layer.cache_sliding_window,
+        work.decode_state.attention_kv_rows_per_tile,
+    )?;
+    Ok((
+        state.0,
+        DecodeKvCacheAppendWork::Active {
+            work: DecodeLayerWork::Active(work),
+            state: state.1,
+        },
+    ))
+}
+
+#[tile(kind = recursive)]
+fn compute_next_decode_kv_cache_append_work_row_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    cache_work: DecodeKvCacheAppendWork,
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeKvCacheAppendWork)> {
+    match cache_work {
+        DecodeKvCacheAppendWork::Skip(layer_work) => Ok((
+            true,
+            artifact_store_roots,
+            DecodeKvCacheAppendWork::Skip(layer_work),
+        )),
+        DecodeKvCacheAppendWork::Active { work, state } => {
+            let (done, artifact_store_roots, state) =
+                compute_next_decode_kv_cache_append_artifact_work_row(artifact_store_roots, state)?;
+            Ok((
+                done,
+                artifact_store_roots,
+                DecodeKvCacheAppendWork::Active { work, state },
+            ))
+        }
+    }
+}
+
+#[tile]
+fn finalize_update_decode_attention_cache_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    cache_work: DecodeKvCacheAppendWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    match cache_work {
+        DecodeKvCacheAppendWork::Skip(layer_work) => Ok((artifact_store_roots, layer_work)),
+        DecodeKvCacheAppendWork::Active { work, state } => {
+            let (artifact_store_roots, cache_slot) =
+                finalize_decode_kv_cache_append_artifact_work_state(artifact_store_roots, state)?;
+            let mut work = active_decode_layer_work(work)?;
+            work.updated_cache = Some(cache_slot);
+            Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+        }
+    }
+}
+
+#[tile]
+fn init_compute_decode_attention_scores_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeAttentionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((artifact_store_roots, DecodeAttentionWork::Skip(layer_work)));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    let attention_cache_slot = work
+        .donor_cache_slot
+        .as_ref()
+        .or(work.updated_cache.as_ref())
+        .ok_or_else(|| anyhow!("decode attention requires an updated cache slot"))?;
+    let attention_cache_ref = match attention_cache_slot {
+        DecodeLayerCacheSlot::Empty { .. } => bail!("decode attention cache is empty"),
+        DecodeLayerCacheSlot::Ref(cache_ref) => cache_ref.clone(),
+    };
+    let attention_window = match work.layer.attention_kind {
+        GemmaDecodeAttentionKind::Full => None,
+        GemmaDecodeAttentionKind::Sliding => Some(
+            work.layer
+                .sliding_window
+                .ok_or_else(|| anyhow!("sliding attention layer is missing a sliding window"))?,
+        ),
+    };
+    let (artifact_store_roots, state) = init_decode_attention_artifact_work_state(
         artifact_store_roots,
-        query_ref,
-        cache_ref,
-        RasterTensorId::new(format!("{id_prefix}.output"))?,
-        id_prefix,
+        require_decode_heads_ref(work.q_heads_ref.clone(), "query heads ref")?,
+        attention_cache_ref,
+        RasterTensorId::new(format!(
+            "{}.attention_block.attention.scores.output",
+            work.output_prefix
+        ))?,
+        format!("{}.attention_block.attention.scores", work.output_prefix),
         attention_window,
-        kv_rows_per_tile
+        work.decode_state.attention_kv_rows_per_tile,
     )?;
-    let (artifact_store_roots, attention_state) = call_recur_tile!(
-        compute_next_decode_attention_head_with_roots,
-        (artifact_store_roots, attention_state)
-    )?;
-    call_tile!(
-        finalize_decode_attention_state_ref_with_roots,
+    Ok((
         artifact_store_roots,
-        attention_state
-    )
+        DecodeAttentionWork::Active {
+            work: DecodeLayerWork::Active(work),
+            state,
+        },
+    ))
 }
 
-#[sequence]
-fn combine_decode_attention_heads_ref_with_roots(
+#[tile(kind = recursive)]
+fn compute_next_decode_attention_work_head_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    heads_ref: RasterAttentionHeadsRef,
-    output_id: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, combine_state) =
+    attention_work: DecodeAttentionWork,
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeAttentionWork)> {
+    match attention_work {
+        DecodeAttentionWork::Skip(layer_work) => Ok((
+            true,
+            artifact_store_roots,
+            DecodeAttentionWork::Skip(layer_work),
+        )),
+        DecodeAttentionWork::Active { work, state } => {
+            let (done, artifact_store_roots, state) =
+                compute_next_decode_attention_artifact_work_head(artifact_store_roots, state)?;
+            Ok((
+                done,
+                artifact_store_roots,
+                DecodeAttentionWork::Active { work, state },
+            ))
+        }
+    }
+}
+
+#[tile]
+fn finalize_compute_decode_attention_scores_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    attention_work: DecodeAttentionWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    match attention_work {
+        DecodeAttentionWork::Skip(layer_work) => Ok((artifact_store_roots, layer_work)),
+        DecodeAttentionWork::Active { work, state } => {
+            let (artifact_store_roots, heads_ref) =
+                finalize_decode_attention_artifact_work_state(artifact_store_roots, state)?;
+            let mut work = active_decode_layer_work(work)?;
+            work.attention_heads_ref = Some(heads_ref);
+            Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+        }
+    }
+}
+
+#[tile]
+fn combine_decode_attention_heads_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (mut artifact_store_roots, mut combine_state) =
         crate::shared::raster_kernels::transformer::init_combine_heads_artifact_state_from_ref(
             artifact_store_roots,
-            heads_ref,
-            RasterTensorId::new(output_id)?,
+            require_decode_heads_ref(work.attention_heads_ref.clone(), "attention heads ref")?,
+            RasterTensorId::new(format!(
+                "{}.attention_block.attention.combined",
+                work.output_prefix
+            ))?,
         )?;
-    let mut artifact_store_roots = artifact_store_roots;
-    let mut combine_state = combine_state;
     loop {
         let (done, next_roots, next_state) =
             crate::shared::raster_kernels::transformer::compute_next_combine_heads_artifact_row(
@@ -789,201 +1403,766 @@ fn combine_decode_attention_heads_ref_with_roots(
             break;
         }
     }
-    crate::shared::raster_kernels::transformer::finalize_combine_heads_artifact_state_ref(
-        artifact_store_roots,
-        combine_state,
-    )
+    let (artifact_store_roots, output_ref) =
+        crate::shared::raster_kernels::transformer::finalize_combine_heads_artifact_state_ref(
+            artifact_store_roots,
+            combine_state,
+        )?;
+    work.attention_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
 }
 
-#[sequence]
-fn run_decode_mlp_block_with_roots(
+#[tile]
+fn init_project_decode_attention_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    rms_norm_eps: Acc,
-    projection_rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let residual_ref = input_ref.clone();
-    let norm_weights = call_tile!(
-        read_decode_layer_norm_weights,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::PreFeedForward
-    )?;
-    let (artifact_store_roots, normed_ref) = call_tile!(
-        rms_norm_decode_ref_with_roots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerAttentionOutput(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
         artifact_store_roots,
-        input_ref,
-        &norm_weights,
-        rms_norm_eps,
-        "decode MLP pre-feedforward RMSNorm",
-        format!("{output_prefix}.pre_ff_norm")
-    )?;
-    let (artifact_store_roots, gate_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        normed_ref.clone(),
-        source,
+        require_decode_activation_ref(work.attention_ref.clone(), "attention combined ref")?,
         DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
+            layer_idx: work.layer_idx,
+            matrix: GemmaDecodeLayerMatrixKind::Output,
+        },
+        work.layer.o_proj_shape.rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.attention_block.attention.o_proj", work.output_prefix),
+        None,
+    )?;
+    Ok((
+        artifact_store_roots,
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerAttentionOutput(
+                DecodeLayerWork::Active(work),
+            ),
+            state,
+        },
+    ))
+}
+
+#[tile]
+fn normalize_decode_attention_output_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let norm_weights = auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest {
+            layer_idx: work.layer_idx,
+            norm: GemmaDecodeLayerNormKind::PostAttention
+        }
+    )?;
+    let (artifact_store_roots, output_ref) = rms_norm_decode_ref(
+        artifact_store_roots,
+        require_decode_activation_ref(work.attention_output_ref.clone(), "attention output ref")?,
+        &norm_weights,
+        scalars.rms_norm_eps,
+        "decode layer RMSNorm",
+        format!("{}.attention_block.post_attention_norm", work.output_prefix),
+    )?;
+    work.attention_output_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn add_decode_attention_residual_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, output_ref) = add_decode_refs(
+        artifact_store_roots,
+        work.decode_state.current_activation_ref.clone(),
+        require_decode_activation_ref(work.attention_output_ref.clone(), "attention output ref")?,
+        format!("{}.attention_block.residual", work.output_prefix),
+    )?;
+    work.xs_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn normalize_decode_mlp_input_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let norm_weights = auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest {
+            layer_idx: work.layer_idx,
+            norm: GemmaDecodeLayerNormKind::PreFeedForward
+        }
+    )?;
+    let (artifact_store_roots, output_ref) = rms_norm_decode_ref(
+        artifact_store_roots,
+        require_decode_activation_ref(work.xs_ref.clone(), "attention residual ref")?,
+        &norm_weights,
+        scalars.rms_norm_eps,
+        "decode MLP pre-feedforward RMSNorm",
+        format!("{}.mlp.pre_ff_norm", work.output_prefix),
+    )?;
+    work.mlp_normed_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn init_project_decode_mlp_gate_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerMlpGate(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
+        artifact_store_roots,
+        require_decode_activation_ref(work.mlp_normed_ref.clone(), "MLP normed ref")?,
+        DecodeProjectionKind::LayerMatrix {
+            layer_idx: work.layer_idx,
             matrix: GemmaDecodeLayerMatrixKind::Gate,
         },
-        layer.gate_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.gate_proj"),
-        None
+        work.layer.gate_proj_shape.rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.mlp.gate_proj", work.output_prefix),
+        None,
     )?;
-    let (artifact_store_roots, gate_ref) = call_tile!(
-        gelu_decode_ref_with_roots,
+    Ok((
         artifact_store_roots,
-        gate_ref,
-        format!("{output_prefix}.gate_gelu")
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerMlpGate(DecodeLayerWork::Active(work)),
+            state,
+        },
+    ))
+}
+
+#[tile]
+fn gelu_decode_mlp_gate_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, output_ref) = gelu_decode_ref(
+        artifact_store_roots,
+        require_decode_activation_ref(work.mlp_gate_ref.clone(), "MLP gate ref")?,
+        format!("{}.mlp.gate_gelu", work.output_prefix),
     )?;
-    let (artifact_store_roots, up_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
+    work.mlp_gate_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn init_project_decode_mlp_up_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerMlpUp(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
         artifact_store_roots,
-        normed_ref,
-        source,
+        require_decode_activation_ref(work.mlp_normed_ref.clone(), "MLP normed ref")?,
         DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
+            layer_idx: work.layer_idx,
             matrix: GemmaDecodeLayerMatrixKind::Up,
         },
-        layer.up_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.up_proj"),
-        None
+        work.layer.up_proj_shape.rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.mlp.up_proj", work.output_prefix),
+        None,
     )?;
-    let (artifact_store_roots, ff_hidden_ref) = call_tile!(
-        mul_decode_refs_with_roots,
+    Ok((
         artifact_store_roots,
-        gate_ref,
-        up_ref,
-        format!("{output_prefix}.ff_hidden")
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerMlpUp(DecodeLayerWork::Active(work)),
+            state,
+        },
+    ))
+}
+
+#[tile]
+fn multiply_decode_mlp_hidden_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, output_ref) = mul_decode_refs(
+        artifact_store_roots,
+        require_decode_activation_ref(work.mlp_gate_ref.clone(), "MLP gate ref")?,
+        require_decode_activation_ref(work.mlp_up_ref.clone(), "MLP up ref")?,
+        format!("{}.mlp.ff_hidden", work.output_prefix),
     )?;
-    let (artifact_store_roots, ff_out_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
+    work.mlp_hidden_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn init_project_decode_mlp_down_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerMlpDown(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
         artifact_store_roots,
-        ff_hidden_ref,
-        source,
+        require_decode_activation_ref(work.mlp_hidden_ref.clone(), "MLP hidden ref")?,
         DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
+            layer_idx: work.layer_idx,
             matrix: GemmaDecodeLayerMatrixKind::Down,
         },
-        layer.down_proj_shape.rows,
-        projection_rows_per_tile,
-        format!("{output_prefix}.down_proj"),
-        None
+        work.layer.down_proj_shape.rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.mlp.down_proj", work.output_prefix),
+        None,
     )?;
-    let norm_weights = call_tile!(
-        read_decode_layer_norm_weights,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::PostFeedForward
-    )?;
-    let (artifact_store_roots, ff_out_ref) = call_tile!(
-        rms_norm_decode_ref_with_roots,
+    Ok((
         artifact_store_roots,
-        ff_out_ref,
-        &norm_weights,
-        rms_norm_eps,
-        "decode MLP post-feedforward RMSNorm",
-        format!("{output_prefix}.post_ff_norm")
-    )?;
-    call_tile!(
-        add_decode_refs_with_roots,
-        artifact_store_roots,
-        residual_ref,
-        ff_out_ref,
-        format!("{output_prefix}.residual")
-    )
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerMlpDown(DecodeLayerWork::Active(work)),
+            state,
+        },
+    ))
 }
 
-#[sequence]
-fn run_decode_ple_block_with_roots(
+#[tile]
+fn normalize_decode_mlp_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
-    input_ref: RasterActivationSequenceRef,
-    per_layer_input_ref: RasterActivationSequenceRef,
+    layer_work: DecodeLayerWork,
     source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer: &GemmaDecodeLayerMetadata,
-    rms_norm_eps: Acc,
-    projection_rows_per_tile: usize,
-    output_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let residual_ref = input_ref.clone();
-    let (artifact_store_roots, gated_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        input_ref,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let scalars = auth_read!(
         source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let norm_weights = auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest {
+            layer_idx: work.layer_idx,
+            norm: GemmaDecodeLayerNormKind::PostFeedForward
+        }
+    )?;
+    let (artifact_store_roots, output_ref) = rms_norm_decode_ref(
+        artifact_store_roots,
+        require_decode_activation_ref(work.mlp_out_ref.clone(), "MLP output ref")?,
+        &norm_weights,
+        scalars.rms_norm_eps,
+        "decode MLP post-feedforward RMSNorm",
+        format!("{}.mlp.post_ff_norm", work.output_prefix),
+    )?;
+    work.mlp_out_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn add_decode_mlp_residual_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let (artifact_store_roots, output_ref) = add_decode_refs(
+        artifact_store_roots,
+        require_decode_activation_ref(work.xs_ref.clone(), "attention residual ref")?,
+        require_decode_activation_ref(work.mlp_out_ref.clone(), "MLP output ref")?,
+        format!("{}.mlp.residual", work.output_prefix),
+    )?;
+    work.xs_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn init_project_decode_ple_gate_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerPleGate(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    if work.per_layer_input_ref.is_none() {
+        return Ok((
+            artifact_store_roots,
+            DecodeProjectionWork::Skip {
+                continuation: DecodeProjectionContinuation::LayerPleGate(DecodeLayerWork::Active(
+                    work,
+                )),
+            },
+        ));
+    }
+    let projection_rows = work
+        .layer
+        .ple_input_gate_shape
+        .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing PLE input gate shape"))?
+        .rows;
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
+        artifact_store_roots,
+        require_decode_activation_ref(work.xs_ref.clone(), "MLP residual ref")?,
         DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
+            layer_idx: work.layer_idx,
             matrix: GemmaDecodeLayerMatrixKind::PleInputGate,
         },
-        call_tile!(decode_ple_input_gate_rows, layer)?,
-        projection_rows_per_tile,
-        format!("{output_prefix}.input_gate"),
-        None
+        projection_rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.ple.input_gate", work.output_prefix),
+        None,
     )?;
-    let (artifact_store_roots, gated_ref) = call_tile!(
-        gelu_decode_ref_with_roots,
+    Ok((
         artifact_store_roots,
-        gated_ref,
-        format!("{output_prefix}.input_gate_gelu")
-    )?;
-    let (artifact_store_roots, gated_ref) = call_tile!(
-        mul_decode_refs_with_roots,
-        artifact_store_roots,
-        gated_ref,
-        per_layer_input_ref,
-        format!("{output_prefix}.gated")
-    )?;
-    let (artifact_store_roots, projected_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        gated_ref,
-        source,
-        DecodeProjectionKind::LayerMatrix {
-            layer_idx: layer.layer_idx,
-            matrix: GemmaDecodeLayerMatrixKind::PleLayerProjection,
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerPleGate(DecodeLayerWork::Active(work)),
+            state,
         },
-        call_tile!(decode_ple_layer_projection_rows, layer)?,
-        projection_rows_per_tile,
-        format!("{output_prefix}.layer_projection"),
-        None
-    )?;
-    let norm_weights = call_tile!(
-        read_decode_layer_norm_weights,
-        source,
-        layer.layer_idx,
-        GemmaDecodeLayerNormKind::PlePostInput
-    )?;
-    let (artifact_store_roots, projected_ref) = call_tile!(
-        rms_norm_decode_ref_with_roots,
-        artifact_store_roots,
-        projected_ref,
-        &norm_weights,
-        rms_norm_eps,
-        "decode PLE post-input RMSNorm",
-        format!("{output_prefix}.post_input_norm")
-    )?;
-    call_tile!(
-        add_decode_refs_with_roots,
-        artifact_store_roots,
-        residual_ref,
-        projected_ref,
-        format!("{output_prefix}.residual")
-    )
+    ))
 }
 
-#[sequence]
-pub fn run(
+#[tile]
+fn gelu_decode_ple_gate_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    if work.per_layer_input_ref.is_none() {
+        return Ok((artifact_store_roots, DecodeLayerWork::Active(work)));
+    }
+    let (artifact_store_roots, output_ref) = gelu_decode_ref(
+        artifact_store_roots,
+        require_decode_activation_ref(work.ple_gate_ref.clone(), "PLE gate ref")?,
+        format!("{}.ple.input_gate_gelu", work.output_prefix),
+    )?;
+    work.ple_gate_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn multiply_decode_ple_input_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let Some(per_layer_input_ref) = work.per_layer_input_ref.clone() else {
+        return Ok((artifact_store_roots, DecodeLayerWork::Active(work)));
+    };
+    let (artifact_store_roots, output_ref) = mul_decode_refs(
+        artifact_store_roots,
+        require_decode_activation_ref(work.ple_gate_ref.clone(), "PLE gate ref")?,
+        per_layer_input_ref,
+        format!("{}.ple.gated", work.output_prefix),
+    )?;
+    work.ple_gate_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn init_project_decode_ple_output_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Skip {
+                    continuation: DecodeProjectionContinuation::LayerPleOutput(layer_work),
+                },
+            ));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    if work.per_layer_input_ref.is_none() {
+        return Ok((
+            artifact_store_roots,
+            DecodeProjectionWork::Skip {
+                continuation: DecodeProjectionContinuation::LayerPleOutput(
+                    DecodeLayerWork::Active(work),
+                ),
+            },
+        ));
+    }
+    let projection_rows = work
+        .layer
+        .ple_layer_projection_shape
+        .ok_or_else(|| {
+            anyhow!("Gemma decode layer metadata is missing PLE layer projection shape")
+        })?
+        .rows;
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
+        artifact_store_roots,
+        require_decode_activation_ref(work.ple_gate_ref.clone(), "PLE gated input ref")?,
+        DecodeProjectionKind::LayerMatrix {
+            layer_idx: work.layer_idx,
+            matrix: GemmaDecodeLayerMatrixKind::PleLayerProjection,
+        },
+        projection_rows,
+        work.decode_state.projection_rows_per_tile,
+        format!("{}.ple.layer_projection", work.output_prefix),
+        None,
+    )?;
+    Ok((
+        artifact_store_roots,
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::LayerPleOutput(DecodeLayerWork::Active(
+                work,
+            )),
+            state,
+        },
+    ))
+}
+
+#[tile]
+fn normalize_decode_ple_output_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    if work.per_layer_input_ref.is_none() {
+        return Ok((artifact_store_roots, DecodeLayerWork::Active(work)));
+    }
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let norm_weights = auth_read!(
+        source,
+        GemmaDecodeLayerNormWeightsRequest {
+            layer_idx: work.layer_idx,
+            norm: GemmaDecodeLayerNormKind::PlePostInput
+        }
+    )?;
+    let (artifact_store_roots, output_ref) = rms_norm_decode_ref(
+        artifact_store_roots,
+        require_decode_activation_ref(work.ple_projected_ref.clone(), "PLE projected ref")?,
+        &norm_weights,
+        scalars.rms_norm_eps,
+        "decode PLE post-input RMSNorm",
+        format!("{}.ple.post_input_norm", work.output_prefix),
+    )?;
+    work.ple_projected_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn add_decode_ple_residual_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    if work.per_layer_input_ref.is_none() {
+        return Ok((artifact_store_roots, DecodeLayerWork::Active(work)));
+    }
+    let (artifact_store_roots, output_ref) = add_decode_refs(
+        artifact_store_roots,
+        require_decode_activation_ref(work.xs_ref.clone(), "MLP residual ref")?,
+        require_decode_activation_ref(work.ple_projected_ref.clone(), "PLE projected ref")?,
+        format!("{}.ple.residual", work.output_prefix),
+    )?;
+    work.xs_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn scale_decode_layer_output_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    let mut work = match layer_work {
+        DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
+        DecodeLayerWork::Active(work) => work,
+    };
+    let input_ref = require_decode_activation_ref(work.xs_ref.clone(), "layer output ref")?;
+    let scalars = auth_read!(
+        source,
+        GemmaDecodeLayerScalarsRequest {
+            layer_idx: work.layer_idx
+        }
+    )?;
+    let (artifact_store_roots, output_ref) = scale_decode_ref(
+        artifact_store_roots,
+        input_ref,
+        scalars.layer_scalar,
+        format!("{}.scaled", work.output_prefix),
+    )?;
+    work.layer_output_ref = Some(output_ref);
+    Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+}
+
+#[tile]
+fn read_decode_selected_token(
+    artifact_store_roots: &RasterArtifactStoreRoots,
+    selected_token_ref: &RasterSelectedTokenRef,
+) -> Result<u32> {
+    read_selected_token_from_roots(artifact_store_roots, selected_token_ref)
+}
+
+#[tile]
+fn init_decode_transition_state_refs_from_input_roots(
+    input_roots: RasterDecodeTransitionInputRoots,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+    if input_roots.decode_transition_source_root != source.static_source_root() {
+        bail!(
+            "raster decode transition source root {} does not match input source root {}",
+            source.static_source_root(),
+            input_roots.decode_transition_source_root
+        );
+    }
+    let next_token = read_selected_token_from_roots(
+        &input_roots.artifact_store_roots,
+        &input_roots.selected_token_ref,
+    )?;
+    validate_projection_rows_per_tile(input_roots.raster_sizing.projection_rows_per_tile)?;
+    validate_attention_kv_rows_per_tile(input_roots.raster_sizing.attention_kv_rows_per_tile)?;
+    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    if metadata.layer_count == 0 {
+        bail!("transformer decode requires at least one layer");
+    }
+    if input_roots.transformer_decode_state.layer_caches.len() != metadata.layer_count {
+        bail!(
+            "transformer decode cache count mismatch: {} vs {}",
+            input_roots.transformer_decode_state.layer_caches.len(),
+            metadata.layer_count
+        );
+    }
+
+    let embedded = RasterActivationRow::from_acts(auth_read!(
+        source,
+        GemmaDecodeEmbeddingRowRequest {
+            token_id: next_token
+        },
+    )?);
+    if embedded.width() != metadata.embedding_width {
+        bail!(
+            "decode embedded token width {}, expected {}",
+            embedded.width(),
+            metadata.embedding_width
+        );
+    }
+    let mut artifact_store_roots = input_roots.artifact_store_roots;
+    let (roots, decode_input_ref) = insert_decode_activation_row_with_roots(
+        &artifact_store_roots,
+        format!(
+            "{}.input.selected_token_embedding",
+            input_roots.output_source_prefix
+        ),
+        &embedded,
+    )?;
+    artifact_store_roots = roots;
+    let mut original_layer_caches =
+        Vec::with_capacity(input_roots.transformer_decode_state.layer_caches.len());
+    for (layer_idx, cache) in input_roots
+        .transformer_decode_state
+        .layer_caches
+        .iter()
+        .enumerate()
+    {
+        let cache = raster_cache_from_layer_cache(cache)?;
+        let (roots, cache_slot) = register_decode_layer_cache_with_roots(
+            &artifact_store_roots,
+            &format!("{}.original.cache", input_roots.output_source_prefix),
+            layer_idx,
+            cache,
+        )?;
+        artifact_store_roots = roots;
+        original_layer_caches.push(cache_slot);
+    }
+
+    Ok((
+        artifact_store_roots.clone(),
+        DecodeTransitionRasterState {
+            artifact_store_roots,
+            decode_input_ref: decode_input_ref.clone(),
+            current_activation_ref: decode_input_ref,
+            next_token,
+            position: input_roots.transformer_decode_state.position,
+            token_count: input_roots.transformer_decode_state.token_count,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            original_layer_caches,
+            updated_layer_caches: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+            projection_rows_per_tile: input_roots.raster_sizing.projection_rows_per_tile,
+            attention_kv_rows_per_tile: input_roots.raster_sizing.attention_kv_rows_per_tile,
+            output_source_prefix: input_roots.output_source_prefix,
+        },
+    ))
+}
+
+#[tile]
+fn init_decode_transition_state_from_input_refs(
+    input_roots: RasterDecodeTransitionInputRefs,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+    if input_roots.decode_transition_source_root != source.static_source_root() {
+        bail!(
+            "raster decode transition source root {} does not match input source root {}",
+            source.static_source_root(),
+            input_roots.decode_transition_source_root
+        );
+    }
+    let next_token = read_selected_token_from_roots(
+        &input_roots.artifact_store_roots,
+        &input_roots.selected_token_ref,
+    )?;
+    validate_projection_rows_per_tile(input_roots.raster_sizing.projection_rows_per_tile)?;
+    validate_attention_kv_rows_per_tile(input_roots.raster_sizing.attention_kv_rows_per_tile)?;
+    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    if metadata.layer_count == 0 {
+        bail!("transformer decode requires at least one layer");
+    }
+    if input_roots.layer_caches.len() != metadata.layer_count {
+        bail!(
+            "transformer decode cache count mismatch: {} vs {}",
+            input_roots.layer_caches.len(),
+            metadata.layer_count
+        );
+    }
+
+    let embedded = RasterActivationRow::from_acts(auth_read!(
+        source,
+        GemmaDecodeEmbeddingRowRequest {
+            token_id: next_token
+        },
+    )?);
+    if embedded.width() != metadata.embedding_width {
+        bail!(
+            "decode embedded token width {}, expected {}",
+            embedded.width(),
+            metadata.embedding_width
+        );
+    }
+    let (artifact_store_roots, decode_input_ref) = insert_decode_activation_row_with_roots(
+        &input_roots.artifact_store_roots,
+        format!(
+            "{}.input.selected_token_embedding",
+            input_roots.output_source_prefix
+        ),
+        &embedded,
+    )?;
+
+    Ok((
+        artifact_store_roots.clone(),
+        DecodeTransitionRasterState {
+            artifact_store_roots,
+            decode_input_ref: decode_input_ref.clone(),
+            current_activation_ref: decode_input_ref,
+            next_token,
+            position: input_roots.position,
+            token_count: input_roots.token_count,
+            next_layer_idx: 0,
+            layer_count: metadata.layer_count,
+            original_layer_caches: input_roots.layer_caches,
+            updated_layer_caches: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_sha256s: Vec::with_capacity(metadata.layer_count),
+            completed_layer_output_det_sha256s: Vec::with_capacity(metadata.layer_count),
+            projection_rows_per_tile: input_roots.raster_sizing.projection_rows_per_tile,
+            attention_kv_rows_per_tile: input_roots.raster_sizing.attention_kv_rows_per_tile,
+            output_source_prefix: input_roots.output_source_prefix,
+        },
+    ))
+}
+
+#[tile]
+fn init_decode_transition_run_input_roots(
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
     source: &AuthenticatedGemmaDecodeTransitionSource,
     raster_sizing: RasterSizingControls,
-) -> Result<TransformerDecodeStepResult> {
+) -> Result<RasterDecodeTransitionInputRoots> {
     ArtifactIo::reset_store();
     let roots = ArtifactIo::export_store_roots();
     let output_source_prefix = format!(
@@ -995,144 +2174,21 @@ pub fn run(
         format!("{output_source_prefix}.input.selected_token"),
         next_token,
     )?;
-    let output = main(
-        RasterDecodeTransitionInputRoots {
-            artifact_store_roots,
-            transformer_decode_state,
-            selected_token_ref,
-            decode_transition_source_root: source.static_source_root(),
-            output_source_prefix,
-            raster_sizing,
-        },
-        source,
-    )?;
-    Ok(output.transition_result)
-}
-
-#[sequence]
-pub fn main_state_refs(
-    input_roots: RasterDecodeTransitionInputRefs,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-) -> Result<RasterDecodeTransitionOutputStateRefs> {
-    if input_roots.decode_transition_source_root != source.static_source_root() {
-        bail!(
-            "raster decode transition source root {} does not match input source root {}",
-            source.static_source_root(),
-            input_roots.decode_transition_source_root
-        );
-    }
-    let next_token = call_tile!(
-        read_decode_selected_token,
-        &input_roots.artifact_store_roots,
-        &input_roots.selected_token_ref
-    )?;
-    let (_artifact_store_roots, decode_state) = call_tile!(
-        init_decode_transition_state_from_refs_with_roots,
-        input_roots.artifact_store_roots,
-        input_roots.position,
-        input_roots.token_count,
-        input_roots.layer_caches,
-        next_token,
-        source,
-        input_roots.raster_sizing,
-        input_roots.output_source_prefix
-    )?;
-    let (artifact_store_roots, decode_state) = call_recur_seq!(
-        compute_next_decode_layer_with_roots,
-        (_artifact_store_roots, decode_state),
-        source
-    )?;
-    let final_hidden_state_ref = decode_state.current_activation_ref.clone();
-    let (artifact_store_roots, normalized_ref) = call_tile!(
-        normalize_decode_final_position_ref_with_roots,
+    Ok(RasterDecodeTransitionInputRoots {
         artifact_store_roots,
-        final_hidden_state_ref.clone(),
-        source,
-        format!("{}.final_norm", decode_state.output_source_prefix)
-    )?;
-    let (artifact_store_roots, logits_ref) = call_seq!(
-        project_ref_with_decode_source_with_roots,
-        artifact_store_roots,
-        normalized_ref,
-        source,
-        DecodeProjectionKind::FinalLogits,
-        call_tile!(decode_projection_row_count, source)?,
-        input_roots.raster_sizing.projection_rows_per_tile,
-        format!("{}.final_logits", decode_state.output_source_prefix),
-        call_tile!(decode_final_logit_softcap_bits, source)?
-    )?;
-    let (layer_caches, position, token_count) =
-        call_tile!(finalize_decode_layer_refs_with_roots, decode_state)?;
-    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
-    let logit_count = match (row_count, width) {
-        (rows, 1) => rows,
-        (1, cols) => cols,
-        _ => bail!("raster decode transition logits shape {row_count}x{width} must be Nx1 or 1xN"),
-    };
-    Ok(RasterDecodeTransitionOutputStateRefs {
-        artifact_store_roots,
-        final_hidden_state_ref,
-        logits_ref,
-        logit_count,
-        layer_caches,
-        position,
-        token_count,
+        transformer_decode_state,
+        selected_token_ref,
+        decode_transition_source_root: source.static_source_root(),
+        output_source_prefix,
+        raster_sizing,
     })
 }
 
-#[sequence]
-fn rms_norm_decode_layer_row(
-    row: &RasterActivationRow,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    norm: GemmaDecodeLayerNormKind,
-) -> Result<RasterActivationRow> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
-    call_tile!(
-        rms_norm_decode_row,
-        row,
-        &norm_weights,
-        scalars.rms_norm_eps,
-        "decode layer RMSNorm"
-    )
-}
-
-#[sequence]
-fn rms_norm_decode_attention_heads(
-    heads: &RasterAttentionHeadSequence,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-    norm: GemmaDecodeLayerNormKind,
-) -> Result<RasterAttentionHeadSequence> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    let norm_weights = call_tile!(read_decode_layer_norm_weights, source, layer_idx, norm)?;
-    call_tile!(
-        rms_norm_decode_heads,
-        heads,
-        &norm_weights,
-        scalars.rms_norm_eps
-    )
-}
-
-#[sequence]
-fn value_rms_norm_decode_attention_heads(
-    heads: &RasterAttentionHeadSequence,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
-    layer_idx: usize,
-) -> Result<RasterAttentionHeadSequence> {
-    let scalars = call_tile!(read_decode_layer_scalars, source, layer_idx)?;
-    call_tile!(value_rms_norm_decode_heads, heads, scalars.rms_norm_eps)
-}
-
-// Raster execution tiles, ordered by the sequence calls that reach them.
-
 #[tile]
-fn read_decode_selected_token(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    selected_token_ref: &RasterSelectedTokenRef,
-) -> Result<u32> {
-    read_selected_token_from_roots(artifact_store_roots, selected_token_ref)
+fn finalize_decode_transition_run_output(
+    output: RasterDecodeTransitionOutputRefs,
+) -> Result<TransformerDecodeStepResult> {
+    Ok(output.transition_result)
 }
 
 #[tile]
@@ -1235,6 +2291,189 @@ fn normalize_decode_final_position_ref_with_roots(
 }
 
 #[tile]
+fn init_decode_transition_final_work_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    decode_state: DecodeTransitionRasterState,
+) -> Result<DecodeTransitionFinalWork> {
+    if decode_state.next_layer_idx != decode_state.layer_count {
+        bail!(
+            "raster decode finalized after {} layers, expected {}",
+            decode_state.next_layer_idx,
+            decode_state.layer_count
+        );
+    }
+    if decode_state.updated_layer_caches.len() != decode_state.layer_count {
+        bail!(
+            "raster decode stored {} layer caches, expected {}",
+            decode_state.updated_layer_caches.len(),
+            decode_state.layer_count
+        );
+    }
+    Ok(DecodeTransitionFinalWork {
+        artifact_store_roots,
+        final_hidden_state_ref: decode_state.current_activation_ref,
+        normalized_ref: None,
+        logits_ref: None,
+        output_source_prefix: decode_state.output_source_prefix,
+        projection_rows_per_tile: decode_state.projection_rows_per_tile,
+        layer_caches: decode_state.updated_layer_caches,
+        position: decode_state.position,
+        token_count: decode_state.token_count,
+    })
+}
+
+#[tile]
+fn normalize_decode_final_work_with_roots(
+    mut final_work: DecodeTransitionFinalWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<DecodeTransitionFinalWork> {
+    let final_hidden_state = read_activation_row_from_ref_roots(
+        &final_work.artifact_store_roots,
+        &final_work.final_hidden_state_ref,
+    )?;
+    let norm_weights = auth_read!(source, GemmaDecodeFinalNormWeightsRequest)?;
+    let scalars = auth_read!(source, GemmaDecodeFinalScalarsRequest)?;
+    let normalized = first_row(
+        rms_norm_sequence(
+            &RasterActivationSequence::from_rows(vec![final_hidden_state]),
+            Some(&norm_weights),
+            Some(scalars.rms_norm_eps),
+        )?,
+        "deterministic decode final RMSNorm",
+    )?;
+    let (artifact_store_roots, normalized_ref) = insert_decode_activation_row_with_roots(
+        &final_work.artifact_store_roots,
+        format!("{}.final_norm", final_work.output_source_prefix),
+        &normalized,
+    )?;
+    final_work.artifact_store_roots = artifact_store_roots;
+    final_work.normalized_ref = Some(normalized_ref);
+    Ok(final_work)
+}
+
+#[tile]
+fn init_decode_final_logits_projection_work(
+    final_work: DecodeTransitionFinalWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    let normalized_ref = final_work
+        .normalized_ref
+        .clone()
+        .ok_or_else(|| anyhow!("decode final logits projection requires normalized ref"))?;
+    let projection_rows = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?.projection_rows;
+    let softcap_bits = auth_read!(source, GemmaDecodeFinalScalarsRequest)?
+        .final_logit_softcapping
+        .map(Act::to_bits);
+    let output_source_name = format!("{}.final_logits", final_work.output_source_prefix);
+    let projection_rows_per_tile = final_work.projection_rows_per_tile;
+    let artifact_store_roots = final_work.artifact_store_roots.clone();
+    let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
+        artifact_store_roots,
+        normalized_ref,
+        DecodeProjectionKind::FinalLogits,
+        projection_rows,
+        projection_rows_per_tile,
+        output_source_name,
+        softcap_bits,
+    )?;
+    Ok((
+        artifact_store_roots,
+        DecodeProjectionWork::Active {
+            continuation: DecodeProjectionContinuation::FinalLogits(final_work),
+            state,
+        },
+    ))
+}
+
+#[tile]
+fn finalize_decode_final_logits_projection_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    continuation: DecodeProjectionContinuation,
+) -> Result<DecodeTransitionFinalWork> {
+    match continuation {
+        DecodeProjectionContinuation::FinalLogits(mut final_work) => {
+            final_work.artifact_store_roots = artifact_store_roots;
+            if final_work.logits_ref.is_none() {
+                bail!("decode final logits projection did not produce logits ref");
+            }
+            Ok(final_work)
+        }
+        _ => bail!("decode final logits projection returned unexpected continuation"),
+    }
+}
+
+#[tile]
+fn finalize_decode_transition_output_refs(
+    final_work: DecodeTransitionFinalWork,
+) -> Result<RasterDecodeTransitionOutputRefs> {
+    let current_activation = read_activation_row_from_ref_roots(
+        &final_work.artifact_store_roots,
+        &final_work.final_hidden_state_ref,
+    )?;
+    let det_row = current_activation.acts();
+    let values = vec![current_activation.to_f32_values()];
+    let internal = InternalActivationSequence::from_det_values(vec![det_row.clone()]);
+    let mut activation_state = ActivationSequence::from_internal(
+        internal,
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
+    );
+    activation_state.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&[det_row]),
+    );
+    let logits_ref = final_work
+        .logits_ref
+        .ok_or_else(|| anyhow!("decode transition output requires logits ref"))?;
+    let layer_caches = final_work
+        .layer_caches
+        .iter()
+        .map(|cache| {
+            materialize_decode_layer_cache_from_roots(&final_work.artifact_store_roots, cache)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(layer_cache_from_raster)
+        .collect();
+    let transition_result = finalize_decode_transition_result_values_from_roots(
+        &final_work.artifact_store_roots,
+        logits_ref,
+        TransformerDecodeState {
+            layer_caches,
+            position: final_work.position,
+            token_count: final_work.token_count,
+        },
+        activation_state,
+    )?;
+    Ok(RasterDecodeTransitionOutputRefs {
+        artifact_store_roots: final_work.artifact_store_roots,
+        transition_result,
+    })
+}
+
+#[tile]
+fn finalize_decode_transition_output_state_refs(
+    final_work: DecodeTransitionFinalWork,
+) -> Result<RasterDecodeTransitionOutputStateRefs> {
+    let logits_ref = final_work
+        .logits_ref
+        .ok_or_else(|| anyhow!("decode transition state output requires logits ref"))?;
+    let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
+    let logit_count = match (row_count, width) {
+        (rows, 1) => rows,
+        (1, cols) => cols,
+        _ => bail!("raster decode transition logits shape {row_count}x{width} must be Nx1 or 1xN"),
+    };
+    Ok(RasterDecodeTransitionOutputStateRefs {
+        artifact_store_roots: final_work.artifact_store_roots,
+        final_hidden_state_ref: final_work.final_hidden_state_ref,
+        logits_ref,
+        logit_count,
+        layer_caches: final_work.layer_caches,
+        position: final_work.position + 1,
+        token_count: final_work.token_count + 1,
+    })
+}
+
+#[tile]
 fn decode_projection_row_count(source: &AuthenticatedGemmaDecodeTransitionSource) -> Result<usize> {
     Ok(auth_read!(source, GemmaDecodeTransitionMetadataRequest)?.projection_rows)
 }
@@ -1301,26 +2540,12 @@ fn finalize_decode_transition_result_from_roots(
     transformer_decode_state: TransformerDecodeState,
     final_hidden_state: ActivationSequence,
 ) -> Result<TransformerDecodeStepResult> {
-    let logits_row = read_activation_row_from_ref_roots(artifact_store_roots, &logits_ref)?;
-    let det_logits = logits_row.acts();
-    let internal_logits = InternalLogits::from_det_values(det_logits.clone());
-    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
-        internal_logits.as_f32_slice(),
-    );
-    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
-    );
-
-    Ok(TransformerDecodeStepResult {
-        transformer_decode_state: TransformerDecodeState {
-            layer_caches: transformer_decode_state.layer_caches,
-            position: transformer_decode_state.position + 1,
-            token_count: transformer_decode_state.token_count + 1,
-        },
-        activation_state: final_hidden_state,
-        prefill_logits,
-    })
+    finalize_decode_transition_result_values_from_roots(
+        artifact_store_roots,
+        logits_ref,
+        transformer_decode_state,
+        final_hidden_state,
+    )
 }
 
 #[tile]
@@ -1347,39 +2572,110 @@ pub(in super::super) fn prepare_next_decode_layer_context(
 }
 
 #[tile]
+fn init_next_decode_layer_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    decode_state: DecodeTransitionRasterState,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    if decode_state.next_layer_idx >= decode_state.layer_count {
+        return Ok((
+            artifact_store_roots,
+            DecodeLayerWork::Complete(decode_state),
+        ));
+    }
+    let layer_idx = decode_state.next_layer_idx;
+    let layer = auth_read!(source, GemmaDecodeLayerMetadataRequest { layer_idx })?;
+    let cache_slot = decode_state
+        .original_layer_caches
+        .get(layer_idx)
+        .cloned()
+        .ok_or_else(|| anyhow!("transformer decode cache {layer_idx} missing"))?;
+    let donor_cache_slot =
+        resolve_decode_donor_cache_slot(&decode_state.updated_layer_caches, layer_idx, &layer)?
+            .cloned();
+    let _trace = crate::trace::trace_scope(format!(
+        "decode.layer.det layer={} token={} position={} attention={:?} ple={} donor={:?}",
+        layer_idx,
+        decode_state.next_token,
+        decode_state.position,
+        layer.attention_kind,
+        layer.has_ple,
+        layer.kv_shared_layer_index,
+    ));
+    Ok((
+        artifact_store_roots,
+        DecodeLayerWork::Active(DecodeActiveLayerWork {
+            output_prefix: format!("{}.layer_{}", decode_state.output_source_prefix, layer_idx),
+            decode_state,
+            layer_idx,
+            layer,
+            cache_slot,
+            donor_cache_slot,
+            per_layer_input_ref: None,
+            attention_normed_ref: None,
+            q_projected_ref: None,
+            k_projected_ref: None,
+            v_projected_ref: None,
+            q_heads_ref: None,
+            k_heads_ref: None,
+            v_heads_ref: None,
+            attention_heads_ref: None,
+            attention_ref: None,
+            attention_output_ref: None,
+            xs_ref: None,
+            mlp_normed_ref: None,
+            mlp_gate_ref: None,
+            mlp_up_ref: None,
+            mlp_hidden_ref: None,
+            mlp_out_ref: None,
+            ple_gate_ref: None,
+            ple_projected_ref: None,
+            layer_output_ref: None,
+            updated_cache: None,
+        }),
+    ))
+}
+
+#[tile]
+fn finalize_next_decode_layer_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+    match layer_work {
+        DecodeLayerWork::Complete(decode_state) => Ok((true, artifact_store_roots, decode_state)),
+        DecodeLayerWork::Active(work) => {
+            let layer_output_ref = work
+                .layer_output_ref
+                .ok_or_else(|| anyhow!("decode layer work finalized without layer output ref"))?;
+            let updated_cache = work
+                .updated_cache
+                .ok_or_else(|| anyhow!("decode layer work finalized without updated cache"))?;
+            update_decode_layer_state_refs(
+                artifact_store_roots,
+                work.decode_state,
+                work.layer_idx,
+                layer_output_ref,
+                updated_cache,
+            )
+        }
+    }
+}
+
+#[tile]
 fn update_decode_layer_state_refs_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut decode_state: DecodeTransitionRasterState,
+    decode_state: DecodeTransitionRasterState,
     layer_idx: usize,
     layer_output_ref: RasterActivationSequenceRef,
     updated_cache: DecodeLayerCacheSlot,
 ) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    if layer_idx != decode_state.next_layer_idx {
-        bail!(
-            "cannot update decode layer {layer_idx} while next layer is {}",
-            decode_state.next_layer_idx
-        );
-    }
-    let layer_output =
-        read_activation_row_from_ref_roots(&artifact_store_roots, &layer_output_ref)?;
-    decode_state.artifact_store_roots = artifact_store_roots.clone();
-    decode_state.current_activation_ref = layer_output_ref;
-    decode_state.updated_layer_caches.push(updated_cache);
-    let current_activation_values = layer_output.to_f32_values();
-    let current_activation_acts = layer_output.acts();
-    decode_state.completed_layer_output_sha256s.push(
-        crate::shared::numerics::transformer_kernels::build_vector_commitment(
-            &current_activation_values,
-        ),
-    );
-    decode_state.completed_layer_output_det_sha256s.push(Some(
-        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
-            &current_activation_acts,
-        ),
-    ));
-    trace_decode_layer_checkpoint_with_roots(&artifact_store_roots, &decode_state, layer_idx)?;
-    decode_state.next_layer_idx += 1;
-    Ok((false, artifact_store_roots, decode_state))
+    update_decode_layer_state_refs(
+        artifact_store_roots,
+        decode_state,
+        layer_idx,
+        layer_output_ref,
+        updated_cache,
+    )
 }
 
 #[tile]
@@ -1388,6 +2684,173 @@ fn decode_ple_input_gate_rows(layer: &GemmaDecodeLayerMetadata) -> Result<usize>
         .ple_input_gate_shape
         .ok_or_else(|| anyhow!("Gemma decode layer metadata is missing PLE input gate shape"))?
         .rows)
+}
+
+#[tile]
+fn init_decode_ple_input_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_work: DecodeLayerWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(RasterArtifactStoreRoots, DecodePleInputWork)> {
+    let work = match layer_work {
+        DecodeLayerWork::Complete(_) => {
+            return Ok((artifact_store_roots, DecodePleInputWork::Skip(layer_work)));
+        }
+        DecodeLayerWork::Active(work) => work,
+    };
+    if !work.layer.has_ple {
+        return Ok((
+            artifact_store_roots,
+            DecodePleInputWork::Skip(DecodeLayerWork::Active(work)),
+        ));
+    }
+    let scalars = auth_read!(source, GemmaDecodePleScalarsRequest)?;
+    let norm_weights = auth_read!(source, GemmaDecodePleProjectionNormWeightsRequest)?;
+    let embedded = RasterActivationRow::from_acts(auth_read!(
+        source,
+        GemmaDecodePleTokenEmbeddingRowRequest {
+            layer_idx: work.layer.layer_idx,
+            token_id: work.decode_state.next_token,
+        },
+    )?);
+    let embedded = scale_row(&embedded, Some(scalars.embedding_scale))?;
+    let output_prefix = format!("{}.ple.input", work.output_prefix);
+    let (artifact_store_roots, embedded_ref) = insert_decode_activation_row_with_roots(
+        &artifact_store_roots,
+        format!("{output_prefix}.token_embedding"),
+        &embedded,
+    )?;
+    Ok((
+        artifact_store_roots,
+        DecodePleInputWork::Active {
+            work,
+            scalars,
+            norm_weights,
+            embedded_ref,
+            projected_ref: None,
+            output_prefix,
+        },
+    ))
+}
+
+#[tile]
+fn init_project_decode_ple_input_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    ple_work: DecodePleInputWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    match ple_work {
+        DecodePleInputWork::Skip(layer_work) => Ok((
+            artifact_store_roots,
+            DecodeProjectionWork::Skip {
+                continuation: DecodeProjectionContinuation::PleInput(DecodePleInputWork::Skip(
+                    layer_work,
+                )),
+            },
+        )),
+        DecodePleInputWork::Active {
+            work,
+            scalars,
+            norm_weights,
+            embedded_ref,
+            projected_ref,
+            output_prefix,
+        } => {
+            let projection_rows = work
+                .layer
+                .ple_input_gate_shape
+                .ok_or_else(|| {
+                    anyhow!("Gemma decode layer metadata is missing PLE input gate shape")
+                })?
+                .rows;
+            let (artifact_store_roots, state) = init_decode_row_projection_artifact_state(
+                artifact_store_roots,
+                work.decode_state.decode_input_ref.clone(),
+                DecodeProjectionKind::PleModel {
+                    layer_idx: work.layer.layer_idx,
+                },
+                projection_rows,
+                work.decode_state.projection_rows_per_tile,
+                format!("{output_prefix}.model_projection"),
+                None,
+            )?;
+            Ok((
+                artifact_store_roots,
+                DecodeProjectionWork::Active {
+                    continuation: DecodeProjectionContinuation::PleInput(
+                        DecodePleInputWork::Active {
+                            work,
+                            scalars,
+                            norm_weights,
+                            embedded_ref,
+                            projected_ref,
+                            output_prefix,
+                        },
+                    ),
+                    state,
+                },
+            ))
+        }
+    }
+}
+
+#[tile]
+fn finalize_project_decode_ple_input_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    continuation: DecodeProjectionContinuation,
+) -> Result<(RasterArtifactStoreRoots, DecodePleInputWork)> {
+    match continuation {
+        DecodeProjectionContinuation::PleInput(ple_work) => Ok((artifact_store_roots, ple_work)),
+        _ => bail!("decode PLE input projection returned unexpected continuation"),
+    }
+}
+
+#[tile]
+fn finalize_decode_ple_input_work(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    ple_work: DecodePleInputWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
+    match ple_work {
+        DecodePleInputWork::Skip(layer_work) => Ok((artifact_store_roots, layer_work)),
+        DecodePleInputWork::Active {
+            mut work,
+            scalars,
+            norm_weights,
+            embedded_ref,
+            projected_ref,
+            output_prefix,
+        } => {
+            let projected_ref = projected_ref
+                .ok_or_else(|| anyhow!("decode PLE input projection did not produce ref"))?;
+            let (artifact_store_roots, projected_ref) = scale_decode_ref(
+                artifact_store_roots,
+                projected_ref,
+                Some(scalars.projection_scalar),
+                format!("{output_prefix}.projection_scaled"),
+            )?;
+            let (artifact_store_roots, projected_ref) = rms_norm_decode_ref(
+                artifact_store_roots,
+                projected_ref,
+                &norm_weights,
+                scalars.rms_norm_eps,
+                "decode PLE input RMSNorm",
+                format!("{output_prefix}.projection_norm"),
+            )?;
+            let (artifact_store_roots, combined_ref) = add_decode_refs(
+                artifact_store_roots,
+                embedded_ref,
+                projected_ref,
+                format!("{output_prefix}.combined"),
+            )?;
+            let (artifact_store_roots, input_ref) = scale_decode_ref(
+                artifact_store_roots,
+                combined_ref,
+                Some(scalars.input_scale),
+                format!("{output_prefix}.scaled"),
+            )?;
+            work.per_layer_input_ref = Some(input_ref);
+            Ok((artifact_store_roots, DecodeLayerWork::Active(work)))
+        }
+    }
 }
 
 #[tile]
@@ -1437,12 +2900,7 @@ fn scale_decode_ref_optional_with_roots(
     scalar: Option<Act>,
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    if scalar.is_none() {
-        return Ok((artifact_store_roots, input_ref));
-    }
-    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
-    let row = call_tile!(scale_decode_row_optional, &row, scalar)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
+    scale_decode_ref(artifact_store_roots, input_ref, scalar, output_source_name)
 }
 
 #[tile]
@@ -1454,9 +2912,14 @@ fn rms_norm_decode_ref_with_roots(
     label: &str,
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
-    let row = call_tile!(rms_norm_decode_row, &row, norm_weights, eps, label)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
+    rms_norm_decode_ref(
+        artifact_store_roots,
+        input_ref,
+        norm_weights,
+        eps,
+        label,
+        output_source_name,
+    )
 }
 
 #[tile]
@@ -1466,10 +2929,7 @@ fn add_decode_refs_with_roots(
     rhs_ref: RasterActivationSequenceRef,
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let lhs = read_activation_row_from_ref_roots(&artifact_store_roots, &lhs_ref)?;
-    let rhs = read_activation_row_from_ref_roots(&artifact_store_roots, &rhs_ref)?;
-    let row = call_tile!(add_decode_rows, &lhs, &rhs)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
+    add_decode_refs(artifact_store_roots, lhs_ref, rhs_ref, output_source_name)
 }
 
 #[tile]
@@ -1479,98 +2939,31 @@ pub fn init_decode_row_projection_artifact(
     projection_kind: DecodeProjectionKind,
     projection_rows: usize,
     rows_per_tile: usize,
-    output_id: RasterTensorId,
+    output_id: String,
     softcap_bits: Option<i32>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeRowProjectionArtifactState)> {
-    if projection_rows == 0 {
-        bail!("deterministic decode projection requires at least one projection row");
-    }
-    validate_projection_rows_per_tile(rows_per_tile)?;
-    let (row_count, input_width) = input_ref.tensor_ref().shape().sequence_metadata()?;
-    if row_count != 1 {
-        bail!("decode row projection expects a one-row input ref, got {row_count}");
-    }
-    let output_source_name = output_id.source_name().to_string();
-    let artifact_store_roots = start_sequence_builder_with_roots(
-        &artifact_store_roots,
-        RasterArtifactId::new(&output_source_name)?,
-        1,
-        projection_rows,
-    )?;
-    Ok((
+    init_decode_row_projection_artifact_state(
         artifact_store_roots,
-        DecodeRowProjectionArtifactState {
-            input_ref,
-            projection_kind,
-            output_source_name,
-            current_row_bits: Vec::new(),
-            next_projection_row_idx: 0,
-            projection_rows,
-            input_width,
-            rows_per_tile,
-            softcap_bits,
-        },
-    ))
+        input_ref,
+        projection_kind,
+        projection_rows,
+        rows_per_tile,
+        output_id,
+        softcap_bits,
+    )
 }
 
 #[tile(kind = recursive)]
 pub fn project_next_decode_projection_chunk_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut projection_state: DecodeRowProjectionArtifactState,
+    projection_state: DecodeRowProjectionArtifactState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     DecodeRowProjectionArtifactState,
 )> {
-    if projection_state.next_projection_row_idx >= projection_state.projection_rows {
-        return Ok((true, artifact_store_roots, projection_state));
-    }
-    let input =
-        read_activation_row_from_ref_roots(&artifact_store_roots, &projection_state.input_ref)?;
-    if input.width() != projection_state.input_width {
-        bail!(
-            "decode projection input row has width {}, expected {}",
-            input.width(),
-            projection_state.input_width
-        );
-    }
-    let end = projection_state
-        .next_projection_row_idx
-        .saturating_add(projection_state.rows_per_tile)
-        .min(projection_state.projection_rows);
-    while projection_state.next_projection_row_idx < end {
-        let projection_row = read_decode_projection_row(
-            source,
-            &projection_state.projection_kind,
-            projection_state.next_projection_row_idx,
-        )?;
-        if projection_row.len() != projection_state.input_width {
-            bail!(
-                "decode projection row {} has width {}, expected {}",
-                projection_state.next_projection_row_idx,
-                projection_row.len(),
-                projection_state.input_width
-            );
-        }
-        let mut projected = project_row_with_weights(&input, &projection_row)?;
-        if let Some(softcap_bits) = projection_state.softcap_bits {
-            projected = softcap_act(projected, Act::from_bits(softcap_bits));
-        }
-        projection_state.current_row_bits.push(projected.to_bits());
-        projection_state.next_projection_row_idx += 1;
-    }
-    if projection_state.next_projection_row_idx == projection_state.projection_rows {
-        let row_bits = std::mem::take(&mut projection_state.current_row_bits);
-        let artifact_store_roots = append_sequence_row_by_source_name_with_roots(
-            &artifact_store_roots,
-            &projection_state.output_source_name,
-            0,
-            RasterActivationRow::from_act_bits(row_bits),
-        )?;
-        return Ok((true, artifact_store_roots, projection_state));
-    }
-    Ok((false, artifact_store_roots, projection_state))
+    project_next_decode_projection_artifact_chunk(artifact_store_roots, projection_state, source)
 }
 
 #[tile]
@@ -1578,24 +2971,58 @@ pub fn finalize_decode_row_projection_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     projection_state: DecodeRowProjectionArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    if projection_state.next_projection_row_idx != projection_state.projection_rows {
-        bail!(
-            "raster decode projection completed {} rows, expected {}",
-            projection_state.next_projection_row_idx,
-            projection_state.projection_rows
-        );
+    finalize_decode_row_projection_artifact_state_ref(artifact_store_roots, projection_state)
+}
+
+#[tile(kind = recursive)]
+fn project_next_decode_projection_work_chunk_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    projection_work: DecodeProjectionWork,
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeProjectionWork)> {
+    match projection_work {
+        DecodeProjectionWork::Skip { continuation } => Ok((
+            true,
+            artifact_store_roots,
+            DecodeProjectionWork::Skip { continuation },
+        )),
+        DecodeProjectionWork::Active {
+            continuation,
+            state,
+        } => {
+            let (done, artifact_store_roots, state) =
+                project_next_decode_projection_artifact_chunk(artifact_store_roots, state, source)?;
+            Ok((
+                done,
+                artifact_store_roots,
+                DecodeProjectionWork::Active {
+                    continuation,
+                    state,
+                },
+            ))
+        }
     }
-    if !projection_state.current_row_bits.is_empty() {
-        bail!(
-            "raster decode projection finalized with partial row width {}",
-            projection_state.current_row_bits.len()
-        );
+}
+
+#[tile]
+fn finalize_decode_projection_work_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    projection_work: DecodeProjectionWork,
+) -> Result<(RasterArtifactStoreRoots, DecodeProjectionContinuation)> {
+    match projection_work {
+        DecodeProjectionWork::Skip { continuation } => Ok((artifact_store_roots, continuation)),
+        DecodeProjectionWork::Active {
+            continuation,
+            state,
+        } => {
+            let (artifact_store_roots, output_ref) =
+                finalize_decode_row_projection_artifact_state_ref(artifact_store_roots, state)?;
+            Ok((
+                artifact_store_roots,
+                attach_decode_projection_output(continuation, output_ref),
+            ))
+        }
     }
-    finalize_sequence_builder_by_source_name_with_roots(
-        &artifact_store_roots,
-        &projection_state.output_source_name,
-        RasterTensorId::new(projection_state.output_source_name.clone())?,
-    )
 }
 
 #[tile]
@@ -1658,13 +3085,12 @@ fn apply_decode_rope_to_heads_ref_with_roots(
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
     let heads = materialize_attention_heads_from_roots(&artifact_store_roots, &heads_ref)?;
-    let heads = call_tile!(
-        apply_decode_rope_to_heads,
+    let heads = apply_rope_to_heads(
         &heads,
         partial_rotary_dim,
         rope_freq_base_dim,
         rope_base,
-        position
+        position,
     )?;
     insert_attention_heads_with_roots(&artifact_store_roots, output_source_name, heads)
 }
@@ -2396,9 +3822,7 @@ fn gelu_decode_ref_with_roots(
     input_ref: RasterActivationSequenceRef,
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let row = read_activation_row_from_ref_roots(&artifact_store_roots, &input_ref)?;
-    let row = call_tile!(gelu_decode_row, &row)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
+    gelu_decode_ref(artifact_store_roots, input_ref, output_source_name)
 }
 
 #[tile]
@@ -2408,10 +3832,7 @@ fn mul_decode_refs_with_roots(
     rhs_ref: RasterActivationSequenceRef,
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let lhs = read_activation_row_from_ref_roots(&artifact_store_roots, &lhs_ref)?;
-    let rhs = read_activation_row_from_ref_roots(&artifact_store_roots, &rhs_ref)?;
-    let row = call_tile!(mul_decode_rows, &lhs, &rhs)?;
-    insert_decode_activation_row_with_roots(&artifact_store_roots, output_source_name, &row)
+    mul_decode_refs(artifact_store_roots, lhs_ref, rhs_ref, output_source_name)
 }
 
 #[tile]
