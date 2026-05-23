@@ -18,17 +18,20 @@ pub fn main(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterInputEmbeddingInputRoots,
 ) -> Result<RasterInputEmbeddingOutput> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, input_embedding_state) = call_tile!(
         init_input_embedding_state,
         artifact_store_roots,
         input_roots
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, input_embedding_state) = call_recur_tile!(
         append_next_input_embedding_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, input_embedding_state)
     )?;
-    let (_artifact_store_roots, refs) =
-        call_tile!(finalize_input_embedding_refs, artifact_store_roots, state)?;
+    let (_artifact_store_roots, refs) = call_tile!(
+        finalize_input_embedding_refs,
+        artifact_store_roots,
+        input_embedding_state
+    )?;
     Ok(RasterInputEmbeddingOutput::new(_artifact_store_roots, refs))
 }
 
@@ -72,28 +75,28 @@ pub fn init_input_embedding_state(
 #[tile(kind = recursive)]
 pub fn append_next_input_embedding_row(
     mut artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: InputEmbeddingRasterState,
+    mut input_embedding_state: InputEmbeddingRasterState,
 ) -> Result<(bool, RasterArtifactStoreRoots, InputEmbeddingRasterState)> {
-    if state.is_complete() {
-        return Ok((true, artifact_store_roots, state));
+    if input_embedding_state.is_complete() {
+        return Ok((true, artifact_store_roots, input_embedding_state));
     }
 
     let token_id = read_prompt_token_id(
         &artifact_store_roots,
-        &state.prompt_token_ids_root,
-        state.prompt_token_count,
-        state.next_token_idx,
+        &input_embedding_state.prompt_token_ids_root,
+        input_embedding_state.prompt_token_count,
+        input_embedding_state.next_token_idx,
     )?;
     let row = ArtifactIo::auth_read(
-        state.embedding_source_root.as_str(),
+        input_embedding_state.embedding_source_root.as_str(),
         GemmaInputEmbeddingRowRequest { token_id },
     )?;
-    if row.len() != state.hidden_size {
+    if row.len() != input_embedding_state.hidden_size {
         bail!(
             "input embedding row {} has width {}, expected {}",
-            state.next_token_idx,
+            input_embedding_state.next_token_idx,
             row.len(),
-            state.hidden_size
+            input_embedding_state.hidden_size
         );
     }
     let output_builder_root = artifact_store_roots
@@ -102,25 +105,29 @@ pub fn append_next_input_embedding_row(
     let (next_roots, _next_builder_root) = append_activation_row_by_builder_root_with_roots(
         &artifact_store_roots,
         &output_builder_root,
-        state.next_token_idx,
+        input_embedding_state.next_token_idx,
         RasterActivationRow::from_acts(row),
     )?;
     artifact_store_roots = next_roots;
-    state.next_token_idx += 1;
+    input_embedding_state.next_token_idx += 1;
 
-    Ok((state.is_complete(), artifact_store_roots, state))
+    Ok((
+        input_embedding_state.is_complete(),
+        artifact_store_roots,
+        input_embedding_state,
+    ))
 }
 
 #[tile]
 pub fn finalize_input_embedding_refs(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: InputEmbeddingRasterState,
+    input_embedding_state: InputEmbeddingRasterState,
 ) -> Result<(RasterArtifactStoreRoots, RasterInputEmbeddingRefs)> {
-    if !state.is_complete() {
+    if !input_embedding_state.is_complete() {
         bail!(
             "input embedding finalized at token {}, expected {}",
-            state.next_token_idx,
-            state.prompt_token_count
+            input_embedding_state.next_token_idx,
+            input_embedding_state.prompt_token_count
         );
     }
     let output_builder_root = artifact_store_roots
@@ -135,10 +142,10 @@ pub fn finalize_input_embedding_refs(
     Ok((
         artifact_store_roots.clone(),
         RasterInputEmbeddingRefs {
-            source_id: state.source_id,
-            embedding_source_root: state.embedding_source_root,
-            prompt_token_ids_root: state.prompt_token_ids_root,
-            prompt_token_count: state.prompt_token_count,
+            source_id: input_embedding_state.source_id,
+            embedding_source_root: input_embedding_state.embedding_source_root,
+            prompt_token_ids_root: input_embedding_state.prompt_token_ids_root,
+            prompt_token_count: input_embedding_state.prompt_token_count,
             embedded_prompt_activations_ref,
         },
     ))

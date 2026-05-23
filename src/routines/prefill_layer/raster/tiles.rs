@@ -60,7 +60,7 @@ pub fn main(
         &artifact_store_roots,
         input_embedding_refs.embedded_prompt_activations_ref.root(),
     )?;
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, layer_state) = call_tile!(
         init_prefill_layer_state_from_input_embedding_refs_with_roots,
         artifact_store_roots,
         input_embedding_refs,
@@ -68,26 +68,30 @@ pub fn main(
         ple_input_manifest_root,
         raster_sizing
     )?;
-    let (artifact_store_roots, state) = call_recur_seq!(
+    let (artifact_store_roots, layer_state) = call_recur_seq!(
         compute_next_prefill_layer_sequence_with_roots,
-        (artifact_store_roots, state),
+        (artifact_store_roots, layer_state),
         layer_source
     )?;
-    let refs = call_tile!(finalize_prefill_layer_refs, state)?;
+    let refs = call_tile!(finalize_prefill_layer_refs, layer_state)?;
     Ok((artifact_store_roots, refs))
 }
 
 #[sequence(kind = recursive)]
 pub fn compute_next_prefill_layer_sequence_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: PrefillLayerRasterState,
+    layer_state: PrefillLayerRasterState,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
-    if state.next_layer_idx >= state.layer_count {
-        return Ok((true, artifact_store_roots, state));
+    if layer_state.next_layer_idx >= layer_state.layer_count {
+        return Ok((true, artifact_store_roots, layer_state));
     }
 
-    let context = call_tile!(prepare_next_prefill_layer_context, &state, layer_source)?;
+    let context = call_tile!(
+        prepare_next_prefill_layer_context,
+        &layer_state,
+        layer_source
+    )?;
     if let Some(per_layer_input) = context.per_layer_input.as_ref() {
         read_sequence_row_from_roots(
             &artifact_store_roots,
@@ -97,7 +101,7 @@ pub fn compute_next_prefill_layer_sequence_with_roots(
             },
         )?;
     }
-    let (token_count, _) = state
+    let (token_count, _) = layer_state
         .current_activations_ref
         .tensor_ref()
         .shape()
@@ -113,7 +117,7 @@ pub fn compute_next_prefill_layer_sequence_with_roots(
     trace_event(format!(
         "progress prefill.layer layer={}/{} tokens={} attention={:?} ple={} donor={:?}",
         context.layer_idx + 1,
-        state.layer_count,
+        layer_state.layer_count,
         token_count,
         context.layer.attention_kind,
         context.layer.has_ple,
@@ -122,21 +126,21 @@ pub fn compute_next_prefill_layer_sequence_with_roots(
     let (artifact_store_roots, layer_output_ref, layer_cache) = call_seq!(
         run_prefill_layer_sequence_artifact_ref,
         artifact_store_roots,
-        state.current_activations_ref.clone(),
+        layer_state.current_activations_ref.clone(),
         layer_source,
         &context.layer,
         context.donor_cache.as_ref(),
         context.per_layer_input.clone(),
-        state.projection_rows_per_tile,
-        state.attention_kv_rows_per_tile,
-        state.sequence_rows_per_tile,
-        state.head_rows_per_tile,
+        layer_state.projection_rows_per_tile,
+        layer_state.attention_kv_rows_per_tile,
+        layer_state.sequence_rows_per_tile,
+        layer_state.head_rows_per_tile,
     )?;
 
     call_tile!(
         update_prefill_layer_state_refs_with_roots,
         artifact_store_roots,
-        state,
+        layer_state,
         context.layer_idx,
         layer_output_ref,
         layer_cache
@@ -436,7 +440,7 @@ fn compute_sequence_rms_norm_artifact_ref(
     eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, sequence_unary_state) = call_tile!(
         init_prefill_sequence_rms_norm_artifact_state_from_ref,
         artifact_store_roots,
         input_ref,
@@ -445,14 +449,14 @@ fn compute_sequence_rms_norm_artifact_ref(
         eps,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, sequence_unary_state) = call_recur_tile!(
         transform_next_prefill_sequence_unary_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, sequence_unary_state)
     )?;
     call_tile!(
         finalize_prefill_sequence_unary_artifact_state_ref,
         artifact_store_roots,
-        state
+        sequence_unary_state
     )
 }
 
@@ -467,7 +471,7 @@ fn project_sequence_with_prefill_source_artifact_ref(
     rows_per_tile: usize,
     id_prefix: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, projection_state) = call_tile!(
         init_prefill_sequence_projection_artifact_from_ref,
         artifact_store_roots,
         input_ref,
@@ -475,9 +479,9 @@ fn project_sequence_with_prefill_source_artifact_ref(
         projection_rows,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, projection_state) = call_recur_tile!(
         project_next_prefill_sequence_artifact_rows,
-        (artifact_store_roots, state),
+        (artifact_store_roots, projection_state),
         layer_source,
         layer_idx,
         matrix
@@ -485,7 +489,7 @@ fn project_sequence_with_prefill_source_artifact_ref(
     call_tile!(
         finalize_prefill_sequence_projection_artifact_ref,
         artifact_store_roots,
-        state
+        projection_state
     )
 }
 
@@ -497,7 +501,7 @@ fn reshape_heads_artifact_ref(
     num_heads: usize,
     head_dim: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, reshape_state) = call_tile!(
         init_prefill_reshape_heads_artifact_state_from_ref,
         artifact_store_roots,
         input_ref,
@@ -505,14 +509,14 @@ fn reshape_heads_artifact_ref(
         num_heads,
         head_dim
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, reshape_state) = call_recur_tile!(
         transform_next_prefill_reshape_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, reshape_state)
     )?;
     call_tile!(
         finalize_prefill_reshape_heads_artifact_state_ref,
         artifact_store_roots,
-        state
+        reshape_state
     )
 }
 
@@ -525,7 +529,7 @@ fn compute_head_rms_norm_artifact_ref(
     eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, head_state) = call_tile!(
         init_prefill_head_rms_norm_artifact_state_from_ref,
         artifact_store_roots,
         heads_ref,
@@ -534,14 +538,14 @@ fn compute_head_rms_norm_artifact_ref(
         eps,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, head_state) = call_recur_tile!(
         transform_next_prefill_head_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, head_state)
     )?;
     call_tile!(
         finalize_prefill_head_artifact_state_ref,
         artifact_store_roots,
-        state
+        head_state
     )
 }
 
@@ -553,7 +557,7 @@ fn compute_value_rms_norm_artifact_ref(
     eps: Option<crate::shared::numerics::det_num::Acc>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, head_state) = call_tile!(
         init_prefill_value_rms_norm_artifact_state_from_ref,
         artifact_store_roots,
         heads_ref,
@@ -561,14 +565,14 @@ fn compute_value_rms_norm_artifact_ref(
         eps,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, head_state) = call_recur_tile!(
         transform_next_prefill_head_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, head_state)
     )?;
     call_tile!(
         finalize_prefill_head_artifact_state_ref,
         artifact_store_roots,
-        state
+        head_state
     )
 }
 
@@ -583,7 +587,7 @@ fn compute_rope_artifact_ref(
     position_offset: usize,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, head_state) = call_tile!(
         init_prefill_rope_artifact_state_from_ref,
         artifact_store_roots,
         heads_ref,
@@ -594,14 +598,14 @@ fn compute_rope_artifact_ref(
         position_offset,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, head_state) = call_recur_tile!(
         transform_next_prefill_head_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, head_state)
     )?;
     call_tile!(
         finalize_prefill_head_artifact_state_ref,
         artifact_store_roots,
-        state
+        head_state
     )
 }
 
@@ -613,7 +617,7 @@ fn build_kv_cache_artifact_ref(
     id_prefix: String,
     sliding_window: Option<usize>,
 ) -> Result<(RasterArtifactStoreRoots, RasterKvCacheRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, kv_cache_state) = call_tile!(
         init_prefill_kv_cache_artifact_state_from_refs,
         artifact_store_roots,
         key_ref,
@@ -622,14 +626,14 @@ fn build_kv_cache_artifact_ref(
         RasterTensorId::new(format!("{id_prefix}.values"))?,
         sliding_window
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, kv_cache_state) = call_recur_tile!(
         transform_next_prefill_kv_cache_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, kv_cache_state)
     )?;
     call_tile!(
         finalize_prefill_kv_cache_artifact_state_ref,
         artifact_store_roots,
-        state
+        kv_cache_state
     )
 }
 
@@ -644,7 +648,7 @@ fn compute_attention_artifact_ref(
     attention_window: Option<usize>,
     kv_rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, attention_state) = call_tile!(
         init_prefill_attention_artifact_state_from_refs,
         artifact_store_roots,
         query_ref,
@@ -655,14 +659,14 @@ fn compute_attention_artifact_ref(
         attention_window,
         kv_rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, attention_state) = call_recur_tile!(
         project_next_prefill_attention_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, attention_state)
     )?;
     call_tile!(
         finalize_prefill_attention_artifact_state_ref,
         artifact_store_roots,
-        state
+        attention_state
     )
 }
 
@@ -672,20 +676,20 @@ fn combine_heads_artifact_ref(
     heads_ref: RasterAttentionHeadsRef,
     id_prefix: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, combine_state) = call_tile!(
         init_prefill_combine_heads_artifact_state_from_ref,
         artifact_store_roots,
         heads_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, combine_state) = call_recur_tile!(
         transform_next_prefill_combine_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, combine_state)
     )?;
     call_tile!(
         finalize_prefill_combine_heads_artifact_state_ref,
         artifact_store_roots,
-        state
+        combine_state
     )
 }
 
@@ -697,7 +701,7 @@ fn compute_sequence_add_artifact_ref(
     id_prefix: String,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, sequence_binary_state) = call_tile!(
         init_prefill_sequence_add_artifact_state_from_refs,
         artifact_store_roots,
         lhs_ref,
@@ -705,14 +709,14 @@ fn compute_sequence_add_artifact_ref(
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, sequence_binary_state) = call_recur_tile!(
         transform_next_prefill_sequence_binary_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, sequence_binary_state)
     )?;
     call_tile!(
         finalize_prefill_sequence_binary_artifact_state_ref,
         artifact_store_roots,
-        state
+        sequence_binary_state
     )
 }
 
@@ -821,21 +825,21 @@ fn compute_sequence_gelu_artifact_ref(
     id_prefix: String,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, sequence_unary_state) = call_tile!(
         init_prefill_sequence_gelu_artifact_state_from_ref,
         artifact_store_roots,
         input_ref,
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, sequence_unary_state) = call_recur_tile!(
         transform_next_prefill_sequence_unary_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, sequence_unary_state)
     )?;
     call_tile!(
         finalize_prefill_sequence_unary_artifact_state_ref,
         artifact_store_roots,
-        state
+        sequence_unary_state
     )
 }
 
@@ -847,7 +851,7 @@ fn compute_sequence_mul_artifact_ref(
     id_prefix: String,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, sequence_binary_state) = call_tile!(
         init_prefill_sequence_mul_artifact_state_from_refs,
         artifact_store_roots,
         lhs_ref,
@@ -855,14 +859,14 @@ fn compute_sequence_mul_artifact_ref(
         RasterTensorId::new(format!("{id_prefix}.output"))?,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, sequence_binary_state) = call_recur_tile!(
         transform_next_prefill_sequence_binary_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, sequence_binary_state)
     )?;
     call_tile!(
         finalize_prefill_sequence_binary_artifact_state_ref,
         artifact_store_roots,
-        state
+        sequence_binary_state
     )
 }
 
@@ -955,7 +959,7 @@ fn compute_sequence_scale_artifact_ref(
     scalar: Option<crate::shared::numerics::det_num::Act>,
     rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, sequence_unary_state) = call_tile!(
         init_prefill_sequence_scale_artifact_state_from_ref,
         artifact_store_roots,
         input_ref,
@@ -963,14 +967,14 @@ fn compute_sequence_scale_artifact_ref(
         scalar,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, sequence_unary_state) = call_recur_tile!(
         transform_next_prefill_sequence_unary_artifact_row,
-        (artifact_store_roots, state)
+        (artifact_store_roots, sequence_unary_state)
     )?;
     call_tile!(
         finalize_prefill_sequence_unary_artifact_state_ref,
         artifact_store_roots,
-        state
+        sequence_unary_state
     )
 }
 
@@ -1002,51 +1006,52 @@ pub fn init_prefill_layer_state_from_input_embedding_refs_with_roots(
 
 #[tile]
 pub fn finalize_prefill_layer_refs(
-    state: PrefillLayerRasterState,
+    layer_state: PrefillLayerRasterState,
 ) -> Result<PrefillLayerOutputRefs> {
-    if state.next_layer_idx != state.layer_count {
+    if layer_state.next_layer_idx != layer_state.layer_count {
         bail!(
             "raster prefill layer finalized after {} layers, expected {}",
-            state.next_layer_idx,
-            state.layer_count
+            layer_state.next_layer_idx,
+            layer_state.layer_count
         );
     }
 
     Ok(PrefillLayerOutputRefs {
-        final_hidden_states_ref: state.current_activations_ref,
-        layer_caches: state.layer_caches,
+        final_hidden_states_ref: layer_state.current_activations_ref,
+        layer_caches: layer_state.layer_caches,
     })
 }
 
 #[tile]
 pub fn prepare_next_prefill_layer_context(
-    state: &PrefillLayerRasterState,
+    layer_state: &PrefillLayerRasterState,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
 ) -> Result<PrefillLayerContext> {
-    if state.next_layer_idx >= state.layer_count {
+    if layer_state.next_layer_idx >= layer_state.layer_count {
         bail!(
             "cannot prepare prefill layer {} after completing {} layers",
-            state.next_layer_idx,
-            state.layer_count
+            layer_state.next_layer_idx,
+            layer_state.layer_count
         );
     }
 
-    let layer_idx = state.next_layer_idx;
+    let layer_idx = layer_state.next_layer_idx;
     let layer = auth_read!(layer_source, GemmaPrefillLayerMetadataRequest { layer_idx })?;
-    let donor_cache = resolve_prefill_donor_cache_index(&state.layer_caches, layer_idx, &layer)?
-        .map(|donor_idx| {
-            state.layer_caches.get(donor_idx).cloned().ok_or_else(|| {
+    let donor_cache =
+        resolve_prefill_donor_cache_index(&layer_state.layer_caches, layer_idx, &layer)?
+            .map(|donor_idx| {
+                layer_state.layer_caches.get(donor_idx).cloned().ok_or_else(|| {
                 anyhow!("transformer prefill donor cache {donor_idx} missing for layer {layer_idx}")
             })
-        })
-        .transpose()?;
-    let per_layer_input = state
+            })
+            .transpose()?;
+    let per_layer_input = layer_state
         .per_layer_inputs
         .get(layer_idx)
         .and_then(Option::as_ref)
         .cloned();
     validate_prefill_layer_ple_input_ref(
-        &state.current_activations_ref,
+        &layer_state.current_activations_ref,
         &layer,
         per_layer_input.as_ref(),
     )?;
@@ -1062,35 +1067,41 @@ pub fn prepare_next_prefill_layer_context(
 #[tile]
 pub fn update_prefill_layer_state_refs_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: PrefillLayerRasterState,
+    mut layer_state: PrefillLayerRasterState,
     layer_idx: usize,
     layer_output_ref: RasterActivationSequenceRef,
     layer_cache: PrefillLayerCacheSlot,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
-    if layer_idx != state.next_layer_idx {
+    if layer_idx != layer_state.next_layer_idx {
         bail!(
             "cannot update prefill layer {layer_idx} while next layer is {}",
-            state.next_layer_idx
+            layer_state.next_layer_idx
         );
     }
 
-    state.current_activations_ref = layer_output_ref;
-    state.layer_caches.push(layer_cache);
+    layer_state.current_activations_ref = layer_output_ref;
+    layer_state.layer_caches.push(layer_cache);
 
     let completed_layer_output =
-        trace_prefill_layer_checkpoint_with_roots(&artifact_store_roots, &state, layer_idx)?;
+        trace_prefill_layer_checkpoint_with_roots(&artifact_store_roots, &layer_state, layer_idx)?;
     if let Some((sha256, det_sha256)) = completed_layer_output {
-        state.completed_layer_output_sha256s.push(sha256);
-        state.completed_layer_output_det_sha256s.push(det_sha256);
+        layer_state.completed_layer_output_sha256s.push(sha256);
+        layer_state
+            .completed_layer_output_det_sha256s
+            .push(det_sha256);
     }
 
-    if trace_prefill_layer_token_checkpoints_with_roots(&artifact_store_roots, &state, layer_idx)? {
-        state.next_layer_idx += 1;
-        state.layer_count = state.next_layer_idx;
-        return Ok((true, artifact_store_roots, state));
+    if trace_prefill_layer_token_checkpoints_with_roots(
+        &artifact_store_roots,
+        &layer_state,
+        layer_idx,
+    )? {
+        layer_state.next_layer_idx += 1;
+        layer_state.layer_count = layer_state.next_layer_idx;
+        return Ok((true, artifact_store_roots, layer_state));
     }
-    state.next_layer_idx += 1;
-    Ok((false, artifact_store_roots, state))
+    layer_state.next_layer_idx += 1;
+    Ok((false, artifact_store_roots, layer_state))
 }
 
 #[tile]
@@ -1149,21 +1160,21 @@ pub fn init_prefill_sequence_rms_norm_artifact_state_from_ref(
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_sequence_unary_artifact_row(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterSequenceUnaryArtifactState,
+    sequence_unary_state: RasterSequenceUnaryArtifactState,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     RasterSequenceUnaryArtifactState,
 )> {
-    compute_next_sequence_unary_artifact_row(artifact_store_roots, state)
+    compute_next_sequence_unary_artifact_row(artifact_store_roots, sequence_unary_state)
 }
 
 #[tile]
 pub fn finalize_prefill_sequence_unary_artifact_state_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterSequenceUnaryArtifactState,
+    sequence_unary_state: RasterSequenceUnaryArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    finalize_sequence_unary_artifact_state_ref(artifact_store_roots, state)
+    finalize_sequence_unary_artifact_state_ref(artifact_store_roots, sequence_unary_state)
 }
 
 #[tile]
@@ -1189,7 +1200,7 @@ pub fn init_prefill_sequence_projection_artifact_from_ref(
 #[tile(kind = recursive)]
 pub fn project_next_prefill_sequence_artifact_rows(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterSequenceProjectionArtifactState,
+    projection_state: RasterSequenceProjectionArtifactState,
     layer_source: &AuthenticatedGemmaPrefillLayerSource,
     layer_idx: usize,
     matrix: GemmaPrefillLayerMatrixKind,
@@ -1198,18 +1209,18 @@ pub fn project_next_prefill_sequence_artifact_rows(
     RasterArtifactStoreRoots,
     RasterSequenceProjectionArtifactState,
 )> {
-    if state.is_complete() {
-        return Ok((true, artifact_store_roots, state));
+    if projection_state.is_complete() {
+        return Ok((true, artifact_store_roots, projection_state));
     }
 
-    let end = state
+    let end = projection_state
         .next_projection_row_idx()
-        .saturating_add(state.rows_per_tile())
-        .min(state.projection_rows());
-    let start_projection_row_idx = state.next_projection_row_idx();
-    let start_token_idx = state.next_token_idx();
-    let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
-    for row_idx in state.next_projection_row_idx()..end {
+        .saturating_add(projection_state.rows_per_tile())
+        .min(projection_state.projection_rows());
+    let start_projection_row_idx = projection_state.next_projection_row_idx();
+    let start_token_idx = projection_state.next_token_idx();
+    let mut rows = Vec::with_capacity(end - projection_state.next_projection_row_idx());
+    for row_idx in projection_state.next_projection_row_idx()..end {
         rows.push(auth_read!(
             layer_source,
             crate::shared::raster_contracts::prefill_layer::GemmaPrefillLayerMatrixRowRequest {
@@ -1219,28 +1230,28 @@ pub fn project_next_prefill_sequence_artifact_rows(
             },
         )?);
     }
-    let (artifact_store_roots, state) =
-        append_projection_chunk_to_artifact_state(artifact_store_roots, state, &rows)?;
+    let (artifact_store_roots, projection_state) =
+        append_projection_chunk_to_artifact_state(artifact_store_roots, projection_state, &rows)?;
     trace_event(format!(
         "progress prefill.layer.projection layer={} matrix={:?} token={}/{} projection_rows={}..{} of {} input_width={}",
         layer_idx,
         matrix,
         start_token_idx + 1,
-        state.token_count(),
+        projection_state.token_count(),
         start_projection_row_idx,
         end,
-        state.projection_rows(),
-        state.input_width()
+        projection_state.projection_rows(),
+        projection_state.input_width()
     ));
-    Ok((false, artifact_store_roots, state))
+    Ok((false, artifact_store_roots, projection_state))
 }
 
 #[tile]
 pub fn finalize_prefill_sequence_projection_artifact_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterSequenceProjectionArtifactState,
+    projection_state: RasterSequenceProjectionArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    finalize_sequence_projection_artifact_state_ref(artifact_store_roots, state)
+    finalize_sequence_projection_artifact_state_ref(artifact_store_roots, projection_state)
 }
 
 #[tile]
@@ -1263,21 +1274,21 @@ pub fn init_prefill_reshape_heads_artifact_state_from_ref(
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_reshape_artifact_row(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterReshapeHeadsArtifactState,
+    reshape_state: RasterReshapeHeadsArtifactState,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     RasterReshapeHeadsArtifactState,
 )> {
-    compute_next_reshape_heads_artifact_row(artifact_store_roots, state)
+    compute_next_reshape_heads_artifact_row(artifact_store_roots, reshape_state)
 }
 
 #[tile]
 pub fn finalize_prefill_reshape_heads_artifact_state_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterReshapeHeadsArtifactState,
+    reshape_state: RasterReshapeHeadsArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    finalize_reshape_heads_artifact_state_ref(artifact_store_roots, state)
+    finalize_reshape_heads_artifact_state_ref(artifact_store_roots, reshape_state)
 }
 
 #[tile]
@@ -1302,17 +1313,17 @@ pub fn init_prefill_head_rms_norm_artifact_state_from_ref(
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_head_artifact_row(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterHeadUnaryArtifactState,
+    head_state: RasterHeadUnaryArtifactState,
 ) -> Result<(bool, RasterArtifactStoreRoots, RasterHeadUnaryArtifactState)> {
-    compute_next_head_unary_artifact_row(artifact_store_roots, state)
+    compute_next_head_unary_artifact_row(artifact_store_roots, head_state)
 }
 
 #[tile]
 pub fn finalize_prefill_head_artifact_state_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterHeadUnaryArtifactState,
+    head_state: RasterHeadUnaryArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    finalize_head_unary_artifact_state_ref(artifact_store_roots, state)
+    finalize_head_unary_artifact_state_ref(artifact_store_roots, head_state)
 }
 
 #[tile]
@@ -1377,21 +1388,21 @@ pub fn init_prefill_kv_cache_artifact_state_from_refs(
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_kv_cache_artifact_row(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterKvCacheBuildArtifactState,
+    kv_cache_state: RasterKvCacheBuildArtifactState,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     RasterKvCacheBuildArtifactState,
 )> {
-    compute_next_kv_cache_artifact_row(artifact_store_roots, state)
+    compute_next_kv_cache_artifact_row(artifact_store_roots, kv_cache_state)
 }
 
 #[tile]
 pub fn finalize_prefill_kv_cache_artifact_state_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterKvCacheBuildArtifactState,
+    kv_cache_state: RasterKvCacheBuildArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterKvCacheRef)> {
-    finalize_kv_cache_build_artifact_state_ref(artifact_store_roots, state)
+    finalize_kv_cache_build_artifact_state_ref(artifact_store_roots, kv_cache_state)
 }
 
 #[tile]
@@ -1420,21 +1431,21 @@ pub fn init_prefill_attention_artifact_state_from_refs(
 #[tile(kind = recursive)]
 pub fn project_next_prefill_attention_artifact_row(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterAttentionArtifactRowState,
+    attention_state: RasterAttentionArtifactRowState,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     RasterAttentionArtifactRowState,
 )> {
-    compute_next_attention_artifact_row(artifact_store_roots, state)
+    compute_next_attention_artifact_row(artifact_store_roots, attention_state)
 }
 
 #[tile]
 pub fn finalize_prefill_attention_artifact_state_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterAttentionArtifactRowState,
+    attention_state: RasterAttentionArtifactRowState,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    finalize_attention_artifact_row_state_ref(artifact_store_roots, state)
+    finalize_attention_artifact_row_state_ref(artifact_store_roots, attention_state)
 }
 
 #[tile]
@@ -1449,21 +1460,21 @@ pub fn init_prefill_combine_heads_artifact_state_from_ref(
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_combine_artifact_row(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterCombineHeadsArtifactState,
+    combine_state: RasterCombineHeadsArtifactState,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     RasterCombineHeadsArtifactState,
 )> {
-    compute_next_combine_heads_artifact_row(artifact_store_roots, state)
+    compute_next_combine_heads_artifact_row(artifact_store_roots, combine_state)
 }
 
 #[tile]
 pub fn finalize_prefill_combine_heads_artifact_state_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterCombineHeadsArtifactState,
+    combine_state: RasterCombineHeadsArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    finalize_combine_heads_artifact_state_ref(artifact_store_roots, state)
+    finalize_combine_heads_artifact_state_ref(artifact_store_roots, combine_state)
 }
 
 #[tile]
@@ -1486,21 +1497,21 @@ pub fn init_prefill_sequence_add_artifact_state_from_refs(
 #[tile(kind = recursive)]
 pub fn transform_next_prefill_sequence_binary_artifact_row(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterSequenceBinaryArtifactState,
+    sequence_binary_state: RasterSequenceBinaryArtifactState,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     RasterSequenceBinaryArtifactState,
 )> {
-    compute_next_sequence_binary_artifact_row(artifact_store_roots, state)
+    compute_next_sequence_binary_artifact_row(artifact_store_roots, sequence_binary_state)
 }
 
 #[tile]
 pub fn finalize_prefill_sequence_binary_artifact_state_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: RasterSequenceBinaryArtifactState,
+    sequence_binary_state: RasterSequenceBinaryArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    finalize_sequence_binary_artifact_state_ref(artifact_store_roots, state)
+    finalize_sequence_binary_artifact_state_ref(artifact_store_roots, sequence_binary_state)
 }
 
 #[tile]

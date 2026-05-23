@@ -31,53 +31,56 @@ pub fn main(
     input_roots: RasterPrefillPleInputRoots,
     ple_source: &AuthenticatedGemmaPleSource,
 ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
-    let (artifact_store_roots, state) =
+    let (artifact_store_roots, ple_state) =
         call_tile!(init_prefill_ple_state, artifact_store_roots, input_roots)?;
-    let (artifact_store_roots, state) = call_recur_seq!(
+    let (artifact_store_roots, ple_state) = call_recur_seq!(
         compute_next_prefill_ple_layer_sequence,
-        (artifact_store_roots, state),
+        (artifact_store_roots, ple_state),
         ple_source
     )?;
-    let (artifact_store_roots, manifest_root) =
-        call_tile!(finalize_prefill_ple_input_refs, artifact_store_roots, state)?;
+    let (artifact_store_roots, manifest_root) = call_tile!(
+        finalize_prefill_ple_input_refs,
+        artifact_store_roots,
+        ple_state
+    )?;
     Ok((artifact_store_roots, manifest_root))
 }
 
 #[sequence(kind = recursive)]
 pub fn compute_next_prefill_ple_layer_sequence(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: PrefillPleRasterState,
+    ple_state: PrefillPleRasterState,
     ple_source: &AuthenticatedGemmaPleSource,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleRasterState)> {
-    if !state.has_ple_global || state.next_layer_idx >= state.layer_count {
-        return Ok((true, artifact_store_roots, state));
+    if !ple_state.has_ple_global || ple_state.next_layer_idx >= ple_state.layer_count {
+        return Ok((true, artifact_store_roots, ple_state));
     }
 
     let (artifact_store_roots, context) = call_tile!(
         prepare_next_prefill_ple_context,
         artifact_store_roots,
-        &state,
+        &ple_state,
         ple_source
     )?;
     crate::trace::trace_event(format!(
         "progress prefill.prepare_aux layer={}/{} ple={} tokens={}",
         context.layer_idx + 1,
-        state.layer_count,
+        ple_state.layer_count,
         context.has_ple,
-        state.token_count
+        ple_state.token_count
     ));
 
     if !context.has_ple {
         return call_tile!(
             update_prefill_ple_state_refs,
             artifact_store_roots,
-            state,
+            ple_state,
             context.layer_idx,
             None
         );
     }
 
-    let input_activations_ref = state
+    let input_activations_ref = ple_state
         .input_activations_ref
         .as_ref()
         .ok_or_else(|| anyhow!("raster PLE state is missing input activation ref"))?
@@ -85,18 +88,18 @@ pub fn compute_next_prefill_ple_layer_sequence(
     let (artifact_store_roots, layer_input_ref) = call_seq!(
         run_prefill_ple_layer_sequence_ref,
         artifact_store_roots,
-        &state.token_ids_source_name,
-        state.token_count,
+        &ple_state.token_ids_source_name,
+        ple_state.token_count,
         input_activations_ref,
         ple_source,
         &context,
-        state.raster_sizing
+        ple_state.raster_sizing
     )?;
 
     call_tile!(
         update_prefill_ple_state_refs,
         artifact_store_roots,
-        state,
+        ple_state,
         context.layer_idx,
         Some(layer_input_ref)
     )
@@ -210,7 +213,7 @@ fn build_scaled_token_embedding_sequence_ref(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, token_embedding_state) = call_tile!(
         init_scaled_token_embedding_sequence_ref,
         artifact_store_roots,
         token_ids_source_name,
@@ -219,15 +222,15 @@ fn build_scaled_token_embedding_sequence_ref(
         scale,
         row_width
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, token_embedding_state) = call_recur_tile!(
         append_next_scaled_token_embedding_row,
-        (artifact_store_roots, state),
+        (artifact_store_roots, token_embedding_state),
         ple_source
     )?;
     call_tile!(
         finalize_scaled_token_embedding_sequence_ref,
         artifact_store_roots,
-        state
+        token_embedding_state
     )
 }
 
@@ -244,7 +247,7 @@ fn project_ple_sequence_with_source_ref(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, projection_state) = call_tile!(
         init_ple_sequence_projection_from_ref,
         artifact_store_roots,
         input_ref,
@@ -252,16 +255,16 @@ fn project_ple_sequence_with_source_ref(
         projection_rows,
         projection_rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, projection_state) = call_recur_tile!(
         project_next_ple_sequence_rows,
-        (artifact_store_roots, state),
+        (artifact_store_roots, projection_state),
         ple_source,
         layer_idx
     )?;
     call_tile!(
         finalize_ple_sequence_projection_ref,
         artifact_store_roots,
-        state
+        projection_state
     )
 }
 
@@ -276,7 +279,7 @@ fn compute_sequence_scale_ref(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, unary_state) = call_tile!(
         init_sequence_scale_ref_state,
         artifact_store_roots,
         input_ref,
@@ -284,14 +287,14 @@ fn compute_sequence_scale_ref(
         scalar,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, unary_state) = call_recur_tile!(
         compute_next_sequence_unary_ref,
-        (artifact_store_roots, state)
+        (artifact_store_roots, unary_state)
     )?;
     call_tile!(
         finalize_sequence_unary_ref_state,
         artifact_store_roots,
-        state
+        unary_state
     )
 }
 
@@ -307,7 +310,7 @@ fn compute_sequence_rms_norm_ref(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, unary_state) = call_tile!(
         init_sequence_rms_norm_ref_state,
         artifact_store_roots,
         input_ref,
@@ -316,14 +319,14 @@ fn compute_sequence_rms_norm_ref(
         eps,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, unary_state) = call_recur_tile!(
         compute_next_sequence_unary_ref,
-        (artifact_store_roots, state)
+        (artifact_store_roots, unary_state)
     )?;
     call_tile!(
         finalize_sequence_unary_ref_state,
         artifact_store_roots,
-        state
+        unary_state
     )
 }
 
@@ -338,7 +341,7 @@ fn compute_sequence_add_ref(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, binary_state) = call_tile!(
         init_sequence_add_ref_state,
         artifact_store_roots,
         lhs_ref,
@@ -346,14 +349,14 @@ fn compute_sequence_add_ref(
         output_id,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, binary_state) = call_recur_tile!(
         compute_next_sequence_binary_ref,
-        (artifact_store_roots, state)
+        (artifact_store_roots, binary_state)
     )?;
     call_tile!(
         finalize_sequence_binary_ref_state,
         artifact_store_roots,
-        state
+        binary_state
     )
 }
 
@@ -383,25 +386,25 @@ pub fn init_prefill_ple_state(
 #[tile]
 pub fn finalize_prefill_ple_input_refs(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: PrefillPleRasterState,
+    ple_state: PrefillPleRasterState,
 ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
-    if !state.has_ple_global {
+    if !ple_state.has_ple_global {
         return Ok((artifact_store_roots, None));
     }
-    if state.per_layer_inputs.len() != state.layer_count {
+    if ple_state.per_layer_inputs.len() != ple_state.layer_count {
         bail!(
             "raster PLE finalized with {} layers, expected {}",
-            state.per_layer_inputs.len(),
-            state.layer_count
+            ple_state.per_layer_inputs.len(),
+            ple_state.layer_count
         );
     }
 
     let (artifact_store_roots, manifest_root) = store_prefill_ple_input_manifest_with_roots(
         &artifact_store_roots,
-        state.source_id,
-        state.layer_count,
-        state.token_count,
-        &state.per_layer_inputs,
+        ple_state.source_id,
+        ple_state.layer_count,
+        ple_state.token_count,
+        &ple_state.per_layer_inputs,
     )?;
     Ok((artifact_store_roots, Some(manifest_root)))
 }
@@ -409,20 +412,20 @@ pub fn finalize_prefill_ple_input_refs(
 #[tile]
 pub fn prepare_next_prefill_ple_context(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: &PrefillPleRasterState,
+    ple_state: &PrefillPleRasterState,
     ple_source: &AuthenticatedGemmaPleSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerContext)> {
-    if !state.has_ple_global {
+    if !ple_state.has_ple_global {
         bail!("cannot prepare PLE layer context without global PLE weights");
     }
-    if state.next_layer_idx >= state.layer_count {
+    if ple_state.next_layer_idx >= ple_state.layer_count {
         bail!(
             "cannot prepare PLE layer {} after completing {} layers",
-            state.next_layer_idx,
-            state.layer_count
+            ple_state.next_layer_idx,
+            ple_state.layer_count
         );
     }
-    let layer_idx = state.next_layer_idx;
+    let layer_idx = ple_state.next_layer_idx;
     let layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx })?;
     if !layer.has_ple {
         return Ok((
@@ -441,7 +444,7 @@ pub fn prepare_next_prefill_ple_context(
         ));
     }
 
-    state
+    ple_state
         .input_activations_ref
         .as_ref()
         .ok_or_else(|| anyhow!("raster PLE state is missing input activation ref"))?;
@@ -473,22 +476,22 @@ pub fn prepare_next_prefill_ple_context(
 #[tile]
 pub fn update_prefill_ple_state_refs(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: PrefillPleRasterState,
+    mut ple_state: PrefillPleRasterState,
     layer_idx: usize,
     per_layer_input: Option<RasterActivationSequenceArtifactRef>,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleRasterState)> {
-    if layer_idx != state.next_layer_idx {
+    if layer_idx != ple_state.next_layer_idx {
         bail!(
             "cannot update PLE layer {layer_idx} while next layer is {}",
-            state.next_layer_idx
+            ple_state.next_layer_idx
         );
     }
-    state.per_layer_inputs.push(per_layer_input);
-    state.next_layer_idx += 1;
+    ple_state.per_layer_inputs.push(per_layer_input);
+    ple_state.next_layer_idx += 1;
     Ok((
-        state.next_layer_idx >= state.layer_count,
+        ple_state.next_layer_idx >= ple_state.layer_count,
         artifact_store_roots,
-        state,
+        ple_state,
     ))
 }
 
@@ -529,77 +532,82 @@ pub(in super::super) fn init_scaled_token_embedding_sequence_ref(
 #[tile(kind = recursive)]
 pub(in super::super) fn append_next_scaled_token_embedding_row(
     mut artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: PrefillPleTokenEmbeddingState,
+    mut token_embedding_state: PrefillPleTokenEmbeddingState,
     ple_source: &AuthenticatedGemmaPleSource,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     PrefillPleTokenEmbeddingState,
 )> {
-    if state.is_complete() {
-        return Ok((true, artifact_store_roots, state));
+    if token_embedding_state.is_complete() {
+        return Ok((true, artifact_store_roots, token_embedding_state));
     }
 
     let token_id = read_prefill_token_id(
         &artifact_store_roots,
-        token_ids_root(&artifact_store_roots, &state.token_ids_source_name)?,
-        state.token_count,
-        state.next_token_idx,
+        token_ids_root(
+            &artifact_store_roots,
+            &token_embedding_state.token_ids_source_name,
+        )?,
+        token_embedding_state.token_count,
+        token_embedding_state.next_token_idx,
     )?;
     let row = auth_read!(
         ple_source,
         GemmaPleTokenEmbeddingRowRequest {
-            layer_idx: state.layer_idx,
+            layer_idx: token_embedding_state.layer_idx,
             token_id,
         },
     )?;
-    if row.len() != state.row_width {
+    if row.len() != token_embedding_state.row_width {
         bail!(
             "PLE token embedding row has width {}, expected {}",
             row.len(),
-            state.row_width
+            token_embedding_state.row_width
         );
     }
     let output_builder_root = artifact_store_roots
-        .builder_root_for_source_name(&state.output_source_name)?
+        .builder_root_for_source_name(&token_embedding_state.output_source_name)?
         .to_string();
     let (next_roots, _next_builder_root) = append_sequence_row_by_builder_root_with_roots(
         &artifact_store_roots,
         &output_builder_root,
-        state.next_token_idx,
+        token_embedding_state.next_token_idx,
         RasterActivationRow::from_acts(
             row.into_iter()
                 .map(|value| {
                     scale_act(
                         value,
-                        crate::shared::numerics::det_num::Act::from_bits(state.scale_bits),
+                        crate::shared::numerics::det_num::Act::from_bits(
+                            token_embedding_state.scale_bits,
+                        ),
                     )
                 })
                 .collect(),
         ),
     )?;
     artifact_store_roots = next_roots;
-    state.next_token_idx += 1;
-    Ok((false, artifact_store_roots, state))
+    token_embedding_state.next_token_idx += 1;
+    Ok((false, artifact_store_roots, token_embedding_state))
 }
 
 #[tile]
 pub(in super::super) fn finalize_scaled_token_embedding_sequence_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: PrefillPleTokenEmbeddingState,
+    token_embedding_state: PrefillPleTokenEmbeddingState,
 ) -> Result<(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    if !state.is_complete() {
+    if !token_embedding_state.is_complete() {
         bail!(
             "PLE token embedding finalized at token {}, expected {}",
-            state.next_token_idx,
-            state.token_count
+            token_embedding_state.next_token_idx,
+            token_embedding_state.token_count
         );
     }
     let output_builder_root = artifact_store_roots
-        .builder_root_for_source_name(&state.output_source_name)?
+        .builder_root_for_source_name(&token_embedding_state.output_source_name)?
         .to_string();
     finalize_sequence_builder_by_root_with_roots(&artifact_store_roots, &output_builder_root)
 }
@@ -644,7 +652,7 @@ fn init_ple_sequence_projection_from_ref(
 #[tile(kind = recursive)]
 pub fn project_next_ple_sequence_rows(
     mut artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: PrefillPleSequenceProjectionState,
+    mut projection_state: PrefillPleSequenceProjectionState,
     ple_source: &AuthenticatedGemmaPleSource,
     layer_idx: usize,
 ) -> Result<(
@@ -652,24 +660,25 @@ pub fn project_next_ple_sequence_rows(
     RasterArtifactStoreRoots,
     PrefillPleSequenceProjectionState,
 )> {
-    if state.is_complete() {
-        return Ok((true, artifact_store_roots, state));
+    if projection_state.is_complete() {
+        return Ok((true, artifact_store_roots, projection_state));
     }
 
-    let end = state
+    let end = projection_state
         .next_projection_row_idx
-        .saturating_add(state.rows_per_tile)
-        .min(state.projection_rows);
-    let start_projection_row_idx = state.next_projection_row_idx;
-    let start_token_idx = state.next_token_idx;
-    let mut rows = Vec::with_capacity(end - state.next_projection_row_idx);
-    for row_idx in state.next_projection_row_idx..end {
+        .saturating_add(projection_state.rows_per_tile)
+        .min(projection_state.projection_rows);
+    let start_projection_row_idx = projection_state.next_projection_row_idx;
+    let start_token_idx = projection_state.next_token_idx;
+    let mut rows = Vec::with_capacity(end - projection_state.next_projection_row_idx);
+    for row_idx in projection_state.next_projection_row_idx..end {
         rows.push(auth_read!(
             ple_source,
             GemmaPleModelProjectionRowRequest { layer_idx, row_idx },
         )?);
     }
-    let input_row = read_activation_row_from_ref(&state.input_ref, state.next_token_idx)?;
+    let input_row =
+        read_activation_row_from_ref(&projection_state.input_ref, projection_state.next_token_idx)?;
     let output_bits = rows
         .iter()
         .map(|projection_row| {
@@ -677,66 +686,70 @@ pub fn project_next_ple_sequence_rows(
                 .map(|projected| projected.to_bits())
         })
         .collect::<Result<Vec<_>>>()?;
-    state.current_row_bits.extend(output_bits);
-    state.next_projection_row_idx = end;
-    if state.next_projection_row_idx == state.projection_rows {
-        if state.current_row_bits.len() != state.projection_rows {
+    projection_state.current_row_bits.extend(output_bits);
+    projection_state.next_projection_row_idx = end;
+    if projection_state.next_projection_row_idx == projection_state.projection_rows {
+        if projection_state.current_row_bits.len() != projection_state.projection_rows {
             bail!(
                 "raster projection output row has width {}, expected {}",
-                state.current_row_bits.len(),
-                state.projection_rows
+                projection_state.current_row_bits.len(),
+                projection_state.projection_rows
             );
         }
         let output_builder_root = artifact_store_roots
-            .builder_root_for_source_name(&state.output_source_name)?
+            .builder_root_for_source_name(&projection_state.output_source_name)?
             .to_string();
         let (next_roots, _next_builder_root) = append_sequence_row_by_builder_root_with_roots(
             &artifact_store_roots,
             &output_builder_root,
-            state.next_token_idx,
-            RasterActivationRow::from_act_bits(std::mem::take(&mut state.current_row_bits)),
+            projection_state.next_token_idx,
+            RasterActivationRow::from_act_bits(std::mem::take(
+                &mut projection_state.current_row_bits,
+            )),
         )?;
         artifact_store_roots = next_roots;
-        state.next_token_idx += 1;
-        state.next_projection_row_idx = 0;
+        projection_state.next_token_idx += 1;
+        projection_state.next_projection_row_idx = 0;
     }
     crate::trace::trace_event(format!(
         "progress prefill.prepare_aux.projection layer={} token={}/{} projection_rows={}..{} of {} input_width={}",
         layer_idx,
         start_token_idx + 1,
-        state.token_count,
+        projection_state.token_count,
         start_projection_row_idx,
         end,
-        state.projection_rows,
-        state.input_width
+        projection_state.projection_rows,
+        projection_state.input_width
     ));
-    Ok((false, artifact_store_roots, state))
+    Ok((false, artifact_store_roots, projection_state))
 }
 
 #[tile]
 fn finalize_ple_sequence_projection_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: PrefillPleSequenceProjectionState,
+    projection_state: PrefillPleSequenceProjectionState,
 ) -> Result<(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    if state.next_token_idx != state.token_count || state.next_projection_row_idx != 0 {
+    if projection_state.next_token_idx != projection_state.token_count
+        || projection_state.next_projection_row_idx != 0
+    {
         bail!(
             "raster projection completed token {}, projection row {}, expected {} complete token rows",
-            state.next_token_idx,
-            state.next_projection_row_idx,
-            state.token_count
+            projection_state.next_token_idx,
+            projection_state.next_projection_row_idx,
+            projection_state.token_count
         );
     }
-    if !state.current_row_bits.is_empty() {
+    if !projection_state.current_row_bits.is_empty() {
         bail!(
             "raster projection finalized with partial row width {}",
-            state.current_row_bits.len()
+            projection_state.current_row_bits.len()
         );
     }
     let output_builder_root = artifact_store_roots
-        .builder_root_for_source_name(&state.output_source_name)?
+        .builder_root_for_source_name(&projection_state.output_source_name)?
         .to_string();
     finalize_sequence_builder_by_root_with_roots(&artifact_store_roots, &output_builder_root)
 }
@@ -776,18 +789,18 @@ fn init_sequence_scale_ref_state(
 #[tile(kind = recursive)]
 fn compute_next_sequence_unary_ref(
     mut artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: PrefillPleSequenceUnaryState,
+    mut unary_state: PrefillPleSequenceUnaryState,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleSequenceUnaryState)> {
-    if state.is_complete() {
-        return Ok((true, artifact_store_roots, state));
+    if unary_state.is_complete() {
+        return Ok((true, artifact_store_roots, unary_state));
     }
-    let end = state
+    let end = unary_state
         .next_row_idx
-        .saturating_add(state.rows_per_tile)
-        .min(state.row_count);
-    while state.next_row_idx < end {
-        let row = read_activation_row_from_ref(&state.input_ref, state.next_row_idx)?;
-        let output_row = match &state.op {
+        .saturating_add(unary_state.rows_per_tile)
+        .min(unary_state.row_count);
+    while unary_state.next_row_idx < end {
+        let row = read_activation_row_from_ref(&unary_state.input_ref, unary_state.next_row_idx)?;
+        let output_row = match &unary_state.op {
             PrefillPleSequenceUnaryOp::RmsNorm {
                 norm_weight_bits,
                 eps_bits,
@@ -811,37 +824,37 @@ fn compute_next_sequence_unary_ref(
             ),
         };
         let output_builder_root = artifact_store_roots
-            .builder_root_for_source_name(&state.output_source_name)?
+            .builder_root_for_source_name(&unary_state.output_source_name)?
             .to_string();
         let (next_roots, _next_builder_root) = append_sequence_row_by_builder_root_with_roots(
             &artifact_store_roots,
             &output_builder_root,
-            state.next_row_idx,
+            unary_state.next_row_idx,
             output_row,
         )?;
         artifact_store_roots = next_roots;
-        state.next_row_idx += 1;
+        unary_state.next_row_idx += 1;
     }
-    Ok((false, artifact_store_roots, state))
+    Ok((false, artifact_store_roots, unary_state))
 }
 
 #[tile]
 fn finalize_sequence_unary_ref_state(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: PrefillPleSequenceUnaryState,
+    unary_state: PrefillPleSequenceUnaryState,
 ) -> Result<(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    if !state.is_complete() {
+    if !unary_state.is_complete() {
         bail!(
             "sequence unary state completed {} rows, expected {}",
-            state.next_row_idx,
-            state.row_count
+            unary_state.next_row_idx,
+            unary_state.row_count
         );
     }
     let output_builder_root = artifact_store_roots
-        .builder_root_for_source_name(&state.output_source_name)?
+        .builder_root_for_source_name(&unary_state.output_source_name)?
         .to_string();
     finalize_sequence_builder_by_root_with_roots(&artifact_store_roots, &output_builder_root)
 }
@@ -933,22 +946,24 @@ fn init_sequence_add_ref_state(
 #[tile(kind = recursive)]
 fn compute_next_sequence_binary_ref(
     mut artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: PrefillPleSequenceBinaryState,
+    mut binary_state: PrefillPleSequenceBinaryState,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     PrefillPleSequenceBinaryState,
 )> {
-    if state.is_complete() {
-        return Ok((true, artifact_store_roots, state));
+    if binary_state.is_complete() {
+        return Ok((true, artifact_store_roots, binary_state));
     }
-    let end = state
+    let end = binary_state
         .next_row_idx
-        .saturating_add(state.rows_per_tile)
-        .min(state.row_count);
-    while state.next_row_idx < end {
-        let lhs_row = read_activation_row_from_ref(&state.lhs_ref, state.next_row_idx)?;
-        let rhs_row = read_activation_row_from_ref(&state.rhs_ref, state.next_row_idx)?;
+        .saturating_add(binary_state.rows_per_tile)
+        .min(binary_state.row_count);
+    while binary_state.next_row_idx < end {
+        let lhs_row =
+            read_activation_row_from_ref(&binary_state.lhs_ref, binary_state.next_row_idx)?;
+        let rhs_row =
+            read_activation_row_from_ref(&binary_state.rhs_ref, binary_state.next_row_idx)?;
         let output_row = RasterActivationRow::from_acts(
             lhs_row
                 .acts()
@@ -958,37 +973,37 @@ fn compute_next_sequence_binary_ref(
                 .collect(),
         );
         let output_builder_root = artifact_store_roots
-            .builder_root_for_source_name(&state.output_source_name)?
+            .builder_root_for_source_name(&binary_state.output_source_name)?
             .to_string();
         let (next_roots, _next_builder_root) = append_sequence_row_by_builder_root_with_roots(
             &artifact_store_roots,
             &output_builder_root,
-            state.next_row_idx,
+            binary_state.next_row_idx,
             output_row,
         )?;
         artifact_store_roots = next_roots;
-        state.next_row_idx += 1;
+        binary_state.next_row_idx += 1;
     }
-    Ok((false, artifact_store_roots, state))
+    Ok((false, artifact_store_roots, binary_state))
 }
 
 #[tile]
 fn finalize_sequence_binary_ref_state(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: PrefillPleSequenceBinaryState,
+    binary_state: PrefillPleSequenceBinaryState,
 ) -> Result<(
     RasterArtifactStoreRoots,
     RasterActivationSequenceArtifactRef,
 )> {
-    if !state.is_complete() {
+    if !binary_state.is_complete() {
         bail!(
             "sequence binary state completed {} rows, expected {}",
-            state.next_row_idx,
-            state.row_count
+            binary_state.next_row_idx,
+            binary_state.row_count
         );
     }
     let output_builder_root = artifact_store_roots
-        .builder_root_for_source_name(&state.output_source_name)?
+        .builder_root_for_source_name(&binary_state.output_source_name)?
         .to_string();
     finalize_sequence_builder_by_root_with_roots(&artifact_store_roots, &output_builder_root)
 }

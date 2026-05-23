@@ -66,7 +66,7 @@ pub fn main(
         &input_roots.artifact_store_roots,
         &input_roots.selected_token_ref
     )?;
-    let (_artifact_store_roots, state) = call_tile!(
+    let (_artifact_store_roots, decode_state) = call_tile!(
         init_decode_transition_state_refs_with_roots,
         input_roots.artifact_store_roots,
         input_roots.transformer_decode_state.clone(),
@@ -75,18 +75,18 @@ pub fn main(
         input_roots.raster_sizing,
         input_roots.output_source_prefix
     )?;
-    let (artifact_store_roots, state) = call_recur_seq!(
+    let (artifact_store_roots, decode_state) = call_recur_seq!(
         compute_next_decode_layer_with_roots,
-        (_artifact_store_roots, state),
+        (_artifact_store_roots, decode_state),
         source
     )?;
-    let final_hidden_states_ref = state.current_activation_ref.clone();
+    let final_hidden_states_ref = decode_state.current_activation_ref.clone();
     let (artifact_store_roots, normalized_ref) = call_tile!(
         normalize_decode_final_position_ref_with_roots,
         artifact_store_roots,
         final_hidden_states_ref,
         source,
-        format!("{}.final_norm", state.output_source_prefix)
+        format!("{}.final_norm", decode_state.output_source_prefix)
     )?;
     let (artifact_store_roots, logits_ref) = call_seq!(
         project_ref_with_decode_source_with_roots,
@@ -96,13 +96,13 @@ pub fn main(
         DecodeProjectionKind::FinalLogits,
         call_tile!(decode_projection_row_count, source)?,
         input_roots.raster_sizing.projection_rows_per_tile,
-        format!("{}.final_logits", state.output_source_prefix),
+        format!("{}.final_logits", decode_state.output_source_prefix),
         call_tile!(decode_final_logit_softcap_bits, source)?
     )?;
     let layer_output = call_tile!(
         finalize_decode_layer_state_with_roots,
         &artifact_store_roots,
-        state
+        decode_state
     )?;
     let transition_result = call_tile!(
         finalize_decode_transition_result_from_roots,
@@ -124,18 +124,18 @@ pub fn main(
 #[sequence(kind = recursive)]
 pub fn compute_next_decode_layer_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: DecodeTransitionRasterState,
+    decode_state: DecodeTransitionRasterState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
 ) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    if state.next_layer_idx >= state.layer_count {
-        return Ok((true, artifact_store_roots, state));
+    if decode_state.next_layer_idx >= decode_state.layer_count {
+        return Ok((true, artifact_store_roots, decode_state));
     }
 
-    let context = call_tile!(prepare_next_decode_layer_context, &state, source)?;
+    let context = call_tile!(prepare_next_decode_layer_context, &decode_state, source)?;
     let _trace = crate::trace::trace_scope(format!(
         "decode.layer.det layer={layer_idx} token={} position={} attention={:?} ple={} donor={:?}",
-        state.next_token,
-        state.position,
+        decode_state.next_token,
+        decode_state.position,
         context.layer.attention_kind,
         context.layer.has_ple,
         context.layer.kv_shared_layer_index,
@@ -144,35 +144,38 @@ pub fn compute_next_decode_layer_with_roots(
     let (artifact_store_roots, per_layer_input_ref) = call_seq!(
         compute_decode_ple_input_with_roots,
         artifact_store_roots,
-        state.next_token,
-        state.decode_input_ref.clone(),
+        decode_state.next_token,
+        decode_state.decode_input_ref.clone(),
         source,
         &context.layer,
-        state.projection_rows_per_tile,
+        decode_state.projection_rows_per_tile,
         format!(
             "{}.layer_{}.ple.input",
-            state.output_source_prefix, context.layer_idx
+            decode_state.output_source_prefix, context.layer_idx
         )
     )?;
     let (artifact_store_roots, layer_output_ref, updated_cache) = call_seq!(
         run_basic_decode_layer_with_roots,
         artifact_store_roots,
-        state.current_activation_ref.clone(),
+        decode_state.current_activation_ref.clone(),
         source,
         &context.layer,
         context.cache_slot,
         context.donor_cache_slot.as_ref(),
         per_layer_input_ref,
-        state.position,
-        state.projection_rows_per_tile,
-        state.attention_kv_rows_per_tile,
-        format!("{}.layer_{}", state.output_source_prefix, context.layer_idx)
+        decode_state.position,
+        decode_state.projection_rows_per_tile,
+        decode_state.attention_kv_rows_per_tile,
+        format!(
+            "{}.layer_{}",
+            decode_state.output_source_prefix, context.layer_idx
+        )
     )?;
 
     call_tile!(
         update_decode_layer_state_refs_with_roots,
         artifact_store_roots,
-        state,
+        decode_state,
         context.layer_idx,
         layer_output_ref,
         updated_cache
@@ -273,7 +276,7 @@ fn project_ref_with_decode_source_with_roots(
     output_id: String,
     softcap_bits: Option<i32>,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, projection_state) = call_tile!(
         init_decode_row_projection_artifact,
         artifact_store_roots,
         input_ref,
@@ -283,15 +286,15 @@ fn project_ref_with_decode_source_with_roots(
         RasterTensorId::new(output_id)?,
         softcap_bits
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, projection_state) = call_recur_tile!(
         project_next_decode_projection_chunk_with_roots,
-        (artifact_store_roots, state),
+        (artifact_store_roots, projection_state),
         source
     )?;
     call_tile!(
         finalize_decode_row_projection_ref_with_roots,
         artifact_store_roots,
-        state
+        projection_state
     )
 }
 
@@ -708,7 +711,7 @@ fn append_decode_kv_cache_ref_with_roots(
     rows_per_tile: usize,
     output_prefix: String,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, kv_cache_append_state) = call_tile!(
         init_decode_kv_cache_append_state_with_roots,
         artifact_store_roots,
         cache_slot,
@@ -719,14 +722,14 @@ fn append_decode_kv_cache_ref_with_roots(
         cache_window,
         rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, kv_cache_append_state) = call_recur_tile!(
         compute_next_decode_kv_cache_append_row_with_roots,
-        (artifact_store_roots, state)
+        (artifact_store_roots, kv_cache_append_state)
     )?;
     call_tile!(
         finalize_decode_kv_cache_append_state_with_roots,
         artifact_store_roots,
-        state
+        kv_cache_append_state
     )
 }
 
@@ -739,7 +742,7 @@ fn compute_decode_attention_ref_with_roots(
     attention_window: Option<usize>,
     kv_rows_per_tile: usize,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    let (artifact_store_roots, state) = call_tile!(
+    let (artifact_store_roots, attention_state) = call_tile!(
         init_decode_attention_artifact_state_from_refs,
         artifact_store_roots,
         query_ref,
@@ -749,14 +752,14 @@ fn compute_decode_attention_ref_with_roots(
         attention_window,
         kv_rows_per_tile
     )?;
-    let (artifact_store_roots, state) = call_recur_tile!(
+    let (artifact_store_roots, attention_state) = call_recur_tile!(
         compute_next_decode_attention_head_with_roots,
-        (artifact_store_roots, state)
+        (artifact_store_roots, attention_state)
     )?;
     call_tile!(
         finalize_decode_attention_state_ref_with_roots,
         artifact_store_roots,
-        state
+        attention_state
     )
 }
 
@@ -766,29 +769,29 @@ fn combine_decode_attention_heads_ref_with_roots(
     heads_ref: RasterAttentionHeadsRef,
     output_id: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    let (artifact_store_roots, state) =
+    let (artifact_store_roots, combine_state) =
         crate::shared::raster_kernels::transformer::init_combine_heads_artifact_state_from_ref(
             artifact_store_roots,
             heads_ref,
             RasterTensorId::new(output_id)?,
         )?;
     let mut artifact_store_roots = artifact_store_roots;
-    let mut state = state;
+    let mut combine_state = combine_state;
     loop {
         let (done, next_roots, next_state) =
             crate::shared::raster_kernels::transformer::compute_next_combine_heads_artifact_row(
                 artifact_store_roots,
-                state,
+                combine_state,
             )?;
         artifact_store_roots = next_roots;
-        state = next_state;
+        combine_state = next_state;
         if done {
             break;
         }
     }
     crate::shared::raster_kernels::transformer::finalize_combine_heads_artifact_state_ref(
         artifact_store_roots,
-        state,
+        combine_state,
     )
 }
 
@@ -1023,7 +1026,7 @@ pub fn main_state_refs(
         &input_roots.artifact_store_roots,
         &input_roots.selected_token_ref
     )?;
-    let (_artifact_store_roots, state) = call_tile!(
+    let (_artifact_store_roots, decode_state) = call_tile!(
         init_decode_transition_state_from_refs_with_roots,
         input_roots.artifact_store_roots,
         input_roots.position,
@@ -1034,18 +1037,18 @@ pub fn main_state_refs(
         input_roots.raster_sizing,
         input_roots.output_source_prefix
     )?;
-    let (artifact_store_roots, state) = call_recur_seq!(
+    let (artifact_store_roots, decode_state) = call_recur_seq!(
         compute_next_decode_layer_with_roots,
-        (_artifact_store_roots, state),
+        (_artifact_store_roots, decode_state),
         source
     )?;
-    let final_hidden_state_ref = state.current_activation_ref.clone();
+    let final_hidden_state_ref = decode_state.current_activation_ref.clone();
     let (artifact_store_roots, normalized_ref) = call_tile!(
         normalize_decode_final_position_ref_with_roots,
         artifact_store_roots,
         final_hidden_state_ref.clone(),
         source,
-        format!("{}.final_norm", state.output_source_prefix)
+        format!("{}.final_norm", decode_state.output_source_prefix)
     )?;
     let (artifact_store_roots, logits_ref) = call_seq!(
         project_ref_with_decode_source_with_roots,
@@ -1055,11 +1058,11 @@ pub fn main_state_refs(
         DecodeProjectionKind::FinalLogits,
         call_tile!(decode_projection_row_count, source)?,
         input_roots.raster_sizing.projection_rows_per_tile,
-        format!("{}.final_logits", state.output_source_prefix),
+        format!("{}.final_logits", decode_state.output_source_prefix),
         call_tile!(decode_final_logit_softcap_bits, source)?
     )?;
     let (layer_caches, position, token_count) =
-        call_tile!(finalize_decode_layer_refs_with_roots, state)?;
+        call_tile!(finalize_decode_layer_refs_with_roots, decode_state)?;
     let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
     let logit_count = match (row_count, width) {
         (rows, 1) => rows,
@@ -1248,25 +1251,25 @@ fn decode_final_logit_softcap_bits(
 #[tile]
 pub fn finalize_decode_layer_state_with_roots(
     roots: &RasterArtifactStoreRoots,
-    state: DecodeTransitionRasterState,
+    decode_state: DecodeTransitionRasterState,
 ) -> Result<ActivationSequenceWithCache> {
-    if state.next_layer_idx != state.layer_count {
+    if decode_state.next_layer_idx != decode_state.layer_count {
         bail!(
             "raster decode finalized after {} layers, expected {}",
-            state.next_layer_idx,
-            state.layer_count
+            decode_state.next_layer_idx,
+            decode_state.layer_count
         );
     }
-    if state.updated_layer_caches.len() != state.layer_count {
+    if decode_state.updated_layer_caches.len() != decode_state.layer_count {
         bail!(
             "raster decode stored {} layer caches, expected {}",
-            state.updated_layer_caches.len(),
-            state.layer_count
+            decode_state.updated_layer_caches.len(),
+            decode_state.layer_count
         );
     }
 
     let current_activation =
-        read_activation_row_from_ref_roots(roots, &state.current_activation_ref)?;
+        read_activation_row_from_ref_roots(roots, &decode_state.current_activation_ref)?;
     let det_row = current_activation.acts();
     let values = vec![current_activation.to_f32_values()];
     let internal = InternalActivationSequence::from_det_values(vec![det_row.clone()]);
@@ -1280,7 +1283,7 @@ pub fn finalize_decode_layer_state_with_roots(
 
     Ok(ActivationSequenceWithCache {
         activation_state,
-        layer_caches: state
+        layer_caches: decode_state
             .updated_layer_caches
             .iter()
             .map(|cache| materialize_decode_layer_cache_from_roots(roots, cache))
@@ -1322,18 +1325,19 @@ fn finalize_decode_transition_result_from_roots(
 
 #[tile]
 pub(in super::super) fn prepare_next_decode_layer_context(
-    state: &DecodeTransitionRasterState,
+    decode_state: &DecodeTransitionRasterState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
 ) -> Result<DecodeLayerContext> {
-    let layer_idx = state.next_layer_idx;
+    let layer_idx = decode_state.next_layer_idx;
     let layer = auth_read!(source, GemmaDecodeLayerMetadataRequest { layer_idx })?;
-    let cache_slot = state
+    let cache_slot = decode_state
         .original_layer_caches
         .get(layer_idx)
         .cloned()
         .ok_or_else(|| anyhow!("transformer decode cache {layer_idx} missing"))?;
     let donor_cache_slot =
-        resolve_decode_donor_cache_slot(&state.updated_layer_caches, layer_idx, &layer)?.cloned();
+        resolve_decode_donor_cache_slot(&decode_state.updated_layer_caches, layer_idx, &layer)?
+            .cloned();
     Ok(DecodeLayerContext {
         layer_idx,
         layer,
@@ -1345,37 +1349,37 @@ pub(in super::super) fn prepare_next_decode_layer_context(
 #[tile]
 fn update_decode_layer_state_refs_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: DecodeTransitionRasterState,
+    mut decode_state: DecodeTransitionRasterState,
     layer_idx: usize,
     layer_output_ref: RasterActivationSequenceRef,
     updated_cache: DecodeLayerCacheSlot,
 ) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    if layer_idx != state.next_layer_idx {
+    if layer_idx != decode_state.next_layer_idx {
         bail!(
             "cannot update decode layer {layer_idx} while next layer is {}",
-            state.next_layer_idx
+            decode_state.next_layer_idx
         );
     }
     let layer_output =
         read_activation_row_from_ref_roots(&artifact_store_roots, &layer_output_ref)?;
-    state.artifact_store_roots = artifact_store_roots.clone();
-    state.current_activation_ref = layer_output_ref;
-    state.updated_layer_caches.push(updated_cache);
+    decode_state.artifact_store_roots = artifact_store_roots.clone();
+    decode_state.current_activation_ref = layer_output_ref;
+    decode_state.updated_layer_caches.push(updated_cache);
     let current_activation_values = layer_output.to_f32_values();
     let current_activation_acts = layer_output.acts();
-    state.completed_layer_output_sha256s.push(
+    decode_state.completed_layer_output_sha256s.push(
         crate::shared::numerics::transformer_kernels::build_vector_commitment(
             &current_activation_values,
         ),
     );
-    state.completed_layer_output_det_sha256s.push(Some(
+    decode_state.completed_layer_output_det_sha256s.push(Some(
         crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
             &current_activation_acts,
         ),
     ));
-    trace_decode_layer_checkpoint_with_roots(&artifact_store_roots, &state, layer_idx)?;
-    state.next_layer_idx += 1;
-    Ok((false, artifact_store_roots, state))
+    trace_decode_layer_checkpoint_with_roots(&artifact_store_roots, &decode_state, layer_idx)?;
+    decode_state.next_layer_idx += 1;
+    Ok((false, artifact_store_roots, decode_state))
 }
 
 #[tile]
@@ -1512,84 +1516,85 @@ pub fn init_decode_row_projection_artifact(
 #[tile(kind = recursive)]
 pub fn project_next_decode_projection_chunk_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: DecodeRowProjectionArtifactState,
+    mut projection_state: DecodeRowProjectionArtifactState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     DecodeRowProjectionArtifactState,
 )> {
-    if state.next_projection_row_idx >= state.projection_rows {
-        return Ok((true, artifact_store_roots, state));
+    if projection_state.next_projection_row_idx >= projection_state.projection_rows {
+        return Ok((true, artifact_store_roots, projection_state));
     }
-    let input = read_activation_row_from_ref_roots(&artifact_store_roots, &state.input_ref)?;
-    if input.width() != state.input_width {
+    let input =
+        read_activation_row_from_ref_roots(&artifact_store_roots, &projection_state.input_ref)?;
+    if input.width() != projection_state.input_width {
         bail!(
             "decode projection input row has width {}, expected {}",
             input.width(),
-            state.input_width
+            projection_state.input_width
         );
     }
-    let end = state
+    let end = projection_state
         .next_projection_row_idx
-        .saturating_add(state.rows_per_tile)
-        .min(state.projection_rows);
-    while state.next_projection_row_idx < end {
+        .saturating_add(projection_state.rows_per_tile)
+        .min(projection_state.projection_rows);
+    while projection_state.next_projection_row_idx < end {
         let projection_row = read_decode_projection_row(
             source,
-            &state.projection_kind,
-            state.next_projection_row_idx,
+            &projection_state.projection_kind,
+            projection_state.next_projection_row_idx,
         )?;
-        if projection_row.len() != state.input_width {
+        if projection_row.len() != projection_state.input_width {
             bail!(
                 "decode projection row {} has width {}, expected {}",
-                state.next_projection_row_idx,
+                projection_state.next_projection_row_idx,
                 projection_row.len(),
-                state.input_width
+                projection_state.input_width
             );
         }
         let mut projected = project_row_with_weights(&input, &projection_row)?;
-        if let Some(softcap_bits) = state.softcap_bits {
+        if let Some(softcap_bits) = projection_state.softcap_bits {
             projected = softcap_act(projected, Act::from_bits(softcap_bits));
         }
-        state.current_row_bits.push(projected.to_bits());
-        state.next_projection_row_idx += 1;
+        projection_state.current_row_bits.push(projected.to_bits());
+        projection_state.next_projection_row_idx += 1;
     }
-    if state.next_projection_row_idx == state.projection_rows {
-        let row_bits = std::mem::take(&mut state.current_row_bits);
+    if projection_state.next_projection_row_idx == projection_state.projection_rows {
+        let row_bits = std::mem::take(&mut projection_state.current_row_bits);
         let artifact_store_roots = append_sequence_row_by_source_name_with_roots(
             &artifact_store_roots,
-            &state.output_source_name,
+            &projection_state.output_source_name,
             0,
             RasterActivationRow::from_act_bits(row_bits),
         )?;
-        return Ok((true, artifact_store_roots, state));
+        return Ok((true, artifact_store_roots, projection_state));
     }
-    Ok((false, artifact_store_roots, state))
+    Ok((false, artifact_store_roots, projection_state))
 }
 
 #[tile]
 pub fn finalize_decode_row_projection_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: DecodeRowProjectionArtifactState,
+    projection_state: DecodeRowProjectionArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
-    if state.next_projection_row_idx != state.projection_rows {
+    if projection_state.next_projection_row_idx != projection_state.projection_rows {
         bail!(
             "raster decode projection completed {} rows, expected {}",
-            state.next_projection_row_idx,
-            state.projection_rows
+            projection_state.next_projection_row_idx,
+            projection_state.projection_rows
         );
     }
-    if !state.current_row_bits.is_empty() {
+    if !projection_state.current_row_bits.is_empty() {
         bail!(
             "raster decode projection finalized with partial row width {}",
-            state.current_row_bits.len()
+            projection_state.current_row_bits.len()
         );
     }
     finalize_sequence_builder_by_source_name_with_roots(
         &artifact_store_roots,
-        &state.output_source_name,
-        RasterTensorId::new(state.output_source_name.clone())?,
+        &projection_state.output_source_name,
+        RasterTensorId::new(projection_state.output_source_name.clone())?,
     )
 }
 
@@ -1799,33 +1804,36 @@ fn init_decode_kv_cache_append_state_with_roots(
 #[tile(kind = recursive)]
 fn compute_next_decode_kv_cache_append_row_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: DecodeKvCacheAppendArtifactState,
+    mut kv_cache_append_state: DecodeKvCacheAppendArtifactState,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
     DecodeKvCacheAppendArtifactState,
 )> {
-    if state.next_head_idx >= state.head_count {
-        return Ok((true, artifact_store_roots, state));
+    if kv_cache_append_state.next_head_idx >= kv_cache_append_state.head_count {
+        return Ok((true, artifact_store_roots, kv_cache_append_state));
     }
     let mut artifact_store_roots = artifact_store_roots;
 
-    if state.next_old_offset < state.retained_old_len {
-        let old_cache_ref = state.old_cache_ref.as_ref().ok_or_else(|| {
-            anyhow!("decode cache append has retained rows without old cache ref")
-        })?;
-        let end = state
+    if kv_cache_append_state.next_old_offset < kv_cache_append_state.retained_old_len {
+        let old_cache_ref = kv_cache_append_state
+            .old_cache_ref
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!("decode cache append has retained rows without old cache ref")
+            })?;
+        let end = kv_cache_append_state
             .next_old_offset
-            .saturating_add(state.rows_per_tile)
-            .min(state.retained_old_len);
-        for old_offset in state.next_old_offset..end {
-            let input_token_idx = state.retained_old_start + old_offset;
+            .saturating_add(kv_cache_append_state.rows_per_tile)
+            .min(kv_cache_append_state.retained_old_len);
+        for old_offset in kv_cache_append_state.next_old_offset..end {
+            let input_token_idx = kv_cache_append_state.retained_old_start + old_offset;
             let key_row = read_kv_row_from_roots(
                 &artifact_store_roots,
                 RasterKvRowRequest {
                     cache_ref: old_cache_ref.clone(),
                     row_kind: RasterKvRowKind::Key,
-                    head_idx: state.next_head_idx,
+                    head_idx: kv_cache_append_state.next_head_idx,
                     token_idx: input_token_idx,
                 },
             )?;
@@ -1834,92 +1842,92 @@ fn compute_next_decode_kv_cache_append_row_with_roots(
                 RasterKvRowRequest {
                     cache_ref: old_cache_ref.clone(),
                     row_kind: RasterKvRowKind::Value,
-                    head_idx: state.next_head_idx,
+                    head_idx: kv_cache_append_state.next_head_idx,
                     token_idx: input_token_idx,
                 },
             )?;
             artifact_store_roots = append_head_row_by_source_name_with_roots(
                 &artifact_store_roots,
-                &state.keys_source_name,
-                state.next_head_idx,
+                &kv_cache_append_state.keys_source_name,
+                kv_cache_append_state.next_head_idx,
                 old_offset,
-                state.current_len,
+                kv_cache_append_state.current_len,
                 key_row,
             )?;
             artifact_store_roots = append_head_row_by_source_name_with_roots(
                 &artifact_store_roots,
-                &state.values_source_name,
-                state.next_head_idx,
+                &kv_cache_append_state.values_source_name,
+                kv_cache_append_state.next_head_idx,
                 old_offset,
-                state.current_len,
+                kv_cache_append_state.current_len,
                 value_row,
             )?;
         }
-        state.next_old_offset = end;
-        if state.next_old_offset < state.retained_old_len {
-            return Ok((false, artifact_store_roots, state));
+        kv_cache_append_state.next_old_offset = end;
+        if kv_cache_append_state.next_old_offset < kv_cache_append_state.retained_old_len {
+            return Ok((false, artifact_store_roots, kv_cache_append_state));
         }
     }
 
-    let output_token_idx = state.retained_old_len;
+    let output_token_idx = kv_cache_append_state.retained_old_len;
     let key_row = read_head_row_from_roots(
         &artifact_store_roots,
         RasterHeadRowRequest {
-            tensor_ref: state.key_ref.clone(),
-            head_idx: state.next_head_idx,
+            tensor_ref: kv_cache_append_state.key_ref.clone(),
+            head_idx: kv_cache_append_state.next_head_idx,
             token_idx: 0,
         },
     )?;
     let value_row = read_head_row_from_roots(
         &artifact_store_roots,
         RasterHeadRowRequest {
-            tensor_ref: state.value_ref.clone(),
-            head_idx: state.next_head_idx,
+            tensor_ref: kv_cache_append_state.value_ref.clone(),
+            head_idx: kv_cache_append_state.next_head_idx,
             token_idx: 0,
         },
     )?;
     artifact_store_roots = append_head_row_by_source_name_with_roots(
         &artifact_store_roots,
-        &state.keys_source_name,
-        state.next_head_idx,
+        &kv_cache_append_state.keys_source_name,
+        kv_cache_append_state.next_head_idx,
         output_token_idx,
-        state.current_len,
+        kv_cache_append_state.current_len,
         key_row,
     )?;
     artifact_store_roots = append_head_row_by_source_name_with_roots(
         &artifact_store_roots,
-        &state.values_source_name,
-        state.next_head_idx,
+        &kv_cache_append_state.values_source_name,
+        kv_cache_append_state.next_head_idx,
         output_token_idx,
-        state.current_len,
+        kv_cache_append_state.current_len,
         value_row,
     )?;
-    state.next_head_idx += 1;
-    state.next_old_offset = 0;
-    Ok((false, artifact_store_roots, state))
+    kv_cache_append_state.next_head_idx += 1;
+    kv_cache_append_state.next_old_offset = 0;
+    Ok((false, artifact_store_roots, kv_cache_append_state))
 }
 
 #[tile]
 fn finalize_decode_kv_cache_append_state_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: DecodeKvCacheAppendArtifactState,
+    kv_cache_append_state: DecodeKvCacheAppendArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerCacheSlot)> {
-    if state.next_head_idx != state.head_count {
+    if kv_cache_append_state.next_head_idx != kv_cache_append_state.head_count {
         bail!(
             "decode cache append finalized at head {}, expected {} heads",
-            state.next_head_idx,
-            state.head_count
+            kv_cache_append_state.next_head_idx,
+            kv_cache_append_state.head_count
         );
     }
     let (artifact_store_roots, cache_ref) = finalize_kv_cache_builders_by_source_name_with_roots(
         &artifact_store_roots,
-        &state.keys_source_name,
-        &state.values_source_name,
-        RasterTensorId::new(state.keys_source_name.clone())?,
-        RasterTensorId::new(state.values_source_name.clone())?,
-        state.head_count,
-        state.current_len,
-        state.head_dim,
+        &kv_cache_append_state.keys_source_name,
+        &kv_cache_append_state.values_source_name,
+        RasterTensorId::new(kv_cache_append_state.keys_source_name.clone())?,
+        RasterTensorId::new(kv_cache_append_state.values_source_name.clone())?,
+        kv_cache_append_state.head_count,
+        kv_cache_append_state.current_len,
+        kv_cache_append_state.head_dim,
     )?;
     Ok((artifact_store_roots, DecodeLayerCacheSlot::Ref(cache_ref)))
 }
@@ -1996,37 +2004,37 @@ pub fn init_decode_attention_artifact_state_from_refs(
 #[tile(kind = recursive)]
 pub fn compute_next_decode_attention_head_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut state: DecodeAttentionArtifactState,
+    mut attention_state: DecodeAttentionArtifactState,
 ) -> Result<(bool, RasterArtifactStoreRoots, DecodeAttentionArtifactState)> {
-    if state.next_query_head_idx >= state.query_head_count {
-        return Ok((true, artifact_store_roots, state));
+    if attention_state.next_query_head_idx >= attention_state.query_head_count {
+        return Ok((true, artifact_store_roots, attention_state));
     }
 
     let mut artifact_store_roots = artifact_store_roots;
-    let query_head_idx = state.next_query_head_idx;
-    let kv_head_idx = query_head_idx / state.kv_groups;
+    let query_head_idx = attention_state.next_query_head_idx;
+    let kv_head_idx = query_head_idx / attention_state.kv_groups;
     let query = read_head_row_from_roots(
         &artifact_store_roots,
         RasterHeadRowRequest {
-            tensor_ref: state.query_ref.clone(),
+            tensor_ref: attention_state.query_ref.clone(),
             head_idx: query_head_idx,
             token_idx: 0,
         },
     )?;
 
-    match state.phase.clone() {
+    match attention_state.phase.clone() {
         DecodeAttentionArtifactPhase::CollectScores {
             score_source_name,
             next_kv_offset,
         } => {
             let end = next_kv_offset
-                .saturating_add(state.kv_rows_per_tile)
-                .min(state.row_count);
+                .saturating_add(attention_state.kv_rows_per_tile)
+                .min(attention_state.row_count);
             for offset in next_kv_offset..end {
-                let token_idx = state.key_start + offset;
+                let token_idx = attention_state.key_start + offset;
                 let key_row = read_decode_attention_kv_row_from_roots(
                     &artifact_store_roots,
-                    &state.cache_ref,
+                    &attention_state.cache_ref,
                     RasterKvRowKind::Key,
                     kv_head_idx,
                     token_idx,
@@ -2046,12 +2054,12 @@ pub fn compute_next_decode_attention_head_with_roots(
                     RasterActivationRow::from_acts(vec![score]),
                 )?;
             }
-            if end < state.row_count {
-                state.phase = DecodeAttentionArtifactPhase::CollectScores {
+            if end < attention_state.row_count {
+                attention_state.phase = DecodeAttentionArtifactPhase::CollectScores {
                     score_source_name,
                     next_kv_offset: end,
                 };
-                return Ok((false, artifact_store_roots, state));
+                return Ok((false, artifact_store_roots, attention_state));
             }
             let (roots, score_ref) = finalize_sequence_builder_by_source_name_with_roots(
                 &artifact_store_roots,
@@ -2059,13 +2067,13 @@ pub fn compute_next_decode_attention_head_with_roots(
                 RasterTensorId::new(score_source_name.clone())?,
             )?;
             artifact_store_roots = roots;
-            state.phase = DecodeAttentionArtifactPhase::FindSoftmaxMax {
+            attention_state.phase = DecodeAttentionArtifactPhase::FindSoftmaxMax {
                 score_ref,
                 next_score_row_idx: 0,
                 max_index: None,
                 max_logit_bits: 0,
             };
-            Ok((false, artifact_store_roots, state))
+            Ok((false, artifact_store_roots, attention_state))
         }
         DecodeAttentionArtifactPhase::FindSoftmaxMax {
             score_ref,
@@ -2074,8 +2082,8 @@ pub fn compute_next_decode_attention_head_with_roots(
             mut max_logit_bits,
         } => {
             let end = next_score_row_idx
-                .saturating_add(state.kv_rows_per_tile)
-                .min(state.row_count);
+                .saturating_add(attention_state.kv_rows_per_tile)
+                .min(attention_state.row_count);
             for row_idx in next_score_row_idx..end {
                 let score = read_decode_attention_scalar_row_from_roots(
                     &artifact_store_roots,
@@ -2089,25 +2097,25 @@ pub fn compute_next_decode_attention_head_with_roots(
                     max_logit_bits = score_bits;
                 }
             }
-            if end < state.row_count {
-                state.phase = DecodeAttentionArtifactPhase::FindSoftmaxMax {
+            if end < attention_state.row_count {
+                attention_state.phase = DecodeAttentionArtifactPhase::FindSoftmaxMax {
                     score_ref,
                     next_score_row_idx: end,
                     max_index,
                     max_logit_bits,
                 };
-                return Ok((false, artifact_store_roots, state));
+                return Ok((false, artifact_store_roots, attention_state));
             }
             let max_index = max_index
                 .ok_or_else(|| anyhow!("decode attention softmax requires at least one score"))?;
-            state.phase = DecodeAttentionArtifactPhase::SumSoftmaxExp {
+            attention_state.phase = DecodeAttentionArtifactPhase::SumSoftmaxExp {
                 score_ref,
                 next_score_row_idx: 0,
                 max_index,
                 max_logit_bits,
                 sum_exp_bits: 0,
             };
-            Ok((false, artifact_store_roots, state))
+            Ok((false, artifact_store_roots, attention_state))
         }
         DecodeAttentionArtifactPhase::SumSoftmaxExp {
             score_ref,
@@ -2117,8 +2125,8 @@ pub fn compute_next_decode_attention_head_with_roots(
             mut sum_exp_bits,
         } => {
             let end = next_score_row_idx
-                .saturating_add(state.kv_rows_per_tile)
-                .min(state.row_count);
+                .saturating_add(attention_state.kv_rows_per_tile)
+                .min(attention_state.row_count);
             let max_logit = Act::from_bits(max_logit_bits);
             let mut sum_exp = Acc::from_bits(sum_exp_bits);
             for row_idx in next_score_row_idx..end {
@@ -2132,30 +2140,30 @@ pub fn compute_next_decode_attention_head_with_roots(
                 sum_exp = acc_add_sat(sum_exp, exp_term);
             }
             sum_exp_bits = sum_exp.to_bits();
-            if end < state.row_count {
-                state.phase = DecodeAttentionArtifactPhase::SumSoftmaxExp {
+            if end < attention_state.row_count {
+                attention_state.phase = DecodeAttentionArtifactPhase::SumSoftmaxExp {
                     score_ref,
                     next_score_row_idx: end,
                     max_index,
                     max_logit_bits,
                     sum_exp_bits,
                 };
-                return Ok((false, artifact_store_roots, state));
+                return Ok((false, artifact_store_roots, attention_state));
             }
             if sum_exp_bits == 0 {
                 bail!("decode attention softmax exp sum is zero");
             }
             let raw_weight_source_name = format!(
                 "{}.raw_weights.head_{query_head_idx}",
-                state.attention_id_prefix
+                attention_state.attention_id_prefix
             );
             artifact_store_roots = start_sequence_builder_with_roots(
                 &artifact_store_roots,
                 RasterArtifactId::new(&raw_weight_source_name)?,
-                state.row_count,
+                attention_state.row_count,
                 1,
             )?;
-            state.phase = DecodeAttentionArtifactPhase::BuildRawSoftmaxWeights {
+            attention_state.phase = DecodeAttentionArtifactPhase::BuildRawSoftmaxWeights {
                 score_ref,
                 raw_weight_source_name,
                 next_score_row_idx: 0,
@@ -2164,7 +2172,7 @@ pub fn compute_next_decode_attention_head_with_roots(
                 sum_exp_bits,
                 summed_weight_bits: 0,
             };
-            Ok((false, artifact_store_roots, state))
+            Ok((false, artifact_store_roots, attention_state))
         }
         DecodeAttentionArtifactPhase::BuildRawSoftmaxWeights {
             score_ref,
@@ -2176,8 +2184,8 @@ pub fn compute_next_decode_attention_head_with_roots(
             mut summed_weight_bits,
         } => {
             let end = next_score_row_idx
-                .saturating_add(state.kv_rows_per_tile)
-                .min(state.row_count);
+                .saturating_add(attention_state.kv_rows_per_tile)
+                .min(attention_state.row_count);
             let max_logit = Act::from_bits(max_logit_bits);
             let sum_exp = Acc::from_bits(sum_exp_bits);
             let mut summed_weight = Act::from_bits(summed_weight_bits);
@@ -2199,8 +2207,8 @@ pub fn compute_next_decode_attention_head_with_roots(
                 summed_weight = add_sat(summed_weight, weight);
             }
             summed_weight_bits = summed_weight.to_bits();
-            if end < state.row_count {
-                state.phase = DecodeAttentionArtifactPhase::BuildRawSoftmaxWeights {
+            if end < attention_state.row_count {
+                attention_state.phase = DecodeAttentionArtifactPhase::BuildRawSoftmaxWeights {
                     score_ref,
                     raw_weight_source_name,
                     next_score_row_idx: end,
@@ -2209,7 +2217,7 @@ pub fn compute_next_decode_attention_head_with_roots(
                     sum_exp_bits,
                     summed_weight_bits,
                 };
-                return Ok((false, artifact_store_roots, state));
+                return Ok((false, artifact_store_roots, attention_state));
             }
             let (roots, raw_weight_ref) = finalize_sequence_builder_by_source_name_with_roots(
                 &artifact_store_roots,
@@ -2219,23 +2227,23 @@ pub fn compute_next_decode_attention_head_with_roots(
             artifact_store_roots = roots;
             let final_weight_source_name = format!(
                 "{}.weights.head_{query_head_idx}",
-                state.attention_id_prefix
+                attention_state.attention_id_prefix
             );
             artifact_store_roots = start_sequence_builder_with_roots(
                 &artifact_store_roots,
                 RasterArtifactId::new(&final_weight_source_name)?,
-                state.row_count,
+                attention_state.row_count,
                 1,
             )?;
             let residual = attention_softmax_residual(Act::from_bits(summed_weight_bits));
-            state.phase = DecodeAttentionArtifactPhase::CorrectSoftmaxResidual {
+            attention_state.phase = DecodeAttentionArtifactPhase::CorrectSoftmaxResidual {
                 raw_weight_ref,
                 final_weight_source_name,
                 next_weight_row_idx: 0,
                 max_index,
                 residual_bits: residual.to_bits(),
             };
-            Ok((false, artifact_store_roots, state))
+            Ok((false, artifact_store_roots, attention_state))
         }
         DecodeAttentionArtifactPhase::CorrectSoftmaxResidual {
             raw_weight_ref,
@@ -2245,8 +2253,8 @@ pub fn compute_next_decode_attention_head_with_roots(
             residual_bits,
         } => {
             let end = next_weight_row_idx
-                .saturating_add(state.kv_rows_per_tile)
-                .min(state.row_count);
+                .saturating_add(attention_state.kv_rows_per_tile)
+                .min(attention_state.row_count);
             let residual = Act::from_bits(residual_bits);
             for row_idx in next_weight_row_idx..end {
                 let mut weight = read_decode_attention_scalar_row_from_roots(
@@ -2265,15 +2273,15 @@ pub fn compute_next_decode_attention_head_with_roots(
                     RasterActivationRow::from_acts(vec![weight]),
                 )?;
             }
-            if end < state.row_count {
-                state.phase = DecodeAttentionArtifactPhase::CorrectSoftmaxResidual {
+            if end < attention_state.row_count {
+                attention_state.phase = DecodeAttentionArtifactPhase::CorrectSoftmaxResidual {
                     raw_weight_ref,
                     final_weight_source_name,
                     next_weight_row_idx: end,
                     max_index,
                     residual_bits,
                 };
-                return Ok((false, artifact_store_roots, state));
+                return Ok((false, artifact_store_roots, attention_state));
             }
             let (roots, weight_ref) = finalize_sequence_builder_by_source_name_with_roots(
                 &artifact_store_roots,
@@ -2281,12 +2289,12 @@ pub fn compute_next_decode_attention_head_with_roots(
                 RasterTensorId::new(final_weight_source_name.clone())?,
             )?;
             artifact_store_roots = roots;
-            state.phase = DecodeAttentionArtifactPhase::ApplyValues {
+            attention_state.phase = DecodeAttentionArtifactPhase::ApplyValues {
                 weight_ref,
                 next_kv_offset: 0,
                 weighted_sum_acc_bits: vec![0; query.width()],
             };
-            Ok((false, artifact_store_roots, state))
+            Ok((false, artifact_store_roots, attention_state))
         }
         DecodeAttentionArtifactPhase::ApplyValues {
             weight_ref,
@@ -2294,10 +2302,10 @@ pub fn compute_next_decode_attention_head_with_roots(
             mut weighted_sum_acc_bits,
         } => {
             let end = next_kv_offset
-                .saturating_add(state.kv_rows_per_tile)
-                .min(state.row_count);
+                .saturating_add(attention_state.kv_rows_per_tile)
+                .min(attention_state.row_count);
             for offset in next_kv_offset..end {
-                let token_idx = state.key_start + offset;
+                let token_idx = attention_state.key_start + offset;
                 let weight = read_decode_attention_scalar_row_from_roots(
                     &artifact_store_roots,
                     &weight_ref,
@@ -2306,7 +2314,7 @@ pub fn compute_next_decode_attention_head_with_roots(
                 )?;
                 let value_row = read_decode_attention_kv_row_from_roots(
                     &artifact_store_roots,
-                    &state.cache_ref,
+                    &attention_state.cache_ref,
                     RasterKvRowKind::Value,
                     kv_head_idx,
                     token_idx,
@@ -2322,13 +2330,13 @@ pub fn compute_next_decode_attention_head_with_roots(
                     *acc_bits = mac_bits(*acc_bits, value.to_bits(), weight.to_bits());
                 }
             }
-            if end < state.row_count {
-                state.phase = DecodeAttentionArtifactPhase::ApplyValues {
+            if end < attention_state.row_count {
+                attention_state.phase = DecodeAttentionArtifactPhase::ApplyValues {
                     weight_ref,
                     next_kv_offset: end,
                     weighted_sum_acc_bits,
                 };
-                return Ok((false, artifact_store_roots, state));
+                return Ok((false, artifact_store_roots, attention_state));
             }
             let output_row = RasterActivationRow::from_acts(
                 weighted_sum_acc_bits
@@ -2338,24 +2346,24 @@ pub fn compute_next_decode_attention_head_with_roots(
             );
             artifact_store_roots = append_head_row_by_source_name_with_roots(
                 &artifact_store_roots,
-                &state.output_source_name,
+                &attention_state.output_source_name,
                 query_head_idx,
                 0,
                 1,
                 output_row,
             )?;
-            state.next_query_head_idx += 1;
-            if state.next_query_head_idx < state.query_head_count {
+            attention_state.next_query_head_idx += 1;
+            if attention_state.next_query_head_idx < attention_state.query_head_count {
                 let (roots, phase) = init_decode_attention_score_phase_with_roots(
                     artifact_store_roots,
-                    &state.attention_id_prefix,
-                    state.next_query_head_idx,
-                    state.row_count,
+                    &attention_state.attention_id_prefix,
+                    attention_state.next_query_head_idx,
+                    attention_state.row_count,
                 )?;
                 artifact_store_roots = roots;
-                state.phase = phase;
+                attention_state.phase = phase;
             }
-            Ok((false, artifact_store_roots, state))
+            Ok((false, artifact_store_roots, attention_state))
         }
     }
 }
@@ -2363,22 +2371,22 @@ pub fn compute_next_decode_attention_head_with_roots(
 #[tile]
 pub fn finalize_decode_attention_state_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    state: DecodeAttentionArtifactState,
+    attention_state: DecodeAttentionArtifactState,
 ) -> Result<(RasterArtifactStoreRoots, RasterAttentionHeadsRef)> {
-    if state.next_query_head_idx != state.query_head_count {
+    if attention_state.next_query_head_idx != attention_state.query_head_count {
         bail!(
             "decode attention finalized at head {}, expected {} heads",
-            state.next_query_head_idx,
-            state.query_head_count
+            attention_state.next_query_head_idx,
+            attention_state.query_head_count
         );
     }
     finalize_heads_builder_by_source_name_with_roots(
         &artifact_store_roots,
-        &state.output_source_name,
-        RasterTensorId::new(state.output_source_name.clone())?,
-        state.query_head_count,
+        &attention_state.output_source_name,
+        RasterTensorId::new(attention_state.output_source_name.clone())?,
+        attention_state.query_head_count,
         1,
-        state.head_dim,
+        attention_state.head_dim,
     )
 }
 
@@ -2485,27 +2493,27 @@ pub fn init_decode_transition_state_from_refs_with_roots(
 
 #[tile]
 pub fn finalize_decode_layer_refs_with_roots(
-    state: DecodeTransitionRasterState,
+    decode_state: DecodeTransitionRasterState,
 ) -> Result<(Vec<DecodeLayerCacheSlot>, usize, usize)> {
-    if state.next_layer_idx != state.layer_count {
+    if decode_state.next_layer_idx != decode_state.layer_count {
         bail!(
             "raster decode finalized after {} layers, expected {}",
-            state.next_layer_idx,
-            state.layer_count
+            decode_state.next_layer_idx,
+            decode_state.layer_count
         );
     }
-    if state.updated_layer_caches.len() != state.layer_count {
+    if decode_state.updated_layer_caches.len() != decode_state.layer_count {
         bail!(
             "raster decode stored {} layer caches, expected {}",
-            state.updated_layer_caches.len(),
-            state.layer_count
+            decode_state.updated_layer_caches.len(),
+            decode_state.layer_count
         );
     }
 
     Ok((
-        state.updated_layer_caches,
-        state.position + 1,
-        state.token_count + 1,
+        decode_state.updated_layer_caches,
+        decode_state.position + 1,
+        decode_state.token_count + 1,
     ))
 }
 
@@ -2528,10 +2536,10 @@ fn rms_norm_decode_row(
 
 #[tile]
 fn read_decode_single_activation_row(
-    state: &DecodeTransitionRasterState,
+    decode_state: &DecodeTransitionRasterState,
     activation_ref: &RasterActivationSequenceRef,
 ) -> Result<RasterActivationRow> {
-    read_activation_row_from_ref_roots(&state.artifact_store_roots, activation_ref)
+    read_activation_row_from_ref_roots(&decode_state.artifact_store_roots, activation_ref)
 }
 
 #[tile]

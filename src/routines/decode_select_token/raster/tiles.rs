@@ -83,49 +83,52 @@ pub fn init_select_next_token(
 
 #[tile(kind = recursive)]
 pub fn scan_next_token_logit(
-    mut state: DecodeSelectArgmaxState,
+    mut argmax_state: DecodeSelectArgmaxState,
 ) -> Result<(bool, DecodeSelectArgmaxState)> {
-    if state.next_token_idx >= state.logit_count {
-        return Ok((true, state));
+    if argmax_state.next_token_idx >= argmax_state.logit_count {
+        return Ok((true, argmax_state));
     }
-    if state.logits_per_tile == 0 {
+    if argmax_state.logits_per_tile == 0 {
         bail!("raster decode select logits per tile must be greater than zero");
     }
 
-    let end = state
+    let end = argmax_state
         .next_token_idx
-        .saturating_add(state.logits_per_tile)
-        .min(state.logit_count);
-    while state.next_token_idx < end {
+        .saturating_add(argmax_state.logits_per_tile)
+        .min(argmax_state.logit_count);
+    while argmax_state.next_token_idx < end {
         let candidate_bits = read_logit_bits(
-            &state.artifact_store_roots,
-            &state.logits_ref,
-            state.next_token_idx,
+            &argmax_state.artifact_store_roots,
+            &argmax_state.logits_ref,
+            argmax_state.next_token_idx,
         )?;
-        if candidate_wins(state.best_logit_bits, candidate_bits) {
-            state.best_token_id = u32::try_from(state.next_token_idx)
+        if candidate_wins(argmax_state.best_logit_bits, candidate_bits) {
+            argmax_state.best_token_id = u32::try_from(argmax_state.next_token_idx)
                 .map_err(|_| anyhow!("raster decode selected token index exceeds u32"))?;
-            state.best_logit_bits = candidate_bits;
+            argmax_state.best_logit_bits = candidate_bits;
         }
-        state.next_token_idx += 1;
+        argmax_state.next_token_idx += 1;
     }
 
-    Ok((state.next_token_idx >= state.logit_count, state))
+    Ok((
+        argmax_state.next_token_idx >= argmax_state.logit_count,
+        argmax_state,
+    ))
 }
 
 #[tile]
-pub fn finalize_selected_token(state: DecodeSelectArgmaxState) -> Result<u32> {
-    if state.logit_count == 0 {
+pub fn finalize_selected_token(argmax_state: DecodeSelectArgmaxState) -> Result<u32> {
+    if argmax_state.logit_count == 0 {
         bail!("raster decode select token cannot finalize empty logits");
     }
-    if state.next_token_idx != state.logit_count {
+    if argmax_state.next_token_idx != argmax_state.logit_count {
         bail!(
             "raster decode select token scanned {} logits, expected {}",
-            state.next_token_idx,
-            state.logit_count
+            argmax_state.next_token_idx,
+            argmax_state.logit_count
         );
     }
-    Ok(state.best_token_id)
+    Ok(argmax_state.best_token_id)
 }
 
 #[tile]
@@ -184,171 +187,174 @@ pub fn init_decode_select_append_state(
 
 #[tile(kind = recursive)]
 pub fn copy_next_full_token_chunk(
-    mut state: DecodeSelectAppendState,
+    mut append_state: DecodeSelectAppendState,
 ) -> Result<(bool, DecodeSelectAppendState)> {
-    if state.next_full_token_idx >= state.full_token_count {
-        return Ok((true, state));
+    if append_state.next_full_token_idx >= append_state.full_token_count {
+        return Ok((true, append_state));
     }
-    if state.token_ids_per_tile == 0 {
+    if append_state.token_ids_per_tile == 0 {
         bail!("raster decode select token ids per tile must be greater than zero");
     }
-    let Some(token_ids_ref) = state.full_token_ids_ref.clone() else {
+    let Some(token_ids_ref) = append_state.full_token_ids_ref.clone() else {
         bail!("raster decode select full token ids root is missing");
     };
-    let end = state
+    let end = append_state
         .next_full_token_idx
-        .saturating_add(state.token_ids_per_tile)
-        .min(state.full_token_count);
-    while state.next_full_token_idx < end {
+        .saturating_add(append_state.token_ids_per_tile)
+        .min(append_state.full_token_count);
+    while append_state.next_full_token_idx < end {
         let token_id = read_token_id_from_ref_roots(
-            &state.artifact_store_roots,
+            &append_state.artifact_store_roots,
             &token_ids_ref,
-            state.next_full_token_idx,
+            append_state.next_full_token_idx,
         )?;
         let (next_roots, _builder_root) =
             ArtifactIo::append_leaf_by_builder_source_name_with_roots(
-                &state.artifact_store_roots,
-                &state.output_full_token_ids_source_name,
-                state.next_full_token_idx,
+                &append_state.artifact_store_roots,
+                &append_state.output_full_token_ids_source_name,
+                append_state.next_full_token_idx,
                 token_id_leaf(token_id),
             )?;
-        state.artifact_store_roots = next_roots;
-        state.next_full_token_idx += 1;
+        append_state.artifact_store_roots = next_roots;
+        append_state.next_full_token_idx += 1;
     }
-    Ok((state.next_full_token_idx >= state.full_token_count, state))
+    Ok((
+        append_state.next_full_token_idx >= append_state.full_token_count,
+        append_state,
+    ))
 }
 
 #[tile(kind = recursive)]
 pub fn copy_next_generated_token_chunk(
-    mut state: DecodeSelectAppendState,
+    mut append_state: DecodeSelectAppendState,
 ) -> Result<(bool, DecodeSelectAppendState)> {
-    if state.next_generated_token_idx >= state.generated_token_count {
-        return Ok((true, state));
+    if append_state.next_generated_token_idx >= append_state.generated_token_count {
+        return Ok((true, append_state));
     }
-    if state.token_ids_per_tile == 0 {
+    if append_state.token_ids_per_tile == 0 {
         bail!("raster decode select token ids per tile must be greater than zero");
     }
-    let Some(token_ids_ref) = state.generated_token_ids_ref.clone() else {
+    let Some(token_ids_ref) = append_state.generated_token_ids_ref.clone() else {
         bail!("raster decode select generated token ids root is missing");
     };
-    let end = state
+    let end = append_state
         .next_generated_token_idx
-        .saturating_add(state.token_ids_per_tile)
-        .min(state.generated_token_count);
-    while state.next_generated_token_idx < end {
+        .saturating_add(append_state.token_ids_per_tile)
+        .min(append_state.generated_token_count);
+    while append_state.next_generated_token_idx < end {
         let token_id = read_token_id_from_ref_roots(
-            &state.artifact_store_roots,
+            &append_state.artifact_store_roots,
             &token_ids_ref,
-            state.next_generated_token_idx,
+            append_state.next_generated_token_idx,
         )?;
         let (next_roots, _builder_root) =
             ArtifactIo::append_leaf_by_builder_source_name_with_roots(
-                &state.artifact_store_roots,
-                &state.output_generated_token_ids_source_name,
-                state.next_generated_token_idx,
+                &append_state.artifact_store_roots,
+                &append_state.output_generated_token_ids_source_name,
+                append_state.next_generated_token_idx,
                 token_id_leaf(token_id),
             )?;
-        state.artifact_store_roots = next_roots;
-        state.next_generated_token_idx += 1;
+        append_state.artifact_store_roots = next_roots;
+        append_state.next_generated_token_idx += 1;
     }
     Ok((
-        state.next_generated_token_idx >= state.generated_token_count,
-        state,
+        append_state.next_generated_token_idx >= append_state.generated_token_count,
+        append_state,
     ))
 }
 
 #[tile]
 pub fn append_selected_token(
-    mut state: DecodeSelectAppendState,
+    mut append_state: DecodeSelectAppendState,
 ) -> Result<DecodeSelectAppendState> {
-    if state.next_full_token_idx != state.full_token_count {
+    if append_state.next_full_token_idx != append_state.full_token_count {
         bail!(
             "raster decode select copied {} full tokens, expected {}",
-            state.next_full_token_idx,
-            state.full_token_count
+            append_state.next_full_token_idx,
+            append_state.full_token_count
         );
     }
-    if state.next_generated_token_idx != state.generated_token_count {
+    if append_state.next_generated_token_idx != append_state.generated_token_count {
         bail!(
             "raster decode select copied {} generated tokens, expected {}",
-            state.next_generated_token_idx,
-            state.generated_token_count
+            append_state.next_generated_token_idx,
+            append_state.generated_token_count
         );
     }
     let (next_roots, _builder_root) = ArtifactIo::append_leaf_by_builder_source_name_with_roots(
-        &state.artifact_store_roots,
-        &state.output_full_token_ids_source_name,
-        state.full_token_count,
-        token_id_leaf(state.next_token),
+        &append_state.artifact_store_roots,
+        &append_state.output_full_token_ids_source_name,
+        append_state.full_token_count,
+        token_id_leaf(append_state.next_token),
     )?;
-    state.artifact_store_roots = next_roots;
+    append_state.artifact_store_roots = next_roots;
     let (next_roots, _builder_root) = ArtifactIo::append_leaf_by_builder_source_name_with_roots(
-        &state.artifact_store_roots,
-        &state.output_generated_token_ids_source_name,
-        state.generated_token_count,
-        token_id_leaf(state.next_token),
+        &append_state.artifact_store_roots,
+        &append_state.output_generated_token_ids_source_name,
+        append_state.generated_token_count,
+        token_id_leaf(append_state.next_token),
     )?;
-    state.artifact_store_roots = next_roots;
-    Ok(state)
+    append_state.artifact_store_roots = next_roots;
+    Ok(append_state)
 }
 
 #[tile]
 pub fn finalize_decode_select_refs(
-    state: DecodeSelectAppendState,
+    append_state: DecodeSelectAppendState,
 ) -> Result<RasterDecodeSelectOutputRefs> {
-    if state.next_full_token_idx != state.full_token_count {
+    if append_state.next_full_token_idx != append_state.full_token_count {
         bail!(
             "raster decode select finalized after copying {} full tokens, expected {}",
-            state.next_full_token_idx,
-            state.full_token_count
+            append_state.next_full_token_idx,
+            append_state.full_token_count
         );
     }
-    if state.next_generated_token_idx != state.generated_token_count {
+    if append_state.next_generated_token_idx != append_state.generated_token_count {
         bail!(
             "raster decode select finalized after copying {} generated tokens, expected {}",
-            state.next_generated_token_idx,
-            state.generated_token_count
+            append_state.next_generated_token_idx,
+            append_state.generated_token_count
         );
     }
     let (artifact_store_roots, full_token_ids_ref) =
         ArtifactIo::finalize_builder_by_source_name_with_roots(
-            &state.artifact_store_roots,
-            &state.output_full_token_ids_source_name,
+            &append_state.artifact_store_roots,
+            &append_state.output_full_token_ids_source_name,
         )?;
     let full_token_ids_ref = RasterTokenIdSequenceRef::new(full_token_ids_ref)?;
     let (artifact_store_roots, generated_token_ids_ref) =
         ArtifactIo::finalize_builder_by_source_name_with_roots(
             &artifact_store_roots,
-            &state.output_generated_token_ids_source_name,
+            &append_state.output_generated_token_ids_source_name,
         )?;
     let generated_token_ids_ref = RasterTokenIdSequenceRef::new(generated_token_ids_ref)?;
     let (artifact_store_roots, _builder) = ArtifactIo::start_builder_with_roots(
         &artifact_store_roots,
-        RasterArtifactId::new(state.output_selected_token_source_name.clone())?,
+        RasterArtifactId::new(append_state.output_selected_token_source_name.clone())?,
         RasterArtifactMetadata::token_ids(1),
     )?;
     let (artifact_store_roots, _builder_root) =
         ArtifactIo::append_leaf_by_builder_source_name_with_roots(
             &artifact_store_roots,
-            &state.output_selected_token_source_name,
+            &append_state.output_selected_token_source_name,
             0,
-            token_id_leaf(state.next_token),
+            token_id_leaf(append_state.next_token),
         )?;
     let (artifact_store_roots, selected_token_ref) =
         ArtifactIo::finalize_builder_by_source_name_with_roots(
             &artifact_store_roots,
-            &state.output_selected_token_source_name,
+            &append_state.output_selected_token_source_name,
         )?;
     let selected_token_ref =
         RasterSelectedTokenRef::new(RasterTokenIdSequenceRef::new(selected_token_ref)?)?;
 
     Ok(RasterDecodeSelectOutputRefs {
         artifact_store_roots,
-        next_token: state.next_token,
+        next_token: append_state.next_token,
         selected_token_ref,
         full_token_ids_ref,
         generated_token_ids_ref,
-        logit_count: decode_select_logit_count(&state.logits_ref)?,
-        logits_ref: state.logits_ref,
+        logit_count: decode_select_logit_count(&append_state.logits_ref)?,
+        logits_ref: append_state.logits_ref,
     })
 }

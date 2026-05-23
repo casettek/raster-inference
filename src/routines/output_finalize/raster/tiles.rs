@@ -31,14 +31,19 @@ pub fn detokenize_output_tokens_ref_with_roots(
     input_roots: RasterOutputFinalizeInputRoots,
     tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<RasterOutputFinalizeOutput> {
-    let (_artifact_store_roots, state) = call_tile!(
+    let (_artifact_store_roots, detokenize_state) = call_tile!(
         init_raster_output_detokenize,
         input_roots.artifact_store_roots.clone(),
         input_roots,
         tokenizer
     )?;
-    let state = call_recur_tile!(decode_next_output_token_with_roots, state, tokenizer)?;
-    let (_artifact_store_roots, refs) = call_tile!(finalize_raster_output_detokenize_refs, state)?;
+    let detokenize_state = call_recur_tile!(
+        decode_next_output_token_with_roots,
+        detokenize_state,
+        tokenizer
+    )?;
+    let (_artifact_store_roots, refs) =
+        call_tile!(finalize_raster_output_detokenize_refs, detokenize_state)?;
     Ok(RasterOutputFinalizeOutput::new(_artifact_store_roots, refs))
 }
 
@@ -185,51 +190,51 @@ pub fn init_raster_output_detokenize(
 
 #[tile(kind = recursive)]
 pub fn decode_next_output_token_with_roots(
-    mut state: RasterOutputDetokenizeState,
+    mut detokenize_state: RasterOutputDetokenizeState,
     tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<(bool, RasterOutputDetokenizeState)> {
     let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
-    if state.tokenizer_source_root != tokenizer_source_root {
+    if detokenize_state.tokenizer_source_root != tokenizer_source_root {
         bail!(
             "raster output finalize tokenizer source root {} does not match state source root {}",
             tokenizer_source_root,
-            state.tokenizer_source_root
+            detokenize_state.tokenizer_source_root
         );
     }
-    match state.phase.clone() {
+    match detokenize_state.phase.clone() {
         RasterOutputDetokenizePhase::ReadNextToken => {
-            if state.next_token_idx >= state.token_count {
-                if state.pending_bytes_written > 0 {
-                    state = begin_pending_byte_flush_with_roots(
-                        state,
+            if detokenize_state.next_token_idx >= detokenize_state.token_count {
+                if detokenize_state.pending_bytes_written > 0 {
+                    detokenize_state = begin_pending_byte_flush_with_roots(
+                        detokenize_state,
                         RasterOutputPendingFlushContinuation::Complete,
                     )?;
-                    return Ok((false, state));
+                    return Ok((false, detokenize_state));
                 }
 
-                state.phase = RasterOutputDetokenizePhase::Complete;
-                return Ok((true, state));
+                detokenize_state.phase = RasterOutputDetokenizePhase::Complete;
+                return Ok((true, detokenize_state));
             }
 
             let token_id = read_token_id_from_ref_roots(
-                &state.artifact_store_roots,
-                &state.token_ids_ref,
-                state.next_token_idx,
+                &detokenize_state.artifact_store_roots,
+                &detokenize_state.token_ids_ref,
+                detokenize_state.next_token_idx,
             )?;
             let token =
                 auth_read!(tokenizer, GemmaTokenByIdRequest { token_id })?.with_context(|| {
                     format!("Gemma tokenizer output token id {token_id} is missing")
                 })?;
             if token.special {
-                state
+                detokenize_state
                     .token_commitment
-                    .update_token(token_id, state.next_token_idx)?;
-                state.next_token_idx += 1;
-                return Ok((false, state));
+                    .update_token(token_id, detokenize_state.next_token_idx)?;
+                detokenize_state.next_token_idx += 1;
+                return Ok((false, detokenize_state));
             }
 
-            state = append_decoded_token_with_roots(state, token)?;
-            Ok((false, state))
+            detokenize_state = append_decoded_token_with_roots(detokenize_state, token)?;
+            Ok((false, detokenize_state))
         }
         RasterOutputDetokenizePhase::ValidatePendingBytes {
             continuation,
@@ -237,14 +242,14 @@ pub fn decode_next_output_token_with_roots(
             next_byte_idx,
             validation_state,
         } => {
-            state = validate_pending_byte_chunk_with_roots(
-                state,
+            detokenize_state = validate_pending_byte_chunk_with_roots(
+                detokenize_state,
                 continuation,
                 pending_ref,
                 next_byte_idx,
                 validation_state,
             )?;
-            Ok((false, state))
+            Ok((false, detokenize_state))
         }
         RasterOutputDetokenizePhase::FlushPendingBytes {
             continuation,
@@ -252,59 +257,61 @@ pub fn decode_next_output_token_with_roots(
             next_byte_idx,
             valid_utf8,
         } => {
-            state = flush_pending_byte_chunk_with_roots(
-                state,
+            detokenize_state = flush_pending_byte_chunk_with_roots(
+                detokenize_state,
                 continuation,
                 pending_ref,
                 next_byte_idx,
                 valid_utf8,
             )?;
-            Ok((false, state))
+            Ok((false, detokenize_state))
         }
-        RasterOutputDetokenizePhase::Complete => Ok((true, state)),
+        RasterOutputDetokenizePhase::Complete => Ok((true, detokenize_state)),
     }
 }
 
 #[tile]
 pub fn finalize_raster_output_detokenize_refs(
-    mut state: RasterOutputDetokenizeState,
+    mut detokenize_state: RasterOutputDetokenizeState,
 ) -> Result<(RasterArtifactStoreRoots, RasterOutputFinalizeRefs)> {
-    if state.next_token_idx != state.token_count {
+    if detokenize_state.next_token_idx != detokenize_state.token_count {
         bail!(
             "raster output finalize decoded {} tokens, expected {}",
-            state.next_token_idx,
-            state.token_count
+            detokenize_state.next_token_idx,
+            detokenize_state.token_count
         );
     }
-    if state.phase != RasterOutputDetokenizePhase::Complete {
+    if detokenize_state.phase != RasterOutputDetokenizePhase::Complete {
         bail!("raster output finalize reached incomplete detokenize phase");
     }
-    if state.pending_bytes_written != 0 || state.pending_bytes_builder_source_name.is_some() {
+    if detokenize_state.pending_bytes_written != 0
+        || detokenize_state.pending_bytes_builder_source_name.is_some()
+    {
         bail!("raster output finalize reached completion with pending bytes");
     }
 
     let (roots, text_ref) = ArtifactIo::finalize_builder_by_source_name_with_roots(
-        &state.artifact_store_roots,
-        &state.text_builder_source_name,
+        &detokenize_state.artifact_store_roots,
+        &detokenize_state.text_builder_source_name,
     )?;
-    state.artifact_store_roots = roots;
+    detokenize_state.artifact_store_roots = roots;
     let text_commitment = text_ref.root().to_string();
     let text_ref = OutputTextRef::from_artifact(
         text_ref,
-        state.text_byte_len,
-        state.text_char_count,
+        detokenize_state.text_byte_len,
+        detokenize_state.text_char_count,
         text_commitment,
     )?;
-    let generated_token_ids_sha256 = state.token_commitment.finish();
+    let generated_token_ids_sha256 = detokenize_state.token_commitment.finish();
 
     Ok((
-        state.artifact_store_roots.clone(),
+        detokenize_state.artifact_store_roots.clone(),
         RasterOutputFinalizeRefs {
-            generated_token_ids_ref: state.token_ids_ref,
+            generated_token_ids_ref: detokenize_state.token_ids_ref,
             generated_text_ref: text_ref,
             generated_token_ids_sha256,
-            generated_token_count: state.token_count,
-            stop_reason: state.stop_reason,
+            generated_token_count: detokenize_state.token_count,
+            stop_reason: detokenize_state.stop_reason,
         },
     ))
 }
