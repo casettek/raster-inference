@@ -45,6 +45,18 @@ pub struct GemmaBpeTokenizeSequenceState {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum GemmaBpeMergeIterationState {
+    Complete(GemmaBpeTokenizeSequenceState),
+    Applying(GemmaBpeApplyTileState),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GemmaBpeMergeDecision {
+    pub sequence_state: GemmaBpeTokenizeSequenceState,
+    pub selection: Option<GemmaBpeMergeSelection>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeMergeSelection {
     pub piece_idx: usize,
     pub merge_index: usize,
@@ -70,6 +82,7 @@ pub struct GemmaBpeScanState {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeScanTileState {
     pub artifact_store_roots: RasterArtifactStoreRoots,
+    pub bpe_state: GemmaBpeState,
     pub scan_state: GemmaBpeScanState,
 }
 

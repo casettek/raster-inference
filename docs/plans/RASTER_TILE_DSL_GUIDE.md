@@ -14,7 +14,7 @@ For every raster implementation:
 
 - Match the native routine's external behavior first. Inputs, outputs, errors, commitments, and tie-breaking rules should stay aligned unless the native path depends on behavior that cannot be replayed deterministically.
 - Keep all tile inputs and outputs explicit. A raster tile should be understandable from its arguments, return value, and authenticated reads.
-- Treat sequences as orchestration. A `#[sequence]` function should compose tiles with `call_tile!`, `call_seq!`, and recursive call helpers; it should not hide substantial routine logic inline.
+- Treat sequences as strict orchestration. A `#[sequence]` function should be a straight-line composition of `call_tile!`, `call_seq!`, and recursive call helpers; it must not branch, loop, inspect `Option`/enum cases, or hide routine logic inline.
 - Treat tiles as the replay units. A `#[tile]` function should perform one meaningful deterministic step with a narrow input and output contract.
 - Use recursive tiles or recursive sequences for dynamic repetition. Do not put unbounded routine-level loops in a sequence when the number of iterations depends on data.
 - Route external data access through `auth_read!`. Files, model weights, tokenizer tables, and other large or external sources must be represented as authenticated sources plus typed request objects.
@@ -74,7 +74,7 @@ pub fn run(...) -> Result<Output> {
 }
 ```
 
-This style makes the future proof trace obvious: each line names a tile, passes explicit state, and either returns a final value or hands state to the next step.
+This style makes the future proof trace obvious: each line names a tile, passes explicit state, and either returns a final value or hands state to the next step. Keep all decisions inside tiles by returning explicit state variants such as "complete" or "continue"; the sequence should not inspect those variants itself.
 
 ### 4. Represent Dynamic Loops As Tail-Recursive State Machines
 
@@ -104,7 +104,7 @@ Invoke fallible recursive tiles with `call_recur_tile!`:
 let state = call_recur_tile!(step, state, source)?;
 ```
 
-The completed prompt-preparation path uses this for BPE merging. The native tokenizer repeatedly chooses the best merge candidate until no merge remains; the raster version makes one logical merge iteration a recursive sequence over compact refs, cursors, and bounded scan/apply states.
+The completed prompt-preparation path uses this for BPE merging. The native tokenizer repeatedly chooses the best merge candidate until no merge remains; the raster version makes one logical merge iteration a recursive sequence over compact refs, cursors, and bounded scan/apply states. The no-merge branch is represented as tile state, so the sequence remains a straight-line chain of tile calls.
 
 ### 5. Replace File And Table Access With Authenticated Reads
 
@@ -157,7 +157,7 @@ In the completed prompt-preparation path, `TokenizePromptInput`, `GemmaNormalize
 - Call tiles with `call_tile!`.
 - Call nested sequences with `call_seq!`.
 - Call recursive tiles with `call_recur_tile!`.
-- Keep sequence bodies mostly linear. Branching is acceptable when it reflects routine semantics, but large branches should usually become separate tiles or sequences.
+- Keep sequence bodies linear. Branching is not acceptable in sequences; all conditional behavior must live inside tiles or in recursive tile/sequence done flags.
 - Do not use a sequence as a place to smuggle dynamic loops around the recursive DSL model.
 
 ### Authenticated Sources
@@ -275,7 +275,7 @@ Prompt preparation demonstrates these concrete moves that future routines should
 - Simple deterministic helpers, such as byte decoding, message construction, template rendering, and final state construction, remain small direct tiles or pre-sequence preparation steps.
 - Native tokenization is expanded into explicit stages: initialize tokenization input, normalize text, split text, initialize BPE pieces, recursively merge BPE pieces, finalize BPE output, and map final pieces to token IDs.
 - Tokenizer metadata, vocab lookups, special-token lookups, and BPE merge lookups are read through typed authenticated requests rather than through an opaque tokenizer object inside a tile.
-- BPE's data-dependent merge loop becomes a recursive sequence over `GemmaBpeState`.
+- BPE's data-dependent merge loop becomes a recursive sequence over `GemmaBpeState`, with the stop/apply decision represented by tile state rather than inline sequence branching.
 - Each logical BPE merge iteration is split into bounded scan and apply phases.
 - The scan phase reads adjacent piece pairs from a committed BPE piece artifact and chooses the best merge candidate by rank.
 - The apply phase streams the old piece artifact into a new builder artifact, replacing exactly the selected pair with the merged piece.
@@ -328,7 +328,7 @@ Use this checklist before converting another routine:
 - Replace data-dependent loops with recursive tiles or recursive sequences that carry explicit cursors and compact refs.
 - Split global-choice mutations into separate scan and apply phases when needed.
 - Validate tile sizing controls and reject zero or unsupported settings.
-- Keep sequence bodies mostly linear so the proof trace is readable.
+- Keep sequence bodies linear and branch-free so the proof trace is readable.
 - Ensure each recursive step makes obvious progress or returns a clear error.
 - Add tests for local tile behavior, recursive completion, native/raster parity, and chunk-size invariance.
 - Fail closed when native behavior depends on unsupported tokenizer, model, arithmetic, or layout features.

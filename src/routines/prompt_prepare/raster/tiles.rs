@@ -63,45 +63,20 @@ pub fn merge_bpe_tokenize_prompt(
     sequence_state: GemmaBpeTokenizeSequenceState,
     tokenizer_source_root: &str,
 ) -> Result<(bool, GemmaBpeTokenizeSequenceState)> {
-    let GemmaBpeTokenizeSequenceState {
-        artifact_store_roots,
-        bpe_state,
-    } = sequence_state;
-    let scan_tile_state = call_tile!(init_bpe_merge_scan, artifact_store_roots, &bpe_state)?;
+    let scan_tile_state = call_tile!(init_bpe_merge_scan, sequence_state)?;
     let scan_tile_state = call_recur_tile!(
         scan_bpe_merge_candidates,
         scan_tile_state,
         tokenizer_source_root
     )?;
-    let (artifact_store_roots, selection) = call_tile!(
+    let decision = call_tile!(
         finalize_bpe_merge_scan,
         scan_tile_state,
         tokenizer_source_root
     )?;
-    let Some(selection) = selection else {
-        return Ok((
-            true,
-            GemmaBpeTokenizeSequenceState {
-                artifact_store_roots,
-                bpe_state,
-            },
-        ));
-    };
-    let apply_tile_state = call_tile!(
-        init_apply_bpe_merge,
-        artifact_store_roots,
-        &bpe_state,
-        selection
-    )?;
-    let apply_tile_state = call_recur_tile!(apply_bpe_merge_chunk, apply_tile_state)?;
-    let (artifact_store_roots, bpe_state) = call_tile!(finalize_apply_bpe_merge, apply_tile_state)?;
-    Ok((
-        false,
-        GemmaBpeTokenizeSequenceState {
-            artifact_store_roots,
-            bpe_state,
-        },
-    ))
+    let iteration_state = call_tile!(init_bpe_merge_iteration, decision)?;
+    let iteration_state = call_recur_tile!(apply_bpe_merge_chunk_or_complete, iteration_state)?;
+    call_tile!(finalize_bpe_merge_iteration, iteration_state)
 }
 
 #[sequence]
@@ -280,20 +255,27 @@ pub fn finalize_raster_prompt_preparation(
 
 #[tile]
 pub fn init_bpe_merge_scan(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    bpe_state: &GemmaBpeState,
+    sequence_state: GemmaBpeTokenizeSequenceState,
 ) -> Result<GemmaBpeScanTileState> {
+    let GemmaBpeTokenizeSequenceState {
+        artifact_store_roots,
+        bpe_state,
+    } = sequence_state;
     if bpe_state.bpe_pairs_per_tile == 0 {
         bail!("raster tokenizer BPE pairs per tile must be greater than zero");
     }
+    let piece_count = bpe_state.piece_count;
+    let iteration = bpe_state.iteration;
+    let bpe_pairs_per_tile = bpe_state.bpe_pairs_per_tile;
     Ok(GemmaBpeScanTileState {
         artifact_store_roots,
+        bpe_state,
         scan_state: GemmaBpeScanState {
-            piece_count: bpe_state.piece_count,
-            iteration: bpe_state.iteration,
+            piece_count,
+            iteration,
             next_pair_idx: 0,
             best_candidate: None,
-            bpe_pairs_per_tile: bpe_state.bpe_pairs_per_tile,
+            bpe_pairs_per_tile,
         },
     })
 }
@@ -358,7 +340,7 @@ pub fn scan_bpe_merge_candidates(
 pub fn finalize_bpe_merge_scan(
     scan_tile_state: GemmaBpeScanTileState,
     tokenizer_source_root: &str,
-) -> Result<(RasterArtifactStoreRoots, Option<GemmaBpeMergeSelection>)> {
+) -> Result<GemmaBpeMergeDecision> {
     let pair_count = scan_tile_state.scan_state.piece_count.saturating_sub(1);
     if scan_tile_state.scan_state.next_pair_idx != pair_count {
         bail!(
@@ -366,8 +348,15 @@ pub fn finalize_bpe_merge_scan(
             scan_tile_state.scan_state.next_pair_idx
         );
     }
+    let sequence_state = GemmaBpeTokenizeSequenceState {
+        artifact_store_roots: scan_tile_state.artifact_store_roots,
+        bpe_state: scan_tile_state.bpe_state,
+    };
     let Some(candidate) = scan_tile_state.scan_state.best_candidate else {
-        return Ok((scan_tile_state.artifact_store_roots, None));
+        return Ok(GemmaBpeMergeDecision {
+            sequence_state,
+            selection: None,
+        });
     };
     let merged = ArtifactIo::auth_read(
         tokenizer_source_root,
@@ -382,22 +371,31 @@ pub fn finalize_bpe_merge_scan(
         )
     })?;
 
-    Ok((
-        scan_tile_state.artifact_store_roots,
-        Some(GemmaBpeMergeSelection {
+    Ok(GemmaBpeMergeDecision {
+        sequence_state,
+        selection: Some(GemmaBpeMergeSelection {
             piece_idx: candidate.piece_idx,
             merge_index: candidate.merge_index,
             merged,
         }),
-    ))
+    })
 }
 
 #[tile]
-pub fn init_apply_bpe_merge(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    bpe_state: &GemmaBpeState,
-    selection: GemmaBpeMergeSelection,
-) -> Result<GemmaBpeApplyTileState> {
+pub fn init_bpe_merge_iteration(
+    decision: GemmaBpeMergeDecision,
+) -> Result<GemmaBpeMergeIterationState> {
+    let GemmaBpeMergeDecision {
+        sequence_state,
+        selection,
+    } = decision;
+    let Some(selection) = selection else {
+        return Ok(GemmaBpeMergeIterationState::Complete(sequence_state));
+    };
+    let GemmaBpeTokenizeSequenceState {
+        artifact_store_roots,
+        bpe_state,
+    } = sequence_state;
     if bpe_state.bpe_pieces_per_tile == 0 {
         bail!("raster tokenizer BPE pieces per tile must be greater than zero");
     }
@@ -415,26 +413,35 @@ pub fn init_apply_bpe_merge(
         RasterArtifactMetadata::open_bpe_pieces(),
     )?;
 
-    Ok(GemmaBpeApplyTileState {
-        artifact_store_roots,
-        apply_state: GemmaBpeApplyState {
-            input_piece_count: bpe_state.piece_count,
-            merge_piece_idx: selection.piece_idx,
-            merged: selection.merged,
-            input_cursor: 0,
-            output_cursor: 0,
-            add_special_tokens: bpe_state.add_special_tokens,
-            iteration: bpe_state.iteration,
-            bpe_pairs_per_tile: bpe_state.bpe_pairs_per_tile,
-            bpe_pieces_per_tile: bpe_state.bpe_pieces_per_tile,
+    Ok(GemmaBpeMergeIterationState::Applying(
+        GemmaBpeApplyTileState {
+            artifact_store_roots,
+            apply_state: GemmaBpeApplyState {
+                input_piece_count: bpe_state.piece_count,
+                merge_piece_idx: selection.piece_idx,
+                merged: selection.merged,
+                input_cursor: 0,
+                output_cursor: 0,
+                add_special_tokens: bpe_state.add_special_tokens,
+                iteration: bpe_state.iteration,
+                bpe_pairs_per_tile: bpe_state.bpe_pairs_per_tile,
+                bpe_pieces_per_tile: bpe_state.bpe_pieces_per_tile,
+            },
         },
-    })
+    ))
 }
 
 #[tile(kind = recursive)]
-pub fn apply_bpe_merge_chunk(
-    mut apply_tile_state: GemmaBpeApplyTileState,
-) -> Result<(bool, GemmaBpeApplyTileState)> {
+pub fn apply_bpe_merge_chunk_or_complete(
+    iteration_state: GemmaBpeMergeIterationState,
+) -> Result<(bool, GemmaBpeMergeIterationState)> {
+    let mut apply_tile_state = match iteration_state {
+        GemmaBpeMergeIterationState::Complete(sequence_state) => {
+            return Ok((true, GemmaBpeMergeIterationState::Complete(sequence_state)));
+        }
+        GemmaBpeMergeIterationState::Applying(apply_tile_state) => apply_tile_state,
+    };
+
     if apply_tile_state.apply_state.bpe_pieces_per_tile == 0 {
         bail!("raster tokenizer BPE pieces per tile must be greater than zero");
     }
@@ -444,7 +451,10 @@ pub fn apply_bpe_merge_chunk(
         .input_piece_count
         .saturating_sub(1);
     if apply_tile_state.apply_state.output_cursor >= max_output_cursor {
-        return Ok((true, apply_tile_state));
+        return Ok((
+            true,
+            GemmaBpeMergeIterationState::Applying(apply_tile_state),
+        ));
     }
 
     let output_limit = apply_tile_state
@@ -500,14 +510,18 @@ pub fn apply_bpe_merge_chunk(
 
     Ok((
         apply_tile_state.apply_state.output_cursor >= max_output_cursor,
-        apply_tile_state,
+        GemmaBpeMergeIterationState::Applying(apply_tile_state),
     ))
 }
 
 #[tile]
-pub fn finalize_apply_bpe_merge(
-    apply_tile_state: GemmaBpeApplyTileState,
-) -> Result<(RasterArtifactStoreRoots, GemmaBpeState)> {
+pub fn finalize_bpe_merge_iteration(
+    iteration_state: GemmaBpeMergeIterationState,
+) -> Result<(bool, GemmaBpeTokenizeSequenceState)> {
+    let apply_tile_state = match iteration_state {
+        GemmaBpeMergeIterationState::Complete(sequence_state) => return Ok((true, sequence_state)),
+        GemmaBpeMergeIterationState::Applying(apply_tile_state) => apply_tile_state,
+    };
     let expected_piece_count = apply_tile_state
         .apply_state
         .input_piece_count
@@ -535,5 +549,11 @@ pub fn finalize_apply_bpe_merge(
         apply_tile_state.apply_state.bpe_pieces_per_tile,
     );
     next_state.iteration = apply_tile_state.apply_state.iteration + 1;
-    Ok((artifact_store_roots, next_state))
+    Ok((
+        false,
+        GemmaBpeTokenizeSequenceState {
+            artifact_store_roots,
+            bpe_state: next_state,
+        },
+    ))
 }
