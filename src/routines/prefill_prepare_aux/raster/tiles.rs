@@ -3,6 +3,7 @@ use anyhow::{anyhow, bail, Result};
 use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
+use crate::shared::artifacts::external_artifacts::CommittedExternalSource;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
 };
@@ -10,8 +11,8 @@ use crate::shared::numerics::det_num::{
     add_sat, rms_norm as det_rms_norm, scale_act, Acc, Act, Wgt,
 };
 use crate::shared::raster_contracts::prefill_ple::{
-    store_prefill_ple_input_manifest_with_roots, AuthenticatedGemmaPleSource,
-    GemmaPleLayerMetadataRequest, GemmaPleModelProjectionRowRequest,
+    store_prefill_ple_input_manifest_with_roots, GemmaPleLayerMetadataRequest,
+    GemmaPleMetadataRequest, GemmaPleModelProjectionRowRequest,
     GemmaPleProjectionNormWeightsRequest, GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
 };
 use crate::shared::raster_kernels::transformer::{
@@ -28,10 +29,14 @@ use super::utils::*;
 pub fn main(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterPrefillPleInputRoots,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
-    let (artifact_store_roots, ple_state) =
-        call_tile!(init_prefill_ple_state, artifact_store_roots, input_roots)?;
+    let (artifact_store_roots, ple_state) = call_tile!(
+        init_prefill_ple_state,
+        artifact_store_roots,
+        input_roots,
+        ple_source
+    )?;
     let (artifact_store_roots, ple_state) = call_recur_seq!(
         compute_next_prefill_ple_layer_sequence,
         (artifact_store_roots, ple_state),
@@ -49,7 +54,7 @@ pub fn main(
 pub fn compute_next_prefill_ple_layer_sequence(
     artifact_store_roots: RasterArtifactStoreRoots,
     ple_state: PrefillPleRasterState,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleRasterState)> {
     let (artifact_store_roots, layer_step) = call_tile!(
         init_prefill_ple_layer_step,
@@ -74,7 +79,7 @@ pub fn compute_next_prefill_ple_layer_sequence(
 fn run_prefill_ple_layer_step_sequence_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillPleLayerStep,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
     let layer_step = call_tile!(
         prepare_prefill_ple_layer_compute_inputs,
@@ -119,7 +124,7 @@ fn run_prefill_ple_layer_step_sequence_ref(
 fn build_scaled_token_embedding_for_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillPleLayerStep,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
     let (artifact_store_roots, token_embedding_step) = call_tile!(
         init_scaled_token_embedding_layer_step,
@@ -142,7 +147,7 @@ fn build_scaled_token_embedding_for_layer_step(
 fn project_prefill_ple_input_for_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillPleLayerStep,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
     let (artifact_store_roots, projection_step) = call_tile!(
         init_project_prefill_ple_layer_step,
@@ -251,18 +256,28 @@ fn scale_prefill_ple_combined_input_for_layer_step(
 pub fn init_prefill_ple_state(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterPrefillPleInputRoots,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleRasterState)> {
+    if input_roots.ple_source_root != ple_source.root() {
+        bail!(
+            "raster PLE source root {} does not match input source root {}",
+            ple_source.root(),
+            input_roots.ple_source_root
+        );
+    }
+    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
     Ok((
         artifact_store_roots,
         PrefillPleRasterState {
-            source_id: input_roots.source_id,
+            source_id: metadata.source_id,
+            ple_source_root: input_roots.ple_source_root,
             token_ids_source_name: input_roots.token_ids_source_name,
             token_count: input_roots.token_count,
             input_activations_ref: input_roots.input_activations_ref,
             next_layer_idx: 0,
-            layer_count: input_roots.layer_count,
-            per_layer_inputs: Vec::with_capacity(input_roots.layer_count),
-            has_ple_global: input_roots.has_ple_global,
+            layer_count: metadata.layer_count,
+            per_layer_inputs: Vec::with_capacity(metadata.layer_count),
+            has_ple_global: metadata.has_ple_global,
             raster_sizing: input_roots.raster_sizing,
         },
     ))
@@ -298,7 +313,7 @@ pub fn finalize_prefill_ple_input_refs(
 pub(in super::super) fn init_prefill_ple_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
     ple_state: PrefillPleRasterState,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
     if !ple_state.has_ple_global || ple_state.next_layer_idx >= ple_state.layer_count {
         return Ok((
@@ -363,7 +378,7 @@ pub(in super::super) fn init_prefill_ple_layer_step(
 #[tile]
 pub(in super::super) fn prepare_prefill_ple_layer_compute_inputs(
     layer_step: PrefillPleLayerStep,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<PrefillPleLayerStep> {
     match layer_step {
         PrefillPleLayerStep::Compute(mut compute_state) => {
@@ -472,7 +487,7 @@ pub(in super::super) fn init_scaled_token_embedding_layer_step(
 fn append_next_scaled_token_embedding_layer_step_row(
     artifact_store_roots: RasterArtifactStoreRoots,
     token_embedding_step: PrefillPleLayerTokenEmbeddingStep,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -573,7 +588,7 @@ fn init_project_prefill_ple_layer_step(
 fn project_next_prefill_ple_layer_step_rows(
     artifact_store_roots: RasterArtifactStoreRoots,
     projection_step: PrefillPleLayerProjectionStep,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -1007,7 +1022,7 @@ pub(in super::super) fn init_scaled_token_embedding_sequence_ref(
 pub(in super::super) fn append_next_scaled_token_embedding_row(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     mut token_embedding_state: PrefillPleTokenEmbeddingState,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -1127,7 +1142,7 @@ fn init_ple_sequence_projection_from_ref(
 pub fn project_next_ple_sequence_rows(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     mut projection_state: PrefillPleSequenceProjectionState,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &CommittedExternalSource,
     layer_idx: usize,
 ) -> Result<(
     bool,

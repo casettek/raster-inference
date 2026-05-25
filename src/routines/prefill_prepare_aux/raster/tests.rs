@@ -162,6 +162,10 @@ fn branch_free_sequence_violations(source: &str) -> Vec<String> {
 #[test]
 fn scaled_token_embedding_rows_advance_one_recursive_step_at_a_time() {
     let fixture = PleFixture::single_layer().expect("fixture should build");
+    let committed_source = fixture
+        .source
+        .committed_source()
+        .expect("source should commit static reads");
     reset_artifact_store();
     let token_ids_ref = store_prefill_token_ids_artifact(&[0, 1]).expect("token ids ref");
     let (mut artifact_store_roots, state) = init_scaled_token_embedding_sequence_ref(
@@ -180,21 +184,21 @@ fn scaled_token_embedding_rows_advance_one_recursive_step_at_a_time() {
     assert_eq!(state.next_token_idx, 0);
 
     let (done, next_roots, state) =
-        append_next_scaled_token_embedding_row(artifact_store_roots, state, &fixture.source)
+        append_next_scaled_token_embedding_row(artifact_store_roots, state, &committed_source)
             .expect("append first row");
     artifact_store_roots = next_roots;
     assert!(!done);
     assert_eq!(state.next_token_idx, 1);
 
     let (done, next_roots, state) =
-        append_next_scaled_token_embedding_row(artifact_store_roots, state, &fixture.source)
+        append_next_scaled_token_embedding_row(artifact_store_roots, state, &committed_source)
             .expect("append second row");
     artifact_store_roots = next_roots;
     assert!(!done);
     assert_eq!(state.next_token_idx, 2);
 
     let (done, artifact_store_roots, state) =
-        append_next_scaled_token_embedding_row(artifact_store_roots, state, &fixture.source)
+        append_next_scaled_token_embedding_row(artifact_store_roots, state, &committed_source)
             .expect("observe completion");
     assert!(done);
 
@@ -454,8 +458,13 @@ fn prefill_ple_state_serializes_refs_not_activation_rows() {
         raster_sizing_with_projection_rows(1),
     )
     .expect("prepare input roots");
+    let committed_source = fixture
+        .source
+        .committed_source()
+        .expect("source should commit static reads");
     let (artifact_store_roots, state) =
-        init_prefill_ple_state(artifact_store_roots, input_roots).expect("init state");
+        init_prefill_ple_state(artifact_store_roots, input_roots, &committed_source)
+            .expect("init state");
 
     let encoded = serde_json::to_string(&state).expect("serialize initial state");
     assert!(encoded.contains("token_ids_source_name"));
@@ -465,7 +474,7 @@ fn prefill_ple_state_serializes_refs_not_activation_rows() {
     assert!(!encoded.contains("act_bits"));
 
     let (_complete, artifact_store_roots, state) =
-        compute_next_prefill_ple_layer_sequence(artifact_store_roots, state, &fixture.source)
+        compute_next_prefill_ple_layer_sequence(artifact_store_roots, state, &committed_source)
             .expect("compute layer");
     let encoded = serde_json::to_string(&state).expect("serialize computed state");
     assert!(encoded.contains("prefill.prepare_aux.input.initial"));
@@ -503,12 +512,17 @@ fn prefill_ple_layer_steps_serialize_refs_not_activation_rows() {
         raster_sizing_with_projection_rows(1),
     )
     .expect("prepare input roots");
+    let committed_source = fixture
+        .source
+        .committed_source()
+        .expect("source should commit static reads");
     let (artifact_store_roots, ple_state) =
-        init_prefill_ple_state(artifact_store_roots, input_roots).expect("init state");
+        init_prefill_ple_state(artifact_store_roots, input_roots, &committed_source)
+            .expect("init state");
     let (artifact_store_roots, layer_step) =
-        init_prefill_ple_layer_step(artifact_store_roots, ple_state, &fixture.source)
+        init_prefill_ple_layer_step(artifact_store_roots, ple_state, &committed_source)
             .expect("init layer step");
-    let layer_step = prepare_prefill_ple_layer_compute_inputs(layer_step, &fixture.source)
+    let layer_step = prepare_prefill_ple_layer_compute_inputs(layer_step, &committed_source)
         .expect("prepare compute inputs");
 
     let encoded = serde_json::to_string(&layer_step).expect("serialize layer step");
@@ -532,6 +546,38 @@ fn prefill_ple_layer_steps_serialize_refs_not_activation_rows() {
     assert!(encoded.contains("token_ids_source_name"));
     assert!(!encoded.contains("[0,1]"));
     assert!(!encoded.contains("act_bits"));
+}
+
+#[test]
+fn prefill_ple_state_rejects_mismatched_committed_source_root() {
+    let fixture = PleFixture::single_layer().expect("fixture should build");
+    let token_ids = [0];
+    let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
+    let (artifact_store_roots, input_roots) = prepare_raster_prefill_ple_input_roots(
+        &token_ids,
+        &input,
+        &fixture.source,
+        raster_sizing_with_projection_rows(1),
+    )
+    .expect("prepare input roots");
+    let other_source = AuthenticatedGemmaPleSource::no_ple(
+        "other-ple-source",
+        vec![GemmaPleLayerConfig {
+            has_ple: false,
+            hidden_width: 2,
+        }],
+    )
+    .expect("other source should build");
+    let other_committed_source = other_source
+        .committed_source()
+        .expect("other source should commit static reads");
+
+    let error = init_prefill_ple_state(artifact_store_roots, input_roots, &other_committed_source)
+        .expect_err("mismatched committed PLE source root should fail");
+
+    assert!(error
+        .to_string()
+        .contains("does not match input source root"));
 }
 
 #[test]
@@ -581,12 +627,17 @@ fn missing_input_ref_fails_closed() {
         raster_sizing_with_projection_rows(1),
     )
     .expect("prepare input roots");
+    let committed_source = fixture
+        .source
+        .committed_source()
+        .expect("source should commit static reads");
     let (artifact_store_roots, mut state) =
-        init_prefill_ple_state(artifact_store_roots, input_roots).expect("init state");
+        init_prefill_ple_state(artifact_store_roots, input_roots, &committed_source)
+            .expect("init state");
     state.input_activations_ref = None;
 
     let error =
-        compute_next_prefill_ple_layer_sequence(artifact_store_roots, state, &fixture.source)
+        compute_next_prefill_ple_layer_sequence(artifact_store_roots, state, &committed_source)
             .expect_err("missing input ref should fail");
 
     assert!(error

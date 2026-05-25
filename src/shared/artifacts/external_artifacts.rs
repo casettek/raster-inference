@@ -1,6 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::shared::artifacts::artifact_io::AuthRead;
 use crate::shared::artifacts::merkle::{
@@ -118,6 +119,36 @@ impl ExternalSourceRead {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedExternalSourceRead {
+    commitment: String,
+    request_key: Vec<u8>,
+    response_payload: Vec<u8>,
+}
+
+impl VerifiedExternalSourceRead {
+    pub fn commitment(&self) -> &str {
+        &self.commitment
+    }
+
+    pub fn request_key(&self) -> &[u8] {
+        &self.request_key
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.response_payload
+    }
+
+    pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
+        postcard::from_bytes(self.bytes()).map_err(|error| {
+            anyhow!(
+                "failed to deserialize committed external source response from postcard bytes: {}",
+                error
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalSourceEntry {
     request_key: Vec<u8>,
     response_payload: Vec<u8>,
@@ -169,6 +200,21 @@ impl CommittedExternalSource {
     pub fn root(&self) -> &str {
         self.source_ref.root()
     }
+
+    pub fn read_verified(&self, request_key: &[u8]) -> Result<Option<VerifiedExternalSourceRead>> {
+        let Some(read) =
+            read_optional_external_source_by_request_key(&self.source_ref, request_key)?
+        else {
+            return Ok(None);
+        };
+        verify_external_source_read(&self.source_ref, &read)?;
+        let leaf = decode_source_leaf(read.payload())?;
+        Ok(Some(VerifiedExternalSourceRead {
+            commitment: self.root().to_string(),
+            request_key: leaf.request_key,
+            response_payload: leaf.response_payload,
+        }))
+    }
 }
 
 pub trait CommittedExternalRequest {
@@ -190,14 +236,10 @@ where
 
     fn auth_read(&self, request: Request) -> Result<Self::Output> {
         let request_key = request.request_key()?;
-        let Some(read) =
-            read_optional_external_source_by_request_key(&self.source_ref, &request_key)?
-        else {
+        let Some(read) = self.read_verified(&request_key)? else {
             return request.decode_missing_response();
         };
-        verify_external_source_read(&self.source_ref, &read)?;
-        let (_, response_payload) = decode_source_leaf(read.payload())?;
-        request.decode_response(&response_payload)
+        request.decode_response(read.bytes())
     }
 }
 
@@ -272,8 +314,8 @@ impl ExternalSourceStore {
     ) -> Result<Option<ExternalSourceRead>> {
         let source = self.source(source_ref)?;
         for (leaf_idx, payload) in source.leaves.iter().enumerate() {
-            let (leaf_request_key, _) = decode_source_leaf(payload)?;
-            if leaf_request_key == request_key {
+            let leaf = decode_source_leaf(payload)?;
+            if leaf.request_key == request_key {
                 let proof = merkle_proof(source.metadata.domain_bytes(), &source.leaves, leaf_idx)?;
                 return Ok(Some(ExternalSourceRead {
                     leaf_idx,
@@ -410,6 +452,42 @@ pub fn external_request_key(request_kind: &str, payload: &[u8]) -> Result<Vec<u8
     Ok(key)
 }
 
+pub fn postcard_request_key<T: Serialize + ?Sized>(
+    request_kind: &str,
+    payload: &T,
+) -> Result<Vec<u8>> {
+    let payload = postcard::to_allocvec(payload)?;
+    external_request_key(request_kind, &payload)
+}
+
+pub fn postcard_response_payload<T: Serialize + ?Sized>(response: &T) -> Result<Vec<u8>> {
+    Ok(postcard::to_allocvec(response)?)
+}
+
+pub fn postcard_external_source_entry<T: Serialize + ?Sized>(
+    request_key: Vec<u8>,
+    response: &T,
+) -> Result<ExternalSourceEntry> {
+    ExternalSourceEntry::new(request_key, postcard_response_payload(response)?)
+}
+
+pub fn decode_postcard_response<T: DeserializeOwned>(response_payload: &[u8]) -> Result<T> {
+    postcard::from_bytes(response_payload)
+        .map_err(|error| anyhow!("failed to deserialize committed external response: {error}"))
+}
+
+pub fn postcard_i32_vec_external_source_entry(
+    request_key: Vec<u8>,
+    values: impl IntoIterator<Item = i32>,
+) -> Result<ExternalSourceEntry> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    postcard_external_source_entry(request_key, &values)
+}
+
+pub fn decode_i32_vec_response(response_payload: &[u8]) -> Result<Vec<i32>> {
+    decode_postcard_response(response_payload)
+}
+
 fn source_leaves(mut entries: Vec<ExternalSourceEntry>) -> Result<Vec<Vec<u8>>> {
     entries.sort_by(|left, right| left.request_key.cmp(&right.request_key));
     for pair in entries.windows(2) {
@@ -424,36 +502,32 @@ fn source_leaves(mut entries: Vec<ExternalSourceEntry>) -> Result<Vec<Vec<u8>>> 
 }
 
 fn source_leaf(request_key: &[u8], response_payload: &[u8]) -> Result<Vec<u8>> {
-    let mut payload = Vec::with_capacity(16 + request_key.len() + response_payload.len());
-    payload.extend_from_slice(&(request_key.len() as u64).to_le_bytes());
-    payload.extend_from_slice(request_key);
-    payload.extend_from_slice(&(response_payload.len() as u64).to_le_bytes());
-    payload.extend_from_slice(response_payload);
-    Ok(payload)
+    Ok(postcard::to_allocvec(&ExternalSourceLeaf {
+        request_key,
+        response_payload,
+    })?)
 }
 
-fn decode_source_leaf(payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let (request_len, rest) = read_len_prefixed(payload).context("invalid request key payload")?;
-    let (response_len, remainder) = read_len_prefixed(rest).context("invalid response payload")?;
-    if !remainder.is_empty() {
-        bail!("external source leaf has trailing bytes");
-    }
-    Ok((request_len, response_len))
+#[derive(Serialize, serde::Deserialize)]
+struct ExternalSourceLeaf<'a> {
+    #[serde(borrow)]
+    request_key: &'a [u8],
+    #[serde(borrow)]
+    response_payload: &'a [u8],
 }
 
-fn read_len_prefixed(payload: &[u8]) -> Result<(Vec<u8>, &[u8])> {
-    if payload.len() < 8 {
-        bail!("length-prefixed payload is too short");
-    }
-    let len = u64::from_le_bytes(
-        payload[0..8]
-            .try_into()
-            .expect("slice length checked above"),
-    ) as usize;
-    let bytes = payload
-        .get(8..8 + len)
-        .ok_or_else(|| anyhow!("length-prefixed payload length mismatch"))?;
-    Ok((bytes.to_vec(), &payload[8 + len..]))
+struct DecodedExternalSourceLeaf {
+    request_key: Vec<u8>,
+    response_payload: Vec<u8>,
+}
+
+fn decode_source_leaf(payload: &[u8]) -> Result<DecodedExternalSourceLeaf> {
+    let leaf: ExternalSourceLeaf<'_> =
+        postcard::from_bytes(payload).context("invalid committed external source leaf")?;
+    Ok(DecodedExternalSourceLeaf {
+        request_key: leaf.request_key.to_vec(),
+        response_payload: leaf.response_payload.to_vec(),
+    })
 }
 
 fn external_source_ref(
@@ -496,9 +570,36 @@ mod tests {
         let read =
             read_external_source_by_request_key(&source_ref, &request_key).expect("source read");
         verify_external_source_read(&source_ref, &read).expect("read should verify");
-        let (_, response) = decode_source_leaf(read.payload()).expect("leaf should decode");
+        let response = decode_source_leaf(read.payload())
+            .expect("leaf should decode")
+            .response_payload;
 
         assert_eq!(response, b"response");
+    }
+
+    #[test]
+    fn committed_source_verified_read_exposes_response_bytes() {
+        reset_external_source_store();
+        let request_key = external_request_key("test.request", b"a").expect("request key");
+        let source_ref = register_external_source(
+            ExternalSourceId::new("verified").expect("source id"),
+            KIND,
+            DOMAIN,
+            vec![
+                ExternalSourceEntry::new(request_key.clone(), b"response".to_vec()).expect("entry"),
+            ],
+        )
+        .expect("source should register");
+        let source = CommittedExternalSource::new(source_ref.clone());
+
+        let read = source
+            .read_verified(&request_key)
+            .expect("verified read should succeed")
+            .expect("response should exist");
+
+        assert_eq!(read.commitment(), source_ref.root());
+        assert_eq!(read.request_key(), request_key);
+        assert_eq!(read.bytes(), b"response");
     }
 
     #[test]

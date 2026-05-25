@@ -1,20 +1,24 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-};
+use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use serde::Serialize;
 
 use crate::shared::artifacts::artifact_io::AuthRead;
 use crate::shared::artifacts::external_artifacts::{
-    register_external_source_leaves, CommittedExternalSource, ExternalSourceId, ExternalSourceRef,
+    decode_postcard_response, postcard_external_source_entry, postcard_request_key,
+    register_external_source, CommittedExternalRequest, CommittedExternalSource,
+    ExternalSourceEntry, ExternalSourceId, ExternalSourceRef,
 };
 use crate::shared::artifacts::raster_artifact_store::RasterBpePieceSequenceRef;
 
 const GEMMA_TOKENIZER_SOURCE_KIND: &str = "gemma_tokenizer";
 const GEMMA_TOKENIZER_SOURCE_DOMAIN: &str = "raster-external-source-gemma-tokenizer-merkle-v1";
-const GEMMA_TOKENIZER_SOURCE_CHUNK_BYTES: usize = 1 << 20;
+const TOKENIZER_METADATA_REQUEST: &str = "gemma_tokenizer.metadata";
+const TOKENIZER_DECODER_METADATA_REQUEST: &str = "gemma_tokenizer.decoder_metadata";
+const TOKENIZER_TOKEN_ID_REQUEST: &str = "gemma_tokenizer.token_id";
+const TOKENIZER_TOKEN_BY_ID_REQUEST: &str = "gemma_tokenizer.token_by_id";
+const TOKENIZER_BPE_MERGE_REQUEST: &str = "gemma_tokenizer.bpe_merge";
+const TOKENIZER_BPE_MERGED_TOKEN_REQUEST: &str = "gemma_tokenizer.bpe_merged_token";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GemmaVocabEntry {
@@ -387,14 +391,12 @@ impl AuthenticatedGemmaTokenizer {
     }
 
     pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
-        let source_ref = register_external_source_leaves(
+        register_external_source(
             ExternalSourceId::new(self.identifier.clone())?,
             GEMMA_TOKENIZER_SOURCE_KIND,
             GEMMA_TOKENIZER_SOURCE_DOMAIN,
-            source_payload_chunks(&self.spec.source_payload),
-        )?;
-        register_native_committed_tokenizer(source_ref.root(), self)?;
-        Ok(source_ref)
+            self.committed_source_entries()?,
+        )
     }
 
     pub fn committed_source(&self) -> Result<CommittedExternalSource> {
@@ -410,6 +412,55 @@ impl AuthenticatedGemmaTokenizer {
             space_replacement: self.spec.space_replacement.clone(),
             split_pattern: self.spec.split_pattern.clone(),
         }
+    }
+
+    fn committed_source_entries(&self) -> Result<Vec<ExternalSourceEntry>> {
+        let mut entries = Vec::new();
+        entries.push(postcard_external_source_entry(
+            GemmaTokenizerMetadataRequest.request_key()?,
+            &self.metadata(),
+        )?);
+        if let Some(decoder_metadata) = self.spec.decoder_metadata.as_ref() {
+            entries.push(postcard_external_source_entry(
+                GemmaDecoderMetadataRequest.request_key()?,
+                decoder_metadata,
+            )?);
+        }
+        for entry in &self.spec.vocab {
+            entries.push(postcard_external_source_entry(
+                GemmaTokenIdRequest {
+                    token: &entry.token,
+                }
+                .request_key()?,
+                &entry.id,
+            )?);
+        }
+        for token_id in self.spec.token_by_id.keys().copied() {
+            if let Some(decoded) = self.spec.token_by_id(token_id) {
+                entries.push(postcard_external_source_entry(
+                    GemmaTokenByIdRequest { token_id }.request_key()?,
+                    &decoded,
+                )?);
+            }
+        }
+        for (merge_index, merge) in self.spec.merges.iter().enumerate() {
+            entries.push(postcard_external_source_entry(
+                GemmaBpeMergeRequest {
+                    left: &merge.left,
+                    right: &merge.right,
+                }
+                .request_key()?,
+                &GemmaBpeMergeCandidate {
+                    merge_index,
+                    rank: merge.rank,
+                },
+            )?);
+            entries.push(postcard_external_source_entry(
+                GemmaBpeMergedTokenRequest { merge_index }.request_key()?,
+                &merge.merged,
+            )?);
+        }
+        Ok(entries)
     }
 }
 
@@ -497,51 +548,91 @@ impl AuthRead<GemmaBpeMergedTokenRequest> for AuthenticatedGemmaTokenizer {
     }
 }
 
-impl AuthRead<GemmaTokenizerMetadataRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaTokenizerMetadataRequest {
     type Output = GemmaTokenizerMetadata;
 
-    fn auth_read(&self, request: GemmaTokenizerMetadataRequest) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(TOKENIZER_METADATA_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
     }
 }
 
-impl AuthRead<GemmaDecoderMetadataRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaDecoderMetadataRequest {
     type Output = GemmaDecoderMetadata;
 
-    fn auth_read(&self, request: GemmaDecoderMetadataRequest) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(TOKENIZER_DECODER_METADATA_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
     }
 }
 
-impl<'a> AuthRead<GemmaTokenIdRequest<'a>> for CommittedExternalSource {
+impl<'a> CommittedExternalRequest for GemmaTokenIdRequest<'a> {
     type Output = Option<u32>;
 
-    fn auth_read(&self, request: GemmaTokenIdRequest<'a>) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(TOKENIZER_TOKEN_ID_REQUEST, self.token)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response::<u32>(response_payload).map(Some)
+    }
+
+    fn decode_missing_response(&self) -> Result<Self::Output> {
+        Ok(None)
     }
 }
 
-impl AuthRead<GemmaTokenByIdRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaTokenByIdRequest {
     type Output = Option<GemmaDecodedToken>;
 
-    fn auth_read(&self, request: GemmaTokenByIdRequest) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(TOKENIZER_TOKEN_BY_ID_REQUEST, &self.token_id)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response::<GemmaDecodedToken>(response_payload).map(Some)
+    }
+
+    fn decode_missing_response(&self) -> Result<Self::Output> {
+        Ok(None)
     }
 }
 
-impl<'a> AuthRead<GemmaBpeMergeRequest<'a>> for CommittedExternalSource {
+impl<'a> CommittedExternalRequest for GemmaBpeMergeRequest<'a> {
     type Output = Option<GemmaBpeMergeCandidate>;
 
-    fn auth_read(&self, request: GemmaBpeMergeRequest<'a>) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(TOKENIZER_BPE_MERGE_REQUEST, &(self.left, self.right))
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response::<GemmaBpeMergeCandidate>(response_payload).map(Some)
+    }
+
+    fn decode_missing_response(&self) -> Result<Self::Output> {
+        Ok(None)
     }
 }
 
-impl AuthRead<GemmaBpeMergedTokenRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaBpeMergedTokenRequest {
     type Output = Option<String>;
 
-    fn auth_read(&self, request: GemmaBpeMergedTokenRequest) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self.root(), |tokenizer| tokenizer.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(TOKENIZER_BPE_MERGED_TOKEN_REQUEST, &self.merge_index)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response::<String>(response_payload).map(Some)
+    }
+
+    fn decode_missing_response(&self) -> Result<Self::Output> {
+        Ok(None)
     }
 }
 
@@ -549,7 +640,7 @@ impl AuthRead<GemmaTokenizerMetadataRequest> for str {
     type Output = GemmaTokenizerMetadata;
 
     fn auth_read(&self, request: GemmaTokenizerMetadataRequest) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -557,7 +648,7 @@ impl AuthRead<GemmaDecoderMetadataRequest> for str {
     type Output = GemmaDecoderMetadata;
 
     fn auth_read(&self, request: GemmaDecoderMetadataRequest) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -565,7 +656,7 @@ impl<'a> AuthRead<GemmaTokenIdRequest<'a>> for str {
     type Output = Option<u32>;
 
     fn auth_read(&self, request: GemmaTokenIdRequest<'a>) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -573,7 +664,7 @@ impl AuthRead<GemmaTokenByIdRequest> for str {
     type Output = Option<GemmaDecodedToken>;
 
     fn auth_read(&self, request: GemmaTokenByIdRequest) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -581,7 +672,7 @@ impl<'a> AuthRead<GemmaBpeMergeRequest<'a>> for str {
     type Output = Option<GemmaBpeMergeCandidate>;
 
     fn auth_read(&self, request: GemmaBpeMergeRequest<'a>) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -589,56 +680,12 @@ impl AuthRead<GemmaBpeMergedTokenRequest> for str {
     type Output = Option<String>;
 
     fn auth_read(&self, request: GemmaBpeMergedTokenRequest) -> Result<Self::Output> {
-        with_native_committed_tokenizer(self, |tokenizer| tokenizer.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
-}
-
-thread_local! {
-    static NATIVE_COMMITTED_TOKENIZERS: RefCell<HashMap<String, AuthenticatedGemmaTokenizer>> =
-        RefCell::new(HashMap::new());
-}
-
-fn register_native_committed_tokenizer(
-    root: &str,
-    tokenizer: &AuthenticatedGemmaTokenizer,
-) -> Result<()> {
-    NATIVE_COMMITTED_TOKENIZERS.with(|sources_ref| {
-        let mut sources = sources_ref.borrow_mut();
-        match sources.get(root) {
-            Some(existing) if existing != tokenizer => {
-                bail!("committed tokenizer root {root} is already registered with different data")
-            }
-            Some(_) => Ok(()),
-            None => {
-                sources.insert(root.to_string(), tokenizer.clone());
-                Ok(())
-            }
-        }
-    })
-}
-
-fn with_native_committed_tokenizer<T>(
-    root: &str,
-    f: impl FnOnce(&AuthenticatedGemmaTokenizer) -> Result<T>,
-) -> Result<T> {
-    NATIVE_COMMITTED_TOKENIZERS.with(|sources_ref| {
-        let sources = sources_ref.borrow();
-        let tokenizer = sources
-            .get(root)
-            .ok_or_else(|| anyhow!("committed tokenizer root {root} is not registered natively"))?;
-        f(tokenizer)
-    })
 }
 
 fn canonical_tokenizer_source_payload(payload: GemmaTokenizerSourcePayload<'_>) -> Vec<u8> {
     serde_json::to_vec(&payload).expect("canonical tokenizer payload should serialize")
-}
-
-fn source_payload_chunks(payload: &[u8]) -> Vec<Vec<u8>> {
-    payload
-        .chunks(GEMMA_TOKENIZER_SOURCE_CHUNK_BYTES)
-        .map(|chunk| chunk.to_vec())
-        .collect()
 }
 
 impl GemmaBpeState {

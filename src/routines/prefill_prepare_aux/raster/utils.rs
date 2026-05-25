@@ -268,18 +268,20 @@ pub fn prepare_raster_prefill_ple_input_roots(
 ) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
     reset_artifact_store();
     let artifact_store_roots = ArtifactIo::export_store_roots();
+    let ple_committed_source = ple_source.committed_source()?;
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
     validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
     let (artifact_store_roots, token_ids_ref) =
         store_prefill_token_ids_artifact_with_roots(&artifact_store_roots, token_ids)?;
     let token_count = token_ids_ref.token_count();
     let token_ids_source_name = token_ids_ref.id().source_name().to_string();
-    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
+    let metadata = auth_read!(&ple_committed_source, GemmaPleMetadataRequest)?;
     if !metadata.has_ple_global {
         return Ok((
             artifact_store_roots,
             RasterPrefillPleInputRoots {
                 source_id: metadata.source_id,
+                ple_source_root: ple_committed_source.root().to_string(),
                 token_ids_source_name,
                 token_count: token_ids_ref.token_count(),
                 input_activations_ref: None,
@@ -318,7 +320,10 @@ pub fn prepare_raster_prefill_ple_input_roots(
         );
     }
 
-    let first_layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx: 0 })?;
+    let first_layer = auth_read!(
+        &ple_committed_source,
+        GemmaPleLayerMetadataRequest { layer_idx: 0 }
+    )?;
     let activation_width = input_activations.width()?;
     if activation_width != first_layer.hidden_width {
         bail!(
@@ -337,6 +342,7 @@ pub fn prepare_raster_prefill_ple_input_roots(
         artifact_store_roots,
         RasterPrefillPleInputRoots {
             source_id: metadata.source_id,
+            ple_source_root: ple_committed_source.root().to_string(),
             token_ids_source_name,
             token_count: token_ids_ref.token_count(),
             input_activations_ref: Some(input_activations_ref),
@@ -353,18 +359,20 @@ pub fn prepare_raster_prefill_ple_input_roots_from_embedding_refs(
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
+    let ple_committed_source = ple_source.committed_source()?;
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
     validate_sequence_rows_per_tile(raster_sizing.sequence_rows_per_tile)?;
     let token_ids_source_name = artifact_source_name_for_root(
         &artifact_store_roots,
         &input_embedding_refs.prompt_token_ids_root,
     )?;
-    let metadata = auth_read!(ple_source, GemmaPleMetadataRequest)?;
+    let metadata = auth_read!(&ple_committed_source, GemmaPleMetadataRequest)?;
     if !metadata.has_ple_global {
         return Ok((
             artifact_store_roots,
             RasterPrefillPleInputRoots {
                 source_id: metadata.source_id,
+                ple_source_root: ple_committed_source.root().to_string(),
                 token_ids_source_name,
                 token_count: input_embedding_refs.prompt_token_count,
                 input_activations_ref: None,
@@ -400,7 +408,10 @@ pub fn prepare_raster_prefill_ple_input_roots_from_embedding_refs(
         bail!("transformer PLE computation requires token ids and activations to have matching lengths");
     }
 
-    let first_layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx: 0 })?;
+    let first_layer = auth_read!(
+        &ple_committed_source,
+        GemmaPleLayerMetadataRequest { layer_idx: 0 }
+    )?;
     if input_embedding_refs.embedded_prompt_activations_ref.width() != first_layer.hidden_width {
         bail!(
             "input activations row 0 has width {}, expected {}",
@@ -415,6 +426,7 @@ pub fn prepare_raster_prefill_ple_input_roots_from_embedding_refs(
         artifact_store_roots,
         RasterPrefillPleInputRoots {
             source_id: metadata.source_id,
+            ple_source_root: ple_committed_source.root().to_string(),
             token_ids_source_name,
             token_count: input_embedding_refs.prompt_token_count,
             input_activations_ref: Some(
@@ -433,13 +445,14 @@ pub fn run(
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
+    let ple_committed_source = ple_source.committed_source()?;
     let (artifact_store_roots, input_roots) = prepare_raster_prefill_ple_input_roots(
         token_ids,
         input_activations,
         ple_source,
         raster_sizing,
     )?;
-    super::tiles::main(artifact_store_roots, input_roots, ple_source)
+    super::tiles::main(artifact_store_roots, input_roots, &ple_committed_source)
 }
 
 pub fn run_with_input_embedding_refs(
@@ -448,6 +461,7 @@ pub fn run_with_input_embedding_refs(
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<RasterPrefillPleOutput> {
+    let ple_committed_source = ple_source.committed_source()?;
     let (artifact_store_roots, input_roots) =
         prepare_raster_prefill_ple_input_roots_from_embedding_refs(
             artifact_store_roots,
@@ -456,6 +470,6 @@ pub fn run_with_input_embedding_refs(
             raster_sizing,
         )?;
     let (artifact_store_roots, refs) =
-        super::tiles::main(artifact_store_roots, input_roots, ple_source)?;
+        super::tiles::main(artifact_store_roots, input_roots, &ple_committed_source)?;
     Ok(RasterPrefillPleOutput::new(artifact_store_roots, refs))
 }

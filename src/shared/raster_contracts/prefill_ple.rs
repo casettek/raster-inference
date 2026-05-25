@@ -1,6 +1,14 @@
+use std::cell::RefCell;
+
 use anyhow::{anyhow, bail, Result};
 
 use crate::shared::artifacts::artifact_io::{ArtifactIo, AuthRead};
+use crate::shared::artifacts::external_artifacts::{
+    decode_i32_vec_response, decode_postcard_response, postcard_external_source_entry,
+    postcard_i32_vec_external_source_entry, postcard_request_key, register_external_source,
+    CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
+    ExternalSourceRef,
+};
 use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
     RasterArtifactStoreRoots,
@@ -18,6 +26,7 @@ pub struct AuthenticatedGemmaPleSource {
     projection_norm_weights: Option<Vec<Wgt>>,
     scalars: Option<GemmaPleScalars>,
     backing: GemmaPleBacking,
+    committed_source: RefCell<Option<CommittedExternalSource>>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +310,23 @@ pub struct GemmaPleScalars {
     pub rms_norm_eps: Acc,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct GemmaPleScalarsPayload {
+    embedding_scale_bits: i32,
+    projection_scalar_bits: i32,
+    input_scale_bits: i32,
+    rms_norm_eps_bits: i64,
+}
+
+const GEMMA_PLE_SOURCE_KIND: &str = "gemma_ple";
+const GEMMA_PLE_SOURCE_DOMAIN: &str = "raster-external-source-gemma-ple-merkle-v1";
+const PLE_METADATA_REQUEST: &str = "gemma_ple.metadata";
+const PLE_LAYER_METADATA_REQUEST: &str = "gemma_ple.layer_metadata";
+const PLE_TOKEN_EMBEDDING_ROW_REQUEST: &str = "gemma_ple.token_embedding_row";
+const PLE_MODEL_PROJECTION_ROW_REQUEST: &str = "gemma_ple.model_projection_row";
+const PLE_PROJECTION_NORM_WEIGHTS_REQUEST: &str = "gemma_ple.projection_norm_weights";
+const PLE_SCALARS_REQUEST: &str = "gemma_ple.scalars";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmaPleMetadataRequest;
 
@@ -381,6 +407,7 @@ impl AuthenticatedGemmaPleSource {
                 projection_norm_weights: None,
                 scalars: None,
                 backing: GemmaPleBacking::None,
+                committed_source: RefCell::new(None),
             });
         };
 
@@ -406,6 +433,7 @@ impl AuthenticatedGemmaPleSource {
             projection_norm_weights: Some(projection_norm_weights),
             scalars: Some(scalars),
             backing: GemmaPleBacking::Model(ple_global),
+            committed_source: RefCell::new(None),
         })
     }
 
@@ -434,6 +462,7 @@ impl AuthenticatedGemmaPleSource {
                 token_embeddings,
                 model_projections,
             },
+            committed_source: RefCell::new(None),
         })
     }
 
@@ -454,6 +483,26 @@ impl AuthenticatedGemmaPleSource {
         &self.identifier
     }
 
+    pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
+        Ok(self.committed_source()?.source_ref().clone())
+    }
+
+    pub fn committed_source(&self) -> Result<CommittedExternalSource> {
+        if let Some(source) = self.committed_source.borrow().clone() {
+            return Ok(source);
+        }
+
+        let source_ref = register_external_source(
+            ExternalSourceId::new(format!("ple:{}", self.identifier))?,
+            GEMMA_PLE_SOURCE_KIND,
+            GEMMA_PLE_SOURCE_DOMAIN,
+            self.committed_source_entries()?,
+        )?;
+        let source = CommittedExternalSource::new(source_ref);
+        *self.committed_source.borrow_mut() = Some(source.clone());
+        Ok(source)
+    }
+
     fn metadata(&self) -> GemmaPleMetadata {
         let has_ple_global = !matches!(self.backing, GemmaPleBacking::None);
         GemmaPleMetadata {
@@ -466,43 +515,91 @@ impl AuthenticatedGemmaPleSource {
         }
     }
 
-    fn layer_metadata(&self, layer_idx: usize) -> Result<GemmaPleLayerMetadata> {
-        self.layers.get(layer_idx).cloned().ok_or_else(|| {
-            anyhow!(
-                "Gemma PLE layer index {layer_idx} is out of range for {} layers",
-                self.layers.len()
-            )
-        })
-    }
-
     fn require_ple_global(&self) -> Result<()> {
         if matches!(self.backing, GemmaPleBacking::None) {
             bail!("Gemma PLE source has no global PLE weights");
         }
         Ok(())
     }
-}
 
-impl AuthRead<GemmaPleMetadataRequest> for AuthenticatedGemmaPleSource {
-    type Output = GemmaPleMetadata;
+    fn committed_source_entries(&self) -> Result<Vec<ExternalSourceEntry>> {
+        let mut entries = Vec::new();
+        entries.push(postcard_external_source_entry(
+            GemmaPleMetadataRequest.request_key()?,
+            &self.metadata(),
+        )?);
+        for layer in &self.layers {
+            entries.push(postcard_external_source_entry(
+                GemmaPleLayerMetadataRequest {
+                    layer_idx: layer.layer_idx,
+                }
+                .request_key()?,
+                layer,
+            )?);
+        }
 
-    fn auth_read(&self, _request: GemmaPleMetadataRequest) -> Result<Self::Output> {
-        Ok(self.metadata())
+        if !matches!(self.backing, GemmaPleBacking::None) {
+            let norm_bits = self
+                .native_projection_norm_weights()?
+                .into_iter()
+                .map(|value| value.to_bits());
+            entries.push(postcard_i32_vec_external_source_entry(
+                GemmaPleProjectionNormWeightsRequest.request_key()?,
+                norm_bits,
+            )?);
+            entries.push(postcard_external_source_entry(
+                GemmaPleScalarsRequest.request_key()?,
+                &self.native_scalars()?.payload(),
+            )?);
+            for layer in &self.layers {
+                let Some(token_count) = layer.token_embedding_vocab_size else {
+                    continue;
+                };
+                for token_id in 0..token_count {
+                    let request = GemmaPleTokenEmbeddingRowRequest {
+                        layer_idx: layer.layer_idx,
+                        token_id: u32::try_from(token_id).map_err(|_| {
+                            anyhow!(
+                                "PLE token id {token_id} exceeds u32 at layer {}",
+                                layer.layer_idx
+                            )
+                        })?,
+                    };
+                    let row_bits = self
+                        .native_token_embedding_row(request)?
+                        .into_iter()
+                        .map(|value| value.to_bits());
+                    entries.push(postcard_i32_vec_external_source_entry(
+                        request.request_key()?,
+                        row_bits,
+                    )?);
+                }
+                if let Some(row_count) = layer.model_projection_rows {
+                    for row_idx in 0..row_count {
+                        let request = GemmaPleModelProjectionRowRequest {
+                            layer_idx: layer.layer_idx,
+                            row_idx,
+                        };
+                        let row_bits = self
+                            .native_model_projection_row(request)?
+                            .into_iter()
+                            .map(|value| value.to_bits());
+                        entries.push(postcard_i32_vec_external_source_entry(
+                            request.request_key()?,
+                            row_bits,
+                        )?);
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
     }
-}
 
-impl AuthRead<GemmaPleLayerMetadataRequest> for AuthenticatedGemmaPleSource {
-    type Output = GemmaPleLayerMetadata;
-
-    fn auth_read(&self, request: GemmaPleLayerMetadataRequest) -> Result<Self::Output> {
-        self.layer_metadata(request.layer_idx)
-    }
-}
-
-impl AuthRead<GemmaPleTokenEmbeddingRowRequest> for AuthenticatedGemmaPleSource {
-    type Output = Vec<Act>;
-
-    fn auth_read(&self, request: GemmaPleTokenEmbeddingRowRequest) -> Result<Self::Output> {
+    fn native_token_embedding_row(
+        &self,
+        request: GemmaPleTokenEmbeddingRowRequest,
+    ) -> Result<Vec<Act>> {
         self.require_ple_global()?;
         let row_idx = usize::try_from(request.token_id).expect("u32 should fit into usize");
         match &self.backing {
@@ -538,12 +635,11 @@ impl AuthRead<GemmaPleTokenEmbeddingRowRequest> for AuthenticatedGemmaPleSource 
             }
         }
     }
-}
 
-impl AuthRead<GemmaPleModelProjectionRowRequest> for AuthenticatedGemmaPleSource {
-    type Output = Vec<Wgt>;
-
-    fn auth_read(&self, request: GemmaPleModelProjectionRowRequest) -> Result<Self::Output> {
+    fn native_model_projection_row(
+        &self,
+        request: GemmaPleModelProjectionRowRequest,
+    ) -> Result<Vec<Wgt>> {
         self.require_ple_global()?;
         match &self.backing {
             GemmaPleBacking::None => unreachable!("require_ple_global checked this case"),
@@ -581,26 +677,186 @@ impl AuthRead<GemmaPleModelProjectionRowRequest> for AuthenticatedGemmaPleSource
             }
         }
     }
+
+    fn native_projection_norm_weights(&self) -> Result<Vec<Wgt>> {
+        self.require_ple_global()?;
+        self.projection_norm_weights.clone().ok_or_else(|| {
+            anyhow!("deterministic raster PLE source requires canonical norm weights")
+        })
+    }
+
+    fn native_scalars(&self) -> Result<GemmaPleScalars> {
+        self.require_ple_global()?;
+        self.scalars
+            .ok_or_else(|| anyhow!("deterministic raster PLE source requires canonical scalars"))
+    }
+}
+
+impl AuthRead<GemmaPleMetadataRequest> for AuthenticatedGemmaPleSource {
+    type Output = GemmaPleMetadata;
+
+    fn auth_read(&self, request: GemmaPleMetadataRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaPleLayerMetadataRequest> for AuthenticatedGemmaPleSource {
+    type Output = GemmaPleLayerMetadata;
+
+    fn auth_read(&self, request: GemmaPleLayerMetadataRequest) -> Result<Self::Output> {
+        if request.layer_idx >= self.layers.len() {
+            bail!(
+                "Gemma PLE layer index {} is out of range for {} layers",
+                request.layer_idx,
+                self.layers.len()
+            );
+        }
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaPleTokenEmbeddingRowRequest> for AuthenticatedGemmaPleSource {
+    type Output = Vec<Act>;
+
+    fn auth_read(&self, request: GemmaPleTokenEmbeddingRowRequest) -> Result<Self::Output> {
+        self.require_ple_global()?;
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaPleModelProjectionRowRequest> for AuthenticatedGemmaPleSource {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPleModelProjectionRowRequest) -> Result<Self::Output> {
+        self.require_ple_global()?;
+        self.committed_source()?.auth_read(request)
+    }
 }
 
 impl AuthRead<GemmaPleProjectionNormWeightsRequest> for AuthenticatedGemmaPleSource {
     type Output = Vec<Wgt>;
 
-    fn auth_read(&self, _request: GemmaPleProjectionNormWeightsRequest) -> Result<Self::Output> {
+    fn auth_read(&self, request: GemmaPleProjectionNormWeightsRequest) -> Result<Self::Output> {
         self.require_ple_global()?;
-        self.projection_norm_weights.clone().ok_or_else(|| {
-            anyhow!("deterministic raster PLE source requires canonical norm weights")
-        })
+        self.committed_source()?.auth_read(request)
     }
 }
 
 impl AuthRead<GemmaPleScalarsRequest> for AuthenticatedGemmaPleSource {
     type Output = GemmaPleScalars;
 
-    fn auth_read(&self, _request: GemmaPleScalarsRequest) -> Result<Self::Output> {
+    fn auth_read(&self, request: GemmaPleScalarsRequest) -> Result<Self::Output> {
         self.require_ple_global()?;
-        self.scalars
-            .ok_or_else(|| anyhow!("deterministic raster PLE source requires canonical scalars"))
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl CommittedExternalRequest for GemmaPleMetadataRequest {
+    type Output = GemmaPleMetadata;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PLE_METADATA_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
+    }
+}
+
+impl CommittedExternalRequest for GemmaPleLayerMetadataRequest {
+    type Output = GemmaPleLayerMetadata;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PLE_LAYER_METADATA_REQUEST, &self.layer_idx)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
+    }
+}
+
+impl CommittedExternalRequest for GemmaPleTokenEmbeddingRowRequest {
+    type Output = Vec<Act>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(
+            PLE_TOKEN_EMBEDDING_ROW_REQUEST,
+            &(self.layer_idx, self.token_id),
+        )
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Act::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaPleModelProjectionRowRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(
+            PLE_MODEL_PROJECTION_ROW_REQUEST,
+            &(self.layer_idx, self.row_idx),
+        )
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaPleProjectionNormWeightsRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PLE_PROJECTION_NORM_WEIGHTS_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaPleScalarsRequest {
+    type Output = GemmaPleScalars;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PLE_SCALARS_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(GemmaPleScalars::from_payload(decode_postcard_response(
+            response_payload,
+        )?))
+    }
+}
+
+impl GemmaPleScalars {
+    fn payload(self) -> GemmaPleScalarsPayload {
+        GemmaPleScalarsPayload {
+            embedding_scale_bits: self.embedding_scale.to_bits(),
+            projection_scalar_bits: self.projection_scalar.to_bits(),
+            input_scale_bits: self.input_scale.to_bits(),
+            rms_norm_eps_bits: self.rms_norm_eps.to_bits(),
+        }
+    }
+
+    fn from_payload(payload: GemmaPleScalarsPayload) -> Self {
+        Self {
+            embedding_scale: Act::from_bits(payload.embedding_scale_bits),
+            projection_scalar: Act::from_bits(payload.projection_scalar_bits),
+            input_scale: Act::from_bits(payload.input_scale_bits),
+            rms_norm_eps: Acc::from_bits(payload.rms_norm_eps_bits),
+        }
     }
 }
 

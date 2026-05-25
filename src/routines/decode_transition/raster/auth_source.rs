@@ -1,8 +1,14 @@
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
 
 use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::external_artifacts::{
+    decode_i32_vec_response, decode_postcard_response, postcard_external_source_entry,
+    postcard_i32_vec_external_source_entry, postcard_request_key, register_external_source,
+    CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
+    ExternalSourceRef,
+};
 use crate::shared::model::transformer::{
     DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
@@ -23,6 +29,7 @@ pub struct AuthenticatedGemmaDecodeTransitionSource {
     final_norm_weights: Vec<Wgt>,
     final_scalars: GemmaDecodeFinalScalars,
     projection: GemmaDecodeProjectionBacking,
+    committed_source: RefCell<Option<CommittedExternalSource>>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +149,13 @@ pub struct GemmaDecodeLayerScalars {
     pub layer_scalar: Option<Act>,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct GemmaDecodeLayerScalarsPayload {
+    rms_norm_eps_bits: i64,
+    rope_base_bits: Option<i64>,
+    layer_scalar_bits: Option<i32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmaDecodePleScalars {
     pub embedding_scale: Act,
@@ -150,11 +164,45 @@ pub struct GemmaDecodePleScalars {
     pub rms_norm_eps: Acc,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct GemmaDecodePleScalarsPayload {
+    embedding_scale_bits: i32,
+    projection_scalar_bits: i32,
+    input_scale_bits: i32,
+    rms_norm_eps_bits: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmaDecodeFinalScalars {
     pub rms_norm_eps: Acc,
     pub final_logit_softcapping: Option<Act>,
 }
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct GemmaDecodeFinalScalarsPayload {
+    rms_norm_eps_bits: i64,
+    final_logit_softcapping_bits: Option<i32>,
+}
+
+const GEMMA_DECODE_TRANSITION_SOURCE_KIND: &str = "gemma_decode_transition";
+const GEMMA_DECODE_TRANSITION_SOURCE_DOMAIN: &str =
+    "raster-external-source-gemma-decode-transition-merkle-v1";
+const DECODE_TRANSITION_METADATA_REQUEST: &str = "gemma_decode_transition.metadata";
+const DECODE_EMBEDDING_ROW_REQUEST: &str = "gemma_decode_transition.embedding_row";
+const DECODE_LAYER_METADATA_REQUEST: &str = "gemma_decode_transition.layer_metadata";
+const DECODE_LAYER_SCALARS_REQUEST: &str = "gemma_decode_transition.layer_scalars";
+const DECODE_LAYER_MATRIX_ROW_REQUEST: &str = "gemma_decode_transition.layer_matrix_row";
+const DECODE_LAYER_NORM_WEIGHTS_REQUEST: &str = "gemma_decode_transition.layer_norm_weights";
+const DECODE_PLE_TOKEN_EMBEDDING_ROW_REQUEST: &str =
+    "gemma_decode_transition.ple_token_embedding_row";
+const DECODE_PLE_MODEL_PROJECTION_ROW_REQUEST: &str =
+    "gemma_decode_transition.ple_model_projection_row";
+const DECODE_PLE_PROJECTION_NORM_WEIGHTS_REQUEST: &str =
+    "gemma_decode_transition.ple_projection_norm_weights";
+const DECODE_PLE_SCALARS_REQUEST: &str = "gemma_decode_transition.ple_scalars";
+const DECODE_FINAL_NORM_WEIGHTS_REQUEST: &str = "gemma_decode_transition.final_norm_weights";
+const DECODE_FINAL_SCALARS_REQUEST: &str = "gemma_decode_transition.final_scalars";
+const DECODE_PROJECTION_ROW_REQUEST: &str = "gemma_decode_transition.projection_row";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmaDecodeTransitionMetadataRequest;
@@ -319,6 +367,7 @@ impl AuthenticatedGemmaDecodeTransitionSource {
             final_norm_weights,
             final_scalars,
             projection,
+            committed_source: RefCell::new(None),
         })
     }
 
@@ -326,21 +375,23 @@ impl AuthenticatedGemmaDecodeTransitionSource {
         &self.identifier
     }
 
-    pub fn static_source_root(&self) -> String {
-        crate::trace::sha256_hex(&(
-            "raster-decode-transition-static-source-v1",
-            self.identifier.as_str(),
-            &self.metadata,
-        ))
+    pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
+        Ok(self.committed_source()?.source_ref().clone())
     }
 
-    fn layer_metadata(&self, layer_idx: usize) -> Result<GemmaDecodeLayerMetadata> {
-        self.layers.get(layer_idx).cloned().ok_or_else(|| {
-            anyhow!(
-                "Gemma decode layer index {layer_idx} is out of range for {} layers",
-                self.layers.len()
-            )
-        })
+    pub fn committed_source(&self) -> Result<CommittedExternalSource> {
+        if let Some(source) = self.committed_source.borrow().clone() {
+            return Ok(source);
+        }
+        let source_ref = register_external_source(
+            ExternalSourceId::new(format!("decode-transition:{}", self.identifier))?,
+            GEMMA_DECODE_TRANSITION_SOURCE_KIND,
+            GEMMA_DECODE_TRANSITION_SOURCE_DOMAIN,
+            self.committed_source_entries()?,
+        )?;
+        let source = CommittedExternalSource::new(source_ref);
+        *self.committed_source.borrow_mut() = Some(source.clone());
+        Ok(source)
     }
 
     fn backing_layer(&self, layer_idx: usize) -> Result<&GemmaDecodeLayerBacking> {
@@ -357,20 +408,176 @@ impl AuthenticatedGemmaDecodeTransitionSource {
             .as_ref()
             .ok_or_else(|| anyhow!("Gemma decode transition source has no global PLE weights"))
     }
-}
 
-impl AuthRead<GemmaDecodeTransitionMetadataRequest> for AuthenticatedGemmaDecodeTransitionSource {
-    type Output = GemmaDecodeTransitionMetadata;
-
-    fn auth_read(&self, _request: GemmaDecodeTransitionMetadataRequest) -> Result<Self::Output> {
-        Ok(self.metadata.clone())
+    fn committed_source_entries(&self) -> Result<Vec<ExternalSourceEntry>> {
+        let mut entries = Vec::new();
+        entries.push(postcard_external_source_entry(
+            GemmaDecodeTransitionMetadataRequest.request_key()?,
+            &self.metadata,
+        )?);
+        for token_id in 0..self.metadata.embedding_vocab_size {
+            let request = GemmaDecodeEmbeddingRowRequest {
+                token_id: u32::try_from(token_id)
+                    .map_err(|_| anyhow!("decode embedding token id {token_id} exceeds u32"))?,
+            };
+            let row_bits = self
+                .native_embedding_row(request)?
+                .into_iter()
+                .map(|value| value.to_bits());
+            entries.push(postcard_i32_vec_external_source_entry(
+                request.request_key()?,
+                row_bits,
+            )?);
+        }
+        for layer in &self.layers {
+            entries.push(postcard_external_source_entry(
+                GemmaDecodeLayerMetadataRequest {
+                    layer_idx: layer.layer_idx,
+                }
+                .request_key()?,
+                layer,
+            )?);
+            entries.push(postcard_external_source_entry(
+                GemmaDecodeLayerScalarsRequest {
+                    layer_idx: layer.layer_idx,
+                }
+                .request_key()?,
+                &self
+                    .native_layer_scalars(GemmaDecodeLayerScalarsRequest {
+                        layer_idx: layer.layer_idx,
+                    })?
+                    .payload(),
+            )?);
+            for norm in decode_layer_norm_requests(layer) {
+                let request = GemmaDecodeLayerNormWeightsRequest {
+                    layer_idx: layer.layer_idx,
+                    norm,
+                };
+                let weights = self
+                    .native_layer_norm_weights(request)?
+                    .into_iter()
+                    .map(|value| value.to_bits());
+                entries.push(postcard_i32_vec_external_source_entry(
+                    request.request_key()?,
+                    weights,
+                )?);
+            }
+            for (matrix, rows) in decode_layer_matrix_requests(layer) {
+                for row_idx in 0..rows {
+                    let request = GemmaDecodeLayerMatrixRowRequest {
+                        layer_idx: layer.layer_idx,
+                        matrix,
+                        row_idx,
+                    };
+                    let row_bits = self
+                        .native_layer_matrix_row(request)?
+                        .into_iter()
+                        .map(|value| value.to_bits());
+                    entries.push(postcard_i32_vec_external_source_entry(
+                        request.request_key()?,
+                        row_bits,
+                    )?);
+                }
+            }
+        }
+        if self.ple.is_some() {
+            entries.push(postcard_i32_vec_external_source_entry(
+                GemmaDecodePleProjectionNormWeightsRequest.request_key()?,
+                self.native_ple_projection_norm_weights()?
+                    .into_iter()
+                    .map(|value| value.to_bits()),
+            )?);
+            entries.push(postcard_external_source_entry(
+                GemmaDecodePleScalarsRequest.request_key()?,
+                &self.native_ple_scalars()?.payload(),
+            )?);
+            for layer in self.layers.iter().filter(|layer| layer.has_ple) {
+                let token_rows = self
+                    .ple()?
+                    .token_embeddings
+                    .get(layer.layer_idx)
+                    .map(ple_matrix_shape)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Gemma decode PLE token embedding layer {} is missing",
+                            layer.layer_idx
+                        )
+                    })?
+                    .rows;
+                for token_id in 0..token_rows {
+                    let request = GemmaDecodePleTokenEmbeddingRowRequest {
+                        layer_idx: layer.layer_idx,
+                        token_id: u32::try_from(token_id).map_err(|_| {
+                            anyhow!(
+                                "decode PLE token id {token_id} exceeds u32 at layer {}",
+                                layer.layer_idx
+                            )
+                        })?,
+                    };
+                    let row_bits = self
+                        .native_ple_token_embedding_row(request)?
+                        .into_iter()
+                        .map(|value| value.to_bits());
+                    entries.push(postcard_i32_vec_external_source_entry(
+                        request.request_key()?,
+                        row_bits,
+                    )?);
+                }
+                let projection_rows = self
+                    .ple()?
+                    .model_projections
+                    .get(layer.layer_idx)
+                    .map(ple_matrix_shape)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Gemma decode PLE model projection layer {} is missing",
+                            layer.layer_idx
+                        )
+                    })?
+                    .rows;
+                for row_idx in 0..projection_rows {
+                    let request = GemmaDecodePleModelProjectionRowRequest {
+                        layer_idx: layer.layer_idx,
+                        row_idx,
+                    };
+                    let row_bits = self
+                        .native_ple_model_projection_row(request)?
+                        .into_iter()
+                        .map(|value| value.to_bits());
+                    entries.push(postcard_i32_vec_external_source_entry(
+                        request.request_key()?,
+                        row_bits,
+                    )?);
+                }
+            }
+        }
+        entries.push(postcard_i32_vec_external_source_entry(
+            GemmaDecodeFinalNormWeightsRequest.request_key()?,
+            self.native_final_norm_weights()?
+                .into_iter()
+                .map(|value| value.to_bits()),
+        )?);
+        entries.push(postcard_external_source_entry(
+            GemmaDecodeFinalScalarsRequest.request_key()?,
+            &self.native_final_scalars().payload(),
+        )?);
+        for row_idx in 0..self.metadata.projection_rows {
+            let request = GemmaDecodeProjectionRowRequest { row_idx };
+            let row_bits = self
+                .native_projection_row(request)?
+                .into_iter()
+                .map(|value| value.to_bits());
+            entries.push(postcard_i32_vec_external_source_entry(
+                request.request_key()?,
+                row_bits,
+            )?);
+        }
+        Ok(entries)
     }
-}
 
-impl AuthRead<GemmaDecodeEmbeddingRowRequest> for AuthenticatedGemmaDecodeTransitionSource {
-    type Output = Vec<Act>;
-
-    fn auth_read(&self, request: GemmaDecodeEmbeddingRowRequest) -> Result<Self::Output> {
+    fn native_embedding_row(&self, request: GemmaDecodeEmbeddingRowRequest) -> Result<Vec<Act>> {
         let row = det_num_tensor_slice_row_wgts(
             &self.embedding,
             usize::try_from(request.token_id).expect("u32 should fit into usize"),
@@ -381,47 +588,35 @@ impl AuthRead<GemmaDecodeEmbeddingRowRequest> for AuthenticatedGemmaDecodeTransi
             .map(|value| scale_act(Act::from_bits(value.to_bits()), self.embedding_scale))
             .collect())
     }
-}
 
-impl AuthRead<GemmaDecodeLayerMetadataRequest> for AuthenticatedGemmaDecodeTransitionSource {
-    type Output = GemmaDecodeLayerMetadata;
-
-    fn auth_read(&self, request: GemmaDecodeLayerMetadataRequest) -> Result<Self::Output> {
-        self.layer_metadata(request.layer_idx)
-    }
-}
-
-impl AuthRead<GemmaDecodeLayerScalarsRequest> for AuthenticatedGemmaDecodeTransitionSource {
-    type Output = GemmaDecodeLayerScalars;
-
-    fn auth_read(&self, request: GemmaDecodeLayerScalarsRequest) -> Result<Self::Output> {
+    fn native_layer_scalars(
+        &self,
+        request: GemmaDecodeLayerScalarsRequest,
+    ) -> Result<GemmaDecodeLayerScalars> {
         Ok(self.backing_layer(request.layer_idx)?.scalars)
     }
-}
 
-impl AuthRead<GemmaDecodeLayerMatrixRowRequest> for AuthenticatedGemmaDecodeTransitionSource {
-    type Output = Vec<Wgt>;
-
-    fn auth_read(&self, request: GemmaDecodeLayerMatrixRowRequest) -> Result<Self::Output> {
+    fn native_layer_matrix_row(
+        &self,
+        request: GemmaDecodeLayerMatrixRowRequest,
+    ) -> Result<Vec<Wgt>> {
         let layer = self.backing_layer(request.layer_idx)?;
         let matrix = layer.matrix_source(request.matrix, request.layer_idx)?;
         matrix_row_wgts(matrix, request.row_idx, request.matrix.label())
     }
-}
 
-impl AuthRead<GemmaDecodeLayerNormWeightsRequest> for AuthenticatedGemmaDecodeTransitionSource {
-    type Output = Vec<Wgt>;
-
-    fn auth_read(&self, request: GemmaDecodeLayerNormWeightsRequest) -> Result<Self::Output> {
+    fn native_layer_norm_weights(
+        &self,
+        request: GemmaDecodeLayerNormWeightsRequest,
+    ) -> Result<Vec<Wgt>> {
         let layer = self.backing_layer(request.layer_idx)?;
         layer.norm_weights(request.norm, request.layer_idx)
     }
-}
 
-impl AuthRead<GemmaDecodePleTokenEmbeddingRowRequest> for AuthenticatedGemmaDecodeTransitionSource {
-    type Output = Vec<Act>;
-
-    fn auth_read(&self, request: GemmaDecodePleTokenEmbeddingRowRequest) -> Result<Self::Output> {
+    fn native_ple_token_embedding_row(
+        &self,
+        request: GemmaDecodePleTokenEmbeddingRowRequest,
+    ) -> Result<Vec<Act>> {
         let ple = self.ple()?;
         let matrix = ple.token_embeddings.get(request.layer_idx).ok_or_else(|| {
             anyhow!(
@@ -429,16 +624,13 @@ impl AuthRead<GemmaDecodePleTokenEmbeddingRowRequest> for AuthenticatedGemmaDeco
                 request.layer_idx
             )
         })?;
-        Ok(ple_token_row(matrix, request.token_id)?)
+        ple_token_row(matrix, request.token_id)
     }
-}
 
-impl AuthRead<GemmaDecodePleModelProjectionRowRequest>
-    for AuthenticatedGemmaDecodeTransitionSource
-{
-    type Output = Vec<Wgt>;
-
-    fn auth_read(&self, request: GemmaDecodePleModelProjectionRowRequest) -> Result<Self::Output> {
+    fn native_ple_model_projection_row(
+        &self,
+        request: GemmaDecodePleModelProjectionRowRequest,
+    ) -> Result<Vec<Wgt>> {
         let ple = self.ple()?;
         let matrix = ple
             .model_projections
@@ -451,6 +643,99 @@ impl AuthRead<GemmaDecodePleModelProjectionRowRequest>
             })?;
         ple_projection_row(matrix, request.row_idx)
     }
+
+    fn native_ple_projection_norm_weights(&self) -> Result<Vec<Wgt>> {
+        Ok(self.ple()?.projection_norm_weights.clone())
+    }
+
+    fn native_ple_scalars(&self) -> Result<GemmaDecodePleScalars> {
+        Ok(self.ple()?.scalars)
+    }
+
+    fn native_final_norm_weights(&self) -> Result<Vec<Wgt>> {
+        Ok(self.final_norm_weights.clone())
+    }
+
+    fn native_final_scalars(&self) -> GemmaDecodeFinalScalars {
+        self.final_scalars
+    }
+
+    fn native_projection_row(&self, request: GemmaDecodeProjectionRowRequest) -> Result<Vec<Wgt>> {
+        match &self.projection {
+            GemmaDecodeProjectionBacking::Matrix(matrix) => {
+                matrix_row_wgts_from_det_matrix(matrix, request.row_idx, "decode lm_head")
+            }
+            GemmaDecodeProjectionBacking::TensorSlice(source) => {
+                det_num_tensor_slice_row_wgts(source, request.row_idx, "decode tied embedding")
+            }
+        }
+    }
+}
+
+impl AuthRead<GemmaDecodeTransitionMetadataRequest> for AuthenticatedGemmaDecodeTransitionSource {
+    type Output = GemmaDecodeTransitionMetadata;
+
+    fn auth_read(&self, request: GemmaDecodeTransitionMetadataRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeEmbeddingRowRequest> for AuthenticatedGemmaDecodeTransitionSource {
+    type Output = Vec<Act>;
+
+    fn auth_read(&self, request: GemmaDecodeEmbeddingRowRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeLayerMetadataRequest> for AuthenticatedGemmaDecodeTransitionSource {
+    type Output = GemmaDecodeLayerMetadata;
+
+    fn auth_read(&self, request: GemmaDecodeLayerMetadataRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeLayerScalarsRequest> for AuthenticatedGemmaDecodeTransitionSource {
+    type Output = GemmaDecodeLayerScalars;
+
+    fn auth_read(&self, request: GemmaDecodeLayerScalarsRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeLayerMatrixRowRequest> for AuthenticatedGemmaDecodeTransitionSource {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaDecodeLayerMatrixRowRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeLayerNormWeightsRequest> for AuthenticatedGemmaDecodeTransitionSource {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaDecodeLayerNormWeightsRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodePleTokenEmbeddingRowRequest> for AuthenticatedGemmaDecodeTransitionSource {
+    type Output = Vec<Act>;
+
+    fn auth_read(&self, request: GemmaDecodePleTokenEmbeddingRowRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodePleModelProjectionRowRequest>
+    for AuthenticatedGemmaDecodeTransitionSource
+{
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaDecodePleModelProjectionRowRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
+    }
 }
 
 impl AuthRead<GemmaDecodePleProjectionNormWeightsRequest>
@@ -460,33 +745,33 @@ impl AuthRead<GemmaDecodePleProjectionNormWeightsRequest>
 
     fn auth_read(
         &self,
-        _request: GemmaDecodePleProjectionNormWeightsRequest,
+        request: GemmaDecodePleProjectionNormWeightsRequest,
     ) -> Result<Self::Output> {
-        Ok(self.ple()?.projection_norm_weights.clone())
+        self.committed_source()?.auth_read(request)
     }
 }
 
 impl AuthRead<GemmaDecodePleScalarsRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = GemmaDecodePleScalars;
 
-    fn auth_read(&self, _request: GemmaDecodePleScalarsRequest) -> Result<Self::Output> {
-        Ok(self.ple()?.scalars)
+    fn auth_read(&self, request: GemmaDecodePleScalarsRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
     }
 }
 
 impl AuthRead<GemmaDecodeFinalNormWeightsRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = Vec<Wgt>;
 
-    fn auth_read(&self, _request: GemmaDecodeFinalNormWeightsRequest) -> Result<Self::Output> {
-        Ok(self.final_norm_weights.clone())
+    fn auth_read(&self, request: GemmaDecodeFinalNormWeightsRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
     }
 }
 
 impl AuthRead<GemmaDecodeFinalScalarsRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = GemmaDecodeFinalScalars;
 
-    fn auth_read(&self, _request: GemmaDecodeFinalScalarsRequest) -> Result<Self::Output> {
-        Ok(self.final_scalars)
+    fn auth_read(&self, request: GemmaDecodeFinalScalarsRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
     }
 }
 
@@ -494,14 +779,205 @@ impl AuthRead<GemmaDecodeProjectionRowRequest> for AuthenticatedGemmaDecodeTrans
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaDecodeProjectionRowRequest) -> Result<Self::Output> {
-        match &self.projection {
-            GemmaDecodeProjectionBacking::Matrix(matrix) => {
-                matrix_row_wgts_from_det_matrix(matrix, request.row_idx, "decode lm_head")
-            }
-            GemmaDecodeProjectionBacking::TensorSlice(source) => {
-                det_num_tensor_slice_row_wgts(source, request.row_idx, "decode tied embedding")
-            }
-        }
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeTransitionMetadataRequest {
+    type Output = GemmaDecodeTransitionMetadata;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_TRANSITION_METADATA_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeEmbeddingRowRequest {
+    type Output = Vec<Act>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_EMBEDDING_ROW_REQUEST, &self.token_id)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Act::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeLayerMetadataRequest {
+    type Output = GemmaDecodeLayerMetadata;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_LAYER_METADATA_REQUEST, &self.layer_idx)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeLayerScalarsRequest {
+    type Output = GemmaDecodeLayerScalars;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_LAYER_SCALARS_REQUEST, &self.layer_idx)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(GemmaDecodeLayerScalars::from_payload(
+            decode_postcard_response(response_payload)?,
+        ))
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeLayerMatrixRowRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(
+            DECODE_LAYER_MATRIX_ROW_REQUEST,
+            &(self.layer_idx, self.matrix, self.row_idx),
+        )
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeLayerNormWeightsRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(
+            DECODE_LAYER_NORM_WEIGHTS_REQUEST,
+            &(self.layer_idx, self.norm),
+        )
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodePleTokenEmbeddingRowRequest {
+    type Output = Vec<Act>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(
+            DECODE_PLE_TOKEN_EMBEDDING_ROW_REQUEST,
+            &(self.layer_idx, self.token_id),
+        )
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Act::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodePleModelProjectionRowRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(
+            DECODE_PLE_MODEL_PROJECTION_ROW_REQUEST,
+            &(self.layer_idx, self.row_idx),
+        )
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodePleProjectionNormWeightsRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_PLE_PROJECTION_NORM_WEIGHTS_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodePleScalarsRequest {
+    type Output = GemmaDecodePleScalars;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_PLE_SCALARS_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(GemmaDecodePleScalars::from_payload(
+            decode_postcard_response(response_payload)?,
+        ))
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeFinalNormWeightsRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_FINAL_NORM_WEIGHTS_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeFinalScalarsRequest {
+    type Output = GemmaDecodeFinalScalars;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_FINAL_SCALARS_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(GemmaDecodeFinalScalars::from_payload(
+            decode_postcard_response(response_payload)?,
+        ))
+    }
+}
+
+impl CommittedExternalRequest for GemmaDecodeProjectionRowRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(DECODE_PROJECTION_ROW_REQUEST, &self.row_idx)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
     }
 }
 
@@ -565,6 +1041,98 @@ impl From<Gemma4AttentionKind> for GemmaDecodeAttentionKind {
         match value {
             Gemma4AttentionKind::Sliding => Self::Sliding,
             Gemma4AttentionKind::Full => Self::Full,
+        }
+    }
+}
+
+fn decode_layer_matrix_requests(
+    layer: &GemmaDecodeLayerMetadata,
+) -> Vec<(GemmaDecodeLayerMatrixKind, usize)> {
+    let mut matrices = vec![
+        (GemmaDecodeLayerMatrixKind::Query, layer.q_proj_shape.rows),
+        (GemmaDecodeLayerMatrixKind::Key, layer.k_proj_shape.rows),
+        (GemmaDecodeLayerMatrixKind::Output, layer.o_proj_shape.rows),
+        (GemmaDecodeLayerMatrixKind::Gate, layer.gate_proj_shape.rows),
+        (GemmaDecodeLayerMatrixKind::Up, layer.up_proj_shape.rows),
+        (GemmaDecodeLayerMatrixKind::Down, layer.down_proj_shape.rows),
+    ];
+    if let Some(shape) = layer.v_proj_shape {
+        matrices.push((GemmaDecodeLayerMatrixKind::Value, shape.rows));
+    }
+    if let Some(shape) = layer.ple_input_gate_shape {
+        matrices.push((GemmaDecodeLayerMatrixKind::PleInputGate, shape.rows));
+    }
+    if let Some(shape) = layer.ple_layer_projection_shape {
+        matrices.push((GemmaDecodeLayerMatrixKind::PleLayerProjection, shape.rows));
+    }
+    matrices
+}
+
+fn decode_layer_norm_requests(layer: &GemmaDecodeLayerMetadata) -> Vec<GemmaDecodeLayerNormKind> {
+    let mut norms = vec![
+        GemmaDecodeLayerNormKind::Query,
+        GemmaDecodeLayerNormKind::Key,
+        GemmaDecodeLayerNormKind::InputLayer,
+        GemmaDecodeLayerNormKind::PostAttention,
+        GemmaDecodeLayerNormKind::PreFeedForward,
+        GemmaDecodeLayerNormKind::PostFeedForward,
+    ];
+    if layer.has_ple {
+        norms.push(GemmaDecodeLayerNormKind::PlePostInput);
+    }
+    norms
+}
+
+impl GemmaDecodeLayerScalars {
+    fn payload(self) -> GemmaDecodeLayerScalarsPayload {
+        GemmaDecodeLayerScalarsPayload {
+            rms_norm_eps_bits: self.rms_norm_eps.to_bits(),
+            rope_base_bits: self.rope_base.map(|value| value.to_bits()),
+            layer_scalar_bits: self.layer_scalar.map(|value| value.to_bits()),
+        }
+    }
+
+    fn from_payload(payload: GemmaDecodeLayerScalarsPayload) -> Self {
+        Self {
+            rms_norm_eps: Acc::from_bits(payload.rms_norm_eps_bits),
+            rope_base: payload.rope_base_bits.map(Acc::from_bits),
+            layer_scalar: payload.layer_scalar_bits.map(Act::from_bits),
+        }
+    }
+}
+
+impl GemmaDecodePleScalars {
+    fn payload(self) -> GemmaDecodePleScalarsPayload {
+        GemmaDecodePleScalarsPayload {
+            embedding_scale_bits: self.embedding_scale.to_bits(),
+            projection_scalar_bits: self.projection_scalar.to_bits(),
+            input_scale_bits: self.input_scale.to_bits(),
+            rms_norm_eps_bits: self.rms_norm_eps.to_bits(),
+        }
+    }
+
+    fn from_payload(payload: GemmaDecodePleScalarsPayload) -> Self {
+        Self {
+            embedding_scale: Act::from_bits(payload.embedding_scale_bits),
+            projection_scalar: Act::from_bits(payload.projection_scalar_bits),
+            input_scale: Act::from_bits(payload.input_scale_bits),
+            rms_norm_eps: Acc::from_bits(payload.rms_norm_eps_bits),
+        }
+    }
+}
+
+impl GemmaDecodeFinalScalars {
+    fn payload(self) -> GemmaDecodeFinalScalarsPayload {
+        GemmaDecodeFinalScalarsPayload {
+            rms_norm_eps_bits: self.rms_norm_eps.to_bits(),
+            final_logit_softcapping_bits: self.final_logit_softcapping.map(|value| value.to_bits()),
+        }
+    }
+
+    fn from_payload(payload: GemmaDecodeFinalScalarsPayload) -> Self {
+        Self {
+            rms_norm_eps: Acc::from_bits(payload.rms_norm_eps_bits),
+            final_logit_softcapping: payload.final_logit_softcapping_bits.map(Act::from_bits),
         }
     }
 }

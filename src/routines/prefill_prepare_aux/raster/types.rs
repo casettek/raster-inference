@@ -8,6 +8,7 @@ use crate::RasterSizingControls;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillPleRasterState {
     pub(in super::super) source_id: String,
+    pub(in super::super) ple_source_root: String,
     pub(in super::super) token_ids_source_name: String,
     pub(in super::super) token_count: usize,
     pub(in super::super) input_activations_ref: Option<RasterActivationSequenceArtifactRef>,
@@ -21,6 +22,7 @@ pub struct PrefillPleRasterState {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RasterPrefillPleInputRoots {
     pub(in super::super) source_id: String,
+    pub(in super::super) ple_source_root: String,
     pub(in super::super) token_ids_source_name: String,
     pub(in super::super) token_count: usize,
     pub(in super::super) input_activations_ref: Option<RasterActivationSequenceArtifactRef>,

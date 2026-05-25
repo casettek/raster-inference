@@ -4,11 +4,12 @@ use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::shared::artifacts::external_artifacts::CommittedExternalSource;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::raster_contracts::prefill_layer::{
-    AuthenticatedGemmaPrefillLayerSource, GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind,
-    GemmaPrefillLayerMetadata, GemmaPrefillLayerNormKind, GemmaPrefillLayerNormWeightsRequest,
-    GemmaPrefillLayerScalars, GemmaPrefillLayerScalarsRequest,
+    GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMetadata,
+    GemmaPrefillLayerNormKind, GemmaPrefillLayerNormWeightsRequest, GemmaPrefillLayerScalars,
+    GemmaPrefillLayerScalarsRequest,
 };
 use crate::shared::raster_kernels::transformer::{
     append_projection_chunk_to_artifact_state, compute_next_attention_artifact_row,
@@ -46,7 +47,7 @@ use super::utils::*;
 pub fn main(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
     ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerOutputRefs)> {
@@ -71,7 +72,7 @@ pub fn main(
 pub fn compute_next_prefill_layer_sequence_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_state: PrefillLayerRasterState,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
     let (artifact_store_roots, layer_step) = call_tile!(
         init_prefill_layer_step,
@@ -96,7 +97,7 @@ pub fn compute_next_prefill_layer_sequence_with_roots(
 fn run_prefill_layer_sequence_artifact_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillLayerStep,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerStep)> {
     let (artifact_store_roots, layer_work) = call_seq!(
         run_prefill_layer_artifact_ref_body,
@@ -115,7 +116,7 @@ fn run_prefill_layer_sequence_artifact_ref(
 fn run_prefill_layer_artifact_ref_body(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillLayerStep,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, layer_work) = call_tile!(
         init_prefill_layer_artifact_work,
@@ -315,7 +316,7 @@ fn run_prefill_layer_artifact_ref_body(
 fn compute_prefill_layer_attention_input_norm_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, unary_work) = call_tile!(
         init_prefill_layer_attention_input_norm_work,
@@ -338,7 +339,7 @@ fn compute_prefill_layer_attention_input_norm_work(
 fn project_prefill_layer_query_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_query_work,
@@ -361,7 +362,7 @@ fn project_prefill_layer_query_work(
 fn project_prefill_layer_key_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_key_work,
@@ -384,7 +385,7 @@ fn project_prefill_layer_key_work(
 fn project_prefill_layer_value_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_value_work,
@@ -449,7 +450,7 @@ fn reshape_prefill_layer_key_heads_work(
 fn normalize_prefill_layer_query_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, head_work) = call_tile!(
         init_normalize_prefill_layer_query_heads_work,
@@ -472,7 +473,7 @@ fn normalize_prefill_layer_query_heads_work(
 fn normalize_prefill_layer_key_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, head_work) = call_tile!(
         init_normalize_prefill_layer_key_heads_work,
@@ -642,7 +643,7 @@ fn combine_prefill_layer_attention_heads_work(
 fn project_prefill_layer_attention_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_attention_output_work,
@@ -665,7 +666,7 @@ fn project_prefill_layer_attention_output_work(
 fn normalize_prefill_layer_attention_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, unary_work) = call_tile!(
         init_normalize_prefill_layer_attention_output_work,
@@ -709,7 +710,7 @@ fn add_prefill_layer_attention_residual_work(
 fn normalize_prefill_layer_mlp_input_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, unary_work) = call_tile!(
         init_normalize_prefill_layer_mlp_input_work,
@@ -732,7 +733,7 @@ fn normalize_prefill_layer_mlp_input_work(
 fn project_prefill_layer_mlp_gate_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_mlp_gate_work,
@@ -776,7 +777,7 @@ fn gelu_prefill_layer_mlp_gate_work(
 fn project_prefill_layer_mlp_up_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_mlp_up_work,
@@ -820,7 +821,7 @@ fn multiply_prefill_layer_mlp_hidden_work(
 fn project_prefill_layer_mlp_down_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_mlp_down_work,
@@ -843,7 +844,7 @@ fn project_prefill_layer_mlp_down_work(
 fn normalize_prefill_layer_mlp_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, unary_work) = call_tile!(
         init_normalize_prefill_layer_mlp_output_work,
@@ -887,7 +888,7 @@ fn add_prefill_layer_mlp_residual_work(
 fn project_prefill_layer_ple_gate_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_ple_gate_work,
@@ -952,7 +953,7 @@ fn multiply_prefill_layer_ple_input_work(
 fn project_prefill_layer_ple_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_prefill_layer_ple_output_work,
@@ -975,7 +976,7 @@ fn project_prefill_layer_ple_output_work(
 fn normalize_prefill_layer_ple_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let (artifact_store_roots, unary_work) = call_tile!(
         init_normalize_prefill_layer_ple_output_work,
@@ -1042,7 +1043,7 @@ fn scale_prefill_layer_output_work(
 fn init_prefill_layer_artifact_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillLayerStep,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerArtifactWork)> {
     let PrefillLayerStep::Compute {
         layer_state,
@@ -1155,7 +1156,7 @@ fn transform_next_prefill_layer_sequence_unary_work_row(
 fn project_next_prefill_layer_sequence_projection_work_rows(
     artifact_store_roots: RasterArtifactStoreRoots,
     projection_work: PrefillLayerSequenceProjectionWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -1376,7 +1377,7 @@ fn transform_next_prefill_layer_sequence_binary_work_row(
 fn init_prefill_layer_attention_input_norm_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerSequenceUnaryWork)> {
     let work = match layer_work {
         PrefillLayerArtifactWork::Passthrough(_) => {
@@ -1699,7 +1700,7 @@ fn finalize_reshape_prefill_layer_key_heads_work(
 fn init_normalize_prefill_layer_query_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerHeadUnaryWork)> {
     let work = match layer_work {
         PrefillLayerArtifactWork::Passthrough(_) => {
@@ -1756,7 +1757,7 @@ fn finalize_normalize_prefill_layer_query_heads_work(
 fn init_normalize_prefill_layer_key_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerHeadUnaryWork)> {
     let work = match layer_work {
         PrefillLayerArtifactWork::Passthrough(_) => {
@@ -2254,7 +2255,7 @@ fn finalize_project_prefill_layer_attention_output_work(
 fn init_normalize_prefill_layer_attention_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerSequenceUnaryWork)> {
     let work = match layer_work {
         PrefillLayerArtifactWork::Passthrough(_) => {
@@ -2365,7 +2366,7 @@ fn finalize_add_prefill_layer_attention_residual_work(
 fn init_normalize_prefill_layer_mlp_input_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerSequenceUnaryWork)> {
     let work = match layer_work {
         PrefillLayerArtifactWork::Passthrough(_) => {
@@ -2664,7 +2665,7 @@ fn finalize_project_prefill_layer_mlp_down_work(
 fn init_normalize_prefill_layer_mlp_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerSequenceUnaryWork)> {
     let work = match layer_work {
         PrefillLayerArtifactWork::Passthrough(_) => {
@@ -3009,7 +3010,7 @@ fn finalize_project_prefill_layer_ple_output_work(
 fn init_normalize_prefill_layer_ple_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: PrefillLayerArtifactWork,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerSequenceUnaryWork)> {
     let work = match layer_work {
         PrefillLayerArtifactWork::Passthrough(_) => {
@@ -3188,7 +3189,7 @@ fn finalize_scale_prefill_layer_output_work(
 pub fn init_prefill_layer_state_from_input_embedding_refs_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
     ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerRasterState)> {
@@ -3230,7 +3231,7 @@ pub fn finalize_prefill_layer_refs(
 fn init_prefill_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_state: PrefillLayerRasterState,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerStep)> {
     if layer_state.next_layer_idx >= layer_state.layer_count {
         return Ok((
@@ -3303,7 +3304,7 @@ fn finalize_prefill_layer_step(
 
 #[tile]
 pub fn read_prefill_layer_scalars(
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
     layer_idx: usize,
 ) -> Result<GemmaPrefillLayerScalars> {
     auth_read!(layer_source, GemmaPrefillLayerScalarsRequest { layer_idx })
@@ -3311,7 +3312,7 @@ pub fn read_prefill_layer_scalars(
 
 #[tile]
 pub fn read_prefill_layer_norm_weights(
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
     layer_idx: usize,
     norm: GemmaPrefillLayerNormKind,
 ) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
@@ -3398,7 +3399,7 @@ pub fn init_prefill_sequence_projection_artifact_from_ref(
 pub fn project_next_prefill_sequence_artifact_rows(
     artifact_store_roots: RasterArtifactStoreRoots,
     projection_state: RasterSequenceProjectionArtifactState,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
     layer_idx: usize,
     matrix: GemmaPrefillLayerMatrixKind,
 ) -> Result<(

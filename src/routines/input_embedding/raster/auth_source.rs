@@ -1,11 +1,11 @@
-use std::{cell::RefCell, collections::HashMap};
-
 use anyhow::{anyhow, bail, Result};
-use serde::Serialize;
 
 use crate::shared::artifacts::artifact_io::AuthRead;
 use crate::shared::artifacts::external_artifacts::{
-    register_external_source_leaves, CommittedExternalSource, ExternalSourceId, ExternalSourceRef,
+    decode_i32_vec_response, decode_postcard_response, postcard_external_source_entry,
+    postcard_i32_vec_external_source_entry, postcard_request_key, register_external_source,
+    CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
+    ExternalSourceRef,
 };
 use crate::shared::model::transformer::{
     DetNumTensorSliceSource, Gemma4ModelProvenance, Gemma4TransformerModel,
@@ -17,7 +17,8 @@ use crate::shared::raster_kernels::transformer::det_num_tensor_slice_row_wgts;
 const GEMMA_INPUT_EMBEDDING_SOURCE_KIND: &str = "gemma_input_embedding";
 const GEMMA_INPUT_EMBEDDING_SOURCE_DOMAIN: &str =
     "raster-external-source-gemma-input-embedding-merkle-v1";
-const GEMMA_INPUT_EMBEDDING_SOURCE_CHUNK_BYTES: usize = 1 << 20;
+const INPUT_EMBEDDING_METADATA_REQUEST: &str = "gemma_input_embedding.metadata";
+const INPUT_EMBEDDING_ROW_REQUEST: &str = "gemma_input_embedding.row";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthenticatedGemmaInputEmbeddingSource {
@@ -32,33 +33,6 @@ pub struct AuthenticatedGemmaInputEmbeddingSource {
 enum GemmaInputEmbeddingBacking {
     Owned(Vec<Vec<Act>>),
     Model(DetNumTensorSliceSource),
-}
-
-#[derive(Serialize)]
-struct GemmaInputEmbeddingSourcePayload<'a> {
-    identifier: &'a str,
-    vocab_size: usize,
-    hidden_size: usize,
-    scale_bits: i32,
-    backing: GemmaInputEmbeddingSourcePayloadBacking,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum GemmaInputEmbeddingSourcePayloadBacking {
-    Owned {
-        rows: Vec<Vec<i32>>,
-    },
-    Model {
-        weights_path: String,
-        total_rows: usize,
-        total_cols: usize,
-        data_offset: usize,
-        row_offset: usize,
-        row_count: usize,
-        col_offset: usize,
-        col_count: usize,
-    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -152,13 +126,12 @@ impl AuthenticatedGemmaInputEmbeddingSource {
     }
 
     pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
-        let source_ref = register_external_source_leaves(
+        let source_ref = register_external_source(
             ExternalSourceId::new(self.identifier.clone())?,
             GEMMA_INPUT_EMBEDDING_SOURCE_KIND,
             GEMMA_INPUT_EMBEDDING_SOURCE_DOMAIN,
-            source_payload_chunks(&self.source_payload()),
+            self.committed_source_entries()?,
         )?;
-        register_native_committed_input_embedding(source_ref.root(), self)?;
         Ok(source_ref)
     }
 
@@ -166,37 +139,27 @@ impl AuthenticatedGemmaInputEmbeddingSource {
         Ok(CommittedExternalSource::new(self.committed_source_ref()?))
     }
 
-    fn source_payload(&self) -> Vec<u8> {
-        let backing = match &self.backing {
-            GemmaInputEmbeddingBacking::Owned(rows) => {
-                GemmaInputEmbeddingSourcePayloadBacking::Owned {
-                    rows: rows
-                        .iter()
-                        .map(|row| row.iter().map(|value| value.to_bits()).collect())
-                        .collect(),
-                }
-            }
-            GemmaInputEmbeddingBacking::Model(source) => {
-                GemmaInputEmbeddingSourcePayloadBacking::Model {
-                    weights_path: source.weights_path.to_string_lossy().into_owned(),
-                    total_rows: source.total_rows,
-                    total_cols: source.total_cols,
-                    data_offset: source.data_offset,
-                    row_offset: source.row_offset,
-                    row_count: source.row_count,
-                    col_offset: source.col_offset,
-                    col_count: source.col_count,
-                }
-            }
-        };
-        serde_json::to_vec(&GemmaInputEmbeddingSourcePayload {
-            identifier: &self.identifier,
-            vocab_size: self.vocab_size,
-            hidden_size: self.hidden_size,
-            scale_bits: self.scale.to_bits(),
-            backing,
-        })
-        .expect("canonical input embedding source payload should serialize")
+    fn committed_source_entries(&self) -> Result<Vec<ExternalSourceEntry>> {
+        let mut entries = Vec::with_capacity(self.vocab_size + 1);
+        entries.push(postcard_external_source_entry(
+            GemmaInputEmbeddingMetadataRequest.request_key()?,
+            &self.metadata(),
+        )?);
+        for token_id in 0..self.vocab_size {
+            let request = GemmaInputEmbeddingRowRequest {
+                token_id: u32::try_from(token_id)
+                    .map_err(|_| anyhow!("input embedding token id {token_id} exceeds u32"))?,
+            };
+            let row_bits = self
+                .auth_read(request)?
+                .into_iter()
+                .map(|value| value.to_bits());
+            entries.push(postcard_i32_vec_external_source_entry(
+                request.request_key()?,
+                row_bits,
+            )?);
+        }
+        Ok(entries)
     }
 }
 
@@ -247,19 +210,30 @@ impl AuthRead<GemmaInputEmbeddingRowRequest> for AuthenticatedGemmaInputEmbeddin
     }
 }
 
-impl AuthRead<GemmaInputEmbeddingMetadataRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaInputEmbeddingMetadataRequest {
     type Output = GemmaInputEmbeddingMetadata;
 
-    fn auth_read(&self, request: GemmaInputEmbeddingMetadataRequest) -> Result<Self::Output> {
-        with_native_committed_input_embedding(self.root(), |source| source.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(INPUT_EMBEDDING_METADATA_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
     }
 }
 
-impl AuthRead<GemmaInputEmbeddingRowRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaInputEmbeddingRowRequest {
     type Output = Vec<Act>;
 
-    fn auth_read(&self, request: GemmaInputEmbeddingRowRequest) -> Result<Self::Output> {
-        with_native_committed_input_embedding(self.root(), |source| source.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(INPUT_EMBEDDING_ROW_REQUEST, &self.token_id)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Act::from_bits)
+            .collect())
     }
 }
 
@@ -267,7 +241,7 @@ impl AuthRead<GemmaInputEmbeddingMetadataRequest> for str {
     type Output = GemmaInputEmbeddingMetadata;
 
     fn auth_read(&self, request: GemmaInputEmbeddingMetadataRequest) -> Result<Self::Output> {
-        with_native_committed_input_embedding(self, |source| source.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -275,45 +249,8 @@ impl AuthRead<GemmaInputEmbeddingRowRequest> for str {
     type Output = Vec<Act>;
 
     fn auth_read(&self, request: GemmaInputEmbeddingRowRequest) -> Result<Self::Output> {
-        with_native_committed_input_embedding(self, |source| source.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
-}
-
-thread_local! {
-    static NATIVE_COMMITTED_INPUT_EMBEDDINGS: RefCell<HashMap<String, AuthenticatedGemmaInputEmbeddingSource>> =
-        RefCell::new(HashMap::new());
-}
-
-fn register_native_committed_input_embedding(
-    root: &str,
-    source: &AuthenticatedGemmaInputEmbeddingSource,
-) -> Result<()> {
-    NATIVE_COMMITTED_INPUT_EMBEDDINGS.with(|sources_ref| {
-        let mut sources = sources_ref.borrow_mut();
-        match sources.get(root) {
-            Some(existing) if existing != source => {
-                bail!("committed input embedding root {root} is already registered with different data")
-            }
-            Some(_) => Ok(()),
-            None => {
-                sources.insert(root.to_string(), source.clone());
-                Ok(())
-            }
-        }
-    })
-}
-
-fn with_native_committed_input_embedding<T>(
-    root: &str,
-    f: impl FnOnce(&AuthenticatedGemmaInputEmbeddingSource) -> Result<T>,
-) -> Result<T> {
-    NATIVE_COMMITTED_INPUT_EMBEDDINGS.with(|sources_ref| {
-        let sources = sources_ref.borrow();
-        let source = sources.get(root).ok_or_else(|| {
-            anyhow!("committed input embedding root {root} is not registered natively")
-        })?;
-        f(source)
-    })
 }
 
 fn validate_full_embedding_source(source: &DetNumTensorSliceSource) -> Result<()> {
@@ -335,11 +272,4 @@ fn validate_identifier(identifier: String) -> Result<String> {
         bail!("Gemma input embedding source identifier must not be empty");
     }
     Ok(identifier)
-}
-
-fn source_payload_chunks(payload: &[u8]) -> Vec<Vec<u8>> {
-    payload
-        .chunks(GEMMA_INPUT_EMBEDDING_SOURCE_CHUNK_BYTES)
-        .map(|chunk| chunk.to_vec())
-        .collect()
 }

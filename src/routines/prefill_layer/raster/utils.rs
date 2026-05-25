@@ -5,12 +5,13 @@ use serde_json::json;
 
 use super::types::*;
 use crate::dsl::prelude::auth_read;
+use crate::shared::artifacts::external_artifacts::CommittedExternalSource;
 use crate::shared::artifacts::raster_artifact_store::RasterActivationSequenceArtifactRef;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::LayerKvCache;
 use crate::shared::raster_contracts::prefill_layer::{
-    AuthenticatedGemmaPrefillLayerSource, GemmaPrefillLayerMetadata,
-    GemmaPrefillLayerMetadataRequest, GemmaPrefillLayerSourceMetadataRequest,
+    GemmaPrefillLayerMetadata, GemmaPrefillLayerMetadataRequest,
+    GemmaPrefillLayerSourceMetadataRequest,
 };
 use crate::shared::raster_contracts::prefill_ple::read_prefill_ple_input_manifest_from_roots;
 use crate::shared::raster_kernels::transformer::{
@@ -27,7 +28,7 @@ use super::PrefillLayerCacheSlot;
 
 pub(in super::super) fn prepare_next_prefill_layer_context(
     layer_state: &PrefillLayerRasterState,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
 ) -> Result<PrefillLayerContext> {
     if layer_state.next_layer_idx >= layer_state.layer_count {
         bail!(
@@ -108,7 +109,7 @@ pub(in super::super) fn update_prefill_layer_state_refs_with_roots(
 pub(in super::super) fn init_prefill_layer_state_from_activation_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_activations_ref: RasterActivationSequenceArtifactRef,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &CommittedExternalSource,
     ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerRasterState)> {

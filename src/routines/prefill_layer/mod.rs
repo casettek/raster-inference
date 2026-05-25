@@ -85,10 +85,11 @@ pub fn run_raster(
     ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, raster::PrefillLayerOutputRefs)> {
+    let committed_layer_source = layer_source.committed_source()?;
     raster::main(
         artifact_store_roots,
         input_embedding_refs,
-        layer_source,
+        &committed_layer_source,
         ple_input_manifest_root,
         raster_sizing,
     )

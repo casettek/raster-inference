@@ -1,6 +1,14 @@
+use std::cell::RefCell;
+
 use anyhow::{anyhow, bail, Result};
 
 use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::external_artifacts::{
+    decode_i32_vec_response, decode_postcard_response, postcard_external_source_entry,
+    postcard_i32_vec_external_source_entry, postcard_request_key, register_external_source,
+    CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
+    ExternalSourceRef,
+};
 use crate::shared::model::transformer::{
     Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4ModelProvenance,
     Gemma4TransformerModel,
@@ -13,6 +21,7 @@ pub struct AuthenticatedGemmaPrefillLayerSource {
     identifier: String,
     layers: Vec<GemmaPrefillLayerMetadata>,
     backing_layers: Vec<GemmaPrefillLayerBacking>,
+    committed_source: RefCell<Option<CommittedExternalSource>>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +120,22 @@ pub struct GemmaPrefillLayerScalars {
     pub layer_scalar: Option<Act>,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct GemmaPrefillLayerScalarsPayload {
+    rms_norm_eps_bits: i64,
+    rope_base_bits: Option<i64>,
+    layer_scalar_bits: Option<i32>,
+}
+
+const GEMMA_PREFILL_LAYER_SOURCE_KIND: &str = "gemma_prefill_layer";
+const GEMMA_PREFILL_LAYER_SOURCE_DOMAIN: &str =
+    "raster-external-source-gemma-prefill-layer-merkle-v1";
+const PREFILL_LAYER_SOURCE_METADATA_REQUEST: &str = "gemma_prefill_layer.source_metadata";
+const PREFILL_LAYER_METADATA_REQUEST: &str = "gemma_prefill_layer.layer_metadata";
+const PREFILL_LAYER_SCALARS_REQUEST: &str = "gemma_prefill_layer.scalars";
+const PREFILL_LAYER_MATRIX_ROW_REQUEST: &str = "gemma_prefill_layer.matrix_row";
+const PREFILL_LAYER_NORM_WEIGHTS_REQUEST: &str = "gemma_prefill_layer.norm_weights";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmaPrefillLayerSourceMetadataRequest;
 
@@ -185,6 +210,7 @@ impl AuthenticatedGemmaPrefillLayerSource {
             identifier,
             layers,
             backing_layers,
+            committed_source: RefCell::new(None),
         })
     }
 
@@ -192,20 +218,30 @@ impl AuthenticatedGemmaPrefillLayerSource {
         &self.identifier
     }
 
+    pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
+        Ok(self.committed_source()?.source_ref().clone())
+    }
+
+    pub fn committed_source(&self) -> Result<CommittedExternalSource> {
+        if let Some(source) = self.committed_source.borrow().clone() {
+            return Ok(source);
+        }
+        let source_ref = register_external_source(
+            ExternalSourceId::new(format!("prefill-layer:{}", self.identifier))?,
+            GEMMA_PREFILL_LAYER_SOURCE_KIND,
+            GEMMA_PREFILL_LAYER_SOURCE_DOMAIN,
+            self.committed_source_entries()?,
+        )?;
+        let source = CommittedExternalSource::new(source_ref);
+        *self.committed_source.borrow_mut() = Some(source.clone());
+        Ok(source)
+    }
+
     fn source_metadata(&self) -> GemmaPrefillLayerSourceMetadata {
         GemmaPrefillLayerSourceMetadata {
             source_id: self.identifier.clone(),
             layer_count: self.layers.len(),
         }
-    }
-
-    fn layer_metadata(&self, layer_idx: usize) -> Result<GemmaPrefillLayerMetadata> {
-        self.layers.get(layer_idx).cloned().ok_or_else(|| {
-            anyhow!(
-                "Gemma prefill layer index {layer_idx} is out of range for {} layers",
-                self.layers.len()
-            )
-        })
     }
 
     fn backing_layer(&self, layer_idx: usize) -> Result<&GemmaPrefillLayerBacking> {
@@ -216,13 +252,132 @@ impl AuthenticatedGemmaPrefillLayerSource {
             )
         })
     }
+
+    fn ensure_layer_index(&self, layer_idx: usize) -> Result<()> {
+        if layer_idx >= self.layers.len() {
+            bail!(
+                "Gemma prefill layer index {layer_idx} is out of range for {} layers",
+                self.layers.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_matrix_row_request(&self, request: GemmaPrefillLayerMatrixRowRequest) -> Result<()> {
+        self.backing_layer(request.layer_idx)?
+            .matrix_source(request.matrix, request.layer_idx)?;
+        let rows = self
+            .layers
+            .get(request.layer_idx)
+            .and_then(|layer| matrix_rows_for_prefill_request(layer, request.matrix))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Gemma prefill layer {} has no {} matrix",
+                    request.layer_idx,
+                    request.matrix.label()
+                )
+            })?;
+        if request.row_idx >= rows {
+            bail!(
+                "Gemma prefill {} row {} is out of range for {} rows",
+                request.matrix.label(),
+                request.row_idx,
+                rows
+            );
+        }
+        Ok(())
+    }
+
+    fn committed_source_entries(&self) -> Result<Vec<ExternalSourceEntry>> {
+        let mut entries = Vec::new();
+        entries.push(postcard_external_source_entry(
+            GemmaPrefillLayerSourceMetadataRequest.request_key()?,
+            &self.source_metadata(),
+        )?);
+        for layer in &self.layers {
+            entries.push(postcard_external_source_entry(
+                GemmaPrefillLayerMetadataRequest {
+                    layer_idx: layer.layer_idx,
+                }
+                .request_key()?,
+                layer,
+            )?);
+            entries.push(postcard_external_source_entry(
+                GemmaPrefillLayerScalarsRequest {
+                    layer_idx: layer.layer_idx,
+                }
+                .request_key()?,
+                &self
+                    .native_scalars(GemmaPrefillLayerScalarsRequest {
+                        layer_idx: layer.layer_idx,
+                    })?
+                    .payload(),
+            )?);
+            for norm in prefill_layer_norm_requests(layer) {
+                let weights = self
+                    .native_norm_weights(GemmaPrefillLayerNormWeightsRequest {
+                        layer_idx: layer.layer_idx,
+                        norm,
+                    })?
+                    .into_iter()
+                    .map(|value| value.to_bits());
+                entries.push(postcard_i32_vec_external_source_entry(
+                    GemmaPrefillLayerNormWeightsRequest {
+                        layer_idx: layer.layer_idx,
+                        norm,
+                    }
+                    .request_key()?,
+                    weights,
+                )?);
+            }
+            for (matrix, rows) in prefill_layer_matrix_requests(layer) {
+                for row_idx in 0..rows {
+                    let request = GemmaPrefillLayerMatrixRowRequest {
+                        layer_idx: layer.layer_idx,
+                        matrix,
+                        row_idx,
+                    };
+                    let row_bits = self
+                        .native_matrix_row(request)?
+                        .into_iter()
+                        .map(|value| value.to_bits());
+                    entries.push(postcard_i32_vec_external_source_entry(
+                        request.request_key()?,
+                        row_bits,
+                    )?);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn native_scalars(
+        &self,
+        request: GemmaPrefillLayerScalarsRequest,
+    ) -> Result<GemmaPrefillLayerScalars> {
+        Ok(self.backing_layer(request.layer_idx)?.scalars)
+    }
+
+    fn native_matrix_row(&self, request: GemmaPrefillLayerMatrixRowRequest) -> Result<Vec<Wgt>> {
+        let layer = self.backing_layer(request.layer_idx)?;
+        let matrix = layer.matrix_source(request.matrix, request.layer_idx)?;
+        matrix_row_wgts(matrix, request.row_idx, request.matrix.label())
+    }
+
+    fn native_norm_weights(
+        &self,
+        request: GemmaPrefillLayerNormWeightsRequest,
+    ) -> Result<Vec<Wgt>> {
+        let layer = self.backing_layer(request.layer_idx)?;
+        layer.norm_weights(request.norm, request.layer_idx)
+    }
 }
 
 impl AuthRead<GemmaPrefillLayerSourceMetadataRequest> for AuthenticatedGemmaPrefillLayerSource {
     type Output = GemmaPrefillLayerSourceMetadata;
 
-    fn auth_read(&self, _request: GemmaPrefillLayerSourceMetadataRequest) -> Result<Self::Output> {
-        Ok(self.source_metadata())
+    fn auth_read(&self, request: GemmaPrefillLayerSourceMetadataRequest) -> Result<Self::Output> {
+        self.committed_source()?.auth_read(request)
     }
 }
 
@@ -230,7 +385,8 @@ impl AuthRead<GemmaPrefillLayerMetadataRequest> for AuthenticatedGemmaPrefillLay
     type Output = GemmaPrefillLayerMetadata;
 
     fn auth_read(&self, request: GemmaPrefillLayerMetadataRequest) -> Result<Self::Output> {
-        self.layer_metadata(request.layer_idx)
+        self.ensure_layer_index(request.layer_idx)?;
+        self.committed_source()?.auth_read(request)
     }
 }
 
@@ -238,7 +394,8 @@ impl AuthRead<GemmaPrefillLayerScalarsRequest> for AuthenticatedGemmaPrefillLaye
     type Output = GemmaPrefillLayerScalars;
 
     fn auth_read(&self, request: GemmaPrefillLayerScalarsRequest) -> Result<Self::Output> {
-        Ok(self.backing_layer(request.layer_idx)?.scalars)
+        self.ensure_layer_index(request.layer_idx)?;
+        self.committed_source()?.auth_read(request)
     }
 }
 
@@ -246,9 +403,8 @@ impl AuthRead<GemmaPrefillLayerMatrixRowRequest> for AuthenticatedGemmaPrefillLa
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPrefillLayerMatrixRowRequest) -> Result<Self::Output> {
-        let layer = self.backing_layer(request.layer_idx)?;
-        let matrix = layer.matrix_source(request.matrix, request.layer_idx)?;
-        matrix_row_wgts(matrix, request.row_idx, request.matrix.label())
+        self.ensure_matrix_row_request(request)?;
+        self.committed_source()?.auth_read(request)
     }
 }
 
@@ -256,8 +412,101 @@ impl AuthRead<GemmaPrefillLayerNormWeightsRequest> for AuthenticatedGemmaPrefill
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPrefillLayerNormWeightsRequest) -> Result<Self::Output> {
-        let layer = self.backing_layer(request.layer_idx)?;
-        layer.norm_weights(request.norm, request.layer_idx)
+        self.backing_layer(request.layer_idx)?
+            .norm_weights(request.norm, request.layer_idx)?;
+        self.committed_source()?.auth_read(request)
+    }
+}
+
+impl CommittedExternalRequest for GemmaPrefillLayerSourceMetadataRequest {
+    type Output = GemmaPrefillLayerSourceMetadata;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PREFILL_LAYER_SOURCE_METADATA_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
+    }
+}
+
+impl CommittedExternalRequest for GemmaPrefillLayerMetadataRequest {
+    type Output = GemmaPrefillLayerMetadata;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PREFILL_LAYER_METADATA_REQUEST, &self.layer_idx)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
+    }
+}
+
+impl CommittedExternalRequest for GemmaPrefillLayerScalarsRequest {
+    type Output = GemmaPrefillLayerScalars;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PREFILL_LAYER_SCALARS_REQUEST, &self.layer_idx)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(GemmaPrefillLayerScalars::from_payload(
+            decode_postcard_response(response_payload)?,
+        ))
+    }
+}
+
+impl CommittedExternalRequest for GemmaPrefillLayerMatrixRowRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(
+            PREFILL_LAYER_MATRIX_ROW_REQUEST,
+            &(self.layer_idx, self.matrix, self.row_idx),
+        )
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl CommittedExternalRequest for GemmaPrefillLayerNormWeightsRequest {
+    type Output = Vec<Wgt>;
+
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(
+            PREFILL_LAYER_NORM_WEIGHTS_REQUEST,
+            &(self.layer_idx, self.norm),
+        )
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
+    }
+}
+
+impl GemmaPrefillLayerScalars {
+    fn payload(self) -> GemmaPrefillLayerScalarsPayload {
+        GemmaPrefillLayerScalarsPayload {
+            rms_norm_eps_bits: self.rms_norm_eps.to_bits(),
+            rope_base_bits: self.rope_base.map(|value| value.to_bits()),
+            layer_scalar_bits: self.layer_scalar.map(|value| value.to_bits()),
+        }
+    }
+
+    fn from_payload(payload: GemmaPrefillLayerScalarsPayload) -> Self {
+        Self {
+            rms_norm_eps: Acc::from_bits(payload.rms_norm_eps_bits),
+            rope_base: payload.rope_base_bits.map(Acc::from_bits),
+            layer_scalar: payload.layer_scalar_bits.map(Act::from_bits),
+        }
     }
 }
 
@@ -323,6 +572,69 @@ impl From<Gemma4AttentionKind> for GemmaPrefillAttentionKind {
             Gemma4AttentionKind::Full => Self::Full,
         }
     }
+}
+
+fn prefill_layer_matrix_requests(
+    layer: &GemmaPrefillLayerMetadata,
+) -> Vec<(GemmaPrefillLayerMatrixKind, usize)> {
+    let mut matrices = vec![
+        (GemmaPrefillLayerMatrixKind::Query, layer.q_proj_shape.rows),
+        (GemmaPrefillLayerMatrixKind::Key, layer.k_proj_shape.rows),
+        (GemmaPrefillLayerMatrixKind::Output, layer.o_proj_shape.rows),
+        (
+            GemmaPrefillLayerMatrixKind::Gate,
+            layer.gate_proj_shape.rows,
+        ),
+        (GemmaPrefillLayerMatrixKind::Up, layer.up_proj_shape.rows),
+        (
+            GemmaPrefillLayerMatrixKind::Down,
+            layer.down_proj_shape.rows,
+        ),
+    ];
+    if let Some(shape) = layer.v_proj_shape {
+        matrices.push((GemmaPrefillLayerMatrixKind::Value, shape.rows));
+    }
+    if let Some(shape) = layer.ple_input_gate_shape {
+        matrices.push((GemmaPrefillLayerMatrixKind::PleInputGate, shape.rows));
+    }
+    if let Some(shape) = layer.ple_layer_projection_shape {
+        matrices.push((GemmaPrefillLayerMatrixKind::PleLayerProjection, shape.rows));
+    }
+    matrices
+}
+
+fn matrix_rows_for_prefill_request(
+    layer: &GemmaPrefillLayerMetadata,
+    matrix: GemmaPrefillLayerMatrixKind,
+) -> Option<usize> {
+    Some(match matrix {
+        GemmaPrefillLayerMatrixKind::Query => layer.q_proj_shape.rows,
+        GemmaPrefillLayerMatrixKind::Key => layer.k_proj_shape.rows,
+        GemmaPrefillLayerMatrixKind::Value => layer.v_proj_shape?.rows,
+        GemmaPrefillLayerMatrixKind::Output => layer.o_proj_shape.rows,
+        GemmaPrefillLayerMatrixKind::Gate => layer.gate_proj_shape.rows,
+        GemmaPrefillLayerMatrixKind::Up => layer.up_proj_shape.rows,
+        GemmaPrefillLayerMatrixKind::Down => layer.down_proj_shape.rows,
+        GemmaPrefillLayerMatrixKind::PleInputGate => layer.ple_input_gate_shape?.rows,
+        GemmaPrefillLayerMatrixKind::PleLayerProjection => layer.ple_layer_projection_shape?.rows,
+    })
+}
+
+fn prefill_layer_norm_requests(
+    layer: &GemmaPrefillLayerMetadata,
+) -> Vec<GemmaPrefillLayerNormKind> {
+    let mut norms = vec![
+        GemmaPrefillLayerNormKind::Query,
+        GemmaPrefillLayerNormKind::Key,
+        GemmaPrefillLayerNormKind::InputLayer,
+        GemmaPrefillLayerNormKind::PostAttention,
+        GemmaPrefillLayerNormKind::PreFeedForward,
+        GemmaPrefillLayerNormKind::PostFeedForward,
+    ];
+    if layer.ple_post_input_norm_width.is_some() {
+        norms.push(GemmaPrefillLayerNormKind::PlePostInput);
+    }
+    norms
 }
 
 impl GemmaPrefillLayerMatrixKind {

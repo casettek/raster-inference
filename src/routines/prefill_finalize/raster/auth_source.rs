@@ -1,11 +1,11 @@
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
-
-use anyhow::{anyhow, bail, Result};
-use serde::Serialize;
+use std::sync::Arc;
 
 use crate::shared::artifacts::artifact_io::AuthRead;
 use crate::shared::artifacts::external_artifacts::{
-    register_external_source_leaves, CommittedExternalSource, ExternalSourceId, ExternalSourceRef,
+    decode_i32_vec_response, decode_postcard_response, postcard_external_source_entry,
+    postcard_i32_vec_external_source_entry, postcard_request_key, register_external_source,
+    CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
+    ExternalSourceRef,
 };
 use crate::shared::model::transformer::{
     DetNumMatrix, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
@@ -13,11 +13,15 @@ use crate::shared::model::transformer::{
 };
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
+use anyhow::{anyhow, bail, Result};
 
 const GEMMA_PREFILL_FINALIZE_SOURCE_KIND: &str = "gemma_prefill_finalize";
 const GEMMA_PREFILL_FINALIZE_SOURCE_DOMAIN: &str =
     "raster-external-source-gemma-prefill-finalize-merkle-v1";
-const GEMMA_PREFILL_FINALIZE_SOURCE_CHUNK_BYTES: usize = 1 << 20;
+const PREFILL_FINALIZE_METADATA_REQUEST: &str = "gemma_prefill_finalize.metadata";
+const PREFILL_FINALIZE_NORM_WEIGHTS_REQUEST: &str = "gemma_prefill_finalize.norm_weights";
+const PREFILL_FINALIZE_SCALARS_REQUEST: &str = "gemma_prefill_finalize.scalars";
+const PREFILL_FINALIZE_PROJECTION_ROW_REQUEST: &str = "gemma_prefill_finalize.projection_row";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedGemmaPrefillFinalizeSource {
@@ -31,26 +35,6 @@ pub struct AuthenticatedGemmaPrefillFinalizeSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GemmaPrefillFinalizeProjectionBacking {
     Matrix(Arc<DetNumMatrix>),
-}
-
-#[derive(Serialize)]
-struct GemmaPrefillFinalizeSourcePayload<'a> {
-    identifier: &'a str,
-    metadata: &'a GemmaPrefillFinalizeMetadata,
-    final_norm_weight_bits: Vec<i32>,
-    rms_norm_eps_bits: i64,
-    final_logit_softcapping_bits: Option<i32>,
-    projection: GemmaPrefillFinalizeSourcePayloadProjection,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum GemmaPrefillFinalizeSourcePayloadProjection {
-    Matrix {
-        rows: usize,
-        cols: usize,
-        values: Vec<i32>,
-    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -73,6 +57,12 @@ pub enum GemmaPrefillFinalizeProjectionKind {
 pub struct GemmaPrefillFinalizeScalars {
     pub rms_norm_eps: Acc,
     pub final_logit_softcapping: Option<Act>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct GemmaPrefillFinalizeScalarsPayload {
+    rms_norm_eps_bits: i64,
+    final_logit_softcapping_bits: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,46 +138,45 @@ impl AuthenticatedGemmaPrefillFinalizeSource {
     }
 
     pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
-        let source_ref = register_external_source_leaves(
+        register_external_source(
             ExternalSourceId::new(format!("prefill-finalize:{}", self.identifier))?,
             GEMMA_PREFILL_FINALIZE_SOURCE_KIND,
             GEMMA_PREFILL_FINALIZE_SOURCE_DOMAIN,
-            source_payload_chunks(&self.source_payload()),
-        )?;
-        register_native_committed_prefill_finalize(source_ref.root(), self)?;
-        Ok(source_ref)
+            self.committed_source_entries()?,
+        )
     }
 
     pub fn committed_source(&self) -> Result<CommittedExternalSource> {
         Ok(CommittedExternalSource::new(self.committed_source_ref()?))
     }
 
-    fn source_payload(&self) -> Vec<u8> {
-        let projection = match &self.projection {
-            GemmaPrefillFinalizeProjectionBacking::Matrix(matrix) => {
-                GemmaPrefillFinalizeSourcePayloadProjection::Matrix {
-                    rows: matrix.rows,
-                    cols: matrix.cols,
-                    values: matrix.values.clone(),
-                }
-            }
-        };
-        serde_json::to_vec(&GemmaPrefillFinalizeSourcePayload {
-            identifier: &self.identifier,
-            metadata: &self.metadata,
-            final_norm_weight_bits: self
-                .final_norm_weights
-                .iter()
-                .map(|value| value.to_bits())
-                .collect(),
-            rms_norm_eps_bits: self.scalars.rms_norm_eps.to_bits(),
-            final_logit_softcapping_bits: self
-                .scalars
-                .final_logit_softcapping
-                .map(|value| value.to_bits()),
-            projection,
-        })
-        .expect("canonical prefill finalize source payload should serialize")
+    fn committed_source_entries(&self) -> Result<Vec<ExternalSourceEntry>> {
+        let mut entries = Vec::with_capacity(self.metadata.projection_rows + 3);
+        entries.push(postcard_external_source_entry(
+            GemmaPrefillFinalizeMetadataRequest.request_key()?,
+            &self.metadata,
+        )?);
+        let norm_bits = self.final_norm_weights.iter().map(|value| value.to_bits());
+        entries.push(postcard_i32_vec_external_source_entry(
+            GemmaPrefillFinalizeNormWeightsRequest.request_key()?,
+            norm_bits,
+        )?);
+        entries.push(postcard_external_source_entry(
+            GemmaPrefillFinalizeScalarsRequest.request_key()?,
+            &self.scalars.payload(),
+        )?);
+        for row_idx in 0..self.metadata.projection_rows {
+            let request = GemmaPrefillFinalizeProjectionRowRequest { row_idx };
+            let row_bits = self
+                .auth_read(request)?
+                .into_iter()
+                .map(|value| value.to_bits());
+            entries.push(postcard_i32_vec_external_source_entry(
+                request.request_key()?,
+                row_bits,
+            )?);
+        }
+        Ok(entries)
     }
 }
 
@@ -229,35 +218,59 @@ impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest>
     }
 }
 
-impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaPrefillFinalizeMetadataRequest {
     type Output = GemmaPrefillFinalizeMetadata;
 
-    fn auth_read(&self, request: GemmaPrefillFinalizeMetadataRequest) -> Result<Self::Output> {
-        with_native_committed_prefill_finalize(self.root(), |source| source.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PREFILL_FINALIZE_METADATA_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        decode_postcard_response(response_payload)
     }
 }
 
-impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaPrefillFinalizeNormWeightsRequest {
     type Output = Vec<Wgt>;
 
-    fn auth_read(&self, request: GemmaPrefillFinalizeNormWeightsRequest) -> Result<Self::Output> {
-        with_native_committed_prefill_finalize(self.root(), |source| source.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PREFILL_FINALIZE_NORM_WEIGHTS_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
     }
 }
 
-impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaPrefillFinalizeScalarsRequest {
     type Output = GemmaPrefillFinalizeScalars;
 
-    fn auth_read(&self, request: GemmaPrefillFinalizeScalarsRequest) -> Result<Self::Output> {
-        with_native_committed_prefill_finalize(self.root(), |source| source.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PREFILL_FINALIZE_SCALARS_REQUEST, &())
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(GemmaPrefillFinalizeScalars::from_payload(
+            decode_postcard_response(response_payload)?,
+        ))
     }
 }
 
-impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest> for CommittedExternalSource {
+impl CommittedExternalRequest for GemmaPrefillFinalizeProjectionRowRequest {
     type Output = Vec<Wgt>;
 
-    fn auth_read(&self, request: GemmaPrefillFinalizeProjectionRowRequest) -> Result<Self::Output> {
-        with_native_committed_prefill_finalize(self.root(), |source| source.auth_read(request))
+    fn request_key(&self) -> Result<Vec<u8>> {
+        postcard_request_key(PREFILL_FINALIZE_PROJECTION_ROW_REQUEST, &self.row_idx)
+    }
+
+    fn decode_response(&self, response_payload: &[u8]) -> Result<Self::Output> {
+        Ok(decode_i32_vec_response(response_payload)?
+            .into_iter()
+            .map(Wgt::from_bits)
+            .collect())
     }
 }
 
@@ -265,7 +278,7 @@ impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for str {
     type Output = GemmaPrefillFinalizeMetadata;
 
     fn auth_read(&self, request: GemmaPrefillFinalizeMetadataRequest) -> Result<Self::Output> {
-        with_native_committed_prefill_finalize(self, |source| source.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -273,7 +286,7 @@ impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for str {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPrefillFinalizeNormWeightsRequest) -> Result<Self::Output> {
-        with_native_committed_prefill_finalize(self, |source| source.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -281,7 +294,7 @@ impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for str {
     type Output = GemmaPrefillFinalizeScalars;
 
     fn auth_read(&self, request: GemmaPrefillFinalizeScalarsRequest) -> Result<Self::Output> {
-        with_native_committed_prefill_finalize(self, |source| source.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
@@ -289,45 +302,24 @@ impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest> for str {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPrefillFinalizeProjectionRowRequest) -> Result<Self::Output> {
-        with_native_committed_prefill_finalize(self, |source| source.auth_read(request))
+        CommittedExternalSource::from_root(self)?.auth_read(request)
     }
 }
 
-thread_local! {
-    static NATIVE_COMMITTED_PREFILL_FINALIZE_SOURCES: RefCell<HashMap<String, AuthenticatedGemmaPrefillFinalizeSource>> =
-        RefCell::new(HashMap::new());
-}
-
-fn register_native_committed_prefill_finalize(
-    root: &str,
-    source: &AuthenticatedGemmaPrefillFinalizeSource,
-) -> Result<()> {
-    NATIVE_COMMITTED_PREFILL_FINALIZE_SOURCES.with(|sources_ref| {
-        let mut sources = sources_ref.borrow_mut();
-        match sources.get(root) {
-            Some(existing) if existing != source => {
-                bail!("committed prefill finalize root {root} is already registered with different data")
-            }
-            Some(_) => Ok(()),
-            None => {
-                sources.insert(root.to_string(), source.clone());
-                Ok(())
-            }
+impl GemmaPrefillFinalizeScalars {
+    fn payload(self) -> GemmaPrefillFinalizeScalarsPayload {
+        GemmaPrefillFinalizeScalarsPayload {
+            rms_norm_eps_bits: self.rms_norm_eps.to_bits(),
+            final_logit_softcapping_bits: self.final_logit_softcapping.map(|value| value.to_bits()),
         }
-    })
-}
+    }
 
-fn with_native_committed_prefill_finalize<T>(
-    root: &str,
-    f: impl FnOnce(&AuthenticatedGemmaPrefillFinalizeSource) -> Result<T>,
-) -> Result<T> {
-    NATIVE_COMMITTED_PREFILL_FINALIZE_SOURCES.with(|sources_ref| {
-        let sources = sources_ref.borrow();
-        let source = sources.get(root).ok_or_else(|| {
-            anyhow!("committed prefill finalize root {root} is not registered natively")
-        })?;
-        f(source)
-    })
+    fn from_payload(payload: GemmaPrefillFinalizeScalarsPayload) -> Self {
+        Self {
+            rms_norm_eps: Acc::from_bits(payload.rms_norm_eps_bits),
+            final_logit_softcapping: payload.final_logit_softcapping_bits.map(Act::from_bits),
+        }
+    }
 }
 
 fn validate_identifier(identifier: String) -> Result<String> {
@@ -420,13 +412,6 @@ fn validate_det_matrix_shape(matrix: &DetNumMatrix, label: &str) -> Result<()> {
 
 fn matrix_row_wgts(matrix: &DetNumMatrix, row_idx: usize, label: &str) -> Result<Vec<Wgt>> {
     det_num_matrix_row_wgts(matrix, row_idx, label)
-}
-
-fn source_payload_chunks(payload: &[u8]) -> Vec<Vec<u8>> {
-    payload
-        .chunks(GEMMA_PREFILL_FINALIZE_SOURCE_CHUNK_BYTES)
-        .map(|chunk| chunk.to_vec())
-        .collect()
 }
 
 #[cfg(test)]
