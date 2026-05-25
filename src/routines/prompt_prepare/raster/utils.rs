@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 
 use crate::shared::api::input::{InferenceRequest, ModelSpec};
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -45,9 +45,8 @@ pub(in super::super) struct BpePair {
 pub(in super::super) fn read_bpe_piece(pieces_root: &str, piece_idx: usize) -> Result<String> {
     let pieces_ref =
         RasterBpePieceSequenceRef::new(ArtifactIo::artifact_ref_for_root(pieces_root)?)?;
-    let read = ArtifactIo::read_leaf(pieces_ref.artifact_ref(), piece_idx)?;
-    ArtifactIo::verify_artifact_read(pieces_ref.artifact_ref(), &read)?;
-    decode_bpe_piece_leaf(read.payload())
+    let read = ArtifactIo::read_verified_leaf(pieces_ref.artifact_ref(), piece_idx)?;
+    decode_bpe_piece_leaf(read.bytes())
 }
 
 pub(in super::super) fn read_bpe_pair(
@@ -74,7 +73,10 @@ pub(in super::super) fn store_byte_artifact(
     domain: &str,
     bytes: &[u8],
 ) -> Result<RasterArtifactRef> {
-    let leaves = bytes.iter().map(|byte| vec![*byte]).collect::<Vec<_>>();
+    let leaves = bytes
+        .iter()
+        .map(|byte| postcard_leaf(byte, "prompt byte"))
+        .collect::<Vec<_>>();
     ArtifactIo::insert_artifact(
         artifact_id(name)?,
         RasterArtifactMetadata::open(kind, domain, Vec::new())?,
@@ -291,27 +293,17 @@ fn text_char_leaf(ch: char) -> Vec<u8> {
 }
 
 pub(in super::super) fn bpe_piece_leaf(piece: &str) -> Vec<u8> {
-    let bytes = piece.as_bytes();
-    let mut payload = Vec::with_capacity(8 + bytes.len());
-    payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    payload.extend_from_slice(bytes);
-    payload
+    postcard_leaf(&piece, "BPE piece")
 }
 
 fn decode_bpe_piece_leaf(payload: &[u8]) -> Result<String> {
-    if payload.len() < 8 {
-        bail!("BPE piece leaf payload is too short");
-    }
-    let len = u64::from_le_bytes(
-        payload[0..8]
-            .try_into()
-            .expect("slice length checked above"),
-    ) as usize;
-    let bytes = &payload[8..];
-    if bytes.len() != len {
-        bail!("BPE piece leaf length mismatch: {} vs {len}", bytes.len());
-    }
-    String::from_utf8(bytes.to_vec()).context("BPE piece leaf is not valid UTF-8")
+    postcard::from_bytes(payload)
+        .map_err(|error| anyhow!("failed to deserialize raster BPE piece leaf: {error}"))
+}
+
+fn postcard_leaf<T: serde::Serialize + ?Sized>(value: &T, label: &str) -> Vec<u8> {
+    postcard::to_allocvec(value)
+        .unwrap_or_else(|error| panic!("failed to serialize raster {label} leaf: {error}"))
 }
 
 pub(in super::super) fn split_merged_with_previous(

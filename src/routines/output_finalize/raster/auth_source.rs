@@ -764,22 +764,26 @@ pub fn output_pending_bytes_metadata() -> Result<RasterArtifactMetadata> {
 }
 
 pub fn text_chunk_leaf(chunk: &str) -> Vec<u8> {
-    chunk.as_bytes().to_vec()
+    postcard_leaf(&chunk, "output text chunk")
 }
 
 pub fn decode_text_chunk_leaf(payload: &[u8]) -> Result<String> {
-    Ok(std::str::from_utf8(payload)?.to_string())
+    postcard::from_bytes(payload)
+        .map_err(|error| anyhow!("failed to deserialize raster output text chunk leaf: {error}"))
 }
 
 pub fn pending_byte_leaf(byte: u8) -> Vec<u8> {
-    vec![byte]
+    postcard_leaf(&byte, "output pending byte")
 }
 
 pub fn decode_pending_byte_leaf(payload: &[u8]) -> Result<u8> {
-    let [byte] = payload else {
-        bail!("raster output pending-byte leaf payload must contain exactly one byte");
-    };
-    Ok(*byte)
+    postcard::from_bytes(payload)
+        .map_err(|error| anyhow!("failed to deserialize raster output pending-byte leaf: {error}"))
+}
+
+fn postcard_leaf<T: serde::Serialize + ?Sized>(value: &T, label: &str) -> Vec<u8> {
+    postcard::to_allocvec(value)
+        .unwrap_or_else(|error| panic!("failed to serialize raster {label} leaf: {error}"))
 }
 
 pub fn build_output_text_commitment(text: &str) -> String {
@@ -804,12 +808,12 @@ pub fn materialize_text_from_roots(
     let mut text = String::new();
     for chunk_idx in 0..text_ref.chunk_count() {
         let read =
-            crate::shared::artifacts::artifact_io::ArtifactIo::read_leaf(artifact_ref, chunk_idx)?;
-        crate::shared::artifacts::artifact_io::ArtifactIo::verify_artifact_read(
-            artifact_ref,
-            &read,
-        )?;
-        text.push_str(&decode_text_chunk_leaf(read.payload())?);
+            crate::shared::artifacts::artifact_io::ArtifactIo::read_verified_leaf_from_roots(
+                roots,
+                artifact_ref,
+                chunk_idx,
+            )?;
+        text.push_str(&decode_text_chunk_leaf(read.bytes())?);
     }
     let text_commitment = build_text_commitment(&text);
     let artifact_commitment = artifact_ref.root();

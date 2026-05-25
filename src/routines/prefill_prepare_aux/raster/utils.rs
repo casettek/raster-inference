@@ -6,10 +6,9 @@ use crate::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::merkle::merkle_root;
 use crate::shared::artifacts::raster_artifact_store::{
-    activation_row_leaf, decode_activation_row_leaf, decode_token_id_leaf, token_id_leaf,
-    RasterActivationSequenceArtifactRef, RasterArtifactBuilderRef, RasterArtifactId,
-    RasterArtifactMetadata, RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
-    TOKEN_ID_ARTIFACT_DOMAIN,
+    activation_row_leaf, token_id_leaf, RasterActivationSequenceArtifactRef,
+    RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
+    RasterTokenIdSequenceRef, TOKEN_ID_ARTIFACT_DOMAIN,
 };
 use crate::shared::model::transformer::{ActivationSequence, InternalActivationSequence};
 use crate::shared::raster_contracts::prefill_ple::{
@@ -130,9 +129,8 @@ pub(in super::super) fn read_activation_row_from_ref(
             activation_ref.row_count()
         );
     }
-    let read = ArtifactIo::read_leaf(activation_ref.artifact_ref(), row_idx)?;
-    ArtifactIo::verify_artifact_read(activation_ref.artifact_ref(), &read)?;
-    let row = decode_activation_row_leaf(read.payload())?;
+    let row: RasterActivationRow =
+        ArtifactIo::read_verified_leaf(activation_ref.artifact_ref(), row_idx)?.deserialize()?;
     if row.width() != activation_ref.width() {
         bail!(
             "activation artifact row {row_idx} has width {}, expected {}",
@@ -213,9 +211,8 @@ pub(in super::super) fn read_prefill_token_id(
     if token_idx >= token_count {
         bail!("PLE token index {token_idx} is out of range for {token_count} tokens");
     }
-    let read = ArtifactIo::read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
-    ArtifactIo::verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
-    decode_token_id_leaf(read.payload())
+    ArtifactIo::read_verified_leaf_from_roots(roots, token_ids_ref.artifact_ref(), token_idx)?
+        .deserialize()
 }
 
 pub(in super::super) fn raster_activation_sequence_from_embedding(

@@ -4,9 +4,8 @@ use sha2::{Digest, Sha256};
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::merkle::merkle_root;
 use crate::shared::artifacts::raster_artifact_store::{
-    activation_row_leaf, decode_activation_row_leaf, RasterActivationSequenceArtifactRef,
-    RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
-    ACTIVATION_ROW_ARTIFACT_DOMAIN,
+    activation_row_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
+    RasterArtifactMetadata, RasterArtifactStoreRoots, ACTIVATION_ROW_ARTIFACT_DOMAIN,
 };
 use crate::shared::raster_kernels::transformer::{
     RasterActivationRow, RasterActivationSequence, RasterAttentionHeadSequence, RasterKvCache,
@@ -792,9 +791,8 @@ fn read_activation_artifact_row(
             artifact_ref.row_count()
         );
     }
-    let read = ArtifactIo::read_leaf(artifact_ref.artifact_ref(), row_idx)?;
-    ArtifactIo::verify_artifact_read(artifact_ref.artifact_ref(), &read)?;
-    let row = decode_activation_row_leaf(read.payload())?;
+    let row: RasterActivationRow =
+        ArtifactIo::read_verified_leaf(artifact_ref.artifact_ref(), row_idx)?.deserialize()?;
     if row.width() != artifact_ref.width() {
         bail!(
             "activation artifact row {row_idx} has width {}, expected {}",

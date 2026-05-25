@@ -234,16 +234,8 @@ pub(in super::super) fn read_pending_byte_from_ref_roots(
         );
     }
     let artifact_ref = pending_ref.artifact_ref();
-    let entry = roots.artifact_entry_for_source_name(artifact_ref.id().source_name())?;
-    if entry.root() != artifact_ref.root() {
-        bail!(
-            "raster output pending byte root mismatch for {}",
-            artifact_ref.id().source_name()
-        );
-    }
-    let read = ArtifactIo::read_leaf(artifact_ref, byte_idx)?;
-    ArtifactIo::verify_artifact_read(artifact_ref, &read)?;
-    crate::output_finalize::raster::auth_source::decode_pending_byte_leaf(read.payload())
+    let read = ArtifactIo::read_verified_leaf_from_roots(roots, artifact_ref, byte_idx)?;
+    crate::output_finalize::raster::auth_source::decode_pending_byte_leaf(read.bytes())
 }
 
 pub(in super::super) fn read_pending_byte_range_from_ref_roots(

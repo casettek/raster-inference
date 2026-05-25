@@ -1,6 +1,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use anyhow::{anyhow, bail, Result};
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::shared::artifacts::merkle::{
     merkle_proof, merkle_root, verify_merkle_proof, MerkleProof,
@@ -424,6 +425,36 @@ impl RasterArtifactRead {
 
     pub fn proof(&self) -> &MerkleProof {
         &self.proof
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedArtifactRead {
+    commitment: String,
+    leaf_idx: usize,
+    payload: Vec<u8>,
+}
+
+impl VerifiedArtifactRead {
+    pub fn commitment(&self) -> &str {
+        &self.commitment
+    }
+
+    pub fn leaf_idx(&self) -> usize {
+        self.leaf_idx
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
+        postcard::from_bytes(self.bytes()).map_err(|error| {
+            anyhow!(
+                "failed to deserialize raster artifact leaf from postcard bytes: {}",
+                error
+            )
+        })
     }
 }
 
@@ -902,6 +933,20 @@ impl RasterArtifactStore {
         })
     }
 
+    pub fn read_verified_leaf(
+        &self,
+        artifact_ref: &RasterArtifactRef,
+        leaf_idx: usize,
+    ) -> Result<VerifiedArtifactRead> {
+        let read = self.read_leaf(artifact_ref, leaf_idx)?;
+        verify_artifact_read(artifact_ref, &read)?;
+        Ok(VerifiedArtifactRead {
+            commitment: artifact_ref.root().to_string(),
+            leaf_idx: read.leaf_idx,
+            payload: read.payload,
+        })
+    }
+
     pub fn artifact_ref_for_root(&self, root: &str) -> Result<RasterArtifactRef> {
         let mut matches = self.artifacts.iter().filter_map(|(id, artifact)| {
             let actual_root = artifact_root(&artifact.metadata, &artifact.leaves);
@@ -1165,6 +1210,40 @@ pub fn read_leaf(artifact_ref: &RasterArtifactRef, leaf_idx: usize) -> Result<Ra
     read_artifact_store(|store| store.read_leaf(artifact_ref, leaf_idx))
 }
 
+pub fn read_verified_leaf(
+    artifact_ref: &RasterArtifactRef,
+    leaf_idx: usize,
+) -> Result<VerifiedArtifactRead> {
+    read_artifact_store(|store| store.read_verified_leaf(artifact_ref, leaf_idx))
+}
+
+pub fn read_verified_leaf_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    artifact_ref: &RasterArtifactRef,
+    leaf_idx: usize,
+) -> Result<VerifiedArtifactRead> {
+    let entry = roots.artifact_entry_for_source_name(artifact_ref.id().source_name())?;
+    if entry.root() != artifact_ref.root() {
+        bail!(
+            "raster artifact root mismatch for {}: snapshot has {}, ref has {}",
+            artifact_ref.id().source_name(),
+            entry.root(),
+            artifact_ref.root()
+        );
+    }
+    read_verified_leaf(artifact_ref, leaf_idx)
+}
+
+pub fn read_verified_leaf_by_root_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    artifact_root: &str,
+    leaf_idx: usize,
+) -> Result<VerifiedArtifactRead> {
+    roots.artifact_entry_for_root(artifact_root)?;
+    let artifact_ref = artifact_ref_for_root_any(artifact_root)?;
+    read_verified_leaf(&artifact_ref, leaf_idx)
+}
+
 pub fn artifact_ref_for_root(root: &str) -> Result<RasterArtifactRef> {
     read_artifact_store(|store| store.artifact_ref_for_root(root))
 }
@@ -1194,16 +1273,11 @@ pub fn verify_artifact_read(
 }
 
 pub fn token_id_leaf(token_id: u32) -> Vec<u8> {
-    token_id.to_le_bytes().to_vec()
+    postcard_leaf(&token_id, "token-id")
 }
 
 pub fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
-    if payload.len() != 4 {
-        bail!("token-id leaf payload must be exactly four bytes");
-    }
-    Ok(u32::from_le_bytes(
-        payload.try_into().expect("payload length checked above"),
-    ))
+    decode_postcard_leaf(payload, "token-id")
 }
 
 pub fn token_ids_ref_for_root(
@@ -1231,10 +1305,8 @@ pub fn read_token_id_from_roots(
     if token_idx >= token_count {
         bail!("token-id index {token_idx} is out of range for {token_count} tokens");
     }
-    let token_ids_ref = token_ids_ref_for_root(roots, token_ids_root, token_count)?;
-    let read = read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
-    verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
-    decode_token_id_leaf(read.payload())
+    token_ids_ref_for_root(roots, token_ids_root, token_count)?;
+    read_verified_leaf_by_root_from_roots(roots, token_ids_root, token_idx)?.deserialize()
 }
 
 pub fn read_token_id_from_ref_roots(
@@ -1257,9 +1329,7 @@ pub fn read_token_id_from_ref_roots(
             token_ids_ref.root()
         );
     }
-    let read = read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
-    verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
-    decode_token_id_leaf(read.payload())
+    read_verified_leaf_from_roots(roots, token_ids_ref.artifact_ref(), token_idx)?.deserialize()
 }
 
 pub fn read_selected_token_from_roots(
@@ -1270,44 +1340,21 @@ pub fn read_selected_token_from_roots(
 }
 
 pub fn activation_row_leaf(row: &RasterActivationRow) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(8 + row.width() * std::mem::size_of::<i32>());
-    payload.extend_from_slice(&(row.width() as u64).to_le_bytes());
-    for bits in row.act_bits() {
-        payload.extend_from_slice(&bits.to_le_bytes());
-    }
-    payload
+    postcard_leaf(row, "activation row")
 }
 
 pub fn decode_activation_row_leaf(payload: &[u8]) -> Result<RasterActivationRow> {
-    if payload.len() < 8 {
-        bail!("activation row leaf payload is too short");
-    }
-    let width = u64::from_le_bytes(
-        payload[0..8]
-            .try_into()
-            .expect("slice length checked above"),
-    ) as usize;
-    let bits = &payload[8..];
-    let expected_len = width
-        .checked_mul(std::mem::size_of::<i32>())
-        .ok_or_else(|| anyhow!("activation row leaf width is too large"))?;
-    if bits.len() != expected_len {
-        bail!(
-            "activation row leaf payload has {} value bytes, expected {expected_len}",
-            bits.len()
-        );
-    }
-    let act_bits = bits
-        .chunks_exact(std::mem::size_of::<i32>())
-        .map(|chunk| {
-            i32::from_le_bytes(
-                chunk
-                    .try_into()
-                    .expect("chunks_exact yields four-byte chunks"),
-            )
-        })
-        .collect();
-    Ok(RasterActivationRow::from_act_bits(act_bits))
+    decode_postcard_leaf(payload, "activation row")
+}
+
+fn postcard_leaf<T: Serialize>(value: &T, label: &str) -> Vec<u8> {
+    postcard::to_allocvec(value)
+        .unwrap_or_else(|error| panic!("failed to serialize raster {label} leaf: {error}"))
+}
+
+fn decode_postcard_leaf<T: DeserializeOwned>(payload: &[u8], label: &str) -> Result<T> {
+    postcard::from_bytes(payload)
+        .map_err(|error| anyhow!("failed to deserialize raster {label} leaf: {error}"))
 }
 
 fn artifact_ref(id: RasterArtifactId, state: &ArtifactBuilderState) -> RasterArtifactRef {
@@ -1362,27 +1409,11 @@ mod tests {
     }
 
     fn bpe_piece_leaf(piece: &str) -> Vec<u8> {
-        let bytes = piece.as_bytes();
-        let mut payload = Vec::with_capacity(8 + bytes.len());
-        payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        payload.extend_from_slice(bytes);
-        payload
+        postcard_leaf(&piece, "BPE piece")
     }
 
     fn decode_bpe_piece_leaf(payload: &[u8]) -> Result<String> {
-        if payload.len() < 8 {
-            bail!("BPE piece leaf payload is too short");
-        }
-        let len = u64::from_le_bytes(
-            payload[0..8]
-                .try_into()
-                .expect("slice length checked above"),
-        ) as usize;
-        let bytes = &payload[8..];
-        if bytes.len() != len {
-            bail!("BPE piece leaf length mismatch: {} vs {len}", bytes.len());
-        }
-        String::from_utf8(bytes.to_vec()).map_err(Into::into)
+        decode_postcard_leaf(payload, "BPE piece")
     }
 
     fn start_token_builder(
@@ -1420,9 +1451,9 @@ mod tests {
         token_ref: &RasterTokenIdSequenceRef,
         token_idx: usize,
     ) -> Result<u32> {
-        let read = store.read_leaf(token_ref.artifact_ref(), token_idx)?;
-        verify_artifact_read(token_ref.artifact_ref(), &read)?;
-        decode_token_id_leaf(read.payload())
+        store
+            .read_verified_leaf(token_ref.artifact_ref(), token_idx)?
+            .deserialize()
     }
 
     fn materialize_token_ids(
@@ -1460,9 +1491,8 @@ mod tests {
         pieces_ref: &RasterBpePieceSequenceRef,
         piece_idx: usize,
     ) -> Result<String> {
-        let read = store.read_leaf(pieces_ref.artifact_ref(), piece_idx)?;
-        verify_artifact_read(pieces_ref.artifact_ref(), &read)?;
-        decode_bpe_piece_leaf(read.payload())
+        let read = store.read_verified_leaf(pieces_ref.artifact_ref(), piece_idx)?;
+        decode_bpe_piece_leaf(read.bytes())
     }
 
     fn materialize_bpe_pieces(
@@ -1494,9 +1524,31 @@ mod tests {
 
         assert_eq!(artifact_ref.kind(), "test_bytes");
         assert_eq!(artifact_ref.metadata().leaf_count(), 2);
-        let read = store.read_leaf(&artifact_ref, 1).expect("read");
-        assert_eq!(read.payload(), b"b");
-        verify_artifact_read(&artifact_ref, &read).expect("read should verify");
+        let read = store
+            .read_verified_leaf(&artifact_ref, 1)
+            .expect("read should verify");
+        assert_eq!(read.bytes(), b"b");
+        assert_eq!(read.commitment(), artifact_ref.root());
+    }
+
+    #[test]
+    fn verified_artifact_read_deserializes_postcard_payload() {
+        let mut store = RasterArtifactStore::new();
+        let artifact_ref = store
+            .insert_artifact(
+                artifact_id("postcard-token"),
+                RasterArtifactMetadata::token_ids(1),
+                vec![token_id_leaf(99)],
+            )
+            .expect("insert token artifact");
+
+        let read = store
+            .read_verified_leaf(&artifact_ref, 0)
+            .expect("verified read");
+
+        assert_eq!(read.commitment(), artifact_ref.root());
+        assert_eq!(read.leaf_idx(), 0);
+        assert_eq!(read.deserialize::<u32>().expect("token decode"), 99);
     }
 
     #[test]
@@ -1729,9 +1781,15 @@ mod tests {
         let activation_ref = store.finalize_builder(builder).expect("finalize");
 
         assert_eq!(activation_ref.kind(), ACTIVATION_ROW_ARTIFACT_KIND);
-        let read = store.read_leaf(&activation_ref, 0).expect("read");
-        assert_eq!(read.payload(), activation_row_leaf(&row));
-        verify_artifact_read(&activation_ref, &read).expect("read should verify");
+        let read = store
+            .read_verified_leaf(&activation_ref, 0)
+            .expect("read should verify");
+        assert_eq!(read.bytes(), activation_row_leaf(&row));
+        assert_eq!(
+            read.deserialize::<RasterActivationRow>()
+                .expect("activation row decode"),
+            row
+        );
     }
 
     #[test]
@@ -1796,35 +1854,25 @@ mod tests {
         let pieces_ref = insert_bpe_pieces(&mut store, "pieces", vec!["a".to_string()]);
         assert!(read_bpe_piece(&store, &pieces_ref, 1).is_err());
 
-        let bad_utf8_ref = store
+        let bad_postcard_ref = store
             .insert_artifact(
-                artifact_id("bad-utf8"),
+                artifact_id("bad-postcard"),
                 RasterArtifactMetadata::bpe_pieces(1),
-                vec![{
-                    let mut payload = Vec::new();
-                    payload.extend_from_slice(&1_u64.to_le_bytes());
-                    payload.push(0xff);
-                    payload
-                }],
+                vec![vec![0xff]],
             )
-            .expect("bad utf8 artifact");
-        let bad_utf8_ref = RasterBpePieceSequenceRef::new(bad_utf8_ref).expect("typed ref");
-        assert!(read_bpe_piece(&store, &bad_utf8_ref, 0).is_err());
+            .expect("bad postcard artifact");
+        let bad_postcard_ref = RasterBpePieceSequenceRef::new(bad_postcard_ref).expect("typed ref");
+        assert!(read_bpe_piece(&store, &bad_postcard_ref, 0).is_err());
 
-        let bad_length_ref = store
+        let truncated_ref = store
             .insert_artifact(
-                artifact_id("bad-length"),
+                artifact_id("truncated-postcard"),
                 RasterArtifactMetadata::bpe_pieces(1),
-                vec![{
-                    let mut payload = Vec::new();
-                    payload.extend_from_slice(&2_u64.to_le_bytes());
-                    payload.push(b'a');
-                    payload
-                }],
+                vec![vec![2, b'a']],
             )
-            .expect("bad length artifact");
-        let bad_length_ref = RasterBpePieceSequenceRef::new(bad_length_ref).expect("typed ref");
-        assert!(read_bpe_piece(&store, &bad_length_ref, 0).is_err());
+            .expect("truncated postcard artifact");
+        let truncated_ref = RasterBpePieceSequenceRef::new(truncated_ref).expect("typed ref");
+        assert!(read_bpe_piece(&store, &truncated_ref, 0).is_err());
     }
 
     #[test]

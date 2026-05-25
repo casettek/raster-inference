@@ -15,8 +15,7 @@ use super::{
 use crate::shared::api::input::{MessageRole, ModelSpec, TextDecodingPolicy};
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
-    self, decode_token_id_leaf, RasterArtifactId, RasterBpePieceSequenceRef,
-    RasterTokenIdSequenceRef,
+    self, RasterArtifactId, RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
 };
 use crate::shared::model::gemma_tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeOutput,
@@ -286,9 +285,8 @@ fn materialize_token_ids(token_ids_root: &str, token_count: usize) -> Result<Vec
     )?;
     (0..token_count)
         .map(|token_idx| {
-            let read = raster_artifact_store::read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
-            raster_artifact_store::verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
-            decode_token_id_leaf(read.payload())
+            raster_artifact_store::read_verified_leaf(token_ids_ref.artifact_ref(), token_idx)?
+                .deserialize()
         })
         .collect()
 }

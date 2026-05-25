@@ -155,7 +155,7 @@ pub fn store_prefill_ple_input_manifest_with_roots(
             .map(|input| input.as_ref().map(|input| input.root().to_string()))
             .collect(),
     )?;
-    let payload = serde_json::to_vec(&manifest)?;
+    let payload = postcard::to_allocvec(&manifest)?;
     let (roots, artifact_ref) = ArtifactIo::insert_artifact_with_roots(
         roots,
         RasterArtifactId::new(PREFILL_PLE_INPUT_MANIFEST_SOURCE_NAME)?,
@@ -191,9 +191,7 @@ pub fn read_prefill_ple_input_manifest_from_roots(
     if artifact_ref.metadata().leaf_count() != 1 {
         bail!("raster PLE input manifest must have exactly one leaf");
     }
-    let read = ArtifactIo::read_leaf(&artifact_ref, 0)?;
-    ArtifactIo::verify_artifact_read(&artifact_ref, &read)?;
-    Ok(serde_json::from_slice(read.payload())?)
+    ArtifactIo::read_verified_leaf_from_roots(roots, &artifact_ref, 0)?.deserialize()
 }
 
 fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) -> Result<()> {

@@ -744,13 +744,7 @@ fn materialize_raster_prompt_token_ids(
 
     (0..token_count)
         .map(|token_idx| {
-            let read = ArtifactIo::read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
-            ArtifactIo::verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
-            let payload = read.payload();
-            let bytes: [u8; 4] = payload
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("token-id leaf payload must be exactly four bytes"))?;
-            Ok(u32::from_le_bytes(bytes))
+            ArtifactIo::read_verified_leaf(token_ids_ref.artifact_ref(), token_idx)?.deserialize()
         })
         .collect()
 }

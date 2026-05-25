@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::shared::artifacts::raster_artifact_store::{
     self, RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactRead,
-    RasterArtifactRef, RasterArtifactStoreRoots,
+    RasterArtifactRef, RasterArtifactStoreRoots, VerifiedArtifactRead,
 };
 
 pub trait AuthRead<Request> {
@@ -143,6 +143,29 @@ impl ArtifactIo {
         leaf_idx: usize,
     ) -> Result<RasterArtifactRead> {
         raster_artifact_store::read_leaf(artifact_ref, leaf_idx)
+    }
+
+    pub fn read_verified_leaf(
+        artifact_ref: &RasterArtifactRef,
+        leaf_idx: usize,
+    ) -> Result<VerifiedArtifactRead> {
+        raster_artifact_store::read_verified_leaf(artifact_ref, leaf_idx)
+    }
+
+    pub fn read_verified_leaf_from_roots(
+        roots: &RasterArtifactStoreRoots,
+        artifact_ref: &RasterArtifactRef,
+        leaf_idx: usize,
+    ) -> Result<VerifiedArtifactRead> {
+        raster_artifact_store::read_verified_leaf_from_roots(roots, artifact_ref, leaf_idx)
+    }
+
+    pub fn read_verified_leaf_by_root_from_roots(
+        roots: &RasterArtifactStoreRoots,
+        artifact_root: &str,
+        leaf_idx: usize,
+    ) -> Result<VerifiedArtifactRead> {
+        raster_artifact_store::read_verified_leaf_by_root_from_roots(roots, artifact_root, leaf_idx)
     }
 
     pub fn artifact_ref_for_root(root: &str) -> Result<RasterArtifactRef> {

@@ -188,20 +188,10 @@ fn materialize_token_ids(token_ids_root: &str, token_count: usize) -> Result<Vec
     )?;
     (0..token_count)
         .map(|token_idx| {
-            let read = raster_artifact_store::read_leaf(token_ids_ref.artifact_ref(), token_idx)?;
-            raster_artifact_store::verify_artifact_read(token_ids_ref.artifact_ref(), &read)?;
-            decode_token_id_leaf(read.payload())
+            raster_artifact_store::read_verified_leaf(token_ids_ref.artifact_ref(), token_idx)?
+                .deserialize()
         })
         .collect()
-}
-
-fn decode_token_id_leaf(payload: &[u8]) -> Result<u32> {
-    if payload.len() != 4 {
-        anyhow::bail!("token-id leaf payload must be exactly four bytes");
-    }
-    Ok(u32::from_le_bytes(
-        payload.try_into().expect("payload length checked above"),
-    ))
 }
 
 fn minimal_gemma_tokenizer_json() -> String {
