@@ -3,6 +3,9 @@ use std::{cell::RefCell, collections::HashMap};
 use anyhow::{anyhow, bail, Result};
 use serde::{de::DeserializeOwned, Serialize};
 
+use crate::shared::artifacts::authenticated_selection::{
+    AuthenticatedSelector, VerifiedSelectedPayload,
+};
 use crate::shared::artifacts::merkle::{
     merkle_proof, merkle_root, verify_merkle_proof, MerkleProof,
 };
@@ -436,6 +439,17 @@ pub struct VerifiedArtifactRead {
 }
 
 impl VerifiedArtifactRead {
+    pub fn from_selected_artifact(selected: VerifiedSelectedPayload) -> Result<Self> {
+        let AuthenticatedSelector::ArtifactLeaf { leaf_idx } = selected.selector() else {
+            bail!("verified selected payload is not a raster artifact leaf");
+        };
+        Ok(Self {
+            commitment: selected.commitment().to_string(),
+            leaf_idx: *leaf_idx,
+            payload: selected.bytes().to_vec(),
+        })
+    }
+
     pub fn commitment(&self) -> &str {
         &self.commitment
     }
@@ -938,13 +952,25 @@ impl RasterArtifactStore {
         artifact_ref: &RasterArtifactRef,
         leaf_idx: usize,
     ) -> Result<VerifiedArtifactRead> {
+        VerifiedArtifactRead::from_selected_artifact(
+            self.read_authenticated_leaf(artifact_ref, leaf_idx)?,
+        )
+    }
+
+    pub fn read_authenticated_leaf(
+        &self,
+        artifact_ref: &RasterArtifactRef,
+        leaf_idx: usize,
+    ) -> Result<VerifiedSelectedPayload> {
         let read = self.read_leaf(artifact_ref, leaf_idx)?;
         verify_artifact_read(artifact_ref, &read)?;
-        Ok(VerifiedArtifactRead {
-            commitment: artifact_ref.root().to_string(),
-            leaf_idx: read.leaf_idx,
-            payload: read.payload,
-        })
+        Ok(VerifiedSelectedPayload::artifact_leaf(
+            artifact_ref.id().source_name(),
+            artifact_ref.root(),
+            read.leaf_idx,
+            read.payload,
+            read.proof,
+        ))
     }
 
     pub fn artifact_ref_for_root(&self, root: &str) -> Result<RasterArtifactRef> {
@@ -1217,11 +1243,30 @@ pub fn read_verified_leaf(
     read_artifact_store(|store| store.read_verified_leaf(artifact_ref, leaf_idx))
 }
 
+pub fn read_authenticated_leaf(
+    artifact_ref: &RasterArtifactRef,
+    leaf_idx: usize,
+) -> Result<VerifiedSelectedPayload> {
+    read_artifact_store(|store| store.read_authenticated_leaf(artifact_ref, leaf_idx))
+}
+
 pub fn read_verified_leaf_from_roots(
     roots: &RasterArtifactStoreRoots,
     artifact_ref: &RasterArtifactRef,
     leaf_idx: usize,
 ) -> Result<VerifiedArtifactRead> {
+    VerifiedArtifactRead::from_selected_artifact(read_authenticated_leaf_from_roots(
+        roots,
+        artifact_ref,
+        leaf_idx,
+    )?)
+}
+
+pub fn read_authenticated_leaf_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    artifact_ref: &RasterArtifactRef,
+    leaf_idx: usize,
+) -> Result<VerifiedSelectedPayload> {
     let entry = roots.artifact_entry_for_source_name(artifact_ref.id().source_name())?;
     if entry.root() != artifact_ref.root() {
         bail!(
@@ -1231,7 +1276,7 @@ pub fn read_verified_leaf_from_roots(
             artifact_ref.root()
         );
     }
-    read_verified_leaf(artifact_ref, leaf_idx)
+    read_authenticated_leaf(artifact_ref, leaf_idx)
 }
 
 pub fn read_verified_leaf_by_root_from_roots(
@@ -1239,9 +1284,37 @@ pub fn read_verified_leaf_by_root_from_roots(
     artifact_root: &str,
     leaf_idx: usize,
 ) -> Result<VerifiedArtifactRead> {
+    VerifiedArtifactRead::from_selected_artifact(read_authenticated_leaf_by_root_from_roots(
+        roots,
+        artifact_root,
+        leaf_idx,
+    )?)
+}
+
+pub fn read_authenticated_leaf_by_root_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    artifact_root: &str,
+    leaf_idx: usize,
+) -> Result<VerifiedSelectedPayload> {
     roots.artifact_entry_for_root(artifact_root)?;
     let artifact_ref = artifact_ref_for_root_any(artifact_root)?;
-    read_verified_leaf(&artifact_ref, leaf_idx)
+    read_authenticated_leaf(&artifact_ref, leaf_idx)
+}
+
+pub fn read_authenticated_leaf_by_present_root_from_roots(
+    roots: &RasterArtifactStoreRoots,
+    artifact_root: &str,
+    leaf_idx: usize,
+) -> Result<VerifiedSelectedPayload> {
+    if !roots
+        .artifacts
+        .iter()
+        .any(|entry| entry.root() == artifact_root)
+    {
+        bail!("raster artifact root {artifact_root} is not present in the store roots snapshot");
+    }
+    let artifact_ref = artifact_ref_for_root_any(artifact_root)?;
+    read_authenticated_leaf(&artifact_ref, leaf_idx)
 }
 
 pub fn artifact_ref_for_root(root: &str) -> Result<RasterArtifactRef> {
@@ -1306,7 +1379,7 @@ pub fn read_token_id_from_roots(
         bail!("token-id index {token_idx} is out of range for {token_count} tokens");
     }
     token_ids_ref_for_root(roots, token_ids_root, token_count)?;
-    read_verified_leaf_by_root_from_roots(roots, token_ids_root, token_idx)?.deserialize()
+    read_authenticated_leaf_by_root_from_roots(roots, token_ids_root, token_idx)?.deserialize()
 }
 
 pub fn read_token_id_from_ref_roots(
@@ -1329,7 +1402,8 @@ pub fn read_token_id_from_ref_roots(
             token_ids_ref.root()
         );
     }
-    read_verified_leaf_from_roots(roots, token_ids_ref.artifact_ref(), token_idx)?.deserialize()
+    read_authenticated_leaf_from_roots(roots, token_ids_ref.artifact_ref(), token_idx)?
+        .deserialize()
 }
 
 pub fn read_selected_token_from_roots(
@@ -1529,6 +1603,95 @@ mod tests {
             .expect("read should verify");
         assert_eq!(read.bytes(), b"b");
         assert_eq!(read.commitment(), artifact_ref.root());
+    }
+
+    #[test]
+    fn authenticated_artifact_leaf_exposes_selector_bytes_and_proof() {
+        let mut store = RasterArtifactStore::new();
+        let artifact_ref = store
+            .insert_artifact(
+                artifact_id("authenticated-bytes"),
+                RasterArtifactMetadata::new("test_bytes", "raster-test-bytes-v1", 2, Vec::new())
+                    .expect("metadata"),
+                vec![b"a".to_vec(), b"b".to_vec()],
+            )
+            .expect("insert artifact");
+
+        let selected = store
+            .read_authenticated_leaf(&artifact_ref, 1)
+            .expect("authenticated read");
+
+        assert_eq!(
+            selected.source_kind(),
+            &crate::shared::artifacts::authenticated_selection::AuthenticatedSourceKind::RasterArtifact
+        );
+        assert_eq!(
+            selected.selector(),
+            &crate::shared::artifacts::authenticated_selection::AuthenticatedSelector::ArtifactLeaf {
+                leaf_idx: 1
+            }
+        );
+        assert_eq!(selected.source_name(), "authenticated-bytes");
+        assert_eq!(selected.commitment(), artifact_ref.root());
+        assert_eq!(selected.bytes(), b"b");
+        assert_eq!(selected.merkle_leaf_payload(), b"b");
+        assert_eq!(selected.proof().leaf_count(), 2);
+    }
+
+    #[test]
+    fn authenticated_artifact_leaf_from_roots_rejects_root_mismatch() {
+        reset_artifact_store();
+        let artifact_ref = insert_artifact(
+            artifact_id("root-mismatch"),
+            RasterArtifactMetadata::token_ids(1),
+            vec![token_id_leaf(1)],
+        )
+        .expect("insert artifact");
+        let roots = artifact_store_roots_snapshot();
+        let mut bad_ref = artifact_ref.clone();
+        bad_ref.root = "wrong-root".to_string();
+
+        let error = read_authenticated_leaf_from_roots(&roots, &bad_ref, 0)
+            .expect_err("root mismatch should fail");
+
+        assert!(error.to_string().contains("root mismatch"));
+    }
+
+    #[test]
+    fn authenticated_artifact_leaf_by_root_rejects_out_of_range_leaf() {
+        reset_artifact_store();
+        let artifact_ref = insert_artifact(
+            artifact_id("root-out-of-range"),
+            RasterArtifactMetadata::token_ids(1),
+            vec![token_id_leaf(1)],
+        )
+        .expect("insert artifact");
+        let roots = artifact_store_roots_snapshot();
+
+        let error = read_authenticated_leaf_by_root_from_roots(&roots, artifact_ref.root(), 1)
+            .expect_err("out of range read should fail");
+
+        assert!(error.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn authenticated_artifact_leaf_by_root_rejects_duplicate_snapshot_roots() {
+        reset_artifact_store();
+        let artifact_ref = insert_artifact(
+            artifact_id("duplicate-root"),
+            RasterArtifactMetadata::token_ids(1),
+            vec![token_id_leaf(1)],
+        )
+        .expect("insert artifact");
+        let mut roots = artifact_store_roots_snapshot();
+        roots.artifacts.push(roots.artifacts[0].clone());
+
+        let error = read_authenticated_leaf_by_root_from_roots(&roots, artifact_ref.root(), 0)
+            .expect_err("duplicate root should fail");
+
+        assert!(error
+            .to_string()
+            .contains("matches multiple snapshot artifacts"));
     }
 
     #[test]

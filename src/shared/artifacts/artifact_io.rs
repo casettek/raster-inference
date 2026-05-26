@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::shared::artifacts::authenticated_selection::VerifiedSelectedPayload;
 use crate::shared::artifacts::raster_artifact_store::{
     self, RasterArtifactBuilderRef, RasterArtifactId, RasterArtifactMetadata, RasterArtifactRead,
     RasterArtifactRef, RasterArtifactStoreRoots, VerifiedArtifactRead,
@@ -152,6 +153,13 @@ impl ArtifactIo {
         raster_artifact_store::read_verified_leaf(artifact_ref, leaf_idx)
     }
 
+    pub fn read_authenticated_leaf(
+        artifact_ref: &RasterArtifactRef,
+        leaf_idx: usize,
+    ) -> Result<VerifiedSelectedPayload> {
+        raster_artifact_store::read_authenticated_leaf(artifact_ref, leaf_idx)
+    }
+
     pub fn read_verified_leaf_from_roots(
         roots: &RasterArtifactStoreRoots,
         artifact_ref: &RasterArtifactRef,
@@ -160,12 +168,44 @@ impl ArtifactIo {
         raster_artifact_store::read_verified_leaf_from_roots(roots, artifact_ref, leaf_idx)
     }
 
+    pub fn read_authenticated_leaf_from_roots(
+        roots: &RasterArtifactStoreRoots,
+        artifact_ref: &RasterArtifactRef,
+        leaf_idx: usize,
+    ) -> Result<VerifiedSelectedPayload> {
+        raster_artifact_store::read_authenticated_leaf_from_roots(roots, artifact_ref, leaf_idx)
+    }
+
     pub fn read_verified_leaf_by_root_from_roots(
         roots: &RasterArtifactStoreRoots,
         artifact_root: &str,
         leaf_idx: usize,
     ) -> Result<VerifiedArtifactRead> {
         raster_artifact_store::read_verified_leaf_by_root_from_roots(roots, artifact_root, leaf_idx)
+    }
+
+    pub fn read_authenticated_leaf_by_root_from_roots(
+        roots: &RasterArtifactStoreRoots,
+        artifact_root: &str,
+        leaf_idx: usize,
+    ) -> Result<VerifiedSelectedPayload> {
+        raster_artifact_store::read_authenticated_leaf_by_root_from_roots(
+            roots,
+            artifact_root,
+            leaf_idx,
+        )
+    }
+
+    pub fn read_authenticated_leaf_by_present_root_from_roots(
+        roots: &RasterArtifactStoreRoots,
+        artifact_root: &str,
+        leaf_idx: usize,
+    ) -> Result<VerifiedSelectedPayload> {
+        raster_artifact_store::read_authenticated_leaf_by_present_root_from_roots(
+            roots,
+            artifact_root,
+            leaf_idx,
+        )
     }
 
     pub fn artifact_ref_for_root(root: &str) -> Result<RasterArtifactRef> {

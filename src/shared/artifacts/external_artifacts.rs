@@ -4,6 +4,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::shared::artifacts::artifact_io::AuthRead;
+use crate::shared::artifacts::authenticated_selection::{
+    AuthenticatedSelector, VerifiedSelectedPayload,
+};
 use crate::shared::artifacts::merkle::{
     merkle_proof, merkle_root, verify_merkle_proof, MerkleProof,
 };
@@ -126,6 +129,17 @@ pub struct VerifiedExternalSourceRead {
 }
 
 impl VerifiedExternalSourceRead {
+    pub fn from_selected_external(selected: VerifiedSelectedPayload) -> Result<Self> {
+        let AuthenticatedSelector::ExternalRequest { request_key } = selected.selector() else {
+            bail!("verified selected payload is not an external source response");
+        };
+        Ok(Self {
+            commitment: selected.commitment().to_string(),
+            request_key: request_key.clone(),
+            response_payload: selected.bytes().to_vec(),
+        })
+    }
+
     pub fn commitment(&self) -> &str {
         &self.commitment
     }
@@ -202,6 +216,18 @@ impl CommittedExternalSource {
     }
 
     pub fn read_verified(&self, request_key: &[u8]) -> Result<Option<VerifiedExternalSourceRead>> {
+        let Some(selected) = self.read_authenticated(request_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(VerifiedExternalSourceRead::from_selected_external(
+            selected,
+        )?))
+    }
+
+    pub fn read_authenticated(
+        &self,
+        request_key: &[u8],
+    ) -> Result<Option<VerifiedSelectedPayload>> {
         let Some(read) =
             read_optional_external_source_by_request_key(&self.source_ref, request_key)?
         else {
@@ -209,11 +235,15 @@ impl CommittedExternalSource {
         };
         verify_external_source_read(&self.source_ref, &read)?;
         let leaf = decode_source_leaf(read.payload())?;
-        Ok(Some(VerifiedExternalSourceRead {
-            commitment: self.root().to_string(),
-            request_key: leaf.request_key,
-            response_payload: leaf.response_payload,
-        }))
+        Ok(Some(VerifiedSelectedPayload::external_response(
+            self.source_ref.id().source_name(),
+            self.root(),
+            leaf.request_key,
+            leaf.response_payload,
+            read.leaf_idx,
+            read.payload,
+            read.proof,
+        )))
     }
 }
 
@@ -236,7 +266,7 @@ where
 
     fn auth_read(&self, request: Request) -> Result<Self::Output> {
         let request_key = request.request_key()?;
-        let Some(read) = self.read_verified(&request_key)? else {
+        let Some(read) = self.read_authenticated(&request_key)? else {
             return request.decode_missing_response();
         };
         request.decode_response(read.bytes())
@@ -411,6 +441,20 @@ pub fn read_optional_external_source_by_request_key(
         let store = store_ref.borrow();
         store.read_optional_by_request_key(source_ref, request_key)
     })
+}
+
+pub fn read_authenticated_external_source(
+    source_ref: &ExternalSourceRef,
+    request_key: &[u8],
+) -> Result<Option<VerifiedSelectedPayload>> {
+    CommittedExternalSource::new(source_ref.clone()).read_authenticated(request_key)
+}
+
+pub fn read_authenticated_external_source_by_root(
+    source_root: &str,
+    request_key: &[u8],
+) -> Result<Option<VerifiedSelectedPayload>> {
+    CommittedExternalSource::from_root(source_root)?.read_authenticated(request_key)
 }
 
 pub fn external_source_ref_for_root(root: &str) -> Result<ExternalSourceRef> {
@@ -600,6 +644,119 @@ mod tests {
         assert_eq!(read.commitment(), source_ref.root());
         assert_eq!(read.request_key(), request_key);
         assert_eq!(read.bytes(), b"response");
+    }
+
+    #[test]
+    fn committed_source_authenticated_read_exposes_selector_payload_and_proof() {
+        reset_external_source_store();
+        let request_key = external_request_key("test.request", b"a").expect("request key");
+        let source_ref = register_external_source(
+            ExternalSourceId::new("authenticated").expect("source id"),
+            KIND,
+            DOMAIN,
+            vec![
+                ExternalSourceEntry::new(request_key.clone(), b"response".to_vec()).expect("entry"),
+            ],
+        )
+        .expect("source should register");
+
+        let selected = read_authenticated_external_source_by_root(source_ref.root(), &request_key)
+            .expect("authenticated read should succeed")
+            .expect("response should exist");
+
+        assert_eq!(
+            selected.source_kind(),
+            &crate::shared::artifacts::authenticated_selection::AuthenticatedSourceKind::ExternalSource
+        );
+        assert_eq!(
+            selected.selector(),
+            &crate::shared::artifacts::authenticated_selection::AuthenticatedSelector::ExternalRequest {
+                request_key: request_key.clone()
+            }
+        );
+        assert_eq!(selected.source_name(), "authenticated");
+        assert_eq!(selected.commitment(), source_ref.root());
+        assert_eq!(selected.bytes(), b"response");
+        assert_eq!(selected.proof().leaf_count(), 1);
+        assert_ne!(selected.merkle_leaf_payload(), selected.bytes());
+    }
+
+    #[test]
+    fn committed_source_authenticated_read_returns_none_for_missing_request() {
+        reset_external_source_store();
+        let request_key = external_request_key("test.request", b"a").expect("request key");
+        let missing_key = external_request_key("test.request", b"missing").expect("request key");
+        let source_ref = register_external_source(
+            ExternalSourceId::new("missing-response").expect("source id"),
+            KIND,
+            DOMAIN,
+            vec![
+                ExternalSourceEntry::new(request_key.clone(), b"response".to_vec()).expect("entry"),
+            ],
+        )
+        .expect("source should register");
+        let source = CommittedExternalSource::new(source_ref);
+
+        assert!(source
+            .read_authenticated(&missing_key)
+            .expect("missing request should not error")
+            .is_none());
+    }
+
+    #[test]
+    fn committed_source_authenticated_read_rejects_unknown_root() {
+        reset_external_source_store();
+        let request_key = external_request_key("test.request", b"a").expect("request key");
+
+        let error = read_authenticated_external_source_by_root("missing-root", &request_key)
+            .expect_err("unknown root should fail");
+
+        assert!(error.to_string().contains("not registered"));
+    }
+
+    #[test]
+    fn committed_source_authenticated_read_rejects_tampered_ref_root() {
+        reset_external_source_store();
+        let request_key = external_request_key("test.request", b"a").expect("request key");
+        let mut source_ref = register_external_source(
+            ExternalSourceId::new("tampered-ref").expect("source id"),
+            KIND,
+            DOMAIN,
+            vec![
+                ExternalSourceEntry::new(request_key.clone(), b"response".to_vec()).expect("entry"),
+            ],
+        )
+        .expect("source should register");
+        source_ref.root = "wrong-root".to_string();
+        let source = CommittedExternalSource::new(source_ref);
+
+        let error = source
+            .read_authenticated(&request_key)
+            .expect_err("tampered source ref should fail");
+
+        assert!(error.to_string().contains("metadata mismatch"));
+    }
+
+    #[test]
+    fn committed_source_authenticated_read_rejects_malformed_leaf_payload() {
+        reset_external_source_store();
+        let request_key = external_request_key("test.request", b"a").expect("request key");
+        let source_ref = register_external_source_leaves(
+            ExternalSourceId::new("malformed-leaf").expect("source id"),
+            KIND,
+            DOMAIN,
+            vec![b"not-postcard".to_vec()],
+        )
+        .expect("source should register");
+        let source = CommittedExternalSource::new(source_ref);
+
+        let error = source
+            .read_authenticated(&request_key)
+            .expect_err("malformed leaf should fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid committed external source leaf"));
     }
 
     #[test]

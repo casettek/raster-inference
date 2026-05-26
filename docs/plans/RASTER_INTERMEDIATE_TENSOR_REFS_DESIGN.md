@@ -61,7 +61,7 @@ The tile then reads only the row or bounded row window it needs.
 ## Core Decision Summary
 
 - Use explicit typed reference structs, not hidden globals.
-- Use `AuthRead<Request>` and `auth_read!` as the row-read mechanism.
+- Use unified authenticated selection under typed row-read helpers.
 - Use one shared shape model with typed wrappers for sequence, head, and KV use cases.
 - Keep an in-memory intermediate store for current execution and tests.
 - Store enough metadata in refs to validate shape before row reads.
@@ -211,7 +211,25 @@ The checkpoint code should not serialize refs unless a future versioned trace fo
 
 ## Authenticated Row Request API
 
-The implementation should model intermediate tensors as authenticated sources.
+The implementation should model intermediate tensors as authenticated selections. Artifact-backed tensor reads use the same verified selected-payload abstraction as committed external source reads, but with an artifact leaf selector rather than an external request-key selector.
+
+Typed row helpers should remain the public surface for routine code. Internally they resolve:
+
+```text
+RasterArtifactStoreRoots + tensor ref + row selector
+  -> verified selected payload
+  -> RasterActivationRow
+```
+
+Static model/tokenizer sources resolve similarly:
+
+```text
+committed source root/ref + request key
+  -> verified selected payload
+  -> typed source response
+```
+
+This preserves the existing separation between routine roots and compact refs while making dynamic artifact reads and static source reads share one proof-carrying verification shape.
 
 ### Sequence Rows
 

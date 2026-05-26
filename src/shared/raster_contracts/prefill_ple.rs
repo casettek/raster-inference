@@ -200,7 +200,7 @@ pub fn read_prefill_ple_input_manifest_from_roots(
     if artifact_ref.metadata().leaf_count() != 1 {
         bail!("raster PLE input manifest must have exactly one leaf");
     }
-    ArtifactIo::read_verified_leaf_from_roots(roots, &artifact_ref, 0)?.deserialize()
+    ArtifactIo::read_authenticated_leaf_from_roots(roots, &artifact_ref, 0)?.deserialize()
 }
 
 fn ensure_artifact_root_present(roots: &RasterArtifactStoreRoots, root: &str) -> Result<()> {

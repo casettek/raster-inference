@@ -285,7 +285,7 @@ fn materialize_token_ids(token_ids_root: &str, token_count: usize) -> Result<Vec
     )?;
     (0..token_count)
         .map(|token_idx| {
-            raster_artifact_store::read_verified_leaf(token_ids_ref.artifact_ref(), token_idx)?
+            raster_artifact_store::read_authenticated_leaf(token_ids_ref.artifact_ref(), token_idx)?
                 .deserialize()
         })
         .collect()

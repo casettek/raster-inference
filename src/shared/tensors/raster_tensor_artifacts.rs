@@ -617,8 +617,8 @@ pub fn read_sequence_row_from_roots(
             row_count
         );
     }
-    ensure_artifact_root_present(roots, request.tensor_ref.tensor_ref().det_commitment())?;
-    read_activation_artifact_row_by_tensor_ref(
+    read_activation_artifact_row_by_tensor_ref_from_roots(
+        roots,
         request.tensor_ref.tensor_ref(),
         request.row_idx,
         width,
@@ -645,8 +645,8 @@ pub fn read_head_row_from_roots(
             sequence_len
         );
     }
-    ensure_artifact_root_present(roots, request.tensor_ref.tensor_ref().det_commitment())?;
-    read_activation_artifact_row_by_tensor_ref(
+    read_activation_artifact_row_by_tensor_ref_from_roots(
+        roots,
         request.tensor_ref.tensor_ref(),
         request.head_idx * sequence_len + request.token_idx,
         head_dim,
@@ -676,8 +676,8 @@ pub fn read_kv_row_from_roots(
         RasterKvRowKind::Key => request.cache_ref.keys(),
         RasterKvRowKind::Value => request.cache_ref.values(),
     };
-    ensure_artifact_root_present(roots, tensor_ref.det_commitment())?;
-    read_activation_artifact_row_by_tensor_ref(
+    read_activation_artifact_row_by_tensor_ref_from_roots(
+        roots,
         tensor_ref,
         request.head_idx * current_len + request.token_idx,
         head_dim,
@@ -713,21 +713,19 @@ pub fn build_intermediate_kv_cache_roots_commitment(keys_root: &str, values_root
     hex_digest(hasher.finalize())
 }
 
-fn artifact_ref_for_tensor_ref(
-    tensor_ref: &RasterTensorRef,
-) -> Result<RasterActivationSequenceArtifactRef> {
-    RasterActivationSequenceArtifactRef::new(ArtifactIo::artifact_ref_for_root_any(
-        tensor_ref.det_commitment(),
-    )?)
-}
-
-fn read_activation_artifact_row_by_tensor_ref(
+fn read_activation_artifact_row_by_tensor_ref_from_roots(
+    roots: &RasterArtifactStoreRoots,
     tensor_ref: &RasterTensorRef,
     row_idx: usize,
     expected_width: usize,
 ) -> Result<RasterActivationRow> {
-    let artifact_ref = artifact_ref_for_tensor_ref(tensor_ref)?;
-    let row = read_activation_artifact_row(&artifact_ref, row_idx)?;
+    ensure_artifact_root_present(roots, tensor_ref.det_commitment())?;
+    let selected = ArtifactIo::read_authenticated_leaf_by_present_root_from_roots(
+        roots,
+        tensor_ref.det_commitment(),
+        row_idx,
+    )?;
+    let row: RasterActivationRow = selected.deserialize()?;
     if row.width() != expected_width {
         bail!(
             "activation artifact row {row_idx} has width {}, expected {expected_width}",
@@ -779,28 +777,6 @@ pub fn insert_activation_sequence_artifact_ref(
         leaves,
     )?;
     RasterActivationSequenceArtifactRef::new(artifact_ref)
-}
-
-fn read_activation_artifact_row(
-    artifact_ref: &RasterActivationSequenceArtifactRef,
-    row_idx: usize,
-) -> Result<RasterActivationRow> {
-    if row_idx >= artifact_ref.row_count() {
-        bail!(
-            "activation artifact row index {row_idx} is out of range for {} rows",
-            artifact_ref.row_count()
-        );
-    }
-    let row: RasterActivationRow =
-        ArtifactIo::read_verified_leaf(artifact_ref.artifact_ref(), row_idx)?.deserialize()?;
-    if row.width() != artifact_ref.width() {
-        bail!(
-            "activation artifact row {row_idx} has width {}, expected {}",
-            row.width(),
-            artifact_ref.width()
-        );
-    }
-    Ok(row)
 }
 
 fn build_rows_commitment(domain: &[u8], rows: &[RasterActivationRow]) -> String {

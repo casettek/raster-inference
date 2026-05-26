@@ -744,7 +744,8 @@ fn materialize_raster_prompt_token_ids(
 
     (0..token_count)
         .map(|token_idx| {
-            ArtifactIo::read_verified_leaf(token_ids_ref.artifact_ref(), token_idx)?.deserialize()
+            ArtifactIo::read_authenticated_leaf(token_ids_ref.artifact_ref(), token_idx)?
+                .deserialize()
         })
         .collect()
 }

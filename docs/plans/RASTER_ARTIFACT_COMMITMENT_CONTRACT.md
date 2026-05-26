@@ -103,6 +103,34 @@ Static model and tokenizer data should keep using typed authenticated reads:
 
 Static sources and dynamic artifacts should look similar at the tile boundary: both are compact references plus narrow typed requests.
 
+## Unified Authenticated Selection
+
+Dynamic artifacts and static external sources share one authenticated selection model. A read first resolves a compact source identity plus a narrow selector into a verified selected payload, then typed helpers decode that payload into routine-specific values.
+
+```text
+artifact source + leaf index
+  -> verified selected payload
+  -> typed artifact value
+
+external source + request key
+  -> verified selected payload
+  -> typed static source value
+```
+
+This mirrors Raster Runtime's external selection shape at the API level: a source name/root plus selector produces selected bytes, proof material, and a typed value. Raster inference differs in its commitment scheme: both artifact leaves and external request responses are verified against Merkle roots, rather than a whole-file SHA256 commitment.
+
+The low-level selected payload should carry:
+
+- source kind
+- source name
+- commitment root
+- selector metadata
+- selected bytes
+- Merkle leaf index and leaf payload
+- Merkle proof
+
+Typed helpers remain the normal tile-facing API. Tiles should not manually parse Merkle proofs or decode arbitrary bytes unless they are adapter/helper boundaries for authenticated reads.
+
 ## Commitment Rules
 
 ### Merkle Roots For Store Artifacts

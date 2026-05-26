@@ -45,7 +45,7 @@ pub(in super::super) struct BpePair {
 pub(in super::super) fn read_bpe_piece(pieces_root: &str, piece_idx: usize) -> Result<String> {
     let pieces_ref =
         RasterBpePieceSequenceRef::new(ArtifactIo::artifact_ref_for_root(pieces_root)?)?;
-    let read = ArtifactIo::read_verified_leaf(pieces_ref.artifact_ref(), piece_idx)?;
+    let read = ArtifactIo::read_authenticated_leaf(pieces_ref.artifact_ref(), piece_idx)?;
     decode_bpe_piece_leaf(read.bytes())
 }
 

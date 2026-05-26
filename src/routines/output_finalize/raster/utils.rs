@@ -234,7 +234,7 @@ pub(in super::super) fn read_pending_byte_from_ref_roots(
         );
     }
     let artifact_ref = pending_ref.artifact_ref();
-    let read = ArtifactIo::read_verified_leaf_from_roots(roots, artifact_ref, byte_idx)?;
+    let read = ArtifactIo::read_authenticated_leaf_from_roots(roots, artifact_ref, byte_idx)?;
     crate::output_finalize::raster::auth_source::decode_pending_byte_leaf(read.bytes())
 }
 

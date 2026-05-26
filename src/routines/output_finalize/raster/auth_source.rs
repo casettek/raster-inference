@@ -808,7 +808,7 @@ pub fn materialize_text_from_roots(
     let mut text = String::new();
     for chunk_idx in 0..text_ref.chunk_count() {
         let read =
-            crate::shared::artifacts::artifact_io::ArtifactIo::read_verified_leaf_from_roots(
+            crate::shared::artifacts::artifact_io::ArtifactIo::read_authenticated_leaf_from_roots(
                 roots,
                 artifact_ref,
                 chunk_idx,

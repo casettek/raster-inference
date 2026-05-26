@@ -86,7 +86,7 @@ pub(in super::super) fn read_prompt_token_id(
     if token_idx >= token_count {
         bail!("input embedding token index {token_idx} is out of range for {token_count} tokens");
     }
-    ArtifactIo::read_verified_leaf_from_roots(roots, token_ids_ref.artifact_ref(), token_idx)?
+    ArtifactIo::read_authenticated_leaf_from_roots(roots, token_ids_ref.artifact_ref(), token_idx)?
         .deserialize()
 }
 
@@ -132,7 +132,8 @@ fn read_activation_row_from_ref(
         );
     }
     let row: RasterActivationRow =
-        ArtifactIo::read_verified_leaf(activation_ref.artifact_ref(), row_idx)?.deserialize()?;
+        ArtifactIo::read_authenticated_leaf(activation_ref.artifact_ref(), row_idx)?
+            .deserialize()?;
     if row.width() != activation_ref.width() {
         bail!(
             "activation artifact row {row_idx} has width {}, expected {}",
