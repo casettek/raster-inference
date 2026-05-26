@@ -5,7 +5,7 @@ use crate::shared::api::input::{
     InferenceRequest, ModelSpec, PromptPreparationState, RasterPromptPreparationState,
 };
 use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
-use crate::trace::{trace_event, trace_scope};
+use crate::trace::{routine_scope, trace_event};
 
 use self::native::{
     build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes, render_prompt,
@@ -18,6 +18,7 @@ use self::raster::utils::{
     PROMPT_BYTES_ARTIFACT_DOMAIN, PROMPT_BYTES_ARTIFACT_KIND, PROMPT_TEXT_ARTIFACT_DOMAIN,
     PROMPT_TEXT_ARTIFACT_KIND, RENDERED_PROMPT_ARTIFACT_DOMAIN, RENDERED_PROMPT_ARTIFACT_KIND,
 };
+use crate::runtime::checkpoints::RoutineId;
 use crate::RasterSizingControls;
 
 pub mod native;
@@ -28,7 +29,7 @@ pub fn run(
     model: &ModelSpec,
     tokenizer: &Tokenizer,
 ) -> Result<PromptPreparationState> {
-    let _trace = trace_scope("prompt.prepare");
+    let _routine = routine_scope(RoutineId::PromptPrepare, "");
     trace_event("prompt.decode_bytes");
     let prompt_text = decode_prompt_bytes(&request.prompt_bytes, request.text_decoding_policy)?;
     trace_event("prompt.build_messages");
@@ -106,6 +107,7 @@ pub fn run_raster(
     tokenizer: &AuthenticatedGemmaTokenizer,
     raster_sizing: RasterSizingControls,
 ) -> Result<raster::RasterPromptPreparationResult> {
+    let _routine = routine_scope(RoutineId::PromptPrepare, "mode=raster");
     let prepared_inputs = prepare_raster_prompt_input_roots(
         request,
         model,

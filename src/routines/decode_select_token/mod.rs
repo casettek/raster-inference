@@ -3,6 +3,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
 #[cfg(test)]
@@ -29,6 +30,13 @@ pub fn run(
     max_new_tokens: usize,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Option<u32>> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::SelectOutputToken,
+        format!(
+            "generated_tokens={}",
+            decode_state.generated_token_ids.len()
+        ),
+    );
     if native::check_stop_condition(decode_state.generated_token_ids.len(), max_new_tokens)
         .is_some()
     {
@@ -104,6 +112,13 @@ pub fn run_raster(
     RasterDecodeLoopState,
     Option<raster::RasterDecodeSelectOutputRefs>,
 )> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::SelectOutputToken,
+        format!(
+            "mode=raster generated_tokens={}",
+            decode_state.generated_token_count
+        ),
+    );
     if raster::check_stop_condition(decode_state.generated_token_count, max_new_tokens).is_some() {
         return Ok((decode_state, None));
     }

@@ -4,6 +4,7 @@ use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::runtime::checkpoints::RoutineId;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::raster_contracts::prefill_layer::{
     GemmaPrefillAttentionKind, GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMetadata,
@@ -34,7 +35,7 @@ use crate::shared::tensors::raster_tensor_artifacts::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterAttentionHeadsRef,
     RasterKvCacheRef, RasterSequenceRowRequest, RasterTensorId,
 };
-use crate::trace::trace_event;
+use crate::trace::routine_scope;
 use crate::RasterSizingControls;
 
 use super::types::*;
@@ -73,6 +74,14 @@ pub fn compute_next_prefill_layer_sequence_with_roots(
     layer_state: PrefillLayerRasterState,
     layer_source: &RasterPrefillLayerSource<'_>,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
+    let layer_idx = layer_state.next_layer_idx;
+    let _routine = routine_scope(
+        RoutineId::PrefillLayer,
+        format!(
+            "mode=raster layer={layer_idx} of {}",
+            layer_state.layer_count
+        ),
+    );
     let (artifact_store_roots, layer_step) = call_tile!(
         init_prefill_layer_step,
         artifact_store_roots,
@@ -1190,8 +1199,6 @@ fn project_next_prefill_layer_sequence_projection_work_rows(
                 .next_projection_row_idx()
                 .saturating_add(state.rows_per_tile())
                 .min(state.projection_rows());
-            let start_projection_row_idx = state.next_projection_row_idx();
-            let start_token_idx = state.next_token_idx();
             let mut rows = Vec::with_capacity(end - state.next_projection_row_idx());
             for row_idx in state.next_projection_row_idx()..end {
                 rows.push(auth_read!(
@@ -1205,17 +1212,6 @@ fn project_next_prefill_layer_sequence_projection_work_rows(
             }
             let (artifact_store_roots, state) =
                 append_projection_chunk_to_artifact_state(artifact_store_roots, state, &rows)?;
-            trace_event(format!(
-                "progress prefill.layer.projection layer={} matrix={:?} token={}/{} projection_rows={}..{} of {} input_width={}",
-                layer_idx,
-                matrix,
-                start_token_idx + 1,
-                state.token_count(),
-                start_projection_row_idx,
-                end,
-                state.projection_rows(),
-                state.input_width()
-            ));
             Ok((
                 false,
                 artifact_store_roots,
@@ -3249,20 +3245,11 @@ fn init_prefill_layer_step(
             },
         )?;
     }
-    let (token_count, _) = layer_state
+    let _ = layer_state
         .current_activations_ref
         .tensor_ref()
         .shape()
         .sequence_metadata()?;
-    trace_event(format!(
-        "progress prefill.layer layer={}/{} tokens={} attention={:?} ple={} donor={:?}",
-        context.layer_idx + 1,
-        layer_state.layer_count,
-        token_count,
-        context.layer.attention_kind,
-        context.layer.has_ple,
-        context.layer.kv_shared_layer_index
-    ));
 
     Ok((
         artifact_store_roots,
@@ -3414,8 +3401,6 @@ pub fn project_next_prefill_sequence_artifact_rows(
         .next_projection_row_idx()
         .saturating_add(projection_state.rows_per_tile())
         .min(projection_state.projection_rows());
-    let start_projection_row_idx = projection_state.next_projection_row_idx();
-    let start_token_idx = projection_state.next_token_idx();
     let mut rows = Vec::with_capacity(end - projection_state.next_projection_row_idx());
     for row_idx in projection_state.next_projection_row_idx()..end {
         rows.push(auth_read!(
@@ -3429,17 +3414,6 @@ pub fn project_next_prefill_sequence_artifact_rows(
     }
     let (artifact_store_roots, projection_state) =
         append_projection_chunk_to_artifact_state(artifact_store_roots, projection_state, &rows)?;
-    trace_event(format!(
-        "progress prefill.layer.projection layer={} matrix={:?} token={}/{} projection_rows={}..{} of {} input_width={}",
-        layer_idx,
-        matrix,
-        start_token_idx + 1,
-        projection_state.token_count(),
-        start_projection_row_idx,
-        end,
-        projection_state.projection_rows(),
-        projection_state.input_width()
-    ));
     Ok((false, artifact_store_roots, projection_state))
 }
 

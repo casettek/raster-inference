@@ -324,13 +324,6 @@ pub(in super::super) fn init_prefill_ple_layer_step(
 
     let layer_idx = ple_state.next_layer_idx;
     let layer = auth_read!(ple_source, GemmaPleLayerMetadataRequest { layer_idx })?;
-    crate::trace::trace_event(format!(
-        "progress prefill.prepare_aux layer={}/{} ple={} tokens={}",
-        layer_idx + 1,
-        ple_state.layer_count,
-        layer.has_ple,
-        ple_state.token_count
-    ));
 
     if !layer.has_ple {
         return Ok((
@@ -1157,8 +1150,6 @@ pub fn project_next_ple_sequence_rows(
         .next_projection_row_idx
         .saturating_add(projection_state.rows_per_tile)
         .min(projection_state.projection_rows);
-    let start_projection_row_idx = projection_state.next_projection_row_idx;
-    let start_token_idx = projection_state.next_token_idx;
     let mut rows = Vec::with_capacity(end - projection_state.next_projection_row_idx);
     for row_idx in projection_state.next_projection_row_idx..end {
         rows.push(auth_read!(
@@ -1200,16 +1191,6 @@ pub fn project_next_ple_sequence_rows(
         projection_state.next_token_idx += 1;
         projection_state.next_projection_row_idx = 0;
     }
-    crate::trace::trace_event(format!(
-        "progress prefill.prepare_aux.projection layer={} token={}/{} projection_rows={}..{} of {} input_width={}",
-        layer_idx,
-        start_token_idx + 1,
-        projection_state.token_count,
-        start_projection_row_idx,
-        end,
-        projection_state.projection_rows,
-        projection_state.input_width
-    ));
     Ok((false, artifact_store_roots, projection_state))
 }
 

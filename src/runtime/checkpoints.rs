@@ -41,7 +41,7 @@ impl FromStr for PhaseId {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineId {
     PromptPrepare,
@@ -52,6 +52,27 @@ pub enum RoutineId {
     SelectOutputToken,
     DecodeTransition,
     FinalizeOutput,
+}
+
+impl RoutineId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PromptPrepare => "prompt.prepare",
+            Self::InputEmbedding => "input.embedding",
+            Self::PrefillPrepareAux => "prefill.prepare_aux",
+            Self::PrefillLayer => "prefill.layer",
+            Self::PrefillFinalize => "prefill.finalize",
+            Self::SelectOutputToken => "decode.select_token",
+            Self::DecodeTransition => "decode.transition",
+            Self::FinalizeOutput => "output.finalize",
+        }
+    }
+}
+
+impl fmt::Display for RoutineId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

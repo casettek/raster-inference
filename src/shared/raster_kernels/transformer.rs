@@ -2204,14 +2204,6 @@ pub fn compute_next_attention_artifact_row(
                     RasterActivationRow::from_acts(vec![score]),
                 )?;
             }
-            crate::trace::trace_event(format!(
-                "progress prefill.attention.scores head={} token={} kv_rows={}..{} of {}",
-                query_head_idx,
-                query_idx,
-                next_kv_token_idx,
-                end,
-                start + row_count
-            ));
             if end < start + row_count {
                 state.phase = RasterAttentionArtifactRowPhase::CollectScores {
                     score_source_name,
@@ -2257,10 +2249,6 @@ pub fn compute_next_attention_artifact_row(
                     max_logit_bits = score_bits;
                 }
             }
-            crate::trace::trace_event(format!(
-                "progress prefill.attention.softmax.max head={} token={} score_rows={}..{} of {}",
-                query_head_idx, query_idx, next_score_row_idx, end, row_count
-            ));
             if end < row_count {
                 state.phase = RasterAttentionArtifactRowPhase::FindSoftmaxMax {
                     score_ref,
@@ -2305,10 +2293,6 @@ pub fn compute_next_attention_artifact_row(
                 sum_exp = acc_add_sat(sum_exp, exp_term);
             }
             sum_exp_bits = sum_exp.to_bits();
-            crate::trace::trace_event(format!(
-                "progress prefill.attention.softmax.exp_sum head={} token={} score_rows={}..{} of {}",
-                query_head_idx, query_idx, next_score_row_idx, end, row_count
-            ));
             if end < row_count {
                 state.phase = RasterAttentionArtifactRowPhase::SumSoftmaxExp {
                     score_ref,
@@ -2377,10 +2361,6 @@ pub fn compute_next_attention_artifact_row(
                 summed_weight = add_sat(summed_weight, weight);
             }
             summed_weight_bits = summed_weight.to_bits();
-            crate::trace::trace_event(format!(
-                "progress prefill.attention.softmax.raw_weights head={} token={} score_rows={}..{} of {}",
-                query_head_idx, query_idx, next_score_row_idx, end, row_count
-            ));
             if end < row_count {
                 state.phase = RasterAttentionArtifactRowPhase::BuildRawSoftmaxWeights {
                     score_ref,
@@ -2449,10 +2429,6 @@ pub fn compute_next_attention_artifact_row(
                     RasterActivationRow::from_acts(vec![weight]),
                 )?;
             }
-            crate::trace::trace_event(format!(
-                "progress prefill.attention.softmax.correct head={} token={} weight_rows={}..{} of {}",
-                query_head_idx, query_idx, next_weight_row_idx, end, row_count
-            ));
             if end < row_count {
                 state.phase = RasterAttentionArtifactRowPhase::CorrectSoftmaxResidual {
                     raw_weight_ref,
@@ -2510,14 +2486,6 @@ pub fn compute_next_attention_artifact_row(
                     *acc_bits = mac_bits(*acc_bits, value.to_bits(), weight.to_bits());
                 }
             }
-            crate::trace::trace_event(format!(
-                "progress prefill.attention.values head={} token={} kv_rows={}..{} of {}",
-                query_head_idx,
-                query_idx,
-                next_kv_token_idx,
-                end,
-                start + row_count
-            ));
             if end < start + row_count {
                 state.phase = RasterAttentionArtifactRowPhase::ApplyValues {
                     weight_ref,

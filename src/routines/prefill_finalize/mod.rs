@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
@@ -19,6 +20,10 @@ pub fn run(
     layer_caches: Vec<LayerKvCache>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerPrefillResult> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::PrefillFinalize,
+        format!("tokens={}", prompt_token_ids.len()),
+    );
     native::run(
         prompt_token_ids,
         model,
@@ -56,6 +61,10 @@ pub fn run_raster(
     layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
 ) -> Result<raster::RasterPrefillFinalizeOutput> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::PrefillFinalize,
+        format!("mode=raster tokens={prompt_token_count}"),
+    );
     let finalize_source =
         raster::auth_source::RasterPrefillFinalizeSource::for_current_integrity_mode(
             finalize_source,

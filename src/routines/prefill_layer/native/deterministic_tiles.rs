@@ -1,11 +1,12 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
+use crate::runtime::checkpoints::RoutineId;
 use crate::shared::model::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
     InternalActivationSequence, LayerKvCache,
 };
-use crate::trace::trace_scope;
+use crate::trace::routine_scope;
 
 pub fn run_text_layers_prefill(
     input_activations: &[Vec<f32>],
@@ -42,13 +43,16 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
     let mut completed_layer_output_det_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         let xs_values = xs.clone_f32();
-        let _trace = trace_scope(format!(
-            "prefill.layer.det layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
-            xs_values.len(),
-            layer.attention_kind,
-            layer.ple.is_some(),
-            layer.kv_shared_layer_index
-        ));
+        let _routine = routine_scope(
+            RoutineId::PrefillLayer,
+            format!(
+                "mode=det layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
+                xs_values.len(),
+                layer.attention_kind,
+                layer.ple.is_some(),
+                layer.kv_shared_layer_index
+            ),
+        );
         let per_layer_input = ple_inputs.and_then(|inputs| inputs.clone_layer_internal(layer_idx));
         let donor_cache = resolve_prefill_donor_cache(layer, &layer_caches, layer_idx)?;
         let resolved_layer = crate::io::resolve_layer_weights(layer)?;

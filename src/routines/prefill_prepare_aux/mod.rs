@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
@@ -23,6 +24,10 @@ pub fn run(
     token_embeddings: &ActivationSequence,
     execution_mode: InferenceExecutionMode,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::PrefillPrepareAux,
+        format!("tokens={}", prompt_token_ids.len()),
+    );
     let ple_inputs = native::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     trace_prefill_prepare_aux_checkpoint(prompt_token_ids, token_embeddings, ple_inputs.as_ref());
     Ok(ple_inputs)
@@ -37,6 +42,10 @@ pub fn run_with_input_embedding_checkpoint(
     input_embedding_refs: &RasterInputEmbeddingRefs,
     ple_source: &AuthenticatedGemmaPleSource,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::PrefillPrepareAux,
+        format!("tokens={}", prompt_token_ids.len()),
+    );
     let ple_inputs = native::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     let ple_input_refs = format_native_prefill_prepare_aux_as_raster_checkpoint_for_trace(
         artifact_store_roots,
@@ -57,6 +66,7 @@ pub fn run_raster(
     ple_source: &AuthenticatedGemmaPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<raster::RasterPrefillPleOutput> {
+    let _routine = crate::trace::routine_scope(RoutineId::PrefillPrepareAux, "mode=raster");
     let output = raster::run_with_input_embedding_refs(
         artifact_store_roots,
         input_embedding_refs,

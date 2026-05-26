@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::{InferenceExecutionMode, RasterPromptPreparationState};
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -18,6 +19,7 @@ pub fn run(
     model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
 ) -> Result<ActivationSequence> {
+    let _routine = crate::trace::routine_scope(RoutineId::InputEmbedding, "");
     native::run(prompt_token_ids, model, execution_mode)
 }
 
@@ -26,6 +28,10 @@ pub fn run_raster(
     prompt_preparation: &RasterPromptPreparationState,
     embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
 ) -> Result<raster::RasterInputEmbeddingOutput> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::InputEmbedding,
+        format!("tokens={}", prompt_preparation.prompt_token_count),
+    );
     let embedding_source =
         raster::auth_source::RasterInputEmbeddingSource::for_current_integrity_mode(
             embedding_source,

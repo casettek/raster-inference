@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::json;
 use tokenizers::Tokenizer;
 
+use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::output::{DecodeState, OutputDecodeState};
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -14,6 +15,13 @@ pub mod native;
 pub mod raster;
 
 pub fn run(decode_state: DecodeState, tokenizer: &Tokenizer) -> Result<OutputDecodeState> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::FinalizeOutput,
+        format!(
+            "generated_tokens={}",
+            decode_state.generated_token_ids.len()
+        ),
+    );
     let generated_token_count = decode_state.generated_token_ids.len();
     let generated_text =
         native::detokenize_output_tokens(tokenizer, &decode_state.generated_token_ids)?;
@@ -129,6 +137,13 @@ pub fn run_raster(
     tokenizer: &AuthenticatedGemmaTokenizer,
     byte_flush_bytes_per_tile: usize,
 ) -> Result<raster::RasterOutputFinalizeOutput> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::FinalizeOutput,
+        format!(
+            "mode=raster generated_tokens={}",
+            decode_state.generated_token_count
+        ),
+    );
     let input_roots = prepare_raster_output_finalize_input_roots_from_state(
         decode_state,
         tokenizer,

@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     cell::RefCell,
+    collections::HashMap,
     env, fs,
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -11,7 +12,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::checkpoints::PhaseId;
+use super::checkpoints::{PhaseId, RoutineId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TraceMode {
@@ -20,6 +21,12 @@ enum TraceMode {
 }
 
 pub struct TraceSpan {
+    label: String,
+    start: Instant,
+    enabled: bool,
+}
+
+pub struct RoutineSpan {
     label: String,
     start: Instant,
     enabled: bool,
@@ -48,41 +55,114 @@ impl Drop for TraceSpan {
     }
 }
 
+impl RoutineSpan {
+    pub fn new(routine_id: RoutineId, details: impl Into<String>) -> Self {
+        let enabled = trace_logging_enabled();
+        let label = next_routine_label(routine_id);
+        let details = details.into();
+        if enabled {
+            ACTIVE_ROUTINES
+                .with(|active_routines| active_routines.borrow_mut().push(label.clone()));
+            emit_routine("start", &label, &details, None);
+        }
+        Self {
+            label,
+            start: Instant::now(),
+            enabled,
+        }
+    }
+}
+
+impl Drop for RoutineSpan {
+    fn drop(&mut self) {
+        if self.enabled {
+            emit_routine("complete", &self.label, "", Some(self.start.elapsed()));
+            ACTIVE_ROUTINES.with(|active_routines| {
+                let mut active_routines = active_routines.borrow_mut();
+                match active_routines
+                    .iter()
+                    .rposition(|label| label == &self.label)
+                {
+                    Some(index) => {
+                        active_routines.remove(index);
+                    }
+                    None => {}
+                }
+            });
+        }
+    }
+}
+
 pub fn trace_scope(label: impl Into<String>) -> TraceSpan {
     TraceSpan::new(label)
 }
 
+pub fn routine_scope(routine_id: RoutineId, details: impl Into<String>) -> RoutineSpan {
+    RoutineSpan::new(routine_id, details)
+}
+
 pub fn trace_event(label: impl AsRef<str>) {
-    if trace_logging_enabled() {
-        emit("event", label.as_ref(), None);
+    let label = label.as_ref();
+    if !should_emit_trace_event(label) {
+        return;
     }
+    if trace_logging_enabled() {
+        let label = match active_routine_label() {
+            Some(routine) => format!("{label} routine={routine}"),
+            None => label.to_string(),
+        };
+        emit("event", &label, None);
+    }
+}
+
+pub fn tile_invoked(invocation_kind: &str, name: &str, ordinal: u64) {
+    if !trace_logging_enabled() {
+        return;
+    }
+
+    let routine = active_routine_label();
+    let label = match routine {
+        Some(routine) => {
+            format!("{invocation_kind} {name} count={ordinal} routine={routine}")
+        }
+        None => format!("{invocation_kind} {name} count={ordinal}"),
+    };
+    emit("tile", &label, None);
 }
 
 pub fn with_trace_logging_enabled<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
     TRACE_LOGGING_OVERRIDE.with(|trace_logging_override| {
         let previous = trace_logging_override.replace(Some(enabled));
+        let previous_routine_counts = ROUTINE_OCCURRENCES
+            .with(|routine_occurrences| routine_occurrences.replace(HashMap::new()));
+        let previous_active_routines =
+            ACTIVE_ROUTINES.with(|active_routines| active_routines.replace(Vec::new()));
         let reset = ResetTraceLoggingOverride(previous);
+        let reset_routine_context = ResetRoutineTraceContext {
+            routine_occurrences: previous_routine_counts,
+            active_routines: previous_active_routines,
+        };
         let result = f();
+        drop(reset_routine_context);
         drop(reset);
         result
     })
 }
 
 pub fn phase_started(phase_id: PhaseId) {
-    emit_phase("start", phase_id);
+    emit("phase-start", phase_id.as_str(), None);
 }
 
 pub fn phase_finished(phase_id: PhaseId) {
-    emit_phase("end", phase_id);
+    emit("phase-end", phase_id.as_str(), None);
 }
 
 pub fn phase_paused(phase_id: PhaseId) {
-    emit_phase("pause", phase_id);
+    emit("phase-pause", phase_id.as_str(), None);
 }
 
 pub fn raster_tile_invocations_finished(total: u64) {
-    let elapsed = process_start().elapsed().as_secs_f64();
-    eprintln!("[raster-tiles +{elapsed:>8.3}s] total {total}");
+    emit("tiles", &format!("total {total}"), None);
 }
 
 pub fn with_checkpointing_enabled<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
@@ -325,10 +405,7 @@ fn trace_mode() -> TraceMode {
             TraceMode::Off
         };
     }
-    match env::var("RASTER_TRACE_TILES").as_deref() {
-        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => TraceMode::Verbose,
-        _ => TraceMode::Off,
-    }
+    TraceMode::Off
 }
 
 fn trace_logging_enabled() -> bool {
@@ -370,32 +447,59 @@ fn mark_terminal_checkpoint(checkpoint_name: &str) -> bool {
     })
 }
 
+fn next_routine_label(routine_id: RoutineId) -> String {
+    ROUTINE_OCCURRENCES.with(|routine_occurrences| {
+        let mut routine_occurrences = routine_occurrences.borrow_mut();
+        let occurrence = routine_occurrences
+            .entry(routine_id.as_str())
+            .and_modify(|occurrence| *occurrence += 1)
+            .or_insert(1);
+        format_occurrence_label(routine_id.as_str(), *occurrence)
+    })
+}
+
+fn format_occurrence_label(label: &str, occurrence: usize) -> String {
+    if occurrence == 1 {
+        label.to_string()
+    } else {
+        format!("{label}:{occurrence}")
+    }
+}
+
+fn active_routine_label() -> Option<String> {
+    ACTIVE_ROUTINES.with(|active_routines| active_routines.borrow().last().cloned())
+}
+
+fn should_emit_trace_event(label: &str) -> bool {
+    !label.starts_with("progress ")
+}
+
 fn emit(kind: &str, label: &str, duration: Option<Duration>) {
     let elapsed = process_start().elapsed().as_secs_f64();
     match duration {
         Some(duration) => {
             eprintln!(
-                "[raster-trace +{elapsed:>8.3}s] {kind:<5} {label} ({:.3}s)",
+                "[raster-trace +{elapsed:>8.3}s] {kind:<11} {label} ({:.3}s)",
                 duration.as_secs_f64()
             );
         }
         None => {
-            eprintln!("[raster-trace +{elapsed:>8.3}s] {kind:<5} {label}");
+            eprintln!("[raster-trace +{elapsed:>8.3}s] {kind:<11} {label}");
         }
     }
 }
 
-fn emit_phase(kind: &str, phase_id: PhaseId) {
-    let elapsed = process_start().elapsed().as_secs_f64();
-    eprintln!(
-        "[raster-phase +{elapsed:>8.3}s] {kind:<5} {}",
-        phase_id.as_str()
-    );
+fn emit_routine(kind: &str, label: &str, details: &str, duration: Option<Duration>) {
+    let label = if details.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label} {details}")
+    };
+    emit(&format!("routine-{kind}"), &label, duration);
 }
 
 fn emit_checkpoint(checkpoint_name: &str) {
-    let elapsed = process_start().elapsed().as_secs_f64();
-    eprintln!("[raster-checkpoint +{elapsed:>8.3}s] hit   {checkpoint_name}");
+    emit("checkpoint", &format!("hit {checkpoint_name}"), None);
 }
 
 fn emit_checkpoint_bundle(payload: &Value, saved_path: Option<&std::path::Path>) {
@@ -475,6 +579,22 @@ impl Drop for ResetTraceLoggingOverride {
     }
 }
 
+struct ResetRoutineTraceContext {
+    routine_occurrences: HashMap<&'static str, usize>,
+    active_routines: Vec<String>,
+}
+
+impl Drop for ResetRoutineTraceContext {
+    fn drop(&mut self) {
+        ROUTINE_OCCURRENCES.with(|routine_occurrences| {
+            routine_occurrences.replace(std::mem::take(&mut self.routine_occurrences));
+        });
+        ACTIVE_ROUTINES.with(|active_routines| {
+            active_routines.replace(std::mem::take(&mut self.active_routines));
+        });
+    }
+}
+
 struct ResetTerminalCheckpoint(Option<TerminalCheckpointState>);
 
 impl Drop for ResetTerminalCheckpoint {
@@ -489,6 +609,8 @@ thread_local! {
     static CHECKPOINTING_ENABLED: Cell<bool> = const { Cell::new(false) };
     static TRACE_LOGGING_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     static TERMINAL_CHECKPOINT: RefCell<Option<TerminalCheckpointState>> = const { RefCell::new(None) };
+    static ROUTINE_OCCURRENCES: RefCell<HashMap<&'static str, usize>> = RefCell::new(HashMap::new());
+    static ACTIVE_ROUTINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -496,6 +618,7 @@ mod tests {
     use serde_json::json;
 
     use super::{should_commit_checkpoint, TerminalCheckpointSpec};
+    use crate::runtime::checkpoints::RoutineId;
 
     #[test]
     fn checkpoint_commitments_skip_prefill_layer_token_entries() {
@@ -587,5 +710,40 @@ mod tests {
                 Some("prefill.layer")
             );
         });
+    }
+
+    #[test]
+    fn routine_occurrence_labels_match_terminal_checkpoint_suffixes() {
+        super::with_trace_logging_enabled(true, || {
+            assert_eq!(
+                super::next_routine_label(RoutineId::PrefillLayer),
+                "prefill.layer"
+            );
+            assert_eq!(
+                super::next_routine_label(RoutineId::PrefillLayer),
+                "prefill.layer:2"
+            );
+            assert_eq!(
+                super::next_routine_label(RoutineId::PrefillLayer),
+                "prefill.layer:3"
+            );
+        });
+    }
+
+    #[test]
+    fn trace_logging_defaults_to_cli_override_only() {
+        assert_eq!(super::trace_mode(), super::TraceMode::Off);
+        super::with_trace_logging_enabled(true, || {
+            assert_eq!(super::trace_mode(), super::TraceMode::Verbose);
+        });
+        assert_eq!(super::trace_mode(), super::TraceMode::Off);
+    }
+
+    #[test]
+    fn progress_trace_events_are_suppressed_by_default() {
+        assert!(!super::should_emit_trace_event(
+            "progress prefill.attention.scores head=0 token=0"
+        ));
+        assert!(super::should_emit_trace_event("decode.select_token"));
     }
 }

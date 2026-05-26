@@ -59,10 +59,12 @@ pub fn stop_tile_invocation_counting() -> Option<u64> {
 }
 
 #[inline(always)]
-pub fn record_tile_invocation() {
+pub fn record_tile_invocation(invocation_kind: &str, name: &str) {
     TILE_INVOCATION_COUNT.with(|count| {
         if let Some(total) = count.get() {
-            count.set(Some(total.saturating_add(1)));
+            let next_total = total.saturating_add(1);
+            count.set(Some(next_total));
+            crate::trace::tile_invoked(invocation_kind, name, next_total);
         }
     });
 }

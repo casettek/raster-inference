@@ -2,13 +2,13 @@
 macro_rules! call_tile {
     ($tile:ident $(,)?) => {
         {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             $tile()
         }
     };
     ($tile:ident, $($args:expr),+ $(,)?) => {
         {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             $tile($($args),+)
         }
     };
@@ -18,13 +18,13 @@ macro_rules! call_tile {
 macro_rules! call_seq {
     ($sequence:ident $(,)?) => {
         {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             $sequence()
         }
     };
     ($sequence:ident, $($args:expr),+ $(,)?) => {
         {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             $sequence($($args),+)
         }
     };
@@ -84,7 +84,7 @@ macro_rules! __dsl_run_recur_tile {
     ($tile:ident, $state:expr $(,)?) => {{
         let mut state = $state;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             let (done, next_state) = $tile(state);
             if done {
                 break next_state;
@@ -96,7 +96,7 @@ macro_rules! __dsl_run_recur_tile {
         let mut state_a = $state_a;
         let mut state_b = $state_b;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             let (done, next_state_a, next_state_b) = $tile(state_a, state_b);
             if done {
                 break (next_state_a, next_state_b);
@@ -110,7 +110,7 @@ macro_rules! __dsl_run_recur_tile {
         let mut state_b = $state_b;
         let mut state_c = $state_c;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             let (done, next_state_a, next_state_b, next_state_c) = $tile(state_a, state_b, state_c);
             if done {
                 break (next_state_a, next_state_b, next_state_c);
@@ -126,7 +126,7 @@ macro_rules! __dsl_run_recur_tile {
         let mut state_c = $state_c;
         let mut state_d = $state_d;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             let (done, next_state_a, next_state_b, next_state_c, next_state_d) =
                 $tile(state_a, state_b, state_c, state_d);
             if done {
@@ -145,7 +145,7 @@ macro_rules! __dsl_run_recur_tile_result {
     ($tile:ident, $state:expr $(,)?) => {{
         let mut state = $state;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             let (done, next_state) = match $tile(state) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -159,7 +159,7 @@ macro_rules! __dsl_run_recur_tile_result {
     ($tile:ident, $state:expr, $($context:expr),+ $(,)?) => {{
         let mut state = $state;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             let (done, next_state) = match $tile(state, $($context),+) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -178,7 +178,7 @@ macro_rules! __dsl_run_recur_tile_result_pair {
         let mut state_a = $state_a;
         let mut state_b = $state_b;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             let (done, next_state_a, next_state_b) = match $tile(state_a, state_b) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -194,7 +194,7 @@ macro_rules! __dsl_run_recur_tile_result_pair {
         let mut state_a = $state_a;
         let mut state_b = $state_b;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("tile", stringify!($tile));
             let (done, next_state_a, next_state_b) = match $tile(state_a, state_b, $($context),+) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -213,7 +213,7 @@ macro_rules! __dsl_run_recur_sequence {
     ($sequence:ident, $state:expr $(,)?) => {{
         let mut state = $state;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             let (done, next_state) = $sequence(state);
             if done {
                 break next_state;
@@ -225,7 +225,7 @@ macro_rules! __dsl_run_recur_sequence {
         let mut state_a = $state_a;
         let mut state_b = $state_b;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             let (done, next_state_a, next_state_b) = $sequence(state_a, state_b);
             if done {
                 break (next_state_a, next_state_b);
@@ -239,7 +239,7 @@ macro_rules! __dsl_run_recur_sequence {
         let mut state_b = $state_b;
         let mut state_c = $state_c;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             let (done, next_state_a, next_state_b, next_state_c) =
                 $sequence(state_a, state_b, state_c);
             if done {
@@ -256,7 +256,7 @@ macro_rules! __dsl_run_recur_sequence {
         let mut state_c = $state_c;
         let mut state_d = $state_d;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             let (done, next_state_a, next_state_b, next_state_c, next_state_d) =
                 $sequence(state_a, state_b, state_c, state_d);
             if done {
@@ -275,7 +275,7 @@ macro_rules! __dsl_run_recur_sequence_result {
     ($sequence:ident, $state:expr $(,)?) => {{
         let mut state = $state;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             let (done, next_state) = match $sequence(state) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -289,7 +289,7 @@ macro_rules! __dsl_run_recur_sequence_result {
     ($sequence:ident, $state:expr, $($context:expr),+ $(,)?) => {{
         let mut state = $state;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             let (done, next_state) = match $sequence(state, $($context),+) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -308,7 +308,7 @@ macro_rules! __dsl_run_recur_sequence_result_pair {
         let mut state_a = $state_a;
         let mut state_b = $state_b;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             let (done, next_state_a, next_state_b) = match $sequence(state_a, state_b) {
                 Ok(next) => next,
                 Err(error) => break Err(error),
@@ -324,7 +324,7 @@ macro_rules! __dsl_run_recur_sequence_result_pair {
         let mut state_a = $state_a;
         let mut state_b = $state_b;
         loop {
-            $crate::dsl::record_tile_invocation();
+            $crate::dsl::record_tile_invocation("sequence", stringify!($sequence));
             let (done, next_state_a, next_state_b) = match $sequence(state_a, state_b, $($context),+) {
                 Ok(next) => next,
                 Err(error) => break Err(error),

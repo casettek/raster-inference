@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -45,6 +46,10 @@ pub fn run_with_mode(
         position,
         token_count,
     } = transformer_decode_state;
+    let _routine = crate::trace::routine_scope(
+        RoutineId::DecodeTransition,
+        format!("position={position} token_count={token_count}"),
+    );
     let embedded_token = if let Some(ref embedding_table) = model.embedding_table {
         crate::shared::numerics::transformer_kernels::embed_input_tokens_with_mode(
             &[next_token],
@@ -125,6 +130,10 @@ pub fn run_raster(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<RasterDecodeLoopState> {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::DecodeTransition,
+        format!("mode=raster position={}", decode_state.position),
+    );
     let source =
         raster::auth_source::RasterDecodeTransitionSource::for_current_integrity_mode(source)?;
     let output_source_prefix = format!("decode.transition.position_{}", decode_state.position);
