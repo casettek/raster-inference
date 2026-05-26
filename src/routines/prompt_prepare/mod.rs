@@ -116,5 +116,6 @@ pub fn run_raster(
     raster::main(
         prepared_inputs.artifact_store_roots,
         prepared_inputs.input_roots,
+        tokenizer,
     )
 }

@@ -125,7 +125,8 @@ pub fn run_raster(
     source: &AuthenticatedGemmaDecodeTransitionSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<RasterDecodeLoopState> {
-    let committed_source = source.committed_source()?;
+    let source =
+        raster::auth_source::RasterDecodeTransitionSource::for_current_integrity_mode(source)?;
     let output_source_prefix = format!("decode.transition.position_{}", decode_state.position);
     let output = raster::main_state_refs(
         raster::RasterDecodeTransitionInputRefs {
@@ -134,11 +135,11 @@ pub fn run_raster(
             token_count: decode_state.token_count,
             layer_caches: decode_state.layer_caches,
             selected_token_ref,
-            decode_transition_source_root: committed_source.root().to_string(),
+            decode_transition_source_root: source.root().to_string(),
             output_source_prefix,
             raster_sizing,
         },
-        &committed_source,
+        &source,
     )?;
     RasterDecodeLoopState::new(
         output.artifact_store_roots,

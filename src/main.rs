@@ -1,11 +1,12 @@
 use std::{env, path::PathBuf, process};
 
+use raster_inference::shared::artifacts::integrity_mode::with_raster_integrity_mode;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
     load_transformer_state_model_from_det_num_wgt_path,
     load_transformer_state_model_from_gemma_model_path, run_inference_with_controls, trace,
     AuthenticatedGemmaTokenizer, InferenceControls, InferenceExecutionMode, InferenceRequest,
-    InferenceRunOutcome, ModelSpec, SamplingConfig, TextDecodingPolicy,
+    InferenceRunOutcome, ModelSpec, RasterIntegrityMode, SamplingConfig, TextDecodingPolicy,
 };
 
 const CLI_MAX_NEW_TOKENS: usize = 3;
@@ -13,10 +14,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] [--raster] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--raster] [--raster-unchecked-test-mode] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use the single root-backed raster tile inference path. Pass --raster-trace-tiles to print verbose raster progress logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use the single root-backed raster tile inference path. Pass --raster-unchecked-test-mode to use synthetic raster handles and skip Merkle proof work in test builds. Pass --raster-trace-tiles to print verbose raster progress logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
     );
 }
 
@@ -74,6 +75,7 @@ fn run() -> anyhow::Result<()> {
         },
     };
 
+    let raster_integrity_mode = cli_args.raster_integrity_mode;
     let controls = InferenceControls {
         commit_checkpoints: cli_args.commit_checkpoints,
         terminal_checkpoint: cli_args.terminal_checkpoint,
@@ -87,8 +89,11 @@ fn run() -> anyhow::Result<()> {
         raster_tokenizer_bpe_pieces_per_tile: cli_args.raster_tokenizer_bpe_pieces_per_tile,
         raster_output_byte_flush_bytes_per_tile: cli_args.raster_output_byte_flush_bytes_per_tile,
     };
-    let run_inference =
-        || run_inference_with_controls(&request, &model, &tokenizer, &transformer_model, &controls);
+    let run_inference = || {
+        with_raster_integrity_mode(raster_integrity_mode, || {
+            run_inference_with_controls(&request, &model, &tokenizer, &transformer_model, &controls)
+        })
+    };
     let inference_outcome = if cli_args.raster_trace_tiles {
         trace::with_trace_logging_enabled(true, run_inference)
     } else {
@@ -114,6 +119,7 @@ struct CliArgs {
     commit_checkpoints: bool,
     execution_mode: InferenceExecutionMode,
     raster: bool,
+    raster_integrity_mode: RasterIntegrityMode,
     raster_trace_tiles: bool,
     raster_projection_rows_per_tile: Option<usize>,
     raster_attention_kv_rows_per_tile: Option<usize>,
@@ -135,6 +141,7 @@ impl CliArgs {
         let mut commit_checkpoints = false;
         let mut execution_mode = InferenceExecutionMode::Fp32;
         let mut raster = false;
+        let mut raster_integrity_mode = RasterIntegrityMode::Verified;
         let mut raster_decode_only = false;
         let mut raster_trace_tiles = false;
         let mut raster_projection_rows_per_tile = None;
@@ -152,6 +159,9 @@ impl CliArgs {
                 "--commit-checkpoints" => commit_checkpoints = true,
                 "--deterministic" => execution_mode = InferenceExecutionMode::Deterministic,
                 "--raster" => raster = true,
+                "--raster-unchecked-test-mode" => {
+                    raster_integrity_mode = parse_raster_unchecked_test_mode_flag()?
+                }
                 "--raster-decode-only" => raster_decode_only = true,
                 "--raster-trace-tiles" => raster_trace_tiles = true,
                 "--raster-projection-rows-per-tile" => {
@@ -280,6 +290,9 @@ impl CliArgs {
         if raster_decode_only {
             anyhow::bail!("--raster-decode-only has been removed; use --raster");
         }
+        if raster_integrity_mode.is_unchecked_test_only() && !raster {
+            anyhow::bail!("--raster-unchecked-test-mode requires --raster");
+        }
         if raster_projection_rows_per_tile.is_some() && !raster {
             anyhow::bail!("--raster-projection-rows-per-tile requires --raster");
         }
@@ -310,6 +323,7 @@ impl CliArgs {
             commit_checkpoints,
             execution_mode,
             raster,
+            raster_integrity_mode,
             raster_trace_tiles,
             raster_projection_rows_per_tile,
             raster_attention_kv_rows_per_tile,
@@ -325,6 +339,20 @@ impl CliArgs {
             model_path: PathBuf::from(&positional_args[3]),
             prompt: positional_args[4..].join(" "),
         })
+    }
+}
+
+fn parse_raster_unchecked_test_mode_flag() -> anyhow::Result<RasterIntegrityMode> {
+    #[cfg(feature = "unchecked-raster-integrity")]
+    {
+        Ok(RasterIntegrityMode::UncheckedTestOnly)
+    }
+
+    #[cfg(not(feature = "unchecked-raster-integrity"))]
+    {
+        anyhow::bail!(
+            "--raster-unchecked-test-mode requires building with the unchecked-raster-integrity feature"
+        )
     }
 }
 
@@ -402,6 +430,8 @@ fn parse_raster_output_byte_flush_bytes_per_tile(value: &str) -> anyhow::Result<
 mod tests {
     use super::CliArgs;
     use raster_inference::InferenceExecutionMode;
+    #[cfg(feature = "unchecked-raster-integrity")]
+    use raster_inference::RasterIntegrityMode;
 
     #[test]
     fn parse_terminal_checkpoint_flag() {
@@ -475,6 +505,49 @@ mod tests {
         assert_eq!(args.raster_projection_rows_per_tile, None);
         assert_eq!(args.raster_attention_kv_rows_per_tile, None);
         assert_eq!(args.raster_output_byte_flush_bytes_per_tile, None);
+    }
+
+    #[cfg(feature = "unchecked-raster-integrity")]
+    #[test]
+    fn parse_raster_unchecked_test_mode_flag() {
+        let args = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-unchecked-test-mode".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(
+            args.raster_integrity_mode,
+            RasterIntegrityMode::UncheckedTestOnly
+        );
+    }
+
+    #[test]
+    fn parse_raster_unchecked_test_mode_requires_raster_or_feature() {
+        let error = CliArgs::parse([
+            "--raster-unchecked-test-mode".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("unchecked test mode should not parse without raster");
+
+        #[cfg(feature = "unchecked-raster-integrity")]
+        assert!(error
+            .to_string()
+            .contains("--raster-unchecked-test-mode requires --raster"));
+
+        #[cfg(not(feature = "unchecked-raster-integrity"))]
+        assert!(error
+            .to_string()
+            .contains("requires building with the unchecked-raster-integrity feature"));
     }
 
     #[test]

@@ -85,11 +85,12 @@ pub fn run_raster(
     ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, raster::PrefillLayerOutputRefs)> {
-    let committed_layer_source = layer_source.committed_source()?;
+    let layer_source =
+        crate::shared::raster_contracts::prefill_layer::RasterPrefillLayerSource::for_current_integrity_mode(layer_source)?;
     raster::main(
         artifact_store_roots,
         input_embedding_refs,
-        &committed_layer_source,
+        &layer_source,
         ple_input_manifest_root,
         raster_sizing,
     )

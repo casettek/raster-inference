@@ -44,6 +44,7 @@ pub use shared::api::input::{
     TextMessage,
 };
 pub use shared::api::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
+pub use shared::artifacts::integrity_mode::RasterIntegrityMode;
 pub use shared::model::gemma_tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeState, GemmaTokenizerSpec,
     GemmaVocabEntry,

@@ -76,11 +76,6 @@ fn init_tokenize_prompt_captures_rendered_prompt_and_special_token_policy() {
 #[test]
 fn finalize_tokenize_prompt_returns_token_id_root() {
     let tokenizer = test_tokenizer_source();
-    let tokenizer_source_root = tokenizer
-        .committed_source_ref()
-        .expect("tokenizer source should commit")
-        .root()
-        .to_string();
     init_artifact_store();
     let _pieces_ref = insert_bpe_piece_sequence_for_test(
         &bpe_pieces_artifact_name(0),
@@ -99,8 +94,8 @@ fn finalize_tokenize_prompt_returns_token_id_root() {
     )
     .expect("token id finalization should init");
     loop {
-        let (done, next_state) = finalize_next_token_ids(state, &tokenizer_source_root)
-            .expect("token ids should advance");
+        let (done, next_state) =
+            finalize_next_token_ids(state, &tokenizer).expect("token ids should advance");
         state = next_state;
         if done {
             break;
@@ -223,12 +218,13 @@ fn run_returns_root_backed_prompt_state() {
         unk_token: None,
     };
 
-    let prepared_inputs =
-        prepare_raster_prompt_input_roots(&request, &model, &test_tokenizer_source(), 1, 1)
-            .expect("raster prompt roots should build");
+    let tokenizer = test_tokenizer_source();
+    let prepared_inputs = prepare_raster_prompt_input_roots(&request, &model, &tokenizer, 1, 1)
+        .expect("raster prompt roots should build");
     let result = main(
         prepared_inputs.artifact_store_roots,
         prepared_inputs.input_roots,
+        &tokenizer,
     )
     .expect("raster prompt refs should build");
     let token_ids = materialize_token_ids(

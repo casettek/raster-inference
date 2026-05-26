@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 
 use crate::dsl::prelude::{call_recur_tile, call_tile, sequence, tile};
 use crate::input_embedding::raster::auth_source::{
-    GemmaInputEmbeddingMetadataRequest, GemmaInputEmbeddingRowRequest,
+    GemmaInputEmbeddingMetadataRequest, GemmaInputEmbeddingRowRequest, RasterInputEmbeddingSource,
 };
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
@@ -17,15 +17,18 @@ use super::utils::*;
 pub fn main(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterInputEmbeddingInputRoots,
+    embedding_source: &RasterInputEmbeddingSource<'_>,
 ) -> Result<RasterInputEmbeddingOutput> {
     let (artifact_store_roots, input_embedding_state) = call_tile!(
         init_input_embedding_state,
         artifact_store_roots,
-        input_roots
+        input_roots,
+        embedding_source
     )?;
     let (artifact_store_roots, input_embedding_state) = call_recur_tile!(
         append_next_input_embedding_row,
-        (artifact_store_roots, input_embedding_state)
+        (artifact_store_roots, input_embedding_state),
+        embedding_source
     )?;
     let (_artifact_store_roots, refs) = call_tile!(
         finalize_input_embedding_refs,
@@ -41,14 +44,19 @@ pub fn main(
 pub fn init_input_embedding_state(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterInputEmbeddingInputRoots,
+    embedding_source: &RasterInputEmbeddingSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, InputEmbeddingRasterState)> {
     if input_roots.prompt_token_count == 0 {
         bail!("transformer embedding requires at least one token id");
     }
-    let metadata = ArtifactIo::auth_read(
-        input_roots.embedding_source_root.as_str(),
-        GemmaInputEmbeddingMetadataRequest,
-    )?;
+    if input_roots.embedding_source_root != embedding_source.root() {
+        bail!(
+            "raster input embedding source root {} does not match input source root {}",
+            embedding_source.root(),
+            input_roots.embedding_source_root
+        );
+    }
+    let metadata = ArtifactIo::auth_read(embedding_source, GemmaInputEmbeddingMetadataRequest)?;
     if metadata.hidden_size == 0 {
         bail!("Gemma input embedding source must have non-zero hidden size");
     }
@@ -76,6 +84,7 @@ pub fn init_input_embedding_state(
 pub fn append_next_input_embedding_row(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     mut input_embedding_state: InputEmbeddingRasterState,
+    embedding_source: &RasterInputEmbeddingSource<'_>,
 ) -> Result<(bool, RasterArtifactStoreRoots, InputEmbeddingRasterState)> {
     if input_embedding_state.is_complete() {
         return Ok((true, artifact_store_roots, input_embedding_state));
@@ -87,10 +96,14 @@ pub fn append_next_input_embedding_row(
         input_embedding_state.prompt_token_count,
         input_embedding_state.next_token_idx,
     )?;
-    let row = ArtifactIo::auth_read(
-        input_embedding_state.embedding_source_root.as_str(),
-        GemmaInputEmbeddingRowRequest { token_id },
-    )?;
+    if input_embedding_state.embedding_source_root != embedding_source.root() {
+        bail!(
+            "raster input embedding source root {} does not match state source root {}",
+            embedding_source.root(),
+            input_embedding_state.embedding_source_root
+        );
+    }
+    let row = ArtifactIo::auth_read(embedding_source, GemmaInputEmbeddingRowRequest { token_id })?;
     if row.len() != input_embedding_state.hidden_size {
         bail!(
             "input embedding row {} has width {}, expected {}",

@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use anyhow::{anyhow, bail, Result};
 
 use crate::shared::artifacts::artifact_io::AuthRead;
@@ -7,6 +9,8 @@ use crate::shared::artifacts::external_artifacts::{
     CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
     ExternalSourceRef,
 };
+#[cfg(feature = "unchecked-raster-integrity")]
+use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
     DetNumTensorSliceSource, Gemma4ModelProvenance, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource,
@@ -27,6 +31,48 @@ pub struct AuthenticatedGemmaInputEmbeddingSource {
     hidden_size: usize,
     scale: Act,
     backing: GemmaInputEmbeddingBacking,
+}
+
+pub enum RasterInputEmbeddingSource<'a> {
+    Committed {
+        source: CommittedExternalSource,
+        _marker: PhantomData<&'a AuthenticatedGemmaInputEmbeddingSource>,
+    },
+    #[cfg(feature = "unchecked-raster-integrity")]
+    DirectUnchecked {
+        source: &'a AuthenticatedGemmaInputEmbeddingSource,
+        root: String,
+    },
+}
+
+impl<'a> RasterInputEmbeddingSource<'a> {
+    pub fn for_current_integrity_mode(
+        source: &'a AuthenticatedGemmaInputEmbeddingSource,
+    ) -> Result<Self> {
+        #[cfg(feature = "unchecked-raster-integrity")]
+        if raster_integrity_is_unchecked() {
+            return Ok(Self::DirectUnchecked {
+                root: format!(
+                    "raster-unchecked-test:direct-input-embedding:{}",
+                    source.identifier()
+                ),
+                source,
+            });
+        }
+
+        Ok(Self::Committed {
+            source: source.committed_source()?,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn root(&self) -> &str {
+        match self {
+            Self::Committed { source, .. } => source.root(),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { root, .. } => root,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +217,18 @@ impl AuthRead<GemmaInputEmbeddingMetadataRequest> for AuthenticatedGemmaInputEmb
     }
 }
 
+impl AuthRead<GemmaInputEmbeddingMetadataRequest> for RasterInputEmbeddingSource<'_> {
+    type Output = GemmaInputEmbeddingMetadata;
+
+    fn auth_read(&self, request: GemmaInputEmbeddingMetadataRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.auth_read(request),
+        }
+    }
+}
+
 impl AuthRead<GemmaInputEmbeddingRowRequest> for AuthenticatedGemmaInputEmbeddingSource {
     type Output = Vec<Act>;
 
@@ -207,6 +265,18 @@ impl AuthRead<GemmaInputEmbeddingRowRequest> for AuthenticatedGemmaInputEmbeddin
             .into_iter()
             .map(|value| scale_act(value, self.scale))
             .collect())
+    }
+}
+
+impl AuthRead<GemmaInputEmbeddingRowRequest> for RasterInputEmbeddingSource<'_> {
+    type Output = Vec<Act>;
+
+    fn auth_read(&self, request: GemmaInputEmbeddingRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.auth_read(request),
+        }
     }
 }
 

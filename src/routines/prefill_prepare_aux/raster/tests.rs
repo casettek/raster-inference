@@ -11,7 +11,7 @@ use crate::shared::model::transformer::{
 use crate::shared::numerics::det_num::act_to_f32;
 use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
 use crate::shared::raster_contracts::prefill_ple::{
-    AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleScalars,
+    AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleScalars, RasterPrefillPleSource,
 };
 use crate::RasterSizingControls;
 use anyhow::{Context, Result};
@@ -162,10 +162,8 @@ fn branch_free_sequence_violations(source: &str) -> Vec<String> {
 #[test]
 fn scaled_token_embedding_rows_advance_one_recursive_step_at_a_time() {
     let fixture = PleFixture::single_layer().expect("fixture should build");
-    let committed_source = fixture
-        .source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = RasterPrefillPleSource::for_current_integrity_mode(&fixture.source)
+        .expect("source should prepare for raster reads");
     reset_artifact_store();
     let token_ids_ref = store_prefill_token_ids_artifact(&[0, 1]).expect("token ids ref");
     let (mut artifact_store_roots, state) = init_scaled_token_embedding_sequence_ref(
@@ -458,10 +456,8 @@ fn prefill_ple_state_serializes_refs_not_activation_rows() {
         raster_sizing_with_projection_rows(1),
     )
     .expect("prepare input roots");
-    let committed_source = fixture
-        .source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = RasterPrefillPleSource::for_current_integrity_mode(&fixture.source)
+        .expect("source should prepare for raster reads");
     let (artifact_store_roots, state) =
         init_prefill_ple_state(artifact_store_roots, input_roots, &committed_source)
             .expect("init state");
@@ -512,10 +508,8 @@ fn prefill_ple_layer_steps_serialize_refs_not_activation_rows() {
         raster_sizing_with_projection_rows(1),
     )
     .expect("prepare input roots");
-    let committed_source = fixture
-        .source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = RasterPrefillPleSource::for_current_integrity_mode(&fixture.source)
+        .expect("source should prepare for raster reads");
     let (artifact_store_roots, ple_state) =
         init_prefill_ple_state(artifact_store_roots, input_roots, &committed_source)
             .expect("init state");
@@ -568,9 +562,8 @@ fn prefill_ple_state_rejects_mismatched_committed_source_root() {
         }],
     )
     .expect("other source should build");
-    let other_committed_source = other_source
-        .committed_source()
-        .expect("other source should commit static reads");
+    let other_committed_source = RasterPrefillPleSource::for_current_integrity_mode(&other_source)
+        .expect("other source should prepare for raster reads");
 
     let error = init_prefill_ple_state(artifact_store_roots, input_roots, &other_committed_source)
         .expect_err("mismatched committed PLE source root should fail");
@@ -627,10 +620,8 @@ fn missing_input_ref_fails_closed() {
         raster_sizing_with_projection_rows(1),
     )
     .expect("prepare input roots");
-    let committed_source = fixture
-        .source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = RasterPrefillPleSource::for_current_integrity_mode(&fixture.source)
+        .expect("source should prepare for raster reads");
     let (artifact_store_roots, mut state) =
         init_prefill_ple_state(artifact_store_roots, input_roots, &committed_source)
             .expect("init state");

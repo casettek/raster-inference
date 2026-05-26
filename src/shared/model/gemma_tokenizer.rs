@@ -9,6 +9,8 @@ use crate::shared::artifacts::external_artifacts::{
     register_external_source, CommittedExternalRequest, CommittedExternalSource,
     ExternalSourceEntry, ExternalSourceId, ExternalSourceRef,
 };
+#[cfg(feature = "unchecked-raster-integrity")]
+use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::artifacts::raster_artifact_store::RasterBpePieceSequenceRef;
 
 const GEMMA_TOKENIZER_SOURCE_KIND: &str = "gemma_tokenizer";
@@ -401,6 +403,18 @@ impl AuthenticatedGemmaTokenizer {
 
     pub fn committed_source(&self) -> Result<CommittedExternalSource> {
         Ok(CommittedExternalSource::new(self.committed_source_ref()?))
+    }
+
+    pub fn raster_source_root_for_current_integrity_mode(&self) -> Result<String> {
+        #[cfg(feature = "unchecked-raster-integrity")]
+        if raster_integrity_is_unchecked() {
+            return Ok(format!(
+                "raster-unchecked-test:direct-tokenizer:{}",
+                self.identifier()
+            ));
+        }
+
+        Ok(self.committed_source_ref()?.root().to_string())
     }
 
     fn metadata(&self) -> GemmaTokenizerMetadata {

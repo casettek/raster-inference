@@ -3,7 +3,6 @@ use anyhow::{anyhow, bail, Result};
 use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::shared::artifacts::external_artifacts::CommittedExternalSource;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactStoreRoots,
 };
@@ -14,6 +13,7 @@ use crate::shared::raster_contracts::prefill_ple::{
     store_prefill_ple_input_manifest_with_roots, GemmaPleLayerMetadataRequest,
     GemmaPleMetadataRequest, GemmaPleModelProjectionRowRequest,
     GemmaPleProjectionNormWeightsRequest, GemmaPleScalarsRequest, GemmaPleTokenEmbeddingRowRequest,
+    RasterPrefillPleSource,
 };
 use crate::shared::raster_kernels::transformer::{
     project_row_with_weights, validate_projection_rows_per_tile, validate_sequence_rows_per_tile,
@@ -29,7 +29,7 @@ use super::utils::*;
 pub fn main(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterPrefillPleInputRoots,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
     let (artifact_store_roots, ple_state) = call_tile!(
         init_prefill_ple_state,
@@ -54,7 +54,7 @@ pub fn main(
 pub fn compute_next_prefill_ple_layer_sequence(
     artifact_store_roots: RasterArtifactStoreRoots,
     ple_state: PrefillPleRasterState,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillPleRasterState)> {
     let (artifact_store_roots, layer_step) = call_tile!(
         init_prefill_ple_layer_step,
@@ -79,7 +79,7 @@ pub fn compute_next_prefill_ple_layer_sequence(
 fn run_prefill_ple_layer_step_sequence_ref(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillPleLayerStep,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
     let layer_step = call_tile!(
         prepare_prefill_ple_layer_compute_inputs,
@@ -124,7 +124,7 @@ fn run_prefill_ple_layer_step_sequence_ref(
 fn build_scaled_token_embedding_for_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillPleLayerStep,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
     let (artifact_store_roots, token_embedding_step) = call_tile!(
         init_scaled_token_embedding_layer_step,
@@ -147,7 +147,7 @@ fn build_scaled_token_embedding_for_layer_step(
 fn project_prefill_ple_input_for_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_step: PrefillPleLayerStep,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
     let (artifact_store_roots, projection_step) = call_tile!(
         init_project_prefill_ple_layer_step,
@@ -256,7 +256,7 @@ fn scale_prefill_ple_combined_input_for_layer_step(
 pub fn init_prefill_ple_state(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_roots: RasterPrefillPleInputRoots,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleRasterState)> {
     if input_roots.ple_source_root != ple_source.root() {
         bail!(
@@ -313,7 +313,7 @@ pub fn finalize_prefill_ple_input_refs(
 pub(in super::super) fn init_prefill_ple_layer_step(
     artifact_store_roots: RasterArtifactStoreRoots,
     ple_state: PrefillPleRasterState,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, PrefillPleLayerStep)> {
     if !ple_state.has_ple_global || ple_state.next_layer_idx >= ple_state.layer_count {
         return Ok((
@@ -378,7 +378,7 @@ pub(in super::super) fn init_prefill_ple_layer_step(
 #[tile]
 pub(in super::super) fn prepare_prefill_ple_layer_compute_inputs(
     layer_step: PrefillPleLayerStep,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<PrefillPleLayerStep> {
     match layer_step {
         PrefillPleLayerStep::Compute(mut compute_state) => {
@@ -487,7 +487,7 @@ pub(in super::super) fn init_scaled_token_embedding_layer_step(
 fn append_next_scaled_token_embedding_layer_step_row(
     artifact_store_roots: RasterArtifactStoreRoots,
     token_embedding_step: PrefillPleLayerTokenEmbeddingStep,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -588,7 +588,7 @@ fn init_project_prefill_ple_layer_step(
 fn project_next_prefill_ple_layer_step_rows(
     artifact_store_roots: RasterArtifactStoreRoots,
     projection_step: PrefillPleLayerProjectionStep,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -1022,7 +1022,7 @@ pub(in super::super) fn init_scaled_token_embedding_sequence_ref(
 pub(in super::super) fn append_next_scaled_token_embedding_row(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     mut token_embedding_state: PrefillPleTokenEmbeddingState,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -1142,7 +1142,7 @@ fn init_ple_sequence_projection_from_ref(
 pub fn project_next_ple_sequence_rows(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     mut projection_state: PrefillPleSequenceProjectionState,
-    ple_source: &CommittedExternalSource,
+    ple_source: &RasterPrefillPleSource<'_>,
     layer_idx: usize,
 ) -> Result<(
     bool,

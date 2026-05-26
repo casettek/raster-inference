@@ -26,14 +26,18 @@ pub fn run_raster(
     prompt_preparation: &RasterPromptPreparationState,
     embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
 ) -> Result<raster::RasterInputEmbeddingOutput> {
-    let embedding_source_ref = embedding_source.committed_source_ref()?;
+    let embedding_source =
+        raster::auth_source::RasterInputEmbeddingSource::for_current_integrity_mode(
+            embedding_source,
+        )?;
     raster::main(
         artifact_store_roots,
         raster::RasterInputEmbeddingInputRoots {
             prompt_token_ids_root: prompt_preparation.prompt_token_ids_root.clone(),
             prompt_token_count: prompt_preparation.prompt_token_count,
-            embedding_source_root: embedding_source_ref.root().to_string(),
+            embedding_source_root: embedding_source.root().to_string(),
         },
+        &embedding_source,
     )
 }
 

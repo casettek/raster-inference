@@ -3,7 +3,9 @@ use super::{
     raster_cache_from_layer_cache, register_decode_layer_cache_with_roots, run,
     RasterDecodeTransitionInputRefs, RasterDecodeTransitionInputRoots,
 };
-use crate::decode_transition::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource;
+use crate::decode_transition::raster::auth_source::{
+    AuthenticatedGemmaDecodeTransitionSource, RasterDecodeTransitionSource,
+};
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::external_artifacts::reset_external_source_store;
@@ -28,6 +30,13 @@ use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+fn raster_source(
+    source: &AuthenticatedGemmaDecodeTransitionSource,
+) -> RasterDecodeTransitionSource<'_> {
+    RasterDecodeTransitionSource::for_current_integrity_mode(source)
+        .expect("source should prepare for raster reads")
+}
 
 #[test]
 fn decode_transition_sequences_are_branch_free_orchestration() {
@@ -78,9 +87,7 @@ fn raster_decode_transition_matches_deterministic_no_ple() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
 
     let raster = run(decode_state.clone(), 1, &committed_source, raster_sizing(1))
@@ -106,9 +113,7 @@ fn root_backed_main_reads_selected_token_ref() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
     let (roots, selected_token_ref) =
         selected_token_ref("decode.transition.selected", 1).expect("selected token ref");
@@ -147,9 +152,7 @@ fn root_backed_main_rejects_mismatched_committed_source_root() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let (roots, selected_token_ref) =
         selected_token_ref("decode.transition.wrong-source.selected", 1)
             .expect("selected token ref");
@@ -177,9 +180,7 @@ fn root_backed_state_main_returns_refs_without_materialized_transition_result() 
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
     let (mut roots, selected_token_ref) =
         selected_token_ref("decode.transition.state.selected", 1).expect("selected token ref");
@@ -278,9 +279,7 @@ fn root_backed_state_main_rejects_mismatched_committed_source_root() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
     let (mut roots, selected_token_ref) =
         selected_token_ref("decode.transition.state.wrong-source.selected", 1)
@@ -324,9 +323,7 @@ fn root_backed_main_rejects_missing_selected_token_root() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let (_roots, selected_token_ref) =
         selected_token_ref("decode.transition.missing.selected", 1).expect("selected token ref");
 
@@ -351,9 +348,7 @@ fn raster_decode_transition_matches_across_projection_and_attention_chunks() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(3);
     let deterministic = crate::decode_transition::run_with_mode(
         decode_state.clone(),
@@ -385,9 +380,7 @@ fn raster_decode_rejects_zero_sizing_controls() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
 
     let projection_error = run(
@@ -418,9 +411,7 @@ fn raster_decode_transition_matches_sliding_cache_window() {
     let (_path, model) = no_ple_model(true);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
 
     for cache_len in [0, 1, 2, 3] {
         let decode_state = decode_state_with_cache(cache_len);
@@ -482,9 +473,7 @@ fn raster_decode_rejects_f32_only_cache() {
     let (_path, model) = no_ple_model(false);
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", &model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let decode_state = TransformerDecodeState {
         layer_caches: vec![LayerKvCache::from_f32_heads(
             vec![VecDeque::from([vec![0.0, 0.0]])],
@@ -517,9 +506,7 @@ fn assert_raster_matches_deterministic(
 ) {
     let source = AuthenticatedGemmaDecodeTransitionSource::from_model("decode", model)
         .expect("source should build");
-    let committed_source = source
-        .committed_source()
-        .expect("source should commit static reads");
+    let committed_source = raster_source(&source);
     let raster = run(
         decode_state.clone(),
         1,

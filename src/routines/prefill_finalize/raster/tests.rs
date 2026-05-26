@@ -1,10 +1,12 @@
 use super::{
-    finalize_prefill_finalize_refs, init_prefill_finalize_state, main,
+    finalize_prefill_finalize_refs, init_prefill_finalize_state,
     materialize_prefill_result_for_api, normalize_final_position_to_artifact,
     project_next_prefill_logit_chunk, RasterPrefillFinalizeInputRoots,
     NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
 };
-use crate::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource;
+use crate::prefill_finalize::raster::auth_source::{
+    AuthenticatedGemmaPrefillFinalizeSource, RasterPrefillFinalizeSource,
+};
 use crate::prefill_layer::raster::PrefillLayerCacheSlot;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -107,7 +109,8 @@ fn finalize_projection_state_serializes_builder_not_logits() {
     let model = untied_model(false);
     let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
-    let source_ref = source.committed_source_ref().expect("source should commit");
+    let raster_source =
+        RasterPrefillFinalizeSource::for_current_integrity_mode(&source).expect("raster source");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
@@ -117,10 +120,11 @@ fn finalize_projection_state_serializes_builder_not_logits() {
     let state = init_prefill_finalize_state(
         roots,
         1,
-        source_ref.root().to_string(),
+        raster_source.root().to_string(),
         final_hidden_states_ref,
         &[],
         1,
+        &raster_source,
     )
     .expect("init finalize projection");
     let encoded = serde_json::to_string(&state).expect("serialize state");
@@ -139,7 +143,8 @@ fn in_progress_projection_state_serializes_refs_not_payloads() {
     let model = untied_model(false);
     let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("in-progress", &model)
         .expect("source should build");
-    let source_ref = source.committed_source_ref().expect("source should commit");
+    let raster_source =
+        RasterPrefillFinalizeSource::for_current_integrity_mode(&source).expect("raster source");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
@@ -147,16 +152,17 @@ fn in_progress_projection_state_serializes_refs_not_payloads() {
     let state = init_prefill_finalize_state(
         ArtifactIo::export_store_roots(),
         1,
-        source_ref.root().to_string(),
+        raster_source.root().to_string(),
         final_hidden_states_ref,
         &[],
         1,
+        &raster_source,
     )
     .expect("init finalize state");
-    let state =
-        normalize_final_position_to_artifact(state).expect("normalization should write a ref");
-    let (done, state) =
-        project_next_prefill_logit_chunk(state).expect("first projection chunk should run");
+    let state = normalize_final_position_to_artifact(state, &raster_source)
+        .expect("normalization should write a ref");
+    let (done, state) = project_next_prefill_logit_chunk(state, &raster_source)
+        .expect("first projection chunk should run");
     assert!(!done);
 
     let encoded = serde_json::to_string(&state).expect("serialize state");
@@ -373,7 +379,11 @@ fn ref_backed_finalize_fails_closed_for_bad_source_root() {
     ArtifactIo::reset_store();
     let final_hidden_states_ref = insert_activation_ref("finalize.hidden", &final_hidden_states);
 
-    let error = main(RasterPrefillFinalizeInputRoots {
+    let finalize_source =
+        RasterPrefillFinalizeSource::from_committed_root("missing-finalize-source-root")
+            .expect_err("missing source should not resolve");
+    assert!(finalize_source.to_string().contains("not registered"));
+    let error = materialize_prefill_result_for_api(RasterPrefillFinalizeInputRoots {
         artifact_store_roots: ArtifactIo::export_store_roots(),
         prompt_token_count: 1,
         finalize_source_root: "missing-finalize-source-root".to_string(),
@@ -425,7 +435,8 @@ fn prefill_finalize_roots_aware_mutation_rejects_stale_builder_root() {
     let model = untied_model(false);
     let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("stale", &model)
         .expect("source should build");
-    let source_ref = source.committed_source_ref().expect("source should commit");
+    let raster_source =
+        RasterPrefillFinalizeSource::for_current_integrity_mode(&source).expect("raster source");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
@@ -433,10 +444,11 @@ fn prefill_finalize_roots_aware_mutation_rejects_stale_builder_root() {
     let state = init_prefill_finalize_state(
         ArtifactIo::export_store_roots(),
         1,
-        source_ref.root().to_string(),
+        raster_source.root().to_string(),
         final_hidden_states_ref,
         &[],
         1,
+        &raster_source,
     )
     .expect("init should build roots-backed state");
     ArtifactIo::append_leaf_by_builder_source_name_with_roots(
@@ -449,8 +461,8 @@ fn prefill_finalize_roots_aware_mutation_rejects_stale_builder_root() {
     )
     .expect("external append should stale the state roots");
 
-    let error =
-        normalize_final_position_to_artifact(state).expect_err("stale builder root should fail");
+    let error = normalize_final_position_to_artifact(state, &raster_source)
+        .expect_err("stale builder root should fail");
 
     assert!(error.to_string().contains("snapshot"));
 }
@@ -460,7 +472,8 @@ fn finalize_refs_rejects_overadvanced_projection_cursor() {
     let model = untied_model(false);
     let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("overadvanced", &model)
         .expect("source should build");
-    let source_ref = source.committed_source_ref().expect("source should commit");
+    let raster_source =
+        RasterPrefillFinalizeSource::for_current_integrity_mode(&source).expect("raster source");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     ArtifactIo::reset_store();
@@ -468,14 +481,15 @@ fn finalize_refs_rejects_overadvanced_projection_cursor() {
     let state = init_prefill_finalize_state(
         ArtifactIo::export_store_roots(),
         1,
-        source_ref.root().to_string(),
+        raster_source.root().to_string(),
         final_hidden_states_ref,
         &[],
         1,
+        &raster_source,
     )
     .expect("init should build state");
-    let mut state =
-        normalize_final_position_to_artifact(state).expect("normalization should finish");
+    let mut state = normalize_final_position_to_artifact(state, &raster_source)
+        .expect("normalization should finish");
     state.next_logit_idx = state.logit_count + 1;
 
     let error = finalize_prefill_finalize_refs(state, vec![])

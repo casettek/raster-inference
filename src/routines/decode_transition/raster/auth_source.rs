@@ -1,4 +1,4 @@
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, marker::PhantomData, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -9,6 +9,8 @@ use crate::shared::artifacts::external_artifacts::{
     CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
     ExternalSourceRef,
 };
+#[cfg(feature = "unchecked-raster-integrity")]
+use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
     DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
     Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
@@ -30,6 +32,49 @@ pub struct AuthenticatedGemmaDecodeTransitionSource {
     final_scalars: GemmaDecodeFinalScalars,
     projection: GemmaDecodeProjectionBacking,
     committed_source: RefCell<Option<CommittedExternalSource>>,
+}
+
+#[derive(Debug)]
+pub enum RasterDecodeTransitionSource<'a> {
+    Committed {
+        source: CommittedExternalSource,
+        _marker: PhantomData<&'a AuthenticatedGemmaDecodeTransitionSource>,
+    },
+    #[cfg(feature = "unchecked-raster-integrity")]
+    DirectUnchecked {
+        source: &'a AuthenticatedGemmaDecodeTransitionSource,
+        root: String,
+    },
+}
+
+impl<'a> RasterDecodeTransitionSource<'a> {
+    pub fn for_current_integrity_mode(
+        source: &'a AuthenticatedGemmaDecodeTransitionSource,
+    ) -> Result<Self> {
+        #[cfg(feature = "unchecked-raster-integrity")]
+        if raster_integrity_is_unchecked() {
+            return Ok(Self::DirectUnchecked {
+                root: format!(
+                    "raster-unchecked-test:direct-decode-transition:{}",
+                    source.identifier()
+                ),
+                source,
+            });
+        }
+
+        Ok(Self::Committed {
+            source: source.committed_source()?,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn root(&self) -> &str {
+        match self {
+            Self::Committed { source, .. } => source.root(),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { root, .. } => root,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -680,11 +725,35 @@ impl AuthRead<GemmaDecodeTransitionMetadataRequest> for AuthenticatedGemmaDecode
     }
 }
 
+impl AuthRead<GemmaDecodeTransitionMetadataRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = GemmaDecodeTransitionMetadata;
+
+    fn auth_read(&self, request: GemmaDecodeTransitionMetadataRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => Ok(source.metadata.clone()),
+        }
+    }
+}
+
 impl AuthRead<GemmaDecodeEmbeddingRowRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = Vec<Act>;
 
     fn auth_read(&self, request: GemmaDecodeEmbeddingRowRequest) -> Result<Self::Output> {
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeEmbeddingRowRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = Vec<Act>;
+
+    fn auth_read(&self, request: GemmaDecodeEmbeddingRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_embedding_row(request),
+        }
     }
 }
 
@@ -696,11 +765,45 @@ impl AuthRead<GemmaDecodeLayerMetadataRequest> for AuthenticatedGemmaDecodeTrans
     }
 }
 
+impl AuthRead<GemmaDecodeLayerMetadataRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = GemmaDecodeLayerMetadata;
+
+    fn auth_read(&self, request: GemmaDecodeLayerMetadataRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source
+                .layers
+                .get(request.layer_idx)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Gemma decode layer index {} is out of range for {} layers",
+                        request.layer_idx,
+                        source.layers.len()
+                    )
+                }),
+        }
+    }
+}
+
 impl AuthRead<GemmaDecodeLayerScalarsRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = GemmaDecodeLayerScalars;
 
     fn auth_read(&self, request: GemmaDecodeLayerScalarsRequest) -> Result<Self::Output> {
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeLayerScalarsRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = GemmaDecodeLayerScalars;
+
+    fn auth_read(&self, request: GemmaDecodeLayerScalarsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_layer_scalars(request),
+        }
     }
 }
 
@@ -712,11 +815,35 @@ impl AuthRead<GemmaDecodeLayerMatrixRowRequest> for AuthenticatedGemmaDecodeTran
     }
 }
 
+impl AuthRead<GemmaDecodeLayerMatrixRowRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaDecodeLayerMatrixRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_layer_matrix_row(request),
+        }
+    }
+}
+
 impl AuthRead<GemmaDecodeLayerNormWeightsRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaDecodeLayerNormWeightsRequest) -> Result<Self::Output> {
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeLayerNormWeightsRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaDecodeLayerNormWeightsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_layer_norm_weights(request),
+        }
     }
 }
 
@@ -728,6 +855,18 @@ impl AuthRead<GemmaDecodePleTokenEmbeddingRowRequest> for AuthenticatedGemmaDeco
     }
 }
 
+impl AuthRead<GemmaDecodePleTokenEmbeddingRowRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = Vec<Act>;
+
+    fn auth_read(&self, request: GemmaDecodePleTokenEmbeddingRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_ple_token_embedding_row(request),
+        }
+    }
+}
+
 impl AuthRead<GemmaDecodePleModelProjectionRowRequest>
     for AuthenticatedGemmaDecodeTransitionSource
 {
@@ -735,6 +874,18 @@ impl AuthRead<GemmaDecodePleModelProjectionRowRequest>
 
     fn auth_read(&self, request: GemmaDecodePleModelProjectionRowRequest) -> Result<Self::Output> {
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodePleModelProjectionRowRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaDecodePleModelProjectionRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_ple_model_projection_row(request),
+        }
     }
 }
 
@@ -751,11 +902,44 @@ impl AuthRead<GemmaDecodePleProjectionNormWeightsRequest>
     }
 }
 
+impl AuthRead<GemmaDecodePleProjectionNormWeightsRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(
+        &self,
+        request: GemmaDecodePleProjectionNormWeightsRequest,
+    ) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => {
+                let _ = request;
+                source.native_ple_projection_norm_weights()
+            }
+        }
+    }
+}
+
 impl AuthRead<GemmaDecodePleScalarsRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = GemmaDecodePleScalars;
 
     fn auth_read(&self, request: GemmaDecodePleScalarsRequest) -> Result<Self::Output> {
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodePleScalarsRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = GemmaDecodePleScalars;
+
+    fn auth_read(&self, request: GemmaDecodePleScalarsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => {
+                let _ = request;
+                source.native_ple_scalars()
+            }
+        }
     }
 }
 
@@ -767,6 +951,21 @@ impl AuthRead<GemmaDecodeFinalNormWeightsRequest> for AuthenticatedGemmaDecodeTr
     }
 }
 
+impl AuthRead<GemmaDecodeFinalNormWeightsRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaDecodeFinalNormWeightsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => {
+                let _ = request;
+                source.native_final_norm_weights()
+            }
+        }
+    }
+}
+
 impl AuthRead<GemmaDecodeFinalScalarsRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = GemmaDecodeFinalScalars;
 
@@ -775,11 +974,38 @@ impl AuthRead<GemmaDecodeFinalScalarsRequest> for AuthenticatedGemmaDecodeTransi
     }
 }
 
+impl AuthRead<GemmaDecodeFinalScalarsRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = GemmaDecodeFinalScalars;
+
+    fn auth_read(&self, request: GemmaDecodeFinalScalarsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => {
+                let _ = request;
+                Ok(source.native_final_scalars())
+            }
+        }
+    }
+}
+
 impl AuthRead<GemmaDecodeProjectionRowRequest> for AuthenticatedGemmaDecodeTransitionSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaDecodeProjectionRowRequest) -> Result<Self::Output> {
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaDecodeProjectionRowRequest> for RasterDecodeTransitionSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaDecodeProjectionRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_projection_row(request),
+        }
     }
 }
 

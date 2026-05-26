@@ -3,6 +3,9 @@ name = "raster-inference"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+unchecked-raster-integrity = []
+
 [[bin]]
 name = "gemma-fp32-converter"
 path = "tools/gemma-fp32-converter/main.rs"

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, marker::PhantomData};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -9,6 +9,8 @@ use crate::shared::artifacts::external_artifacts::{
     CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
     ExternalSourceRef,
 };
+#[cfg(feature = "unchecked-raster-integrity")]
+use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
     Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4ModelProvenance,
     Gemma4TransformerModel,
@@ -22,6 +24,50 @@ pub struct AuthenticatedGemmaPrefillLayerSource {
     layers: Vec<GemmaPrefillLayerMetadata>,
     backing_layers: Vec<GemmaPrefillLayerBacking>,
     committed_source: RefCell<Option<CommittedExternalSource>>,
+}
+
+pub enum RasterPrefillLayerSource<'a> {
+    Committed {
+        source: CommittedExternalSource,
+        _marker: PhantomData<&'a AuthenticatedGemmaPrefillLayerSource>,
+    },
+    #[cfg(feature = "unchecked-raster-integrity")]
+    DirectUnchecked {
+        source: &'a AuthenticatedGemmaPrefillLayerSource,
+        root: String,
+    },
+}
+
+impl<'a> RasterPrefillLayerSource<'a> {
+    pub fn for_current_integrity_mode(
+        source: &'a AuthenticatedGemmaPrefillLayerSource,
+    ) -> Result<Self> {
+        #[cfg(feature = "unchecked-raster-integrity")]
+        if raster_integrity_is_unchecked() {
+            return Ok(Self::DirectUnchecked {
+                root: unchecked_direct_prefill_layer_root(source.identifier()),
+                source,
+            });
+        }
+
+        Ok(Self::Committed {
+            source: source.committed_source()?,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn root(&self) -> &str {
+        match self {
+            Self::Committed { source, .. } => source.root(),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { root, .. } => root,
+        }
+    }
+}
+
+#[cfg(feature = "unchecked-raster-integrity")]
+fn unchecked_direct_prefill_layer_root(identifier: &str) -> String {
+    format!("raster-unchecked-test:direct-prefill-layer:{identifier}")
 }
 
 #[derive(Debug, Clone)]
@@ -381,12 +427,46 @@ impl AuthRead<GemmaPrefillLayerSourceMetadataRequest> for AuthenticatedGemmaPref
     }
 }
 
+impl AuthRead<GemmaPrefillLayerSourceMetadataRequest> for RasterPrefillLayerSource<'_> {
+    type Output = GemmaPrefillLayerSourceMetadata;
+
+    fn auth_read(&self, request: GemmaPrefillLayerSourceMetadataRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => Ok(source.source_metadata()),
+        }
+    }
+}
+
 impl AuthRead<GemmaPrefillLayerMetadataRequest> for AuthenticatedGemmaPrefillLayerSource {
     type Output = GemmaPrefillLayerMetadata;
 
     fn auth_read(&self, request: GemmaPrefillLayerMetadataRequest) -> Result<Self::Output> {
         self.ensure_layer_index(request.layer_idx)?;
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaPrefillLayerMetadataRequest> for RasterPrefillLayerSource<'_> {
+    type Output = GemmaPrefillLayerMetadata;
+
+    fn auth_read(&self, request: GemmaPrefillLayerMetadataRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source
+                .layers
+                .get(request.layer_idx)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Gemma prefill layer index {} is out of range for {} layers",
+                        request.layer_idx,
+                        source.layers.len()
+                    )
+                }),
+        }
     }
 }
 
@@ -399,12 +479,39 @@ impl AuthRead<GemmaPrefillLayerScalarsRequest> for AuthenticatedGemmaPrefillLaye
     }
 }
 
+impl AuthRead<GemmaPrefillLayerScalarsRequest> for RasterPrefillLayerSource<'_> {
+    type Output = GemmaPrefillLayerScalars;
+
+    fn auth_read(&self, request: GemmaPrefillLayerScalarsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_scalars(request),
+        }
+    }
+}
+
 impl AuthRead<GemmaPrefillLayerMatrixRowRequest> for AuthenticatedGemmaPrefillLayerSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPrefillLayerMatrixRowRequest) -> Result<Self::Output> {
         self.ensure_matrix_row_request(request)?;
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaPrefillLayerMatrixRowRequest> for RasterPrefillLayerSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPrefillLayerMatrixRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => {
+                source.ensure_matrix_row_request(request)?;
+                source.native_matrix_row(request)
+            }
+        }
     }
 }
 
@@ -415,6 +522,18 @@ impl AuthRead<GemmaPrefillLayerNormWeightsRequest> for AuthenticatedGemmaPrefill
         self.backing_layer(request.layer_idx)?
             .norm_weights(request.norm, request.layer_idx)?;
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaPrefillLayerNormWeightsRequest> for RasterPrefillLayerSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPrefillLayerNormWeightsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_norm_weights(request),
+        }
     }
 }
 

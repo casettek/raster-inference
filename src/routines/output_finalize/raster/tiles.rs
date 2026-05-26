@@ -130,7 +130,7 @@ pub fn init_raster_output_detokenize(
     tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<(RasterArtifactStoreRoots, RasterOutputDetokenizeState)> {
     validate_output_byte_flush_bytes_per_tile(input_roots.byte_flush_bytes_per_tile)?;
-    let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
+    let tokenizer_source_root = tokenizer.raster_source_root_for_current_integrity_mode()?;
     if input_roots.tokenizer_source_root != tokenizer_source_root {
         bail!(
             "raster output finalize tokenizer source root {} does not match input source root {}",
@@ -193,7 +193,7 @@ pub fn decode_next_output_token_with_roots(
     mut detokenize_state: RasterOutputDetokenizeState,
     tokenizer: &AuthenticatedGemmaTokenizer,
 ) -> Result<(bool, RasterOutputDetokenizeState)> {
-    let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
+    let tokenizer_source_root = tokenizer.raster_source_root_for_current_integrity_mode()?;
     if detokenize_state.tokenizer_source_root != tokenizer_source_root {
         bail!(
             "raster output finalize tokenizer source root {} does not match state source root {}",

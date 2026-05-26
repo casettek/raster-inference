@@ -56,15 +56,21 @@ pub fn run_raster(
     layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
 ) -> Result<raster::RasterPrefillFinalizeOutput> {
-    let finalize_source_ref = finalize_source.committed_source_ref()?;
-    raster::main(raster::RasterPrefillFinalizeInputRoots {
-        artifact_store_roots,
-        prompt_token_count,
-        finalize_source_root: finalize_source_ref.root().to_string(),
-        final_hidden_states_ref,
-        layer_caches,
-        projection_rows_per_tile,
-    })
+    let finalize_source =
+        raster::auth_source::RasterPrefillFinalizeSource::for_current_integrity_mode(
+            finalize_source,
+        )?;
+    raster::main(
+        raster::RasterPrefillFinalizeInputRoots {
+            artifact_store_roots,
+            prompt_token_count,
+            finalize_source_root: finalize_source.root().to_string(),
+            final_hidden_states_ref,
+            layer_caches,
+            projection_rows_per_tile,
+        },
+        &finalize_source,
+    )
 }
 
 /// Compatibility boundary: materializes raster prefill refs into the public

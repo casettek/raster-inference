@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{marker::PhantomData, sync::Arc};
 
 use crate::shared::artifacts::artifact_io::AuthRead;
 use crate::shared::artifacts::external_artifacts::{
@@ -7,6 +7,8 @@ use crate::shared::artifacts::external_artifacts::{
     CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
     ExternalSourceRef,
 };
+#[cfg(feature = "unchecked-raster-integrity")]
+use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
     DetNumMatrix, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource,
@@ -30,6 +32,56 @@ pub struct AuthenticatedGemmaPrefillFinalizeSource {
     final_norm_weights: Vec<Wgt>,
     scalars: GemmaPrefillFinalizeScalars,
     projection: GemmaPrefillFinalizeProjectionBacking,
+}
+
+#[derive(Debug)]
+pub enum RasterPrefillFinalizeSource<'a> {
+    Committed {
+        source: CommittedExternalSource,
+        _marker: PhantomData<&'a AuthenticatedGemmaPrefillFinalizeSource>,
+    },
+    #[cfg(feature = "unchecked-raster-integrity")]
+    DirectUnchecked {
+        source: &'a AuthenticatedGemmaPrefillFinalizeSource,
+        root: String,
+    },
+}
+
+impl<'a> RasterPrefillFinalizeSource<'a> {
+    pub fn for_current_integrity_mode(
+        source: &'a AuthenticatedGemmaPrefillFinalizeSource,
+    ) -> Result<Self> {
+        #[cfg(feature = "unchecked-raster-integrity")]
+        if raster_integrity_is_unchecked() {
+            return Ok(Self::DirectUnchecked {
+                root: format!(
+                    "raster-unchecked-test:direct-prefill-finalize:{}",
+                    source.identifier()
+                ),
+                source,
+            });
+        }
+
+        Ok(Self::Committed {
+            source: source.committed_source()?,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn root(&self) -> &str {
+        match self {
+            Self::Committed { source, .. } => source.root(),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { root, .. } => root,
+        }
+    }
+
+    pub fn from_committed_root(root: &str) -> Result<Self> {
+        Ok(Self::Committed {
+            source: CommittedExternalSource::from_root(root)?,
+            _marker: PhantomData,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +240,18 @@ impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for AuthenticatedGemmaPrefill
     }
 }
 
+impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for RasterPrefillFinalizeSource<'_> {
+    type Output = GemmaPrefillFinalizeMetadata;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeMetadataRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.auth_read(request),
+        }
+    }
+}
+
 impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for AuthenticatedGemmaPrefillFinalizeSource {
     type Output = Vec<Wgt>;
 
@@ -196,11 +260,35 @@ impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for AuthenticatedGemmaPref
     }
 }
 
+impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for RasterPrefillFinalizeSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeNormWeightsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.auth_read(request),
+        }
+    }
+}
+
 impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for AuthenticatedGemmaPrefillFinalizeSource {
     type Output = GemmaPrefillFinalizeScalars;
 
     fn auth_read(&self, _request: GemmaPrefillFinalizeScalarsRequest) -> Result<Self::Output> {
         Ok(self.scalars)
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for RasterPrefillFinalizeSource<'_> {
+    type Output = GemmaPrefillFinalizeScalars;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeScalarsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.auth_read(request),
+        }
     }
 }
 
@@ -214,6 +302,18 @@ impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest>
             GemmaPrefillFinalizeProjectionBacking::Matrix(matrix) => {
                 matrix_row_wgts(matrix, request.row_idx, "lm_head")
             }
+        }
+    }
+}
+
+impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest> for RasterPrefillFinalizeSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPrefillFinalizeProjectionRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.auth_read(request),
         }
     }
 }

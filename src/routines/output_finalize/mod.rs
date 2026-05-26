@@ -191,7 +191,7 @@ fn prepare_raster_output_finalize_input_roots_from_state(
     Ok(raster::RasterOutputFinalizeInputRoots {
         artifact_store_roots: decode_state.artifact_store_roots,
         generated_token_ids_ref,
-        tokenizer_source_root: tokenizer.committed_source_ref()?.root().to_string(),
+        tokenizer_source_root: tokenizer.raster_source_root_for_current_integrity_mode()?,
         output_text_source_name: "output.finalize.output.text".to_string(),
         pending_bytes_source_prefix: "output.finalize.output.pending_bytes".to_string(),
         byte_flush_bytes_per_tile,

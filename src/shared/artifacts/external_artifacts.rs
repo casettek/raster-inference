@@ -7,6 +7,7 @@ use crate::shared::artifacts::artifact_io::AuthRead;
 use crate::shared::artifacts::authenticated_selection::{
     AuthenticatedSelector, VerifiedSelectedPayload,
 };
+use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::artifacts::merkle::{
     merkle_proof, merkle_root, verify_merkle_proof, MerkleProof,
 };
@@ -307,7 +308,7 @@ impl ExternalSourceStore {
         match self.sources.get(&id) {
             Some(existing) => {
                 let existing_ref = external_source_ref(id, &existing.metadata, &existing.leaves);
-                if existing_ref != source_ref {
+                if existing.metadata != metadata || existing.leaves != leaves {
                     bail!(
                         "external source id {} is already registered with a different commitment",
                         existing_ref.id().source_name()
@@ -346,7 +347,7 @@ impl ExternalSourceStore {
         for (leaf_idx, payload) in source.leaves.iter().enumerate() {
             let leaf = decode_source_leaf(payload)?;
             if leaf.request_key == request_key {
-                let proof = merkle_proof(source.metadata.domain_bytes(), &source.leaves, leaf_idx)?;
+                let proof = external_read_proof(&source.metadata, &source.leaves, leaf_idx)?;
                 return Ok(Some(ExternalSourceRead {
                     leaf_idx,
                     payload: payload.clone(),
@@ -360,7 +361,7 @@ impl ExternalSourceStore {
 
     pub fn source_ref_for_root(&self, root: &str) -> Result<ExternalSourceRef> {
         let mut matches = self.sources.iter().filter_map(|(id, source)| {
-            let actual_root = source_root(&source.metadata, &source.leaves);
+            let actual_root = source_root_for_id(id, &source.metadata, &source.leaves);
             (actual_root == root).then_some((id, source))
         });
         let Some((id, source)) = matches.next() else {
@@ -475,6 +476,9 @@ pub fn verify_external_source_read(
             source_ref.metadata.leaf_count()
         );
     }
+    if raster_integrity_is_unchecked() {
+        return Ok(());
+    }
     verify_merkle_proof(
         source_ref.metadata.domain_bytes(),
         source_ref.root(),
@@ -580,9 +584,9 @@ fn external_source_ref(
     leaves: &[Vec<u8>],
 ) -> ExternalSourceRef {
     ExternalSourceRef {
+        root: source_root_for_id(&id, metadata, leaves),
         id,
         metadata: metadata.clone(),
-        root: source_root(metadata, leaves),
     }
 }
 
@@ -590,9 +594,37 @@ fn source_root(metadata: &ExternalSourceMetadata, leaves: &[Vec<u8>]) -> String 
     merkle_root(metadata.domain_bytes(), leaves)
 }
 
+fn source_root_for_id(
+    id: &ExternalSourceId,
+    metadata: &ExternalSourceMetadata,
+    leaves: &[Vec<u8>],
+) -> String {
+    if raster_integrity_is_unchecked() {
+        format!("raster-unchecked-test:external:{}", id.source_name())
+    } else {
+        source_root(metadata, leaves)
+    }
+}
+
+fn external_read_proof(
+    metadata: &ExternalSourceMetadata,
+    leaves: &[Vec<u8>],
+    leaf_idx: usize,
+) -> Result<MerkleProof> {
+    if raster_integrity_is_unchecked() {
+        MerkleProof::new(leaves.len(), Vec::new())
+    } else {
+        merkle_proof(metadata.domain_bytes(), leaves, leaf_idx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "unchecked-raster-integrity")]
+    use crate::shared::artifacts::integrity_mode::{
+        with_raster_integrity_mode, RasterIntegrityMode,
+    };
 
     const KIND: &str = "test_source";
     const DOMAIN: &str = "raster-external-source-test-merkle-v1";
@@ -679,6 +711,51 @@ mod tests {
         assert_eq!(selected.bytes(), b"response");
         assert_eq!(selected.proof().leaf_count(), 1);
         assert_ne!(selected.merkle_leaf_payload(), selected.bytes());
+    }
+
+    #[cfg(feature = "unchecked-raster-integrity")]
+    #[test]
+    fn unchecked_mode_uses_synthetic_external_roots_and_dummy_proofs() {
+        with_raster_integrity_mode(RasterIntegrityMode::UncheckedTestOnly, || {
+            reset_external_source_store();
+            let request_key = external_request_key("test.request", b"a").expect("request key");
+            let source_ref = register_external_source(
+                ExternalSourceId::new("unchecked").expect("source id"),
+                KIND,
+                DOMAIN,
+                vec![
+                    ExternalSourceEntry::new(request_key.clone(), b"response".to_vec())
+                        .expect("entry"),
+                ],
+            )
+            .expect("source should register");
+            assert_eq!(
+                source_ref.root(),
+                "raster-unchecked-test:external:unchecked"
+            );
+
+            let selected =
+                read_authenticated_external_source_by_root(source_ref.root(), &request_key)
+                    .expect("authenticated read should succeed")
+                    .expect("response should exist");
+
+            assert_eq!(selected.bytes(), b"response");
+            assert_eq!(selected.commitment(), source_ref.root());
+            assert_eq!(selected.proof().leaf_count(), 1);
+            assert!(selected.proof().siblings().is_empty());
+
+            let duplicate = register_external_source(
+                ExternalSourceId::new("unchecked").expect("source id"),
+                KIND,
+                DOMAIN,
+                vec![
+                    ExternalSourceEntry::new(request_key.clone(), b"different".to_vec())
+                        .expect("entry"),
+                ],
+            )
+            .expect_err("unchecked mode should still reject different data for a source id");
+            assert!(duplicate.to_string().contains("different commitment"));
+        });
     }
 
     #[test]

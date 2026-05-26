@@ -4,6 +4,7 @@ use crate::dsl::prelude::{auth_read, call_recur_tile, call_seq, call_tile, seque
 use crate::prefill_finalize::raster::auth_source::{
     GemmaPrefillFinalizeMetadataRequest, GemmaPrefillFinalizeNormWeightsRequest,
     GemmaPrefillFinalizeProjectionRowRequest, GemmaPrefillFinalizeScalarsRequest,
+    RasterPrefillFinalizeSource,
 };
 use crate::shared::artifacts::raster_artifact_store::{RasterArtifactId, RasterArtifactStoreRoots};
 use crate::shared::model::transformer::TransformerPrefillResult;
@@ -25,7 +26,10 @@ use super::utils::*;
 // Raster execution sequences, ordered from the primary entry point outward.
 
 #[sequence]
-pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<RasterPrefillFinalizeOutput> {
+pub fn main(
+    input_roots: RasterPrefillFinalizeInputRoots,
+    finalize_source: &RasterPrefillFinalizeSource<'_>,
+) -> Result<RasterPrefillFinalizeOutput> {
     crate::trace::trace_event("prefill.select_final_position");
     let finalize_state = call_tile!(
         init_prefill_finalize_state,
@@ -34,11 +38,20 @@ pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<RasterPrefil
         input_roots.finalize_source_root,
         input_roots.final_hidden_states_ref,
         &input_roots.layer_caches,
-        input_roots.projection_rows_per_tile
+        input_roots.projection_rows_per_tile,
+        finalize_source
     )?;
-    let finalize_state = call_tile!(normalize_final_position_to_artifact, finalize_state)?;
+    let finalize_state = call_tile!(
+        normalize_final_position_to_artifact,
+        finalize_state,
+        finalize_source
+    )?;
     crate::trace::trace_event("prefill.project_to_logits");
-    let finalize_state = call_recur_tile!(project_next_prefill_logit_chunk, finalize_state)?;
+    let finalize_state = call_recur_tile!(
+        project_next_prefill_logit_chunk,
+        finalize_state,
+        finalize_source
+    )?;
     let (artifact_store_roots, refs) = call_tile!(
         finalize_prefill_finalize_refs,
         finalize_state,
@@ -51,7 +64,9 @@ pub fn main(input_roots: RasterPrefillFinalizeInputRoots) -> Result<RasterPrefil
 pub fn materialize_prefill_result_for_api(
     input_roots: RasterPrefillFinalizeInputRoots,
 ) -> Result<TransformerPrefillResult> {
-    let output = call_seq!(main, input_roots)?;
+    let finalize_source =
+        RasterPrefillFinalizeSource::from_committed_root(&input_roots.finalize_source_root)?;
+    let output = call_seq!(main, input_roots, &finalize_source)?;
     call_tile!(
         build_prefill_result_from_refs,
         output.artifact_store_roots,
@@ -69,6 +84,7 @@ pub fn init_prefill_finalize_state(
     final_hidden_states_ref: RasterActivationSequenceRef,
     layer_caches: &[crate::prefill_layer::raster::PrefillLayerCacheSlot],
     projection_rows_per_tile: usize,
+    finalize_source: &RasterPrefillFinalizeSource<'_>,
 ) -> Result<PrefillFinalizeRasterState> {
     validate_projection_rows_per_tile(projection_rows_per_tile)?;
     if prompt_token_count == 0 {
@@ -87,10 +103,14 @@ pub fn init_prefill_finalize_state(
     )?;
     validate_layer_cache_roots(&artifact_store_roots, layer_caches)?;
 
-    let metadata = auth_read!(
-        finalize_source_root.as_str(),
-        GemmaPrefillFinalizeMetadataRequest
-    )?;
+    if finalize_source_root != finalize_source.root() {
+        bail!(
+            "raster prefill finalize source root {} does not match input source root {}",
+            finalize_source.root(),
+            finalize_source_root
+        );
+    }
+    let metadata = auth_read!(finalize_source, GemmaPrefillFinalizeMetadataRequest)?;
     if metadata.projection_rows == 0 {
         bail!("deterministic logits projection requires at least one projection row");
     }
@@ -108,10 +128,7 @@ pub fn init_prefill_finalize_state(
             metadata.hidden_width
         );
     }
-    let scalars = auth_read!(
-        finalize_source_root.as_str(),
-        GemmaPrefillFinalizeScalarsRequest
-    )?;
+    let scalars = auth_read!(finalize_source, GemmaPrefillFinalizeScalarsRequest)?;
     artifact_store_roots = start_sequence_builder_with_roots(
         &artifact_store_roots,
         RasterArtifactId::new(NORMALIZED_FINAL_POSITION_ARTIFACT_NAME)?,
@@ -143,7 +160,15 @@ pub fn init_prefill_finalize_state(
 #[tile]
 pub fn normalize_final_position_to_artifact(
     mut finalize_state: PrefillFinalizeRasterState,
+    finalize_source: &RasterPrefillFinalizeSource<'_>,
 ) -> Result<PrefillFinalizeRasterState> {
+    if finalize_state.finalize_source_root != finalize_source.root() {
+        bail!(
+            "raster prefill finalize source root {} does not match state source root {}",
+            finalize_source.root(),
+            finalize_state.finalize_source_root
+        );
+    }
     let (row_count, _) = finalize_state
         .final_hidden_states_ref
         .tensor_ref()
@@ -156,14 +181,8 @@ pub fn normalize_final_position_to_artifact(
             row_idx: row_count - 1,
         },
     )?;
-    let norm_weights = auth_read!(
-        finalize_state.finalize_source_root.as_str(),
-        GemmaPrefillFinalizeNormWeightsRequest
-    )?;
-    let scalars = auth_read!(
-        finalize_state.finalize_source_root.as_str(),
-        GemmaPrefillFinalizeScalarsRequest
-    )?;
+    let norm_weights = auth_read!(finalize_source, GemmaPrefillFinalizeNormWeightsRequest)?;
+    let scalars = auth_read!(finalize_source, GemmaPrefillFinalizeScalarsRequest)?;
     let normalized = rms_norm_sequence(
         &RasterActivationSequence::from_rows(vec![final_position]),
         Some(&norm_weights),
@@ -200,9 +219,17 @@ pub fn normalize_final_position_to_artifact(
 #[tile(kind = recursive)]
 pub fn project_next_prefill_logit_chunk(
     mut finalize_state: PrefillFinalizeRasterState,
+    finalize_source: &RasterPrefillFinalizeSource<'_>,
 ) -> Result<(bool, PrefillFinalizeRasterState)> {
     if finalize_state.is_complete() {
         return Ok((true, finalize_state));
+    }
+    if finalize_state.finalize_source_root != finalize_source.root() {
+        bail!(
+            "raster prefill finalize source root {} does not match state source root {}",
+            finalize_source.root(),
+            finalize_state.finalize_source_root
+        );
     }
     let normalized_final_position_ref = finalize_state
         .normalized_final_position_ref
@@ -229,7 +256,7 @@ pub fn project_next_prefill_logit_chunk(
         .min(finalize_state.logit_count);
     while finalize_state.next_logit_idx < end {
         let projection_row = auth_read!(
-            finalize_state.finalize_source_root.as_str(),
+            finalize_source,
             GemmaPrefillFinalizeProjectionRowRequest {
                 row_idx: finalize_state.next_logit_idx,
             },

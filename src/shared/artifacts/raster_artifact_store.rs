@@ -6,6 +6,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::shared::artifacts::authenticated_selection::{
     AuthenticatedSelector, VerifiedSelectedPayload,
 };
+use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::artifacts::merkle::{
     merkle_proof, merkle_root, verify_merkle_proof, MerkleProof,
 };
@@ -644,7 +645,7 @@ impl RasterArtifactStore {
             .map(|(id, artifact)| RasterArtifactRootEntry {
                 id: id.clone(),
                 metadata: artifact.metadata.clone(),
-                root: artifact_root(&artifact.metadata, &artifact.leaves),
+                root: artifact_root_for_id(id, &artifact.metadata, &artifact.leaves),
             })
             .collect::<Vec<_>>();
         artifacts.sort_by(|left, right| left.id.source_name().cmp(right.id.source_name()));
@@ -656,7 +657,7 @@ impl RasterArtifactStore {
                 id: id.clone(),
                 metadata: builder.metadata.clone(),
                 leaves_written: builder.leaves.len(),
-                running_root: artifact_root(&builder.metadata, &builder.leaves),
+                running_root: builder_root_for_id(id, &builder.metadata, &builder.leaves),
             })
             .collect::<Vec<_>>();
         builders.sort_by(|left, right| left.id.source_name().cmp(right.id.source_name()));
@@ -939,7 +940,7 @@ impl RasterArtifactStore {
             .get(leaf_idx)
             .ok_or_else(|| anyhow!("raster artifact leaf {leaf_idx} is missing"))?
             .clone();
-        let proof = merkle_proof(artifact.metadata.domain_bytes(), &artifact.leaves, leaf_idx)?;
+        let proof = artifact_read_proof(&artifact.metadata, &artifact.leaves, leaf_idx)?;
         Ok(RasterArtifactRead {
             leaf_idx,
             payload,
@@ -975,7 +976,7 @@ impl RasterArtifactStore {
 
     pub fn artifact_ref_for_root(&self, root: &str) -> Result<RasterArtifactRef> {
         let mut matches = self.artifacts.iter().filter_map(|(id, artifact)| {
-            let actual_root = artifact_root(&artifact.metadata, &artifact.leaves);
+            let actual_root = artifact_root_for_id(id, &artifact.metadata, &artifact.leaves);
             (actual_root == root).then_some((id, artifact))
         });
         let Some((id, artifact)) = matches.next() else {
@@ -992,11 +993,9 @@ impl RasterArtifactStore {
     }
 
     pub fn artifact_ref_for_root_any(&self, root: &str) -> Result<RasterArtifactRef> {
-        let Some((id, artifact)) = self
-            .artifacts
-            .iter()
-            .find(|(_, artifact)| artifact_root(&artifact.metadata, &artifact.leaves) == root)
-        else {
+        let Some((id, artifact)) = self.artifacts.iter().find(|(id, artifact)| {
+            artifact_root_for_id(id, &artifact.metadata, &artifact.leaves) == root
+        }) else {
             bail!("raster artifact root {root} is not registered");
         };
         Ok(RasterArtifactRef {
@@ -1008,7 +1007,7 @@ impl RasterArtifactStore {
 
     fn builder_ref_for_root(&self, root: &str) -> Result<RasterArtifactBuilderRef> {
         let mut matches = self.builders.iter().filter_map(|(id, state)| {
-            let running_root = artifact_root(&state.metadata, &state.leaves);
+            let running_root = builder_root_for_id(id, &state.metadata, &state.leaves);
             (running_root == root).then_some((id, state, running_root))
         });
         let Some((id, state, running_root)) = matches.next() else {
@@ -1091,7 +1090,8 @@ impl RasterArtifactStore {
         if artifact.metadata != artifact_ref.metadata {
             bail!("raster artifact ref metadata mismatch");
         }
-        let actual_root = artifact_root(&artifact.metadata, &artifact.leaves);
+        let actual_root =
+            artifact_root_for_id(artifact_ref.id(), &artifact.metadata, &artifact.leaves);
         if actual_root != artifact_ref.root {
             bail!(
                 "raster artifact root mismatch: {} vs {}",
@@ -1336,6 +1336,9 @@ pub fn verify_artifact_read(
             artifact_ref.metadata.leaf_count()
         );
     }
+    if raster_integrity_is_unchecked() {
+        return Ok(());
+    }
     verify_merkle_proof(
         artifact_ref.metadata.domain_bytes(),
         artifact_ref.root(),
@@ -1433,9 +1436,9 @@ fn decode_postcard_leaf<T: DeserializeOwned>(payload: &[u8], label: &str) -> Res
 
 fn artifact_ref(id: RasterArtifactId, state: &ArtifactBuilderState) -> RasterArtifactRef {
     RasterArtifactRef {
+        root: artifact_root_for_id(&id, &state.metadata, &state.leaves),
         id,
         metadata: state.metadata.clone(),
-        root: artifact_root(&state.metadata, &state.leaves),
     }
 }
 
@@ -1444,10 +1447,10 @@ fn artifact_builder_ref(
     state: &ArtifactBuilderState,
 ) -> RasterArtifactBuilderRef {
     RasterArtifactBuilderRef {
+        running_root: builder_root_for_id(&id, &state.metadata, &state.leaves),
         id,
         metadata: state.metadata.clone(),
         leaves_written: state.leaves.len(),
-        running_root: artifact_root(&state.metadata, &state.leaves),
     }
 }
 
@@ -1457,6 +1460,46 @@ fn update_builder_ref(builder_ref: &mut RasterArtifactBuilderRef, state: &Artifa
 
 fn artifact_root(metadata: &RasterArtifactMetadata, leaves: &[Vec<u8>]) -> String {
     merkle_root(metadata.domain_bytes(), leaves)
+}
+
+fn artifact_root_for_id(
+    id: &RasterArtifactId,
+    metadata: &RasterArtifactMetadata,
+    leaves: &[Vec<u8>],
+) -> String {
+    if raster_integrity_is_unchecked() {
+        unchecked_root("artifact", id)
+    } else {
+        artifact_root(metadata, leaves)
+    }
+}
+
+fn builder_root_for_id(
+    id: &RasterArtifactId,
+    metadata: &RasterArtifactMetadata,
+    leaves: &[Vec<u8>],
+) -> String {
+    if raster_integrity_is_unchecked() {
+        unchecked_root("builder", id)
+    } else {
+        artifact_root(metadata, leaves)
+    }
+}
+
+fn unchecked_root(kind: &str, id: &RasterArtifactId) -> String {
+    format!("raster-unchecked-test:{kind}:{}", id.source_name())
+}
+
+fn artifact_read_proof(
+    metadata: &RasterArtifactMetadata,
+    leaves: &[Vec<u8>],
+    leaf_idx: usize,
+) -> Result<MerkleProof> {
+    if raster_integrity_is_unchecked() {
+        MerkleProof::new(leaves.len(), Vec::new())
+    } else {
+        merkle_proof(metadata.domain_bytes(), leaves, leaf_idx)
+    }
 }
 
 fn ensure_builder_ref_matches(
@@ -1476,6 +1519,10 @@ fn ensure_builder_ref_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "unchecked-raster-integrity")]
+    use crate::shared::artifacts::integrity_mode::{
+        with_raster_integrity_mode, RasterIntegrityMode,
+    };
     use crate::shared::numerics::det_num::Act;
 
     fn artifact_id(name: &str) -> RasterArtifactId {
@@ -1791,6 +1838,48 @@ mod tests {
         assert_eq!(roots.artifacts.len(), 1);
         assert_eq!(roots.artifacts[0].root(), token_ref.root());
         assert!(roots.artifact_entry_for_root(token_ref.root()).is_ok());
+    }
+
+    #[cfg(feature = "unchecked-raster-integrity")]
+    #[test]
+    fn unchecked_mode_uses_synthetic_roots_without_rehashing_appends() {
+        with_raster_integrity_mode(RasterIntegrityMode::UncheckedTestOnly, || {
+            let mut store = RasterArtifactStore::new();
+            let roots = store.roots_snapshot();
+            let (roots, builder) = store
+                .start_builder_with_roots(
+                    &roots,
+                    artifact_id("tokens"),
+                    RasterArtifactMetadata::token_ids(2),
+                )
+                .expect("builder should start");
+            let builder_root = builder.running_root().to_string();
+            assert_eq!(builder_root, "raster-unchecked-test:builder:tokens");
+
+            let (roots, next_builder_root) = store
+                .append_leaf_by_builder_root_with_roots(&roots, &builder_root, 0, token_id_leaf(17))
+                .expect("first token append should succeed");
+            assert_eq!(next_builder_root, builder_root);
+            assert_eq!(roots.builders[0].running_root(), builder_root);
+            assert_eq!(roots.builders[0].leaves_written(), 1);
+
+            let (roots, next_builder_root) = store
+                .append_leaf_by_builder_root_with_roots(&roots, &builder_root, 1, token_id_leaf(23))
+                .expect("second token append should succeed");
+            assert_eq!(next_builder_root, builder_root);
+
+            let (roots, token_ref) = store
+                .finalize_builder_by_root_with_roots(&roots, &builder_root)
+                .expect("builder should finalize");
+            assert_eq!(token_ref.root(), "raster-unchecked-test:artifact:tokens");
+            assert_eq!(roots.artifacts[0].root(), token_ref.root());
+            let token_ref = RasterTokenIdSequenceRef::new(token_ref).expect("token ref");
+
+            assert_eq!(
+                materialize_token_ids(&store, &token_ref).expect("token ids"),
+                vec![17, 23]
+            );
+        });
     }
 
     #[test]

@@ -147,7 +147,7 @@ pub(in super::super) fn prepare_raster_prompt_input_roots(
         bpe_pairs_per_tile,
         bpe_pieces_per_tile,
     )?;
-    let tokenizer_source_root = tokenizer.committed_source_ref()?.root().to_string();
+    let tokenizer_source_root = tokenizer.raster_source_root_for_current_integrity_mode()?;
 
     let input_roots = RasterPromptInputRoots {
         tokenizer_source_root,
@@ -262,10 +262,11 @@ pub fn tokenize_prompt_with_controls(
         bpe_pairs_per_tile,
         bpe_pieces_per_tile,
     )?;
-    let tokenizer_source_root = tokenizer_ref.committed_source_ref()?.root().to_string();
+    let tokenizer_source_root = tokenizer_ref.raster_source_root_for_current_integrity_mode()?;
     let (_artifact_store_roots, tokenization) = super::tokenize_bpe_state(
         ArtifactIo::export_store_roots(),
         state,
+        tokenizer_ref,
         tokenizer_source_root,
     )?;
     Ok(tokenization)

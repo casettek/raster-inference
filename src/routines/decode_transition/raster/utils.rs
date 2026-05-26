@@ -8,10 +8,10 @@ use serde_json::json;
 use crate::decode_transition::raster::auth_source::{
     GemmaDecodeLayerMatrixRowRequest, GemmaDecodeLayerMetadata,
     GemmaDecodePleModelProjectionRowRequest, GemmaDecodeProjectionRowRequest,
+    RasterDecodeTransitionSource,
 };
 use crate::dsl::prelude::auth_read;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
-use crate::shared::artifacts::external_artifacts::CommittedExternalSource;
 use crate::shared::artifacts::raster_artifact_store::{
     activation_row_leaf, token_id_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
     RasterArtifactMetadata, RasterArtifactStoreRoots, RasterSelectedTokenRef,
@@ -115,7 +115,7 @@ pub(in super::super) fn trace_decode_layer_checkpoint_with_roots(
 }
 
 pub(in super::super) fn read_decode_projection_row(
-    source: &CommittedExternalSource,
+    source: &RasterDecodeTransitionSource<'_>,
     projection_kind: &DecodeProjectionKind,
     row_idx: usize,
 ) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
@@ -182,7 +182,7 @@ pub(in super::super) fn init_decode_row_projection_artifact_state(
 pub(in super::super) fn project_next_decode_projection_artifact_chunk(
     artifact_store_roots: RasterArtifactStoreRoots,
     mut projection_state: DecodeRowProjectionArtifactState,
-    source: &CommittedExternalSource,
+    source: &RasterDecodeTransitionSource<'_>,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,

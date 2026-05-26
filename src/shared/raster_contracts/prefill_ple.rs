@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, marker::PhantomData};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -9,6 +9,8 @@ use crate::shared::artifacts::external_artifacts::{
     CommittedExternalRequest, CommittedExternalSource, ExternalSourceEntry, ExternalSourceId,
     ExternalSourceRef,
 };
+#[cfg(feature = "unchecked-raster-integrity")]
+use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
     RasterArtifactStoreRoots,
@@ -27,6 +29,48 @@ pub struct AuthenticatedGemmaPleSource {
     scalars: Option<GemmaPleScalars>,
     backing: GemmaPleBacking,
     committed_source: RefCell<Option<CommittedExternalSource>>,
+}
+
+pub enum RasterPrefillPleSource<'a> {
+    Committed {
+        source: CommittedExternalSource,
+        _marker: PhantomData<&'a AuthenticatedGemmaPleSource>,
+    },
+    #[cfg(feature = "unchecked-raster-integrity")]
+    DirectUnchecked {
+        source: &'a AuthenticatedGemmaPleSource,
+        root: String,
+    },
+}
+
+impl<'a> RasterPrefillPleSource<'a> {
+    pub fn for_current_integrity_mode(source: &'a AuthenticatedGemmaPleSource) -> Result<Self> {
+        #[cfg(feature = "unchecked-raster-integrity")]
+        if raster_integrity_is_unchecked() {
+            return Ok(Self::DirectUnchecked {
+                root: unchecked_direct_ple_root(source.identifier()),
+                source,
+            });
+        }
+
+        Ok(Self::Committed {
+            source: source.committed_source()?,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn root(&self) -> &str {
+        match self {
+            Self::Committed { source, .. } => source.root(),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { root, .. } => root,
+        }
+    }
+}
+
+#[cfg(feature = "unchecked-raster-integrity")]
+fn unchecked_direct_ple_root(identifier: &str) -> String {
+    format!("raster-unchecked-test:direct-ple:{identifier}")
 }
 
 #[derive(Debug, Clone)]
@@ -700,6 +744,18 @@ impl AuthRead<GemmaPleMetadataRequest> for AuthenticatedGemmaPleSource {
     }
 }
 
+impl AuthRead<GemmaPleMetadataRequest> for RasterPrefillPleSource<'_> {
+    type Output = GemmaPleMetadata;
+
+    fn auth_read(&self, request: GemmaPleMetadataRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => Ok(source.metadata()),
+        }
+    }
+}
+
 impl AuthRead<GemmaPleLayerMetadataRequest> for AuthenticatedGemmaPleSource {
     type Output = GemmaPleLayerMetadata;
 
@@ -715,12 +771,46 @@ impl AuthRead<GemmaPleLayerMetadataRequest> for AuthenticatedGemmaPleSource {
     }
 }
 
+impl AuthRead<GemmaPleLayerMetadataRequest> for RasterPrefillPleSource<'_> {
+    type Output = GemmaPleLayerMetadata;
+
+    fn auth_read(&self, request: GemmaPleLayerMetadataRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source
+                .layers
+                .get(request.layer_idx)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Gemma PLE layer index {} is out of range for {} layers",
+                        request.layer_idx,
+                        source.layers.len()
+                    )
+                }),
+        }
+    }
+}
+
 impl AuthRead<GemmaPleTokenEmbeddingRowRequest> for AuthenticatedGemmaPleSource {
     type Output = Vec<Act>;
 
     fn auth_read(&self, request: GemmaPleTokenEmbeddingRowRequest) -> Result<Self::Output> {
         self.require_ple_global()?;
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaPleTokenEmbeddingRowRequest> for RasterPrefillPleSource<'_> {
+    type Output = Vec<Act>;
+
+    fn auth_read(&self, request: GemmaPleTokenEmbeddingRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_token_embedding_row(request),
+        }
     }
 }
 
@@ -733,6 +823,18 @@ impl AuthRead<GemmaPleModelProjectionRowRequest> for AuthenticatedGemmaPleSource
     }
 }
 
+impl AuthRead<GemmaPleModelProjectionRowRequest> for RasterPrefillPleSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPleModelProjectionRowRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => source.native_model_projection_row(request),
+        }
+    }
+}
+
 impl AuthRead<GemmaPleProjectionNormWeightsRequest> for AuthenticatedGemmaPleSource {
     type Output = Vec<Wgt>;
 
@@ -742,12 +844,42 @@ impl AuthRead<GemmaPleProjectionNormWeightsRequest> for AuthenticatedGemmaPleSou
     }
 }
 
+impl AuthRead<GemmaPleProjectionNormWeightsRequest> for RasterPrefillPleSource<'_> {
+    type Output = Vec<Wgt>;
+
+    fn auth_read(&self, request: GemmaPleProjectionNormWeightsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => {
+                let _ = request;
+                source.native_projection_norm_weights()
+            }
+        }
+    }
+}
+
 impl AuthRead<GemmaPleScalarsRequest> for AuthenticatedGemmaPleSource {
     type Output = GemmaPleScalars;
 
     fn auth_read(&self, request: GemmaPleScalarsRequest) -> Result<Self::Output> {
         self.require_ple_global()?;
         self.committed_source()?.auth_read(request)
+    }
+}
+
+impl AuthRead<GemmaPleScalarsRequest> for RasterPrefillPleSource<'_> {
+    type Output = GemmaPleScalars;
+
+    fn auth_read(&self, request: GemmaPleScalarsRequest) -> Result<Self::Output> {
+        match self {
+            Self::Committed { source, .. } => source.auth_read(request),
+            #[cfg(feature = "unchecked-raster-integrity")]
+            Self::DirectUnchecked { source, .. } => {
+                let _ = request;
+                source.native_scalars()
+            }
+        }
     }
 }
 
@@ -1086,7 +1218,11 @@ mod tests {
         AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleLayerMetadataRequest,
         GemmaPleMetadataRequest, GemmaPleModelProjectionRowRequest,
         GemmaPleProjectionNormWeightsRequest, GemmaPleScalars, GemmaPleScalarsRequest,
-        GemmaPleTokenEmbeddingRowRequest,
+        GemmaPleTokenEmbeddingRowRequest, RasterPrefillPleSource,
+    };
+    #[cfg(feature = "unchecked-raster-integrity")]
+    use crate::shared::artifacts::integrity_mode::{
+        with_raster_integrity_mode, RasterIntegrityMode,
     };
     use crate::shared::model::transformer::{
         DetNumTensorSliceSource, Gemma4ModelProvenance, Gemma4PleGlobalWeights, MatrixF32,
@@ -1155,6 +1291,39 @@ mod tests {
                 Wgt::from_num(-0.25)
             ]
         );
+    }
+
+    #[cfg(feature = "unchecked-raster-integrity")]
+    #[test]
+    fn unchecked_raster_source_reads_directly_without_committing_source() {
+        let source = canonical_source();
+        with_raster_integrity_mode(RasterIntegrityMode::UncheckedTestOnly, || {
+            let raster_source = RasterPrefillPleSource::for_current_integrity_mode(&source)
+                .expect("unchecked source should build");
+            assert_eq!(
+                raster_source.root(),
+                "raster-unchecked-test:direct-ple:ple-fixture"
+            );
+
+            let row = crate::auth_read!(
+                &raster_source,
+                GemmaPleModelProjectionRowRequest {
+                    layer_idx: 0,
+                    row_idx: 1,
+                },
+            )
+            .expect("direct projection row should read");
+
+            assert_eq!(
+                row,
+                vec![
+                    Wgt::from_num(0.5),
+                    Wgt::from_num(0.25),
+                    Wgt::from_num(-0.25)
+                ]
+            );
+            assert!(source.committed_source.borrow().is_none());
+        });
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::shared::api::input::{
 };
 use crate::shared::api::output::OutputDecodeState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::shared::artifacts::integrity_mode::current_raster_integrity_mode;
 use crate::shared::artifacts::raster_artifact_store::RasterTokenIdSequenceRef;
 use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::{Gemma4TransformerModel, TransformerStateTransitionState};
@@ -247,6 +248,7 @@ pub fn run_inference_with_controls(
                 "terminal_checkpoint_occurrence": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.occurrence()),
                 "commit_checkpoints": controls.commit_checkpoints,
                 "tile_dsl_mode": if use_raster_prefill { "raster" } else { "native" },
+                "raster_integrity_mode": current_raster_integrity_mode().label(),
                 "raster_sizing_controls": raster_sizing_controls,
             }));
             if use_raster_decode {
