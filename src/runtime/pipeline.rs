@@ -469,17 +469,30 @@ fn run_output_decode_with_mode_internal(
                 .expect("stop condition should have returned earlier")
         };
 
-        if let Some(controller) = detour_controller.as_deref_mut() {
-            controller.reject_if_selected_unsupported(RoutineId::DecodeTransition)?;
-        }
+        let detour_decode_transition = detour_controller
+            .as_deref_mut()
+            .is_some_and(|controller| controller.should_detour(RoutineId::DecodeTransition));
         trace_event("decode.step");
-        let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
-        let decode_transition = crate::decode_transition::run_with_mode(
-            transformer_decode_state,
-            next_token,
-            transformer_model,
-            execution_mode,
-        )?;
+        let decode_transition = if detour_decode_transition {
+            let raster_sizing = raster_sizing.context(
+                "selective raster decode.transition detour requires raster sizing controls",
+            )?;
+            crate::decode_transition::run_selected_raster_detour_from_native_boundary(
+                &decode_state,
+                next_token,
+                transformer_model,
+                raster_sizing,
+            )?
+        } else {
+            let transformer_decode_state =
+                std::mem::take(&mut decode_state.transformer_decode_state);
+            crate::decode_transition::run_with_mode(
+                transformer_decode_state,
+                next_token,
+                transformer_model,
+                execution_mode,
+            )?
+        };
         decode_transition_states.push(decode_transition.activation_state.clone());
         decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;

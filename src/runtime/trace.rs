@@ -456,6 +456,7 @@ fn trace_checkpointing_enabled() -> bool {
 
 fn should_commit_checkpoint(checkpoint_name: &str) -> bool {
     !checkpoint_name.starts_with("prefill.layer_token.")
+        && !checkpoint_name.starts_with("decode.layer_token.")
 }
 
 fn terminal_checkpoint_observes(checkpoint_name: &str) -> bool {
@@ -659,14 +660,15 @@ mod tests {
     use crate::runtime::checkpoints::RoutineId;
 
     #[test]
-    fn checkpoint_commitments_skip_prefill_layer_token_entries() {
+    fn checkpoint_commitments_skip_layer_token_entries() {
         assert!(!should_commit_checkpoint(
             "prefill.layer_token.layer_0.token_0"
         ));
         assert!(should_commit_checkpoint("prefill.layer"));
-        assert!(should_commit_checkpoint(
+        assert!(!should_commit_checkpoint(
             "decode.layer_token.layer_0.position_0"
         ));
+        assert!(should_commit_checkpoint("decode.transition"));
     }
 
     #[test]

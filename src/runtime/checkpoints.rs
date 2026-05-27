@@ -268,7 +268,7 @@ pub fn classify_checkpoint(checkpoint_name: &str) -> Option<CheckpointTaxonomy> 
             phase_id: PhaseId::OutputDecode,
             routine_id: RoutineId::SelectOutputToken,
         }),
-        "decode.finalize" => Some(CheckpointTaxonomy {
+        "decode.transition" => Some(CheckpointTaxonomy {
             phase_id: PhaseId::TransformerStateTransition,
             routine_id: RoutineId::DecodeTransition,
         }),
@@ -279,10 +279,6 @@ pub fn classify_checkpoint(checkpoint_name: &str) -> Option<CheckpointTaxonomy> 
         _ if checkpoint_name.starts_with("prefill.layer_token.") => Some(CheckpointTaxonomy {
             phase_id: PhaseId::TransformerStateTransition,
             routine_id: RoutineId::PrefillLayer,
-        }),
-        _ if checkpoint_name.starts_with("decode.layer_token.") => Some(CheckpointTaxonomy {
-            phase_id: PhaseId::TransformerStateTransition,
-            routine_id: RoutineId::DecodeTransition,
         }),
         _ => None,
     }
@@ -327,11 +323,15 @@ mod tests {
             })
         );
         assert_eq!(
-            classify_checkpoint("decode.layer_token.layer_5.position_17"),
+            classify_checkpoint("decode.transition"),
             Some(CheckpointTaxonomy {
                 phase_id: PhaseId::TransformerStateTransition,
                 routine_id: RoutineId::DecodeTransition,
             })
+        );
+        assert_eq!(
+            classify_checkpoint("decode.layer_token.layer_5.position_17"),
+            None
         );
     }
 
@@ -364,6 +364,13 @@ mod tests {
 
         assert!(error.to_string().contains("unknown routine id"));
         assert!(error.to_string().contains("prefill.layer"));
+
+        let error = "decode.layer_token.layer_0.position_0"
+            .parse::<RoutineId>()
+            .expect_err("decode sub-checkpoints should not parse as routine ids");
+
+        assert!(error.to_string().contains("unknown routine id"));
+        assert!(error.to_string().contains("decode.transition"));
     }
 
     #[test]

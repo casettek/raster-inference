@@ -912,6 +912,35 @@ mod tests {
             .collect()
     }
 
+    fn checkpoint_commitments_with_prefix(
+        payload: &serde_json::Value,
+        checkpoint_prefix: &str,
+    ) -> Vec<String> {
+        payload
+            .as_array()
+            .expect("checkpoint payload should be an array")
+            .iter()
+            .filter_map(|entry| {
+                let object = entry.as_object()?;
+                object.iter().find_map(|(checkpoint, commitment)| {
+                    checkpoint
+                        .starts_with(checkpoint_prefix)
+                        .then(|| commitment.as_str().map(ToString::to_string))
+                        .flatten()
+                })
+            })
+            .collect()
+    }
+
+    fn checkpoint_name_count(payload: &serde_json::Value, checkpoint: &str) -> usize {
+        payload
+            .as_array()
+            .expect("checkpoint payload should be an array")
+            .iter()
+            .filter(|entry| entry.get(checkpoint).is_some())
+            .count()
+    }
+
     struct TraceDirGuard {
         previous: Option<std::ffi::OsString>,
     }
@@ -2463,6 +2492,312 @@ mod tests {
         );
     }
 
+    fn assert_decode_transition_detour_matches_native(
+        test_name: &str,
+        max_new_tokens: usize,
+        detour_spec: &str,
+        expected_decode_transitions: usize,
+    ) {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let _trace_dir = TraceDirGuard::new(test_name);
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(max_new_tokens);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                ..InferenceControls::default()
+            },
+        )
+        .expect("native deterministic inference should complete");
+        let native_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let detour = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_detour: Some(
+                    RasterDetourSpec::parse(detour_spec).expect("detour should parse"),
+                ),
+                raster_projection_rows_per_tile: Some(2),
+                raster_attention_kv_rows_per_tile: Some(2),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("decode transition detour inference should complete");
+        let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        assert_eq!(native_payload, detour_payload);
+        assert_eq!(
+            checkpoint_commitments_with_prefix(&native_payload, "decode.layer_token.").len(),
+            0
+        );
+        assert_eq!(
+            checkpoint_commitments_with_prefix(&detour_payload, "decode.layer_token.").len(),
+            0
+        );
+        assert_eq!(
+            checkpoint_name_count(&native_payload, "decode.transition"),
+            expected_decode_transitions
+        );
+        assert_eq!(
+            checkpoint_name_count(&detour_payload, "decode.transition"),
+            expected_decode_transitions
+        );
+        assert!(
+            checkpoint_name_count(&native_payload, "decode.finalize") == 0
+                && checkpoint_name_count(&detour_payload, "decode.finalize") == 0,
+            "decode.transition is the routine checkpoint; decode.finalize should not be committed"
+        );
+
+        let native = expect_completed_state(native, "native inference");
+        let detour = expect_completed_state(detour, "decode transition detour inference");
+        assert_output_decode_matches(&native, &detour);
+        assert!(
+            detour.raster_tile_invocations.unwrap_or(0) > 0,
+            "detour should expose raster tile telemetry outside committed checkpoints"
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_trace_matches_decode_transition_detour_trace() {
+        assert_decode_transition_detour_matches_native(
+            "decode-transition-detour-trace",
+            2,
+            "decode.transition",
+            2,
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_trace_matches_second_decode_transition_detour_trace() {
+        assert_decode_transition_detour_matches_native(
+            "second-decode-transition-detour-trace",
+            2,
+            "decode.transition:2",
+            2,
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_decode_transition_checkpoint_commitment_matches_raster_detour() {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let _trace_dir = TraceDirGuard::new("decode-transition-checkpoint-commitment");
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                ..InferenceControls::default()
+            },
+        )
+        .expect("native deterministic inference should complete");
+        let deterministic_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_detour: Some(
+                    RasterDetourSpec::parse("decode.transition").expect("detour should parse"),
+                ),
+                raster_projection_rows_per_tile: Some(3),
+                raster_attention_kv_rows_per_tile: Some(2),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("decode transition raster detour inference should complete");
+        let raster_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        assert_eq!(
+            checkpoint_commitments_with_prefix(&deterministic_payload, "decode.layer_token.").len(),
+            0
+        );
+        assert_eq!(
+            checkpoint_commitments(&deterministic_payload, "decode.transition"),
+            checkpoint_commitments(&raster_payload, "decode.transition")
+        );
+    }
+
+    #[test]
+    fn run_inference_reports_unmatched_decode_transition_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("decode.transition:2").expect("detour should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("second decode transition detour should be unmatched");
+
+        assert!(error
+            .to_string()
+            .contains("selective raster detour target decode.transition:2 was not reached"));
+    }
+
+    #[test]
+    fn run_inference_rejects_decode_transition_detour_without_deterministic_execution() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_model = test_transformer_model();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("decode.transition").expect("detour should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("decode transition detour should require deterministic execution");
+
+        assert!(error
+            .to_string()
+            .contains("selective raster detour requires deterministic execution"));
+    }
+
+    #[test]
+    fn run_inference_validates_projection_sizing_for_decode_transition_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("decode.transition").expect("detour should parse"),
+                ),
+                raster_projection_rows_per_tile: Some(0),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("zero projection rows should fail for decode transition detour");
+
+        assert!(error
+            .to_string()
+            .contains("raster projection rows per tile must be greater than zero"));
+    }
+
+    #[test]
+    fn run_inference_validates_attention_sizing_for_decode_transition_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("decode.transition").expect("detour should parse"),
+                ),
+                raster_attention_kv_rows_per_tile: Some(0),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("zero attention rows should fail for decode transition detour");
+
+        assert!(error
+            .to_string()
+            .contains("raster attention KV rows per tile must be greater than zero"));
+    }
+
+    #[cfg(feature = "unchecked-raster-integrity")]
+    #[test]
+    fn run_inference_decode_transition_detour_runs_in_unchecked_integrity_mode() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::integrity_mode::with_raster_integrity_mode(
+            crate::RasterIntegrityMode::UncheckedTestOnly,
+            || {
+                crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+                let detour = run_inference_with_controls(
+                    &request,
+                    &model,
+                    &tokenizer,
+                    &transformer_fixture.model,
+                    &InferenceControls {
+                        raster_detour: Some(
+                            RasterDetourSpec::parse("decode.transition")
+                                .expect("detour should parse"),
+                        ),
+                        raster_projection_rows_per_tile: Some(1),
+                        raster_attention_kv_rows_per_tile: Some(1),
+                        ..InferenceControls::default()
+                    },
+                )
+                .expect("unchecked decode transition detour should complete");
+
+                let detour = expect_completed_state(detour, "unchecked decode transition detour");
+                assert!(
+                    detour.raster_tile_invocations.unwrap_or(0) > 0,
+                    "unchecked decode transition detour should count raster tiles"
+                );
+            },
+        );
+    }
+
     #[cfg(feature = "unchecked-raster-integrity")]
     #[test]
     fn run_inference_decode_select_token_detour_runs_in_unchecked_integrity_mode() {
@@ -3180,7 +3515,7 @@ mod tests {
     }
 
     #[test]
-    fn run_inference_with_controls_raster_can_pause_after_decode_finalize() {
+    fn run_inference_with_controls_raster_can_pause_after_decode_transition() {
         let tokenizer = test_tokenizer();
         let model = test_model_spec();
         let transformer_fixture = deterministic_no_ple_model_fixture();
@@ -3205,7 +3540,7 @@ mod tests {
             &transformer_fixture.model,
             &InferenceControls {
                 commit_checkpoints: false,
-                terminal_checkpoint: Some("decode.finalize".to_string()),
+                terminal_checkpoint: Some("decode.transition".to_string()),
                 raster: true,
                 raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
@@ -3218,11 +3553,11 @@ mod tests {
                 raster_output_byte_flush_bytes_per_tile: None,
             },
         )
-        .expect("raster inference should pause after decode finalize");
+        .expect("raster inference should pause after decode transition");
 
         match paused {
             InferenceRunOutcome::Paused(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "decode.finalize");
+                assert_eq!(state.terminal_checkpoint_id, "decode.transition");
                 let output_decode = state
                     .output_decode
                     .expect("partial output decode state should be present");

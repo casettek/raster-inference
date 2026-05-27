@@ -3,7 +3,6 @@ use super::types::*;
 use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Result};
-use serde_json::json;
 
 use crate::decode_transition::raster::auth_source::{
     GemmaDecodeLayerMatrixRowRequest, GemmaDecodeLayerMetadata,
@@ -62,56 +61,6 @@ pub(in super::super) fn init_decode_attention_score_phase_with_roots(
             next_kv_offset: 0,
         },
     ))
-}
-
-pub(in super::super) fn trace_decode_layer_checkpoint_with_roots(
-    roots: &RasterArtifactStoreRoots,
-    state: &DecodeTransitionRasterState,
-    layer_idx: usize,
-) -> Result<()> {
-    let current_activation =
-        read_activation_row_from_ref_roots(roots, &state.current_activation_ref)?;
-    let current_activation_values = current_activation.to_f32_values();
-    let decode_input = read_activation_row_from_ref_roots(roots, &state.decode_input_ref)?;
-    let decode_input_values = decode_input.to_f32_values();
-    let decode_input_acts = decode_input.acts();
-    let current_activation_sha256 = state
-        .completed_layer_output_sha256s
-        .last()
-        .cloned()
-        .expect("current layer output commitment should exist");
-    let det_current_activation_sha256 = state
-        .completed_layer_output_det_sha256s
-        .last()
-        .cloned()
-        .unwrap_or(None);
-    crate::trace::trace_checkpoint_lazy_result(
-        &format!(
-            "decode.layer_token.layer_{layer_idx}.position_{}",
-            state.position
-        ),
-        || {
-            let checkpoint_layer_caches =
-                materialize_decode_checkpoint_caches_from_roots(roots, state, layer_idx)?;
-            Ok(json!({
-                "execution_mode": "deterministic",
-                "token_id": state.next_token,
-                "position": state.position,
-                "next_layer_idx": layer_idx + 1,
-                "decode_input_activation": decode_input_values.clone(),
-                "decode_input_activation_sha256": crate::shared::numerics::transformer_kernels::build_vector_commitment(&decode_input_values),
-                "det_decode_input_activation_sha256": Some(crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&decode_input_acts)),
-                "current_activation": current_activation_values,
-                "current_activation_sha256": current_activation_sha256,
-                "det_current_activation_sha256": det_current_activation_sha256,
-                "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
-                "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&checkpoint_layer_caches),
-                "completed_layer_output_sha256s": state.completed_layer_output_sha256s.clone(),
-                "completed_layer_output_det_sha256s": state.completed_layer_output_det_sha256s.clone(),
-            }))
-        },
-    )?;
-    Ok(())
 }
 
 pub(in super::super) fn read_decode_projection_row(
@@ -1652,7 +1601,6 @@ pub(in super::super) fn update_decode_layer_state_refs(
             &current_activation_acts,
         ),
     ));
-    trace_decode_layer_checkpoint_with_roots(&artifact_store_roots, &decode_state, layer_idx)?;
     decode_state.next_layer_idx += 1;
     Ok((false, artifact_store_roots, decode_state))
 }

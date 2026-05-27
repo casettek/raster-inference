@@ -982,7 +982,6 @@ pub fn run_text_layers_decode_step(
 
     let mut xs = input_activation.to_vec();
     let mut updated_layer_caches = Vec::with_capacity(model.layers.len());
-    let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         let cache = layer_caches[layer_idx].clone();
         let _trace = trace_scope(format!(
@@ -1024,23 +1023,6 @@ pub fn run_text_layers_decode_step(
         )?;
         xs = layer_output;
         updated_layer_caches.push(updated_cache);
-        completed_layer_output_sha256s.push(build_vector_commitment(&xs));
-        let mut checkpoint_layer_caches = updated_layer_caches.clone();
-        checkpoint_layer_caches.extend(layer_caches.iter().skip(layer_idx + 1).cloned());
-        crate::trace::trace_checkpoint(
-            &format!("decode.layer_token.layer_{layer_idx}.position_{position}"),
-            &json!({
-                "token_id": token_id,
-                "position": position,
-                "next_layer_idx": layer_idx + 1,
-                "decode_input_activation": input_activation,
-                "decode_input_activation_sha256": build_vector_commitment(input_activation),
-                "current_activation": xs.clone(),
-                "current_activation_sha256": build_vector_commitment(&xs),
-                "layer_caches": crate::trace::serialize_layer_caches(&checkpoint_layer_caches),
-                "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
-            }),
-        );
     }
 
     Ok(ActivationSequenceWithCache {

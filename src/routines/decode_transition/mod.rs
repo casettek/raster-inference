@@ -1,20 +1,24 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
-    read_token_id_from_ref_roots, RasterArtifactStoreRoots, RasterSelectedTokenRef,
-    RasterTokenIdSequenceRef,
+    activation_row_leaf, read_token_id_from_ref_roots, token_id_leaf,
+    RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
+    RasterArtifactStoreRoots, RasterSelectedTokenRef, RasterTokenIdSequenceRef,
 };
 use crate::shared::model::transformer::{
-    Gemma4TransformerModel, InternalLogits, LayerKvCache, TransformerDecodeState,
-    TransformerDecodeStepResult,
+    ActivationSequence, Gemma4TransformerModel, InternalActivationSequence, InternalLogits,
+    LayerKvCache, PrefillLogits, TransformerDecodeState, TransformerDecodeStepResult,
 };
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
+use crate::shared::raster_kernels::transformer::RasterActivationRow;
 use crate::shared::tensors::raster_tensor_artifacts::{
-    read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
+    activation_sequence_ref_from_artifact, read_sequence_row_from_roots,
+    RasterActivationSequenceRef, RasterSequenceRowRequest, RasterTensorId,
 };
 use crate::RasterSizingControls;
 
@@ -167,6 +171,144 @@ pub fn run_raster(
     )
 }
 
+pub(crate) fn run_selected_raster_detour_from_native_boundary(
+    decode_state: &DecodeState,
+    next_token: u32,
+    model: &Gemma4TransformerModel,
+    raster_sizing: RasterSizingControls,
+) -> Result<TransformerDecodeStepResult> {
+    let position = decode_state.transformer_decode_state.position;
+    let generated_count = decode_state.generated_token_ids.len();
+    let source_prefix =
+        format!("decode.transition.detour.position_{position}.step_{generated_count}");
+    let mut raster_state =
+        prepare_raster_decode_loop_state_from_native(decode_state, &source_prefix)?;
+    let (artifact_store_roots, selected_token_ref) =
+        raster::insert_decode_selected_token_with_roots(
+            &raster_state.artifact_store_roots,
+            format!("{source_prefix}.input.selected_token"),
+            next_token,
+        )?;
+    raster_state.artifact_store_roots = artifact_store_roots;
+
+    let source = AuthenticatedGemmaDecodeTransitionSource::from_model(
+        format!("decode.transition.position_{position}"),
+        model,
+    )?;
+    let raster_state = run_raster(raster_state, selected_token_ref, &source, raster_sizing)?;
+    let activation_ref = raster_state
+        .activation_state_ref
+        .as_ref()
+        .context("selective raster decode.transition detour requires activation state ref")?;
+    let activation_state = materialize_activation_sequence_from_ref(
+        &raster_state.artifact_store_roots,
+        activation_ref,
+    )?;
+    let materialized = materialize_decode_state_from_raster_state_for_trace(&raster_state)?;
+    let prefill_logits = prefill_logits_from_internal(materialized.clone_internal_logits());
+
+    Ok(TransformerDecodeStepResult {
+        transformer_decode_state: materialized.transformer_decode_state,
+        activation_state,
+        prefill_logits,
+    })
+}
+
+fn prepare_raster_decode_loop_state_from_native(
+    decode_state: &DecodeState,
+    source_prefix: &str,
+) -> Result<RasterDecodeLoopState> {
+    let artifact_store_roots = ArtifactIo::export_store_roots();
+    let (artifact_store_roots, full_token_ids_ref) = insert_decode_token_ids_artifact_with_roots(
+        artifact_store_roots,
+        format!("{source_prefix}.input.full_token_ids"),
+        &decode_state.full_token_ids,
+    )?;
+    let (artifact_store_roots, generated_token_ids_ref) =
+        insert_decode_token_ids_artifact_with_roots(
+            artifact_store_roots,
+            format!("{source_prefix}.input.generated_token_ids"),
+            &decode_state.generated_token_ids,
+        )?;
+    let (artifact_store_roots, logits_ref, logit_count) = insert_decode_logits_artifact_with_roots(
+        artifact_store_roots,
+        format!("{source_prefix}.input.logits"),
+        decode_state,
+        "raster decode transition",
+    )?;
+    let (artifact_store_roots, layer_caches) = insert_decode_layer_cache_refs_from_native(
+        artifact_store_roots,
+        &decode_state.transformer_decode_state.layer_caches,
+        &format!("{source_prefix}.input.layer_cache"),
+    )?;
+
+    RasterDecodeLoopState::new(
+        artifact_store_roots,
+        full_token_ids_ref,
+        decode_state.full_token_ids.len(),
+        generated_token_ids_ref,
+        decode_state.generated_token_ids.len(),
+        logits_ref,
+        logit_count,
+        layer_caches,
+        decode_state.transformer_decode_state.position,
+        decode_state.transformer_decode_state.token_count,
+        None,
+    )
+}
+
+pub(crate) fn insert_decode_token_ids_artifact_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    source_name: String,
+    token_ids: &[u32],
+) -> Result<(RasterArtifactStoreRoots, Option<RasterTokenIdSequenceRef>)> {
+    if token_ids.is_empty() {
+        return Ok((artifact_store_roots, None));
+    }
+    let leaves = token_ids.iter().copied().map(token_id_leaf).collect();
+    let (artifact_store_roots, token_ids_ref) = ArtifactIo::insert_artifact_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(source_name)?,
+        RasterArtifactMetadata::token_ids(token_ids.len()),
+        leaves,
+    )?;
+    Ok((
+        artifact_store_roots,
+        Some(RasterTokenIdSequenceRef::new(token_ids_ref)?),
+    ))
+}
+
+pub(crate) fn insert_decode_logits_artifact_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    source_name: String,
+    decode_state: &DecodeState,
+    label: &str,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef, usize)> {
+    let logits = decode_state.clone_internal_logits();
+    let det_logits = logits
+        .det_values()
+        .ok_or_else(|| anyhow::anyhow!("{label} requires canonical deterministic logits"))?;
+    if det_logits.is_empty() {
+        anyhow::bail!("{label} requires at least one canonical logit");
+    }
+
+    let leaves = det_logits
+        .iter()
+        .map(|logit| activation_row_leaf(&RasterActivationRow::from_acts(vec![*logit])))
+        .collect::<Vec<_>>();
+    let (artifact_store_roots, logits_artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(source_name.clone())?,
+        RasterArtifactMetadata::activation_rows(det_logits.len(), 1)?,
+        leaves,
+    )?;
+    let logits_ref = activation_sequence_ref_from_artifact(
+        RasterTensorId::new(source_name)?,
+        RasterActivationSequenceArtifactRef::new(logits_artifact_ref)?,
+    )?;
+    Ok((artifact_store_roots, logits_ref, det_logits.len()))
+}
+
 pub(crate) fn insert_decode_layer_cache_refs_from_native(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_caches: &[LayerKvCache],
@@ -190,7 +332,7 @@ pub(crate) fn insert_decode_layer_cache_refs_from_native(
 
 pub fn finalize(decode_state: &DecodeState) -> Result<()> {
     crate::trace::trace_checkpoint(
-        "decode.finalize",
+        "decode.transition",
         &json!({
             "full_token_ids": decode_state.full_token_ids.clone(),
             "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
@@ -210,6 +352,37 @@ pub fn finalize(decode_state: &DecodeState) -> Result<()> {
 pub(crate) fn finalize_raster_state_for_trace(decode_state: &RasterDecodeLoopState) -> Result<()> {
     let decode_state = materialize_decode_state_from_raster_state_for_trace(decode_state)?;
     finalize(&decode_state)
+}
+
+pub(crate) fn materialize_activation_sequence_from_ref(
+    roots: &RasterArtifactStoreRoots,
+    activation_ref: &RasterActivationSequenceRef,
+) -> Result<ActivationSequence> {
+    let (row_count, _) = activation_ref.tensor_ref().shape().sequence_metadata()?;
+    let rows = (0..row_count)
+        .map(|row_idx| {
+            read_sequence_row_from_roots(
+                roots,
+                RasterSequenceRowRequest {
+                    tensor_ref: activation_ref.clone(),
+                    row_idx,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let det_rows = rows.iter().map(|row| row.acts()).collect::<Vec<_>>();
+    let values = rows
+        .iter()
+        .map(|row| row.to_f32_values())
+        .collect::<Vec<_>>();
+    let mut activation_sequence = ActivationSequence::from_internal(
+        InternalActivationSequence::from_det_values(det_rows.clone()),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
+    );
+    activation_sequence.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&det_rows),
+    );
+    Ok(activation_sequence)
 }
 
 pub(crate) fn materialize_decode_state_from_raster_state_for_trace(
@@ -289,6 +462,18 @@ fn materialize_internal_logits_from_ref(
         _ => anyhow::bail!("raster logits shape {row_count}x{width} must be Nx1 or 1xN"),
     };
     Ok(InternalLogits::from_det_values(det_logits))
+}
+
+fn prefill_logits_from_internal(internal_logits: InternalLogits) -> PrefillLogits {
+    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
+        internal_logits.as_f32_slice(),
+    );
+    let det_final_logits_sha256 = internal_logits
+        .det_values()
+        .map(crate::shared::numerics::transformer_kernels::build_det_vector_commitment);
+    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
+    prefill_logits.det_final_logits_sha256 = det_final_logits_sha256;
+    prefill_logits
 }
 
 fn generated_token_ids_commitment(decode_state: &DecodeState) -> Result<String> {
