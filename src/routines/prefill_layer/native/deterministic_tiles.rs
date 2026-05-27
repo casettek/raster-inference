@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
+use crate::runtime::checkpoints::RasterDetourController;
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::model::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
@@ -33,6 +34,20 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_text_layers_prefill_with_cache_internal_and_detour(
+        input_activations,
+        model,
+        ple_inputs,
+        None,
+    )
+}
+
+pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
+    input_activations: InternalActivationSequence,
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    mut detour_controller: Option<&mut RasterDetourController>,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     if model.layers.is_empty() {
         bail!("transformer prefill requires at least one layer");
     }
@@ -42,6 +57,9 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
     let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     let mut completed_layer_output_det_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
+        if let Some(controller) = detour_controller.as_deref_mut() {
+            controller.reject_if_selected_unsupported(RoutineId::PrefillLayer)?;
+        }
         let xs_values = xs.clone_f32();
         let _routine = routine_scope(
             RoutineId::PrefillLayer,
@@ -141,6 +159,20 @@ pub(crate) fn run_internal(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     run_text_layers_prefill_with_cache_internal(input_activations, model, ple_inputs)
+}
+
+pub(crate) fn run_internal_with_detour(
+    input_activations: InternalActivationSequence,
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    detour_controller: Option<&mut RasterDetourController>,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_text_layers_prefill_with_cache_internal_and_detour(
+        input_activations,
+        model,
+        ple_inputs,
+        detour_controller,
+    )
 }
 
 fn resolve_prefill_donor_cache<'a>(

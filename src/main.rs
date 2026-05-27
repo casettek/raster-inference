@@ -6,7 +6,8 @@ use raster_inference::{
     load_transformer_state_model_from_det_num_wgt_path,
     load_transformer_state_model_from_gemma_model_path, run_inference_with_controls, trace,
     AuthenticatedGemmaTokenizer, InferenceControls, InferenceExecutionMode, InferenceRequest,
-    InferenceRunOutcome, ModelSpec, RasterIntegrityMode, SamplingConfig, TextDecodingPolicy,
+    InferenceRunOutcome, ModelSpec, RasterDetourSpec, RasterIntegrityMode, SamplingConfig,
+    TextDecodingPolicy,
 };
 
 const CLI_MAX_NEW_TOKENS: usize = 3;
@@ -14,10 +15,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] [--raster] [--raster-unchecked-test-mode] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--raster] [--raster-at <routine-id[:occurrence]>] [--raster-unchecked-test-mode] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use the single root-backed raster tile inference path. Pass --raster-unchecked-test-mode to use synthetic raster handles and skip Merkle proof work in test builds. Pass --raster-trace-tiles to print verbose routine, progress, and individual tile execution logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use the single root-backed raster tile inference path. Pass --raster-at to run native deterministic CPU with one selected raster routine occurrence. Pass --raster-unchecked-test-mode to use synthetic raster handles and skip Merkle proof work in test builds. Pass --raster-trace-tiles to print verbose routine, progress, and individual tile execution logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
     );
 }
 
@@ -80,6 +81,7 @@ fn run() -> anyhow::Result<()> {
         commit_checkpoints: cli_args.commit_checkpoints,
         terminal_checkpoint: cli_args.terminal_checkpoint,
         raster: cli_args.raster,
+        raster_detour: cli_args.raster_detour,
         raster_tokenizer_source,
         raster_projection_rows_per_tile: cli_args.raster_projection_rows_per_tile,
         raster_attention_kv_rows_per_tile: cli_args.raster_attention_kv_rows_per_tile,
@@ -119,6 +121,7 @@ struct CliArgs {
     commit_checkpoints: bool,
     execution_mode: InferenceExecutionMode,
     raster: bool,
+    raster_detour: Option<RasterDetourSpec>,
     raster_integrity_mode: RasterIntegrityMode,
     raster_trace_tiles: bool,
     raster_projection_rows_per_tile: Option<usize>,
@@ -141,6 +144,7 @@ impl CliArgs {
         let mut commit_checkpoints = false;
         let mut execution_mode = InferenceExecutionMode::Fp32;
         let mut raster = false;
+        let mut raster_detour = None;
         let mut raster_integrity_mode = RasterIntegrityMode::Verified;
         let mut raster_decode_only = false;
         let mut raster_trace_tiles = false;
@@ -159,6 +163,19 @@ impl CliArgs {
                 "--commit-checkpoints" => commit_checkpoints = true,
                 "--deterministic" => execution_mode = InferenceExecutionMode::Deterministic,
                 "--raster" => raster = true,
+                "--raster-at" => {
+                    let detour = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("expected a routine id after {arg}"))?;
+                    raster_detour = Some(RasterDetourSpec::parse(&detour)?);
+                }
+                _ if arg.starts_with("--raster-at=") => {
+                    let detour = arg
+                        .split_once('=')
+                        .map(|(_, value)| value)
+                        .expect("split_once should succeed for --raster-at=value");
+                    raster_detour = Some(RasterDetourSpec::parse(detour)?);
+                }
                 "--raster-unchecked-test-mode" => {
                     raster_integrity_mode = parse_raster_unchecked_test_mode_flag()?
                 }
@@ -290,32 +307,40 @@ impl CliArgs {
         if raster_decode_only {
             anyhow::bail!("--raster-decode-only has been removed; use --raster");
         }
-        if raster_integrity_mode.is_unchecked_test_only() && !raster {
-            anyhow::bail!("--raster-unchecked-test-mode requires --raster");
+        let raster_execution_requested = raster || raster_detour.is_some();
+        if raster && raster_detour.is_some() {
+            anyhow::bail!("--raster and --raster-at cannot be used together");
         }
-        if raster_projection_rows_per_tile.is_some() && !raster {
-            anyhow::bail!("--raster-projection-rows-per-tile requires --raster");
+        if raster_integrity_mode.is_unchecked_test_only() && !raster_execution_requested {
+            anyhow::bail!("--raster-unchecked-test-mode requires --raster or --raster-at");
         }
-        if raster_attention_kv_rows_per_tile.is_some() && !raster {
-            anyhow::bail!("--raster-attention-kv-rows-per-tile requires --raster");
+        if raster_projection_rows_per_tile.is_some() && !raster_execution_requested {
+            anyhow::bail!("--raster-projection-rows-per-tile requires --raster or --raster-at");
         }
-        if raster_sequence_rows_per_tile.is_some() && !raster {
-            anyhow::bail!("--raster-sequence-rows-per-tile requires --raster");
+        if raster_attention_kv_rows_per_tile.is_some() && !raster_execution_requested {
+            anyhow::bail!("--raster-attention-kv-rows-per-tile requires --raster or --raster-at");
         }
-        if raster_head_rows_per_tile.is_some() && !raster {
-            anyhow::bail!("--raster-head-rows-per-tile requires --raster");
+        if raster_sequence_rows_per_tile.is_some() && !raster_execution_requested {
+            anyhow::bail!("--raster-sequence-rows-per-tile requires --raster or --raster-at");
         }
-        if raster_tokenizer_bpe_pairs_per_tile.is_some() && !raster {
-            anyhow::bail!("--raster-tokenizer-bpe-pairs-per-tile requires --raster");
+        if raster_head_rows_per_tile.is_some() && !raster_execution_requested {
+            anyhow::bail!("--raster-head-rows-per-tile requires --raster or --raster-at");
         }
-        if raster_tokenizer_bpe_pieces_per_tile.is_some() && !raster {
-            anyhow::bail!("--raster-tokenizer-bpe-pieces-per-tile requires --raster");
+        if raster_tokenizer_bpe_pairs_per_tile.is_some() && !raster_execution_requested {
+            anyhow::bail!("--raster-tokenizer-bpe-pairs-per-tile requires --raster or --raster-at");
         }
-        if raster_output_byte_flush_bytes_per_tile.is_some() && !raster {
-            anyhow::bail!("--raster-output-byte-flush-bytes-per-tile requires --raster");
+        if raster_tokenizer_bpe_pieces_per_tile.is_some() && !raster_execution_requested {
+            anyhow::bail!(
+                "--raster-tokenizer-bpe-pieces-per-tile requires --raster or --raster-at"
+            );
+        }
+        if raster_output_byte_flush_bytes_per_tile.is_some() && !raster_execution_requested {
+            anyhow::bail!(
+                "--raster-output-byte-flush-bytes-per-tile requires --raster or --raster-at"
+            );
         }
 
-        if raster {
+        if raster_execution_requested {
             execution_mode = InferenceExecutionMode::Deterministic;
         }
 
@@ -323,6 +348,7 @@ impl CliArgs {
             commit_checkpoints,
             execution_mode,
             raster,
+            raster_detour,
             raster_integrity_mode,
             raster_trace_tiles,
             raster_projection_rows_per_tile,
@@ -429,9 +455,9 @@ fn parse_raster_output_byte_flush_bytes_per_tile(value: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::CliArgs;
-    use raster_inference::InferenceExecutionMode;
     #[cfg(feature = "unchecked-raster-integrity")]
     use raster_inference::RasterIntegrityMode;
+    use raster_inference::{InferenceExecutionMode, RoutineId};
 
     #[test]
     fn parse_terminal_checkpoint_flag() {
@@ -507,11 +533,118 @@ mod tests {
         assert_eq!(args.raster_output_byte_flush_bytes_per_tile, None);
     }
 
+    #[test]
+    fn parse_raster_at_flag() {
+        let args = CliArgs::parse([
+            "--raster-at".to_string(),
+            "prefill.layer:2".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        let detour = args.raster_detour.expect("detour should be parsed");
+        assert_eq!(detour.routine_id(), RoutineId::PrefillLayer);
+        assert_eq!(detour.occurrence(), 2);
+        assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
+        assert!(!args.raster);
+    }
+
+    #[test]
+    fn parse_raster_at_equals_flag() {
+        let args = CliArgs::parse([
+            "--raster-at=input.embedding".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        let detour = args.raster_detour.expect("detour should be parsed");
+        assert_eq!(detour.routine_id(), RoutineId::InputEmbedding);
+        assert_eq!(detour.occurrence(), 1);
+        assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
+    }
+
+    #[test]
+    fn parse_raster_at_rejects_full_raster() {
+        let error = CliArgs::parse([
+            "--raster".to_string(),
+            "--raster-at=prefill.layer".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("full raster and raster-at should conflict");
+
+        assert!(error
+            .to_string()
+            .contains("--raster and --raster-at cannot be used together"));
+    }
+
+    #[test]
+    fn parse_raster_at_requires_value() {
+        let error = CliArgs::parse([
+            "--raster-at".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("missing detour value should fail");
+
+        assert!(error.to_string().contains("unknown routine id `model`"));
+    }
+
+    #[test]
+    fn parse_raster_at_rejects_unknown_routine() {
+        let error = CliArgs::parse([
+            "--raster-at=not.a.routine".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("unknown detour target should fail");
+
+        assert!(error.to_string().contains("unknown routine id"));
+        assert!(error.to_string().contains("prefill.layer"));
+    }
+
     #[cfg(feature = "unchecked-raster-integrity")]
     #[test]
     fn parse_raster_unchecked_test_mode_flag() {
         let args = CliArgs::parse([
             "--raster".to_string(),
+            "--raster-unchecked-test-mode".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(
+            args.raster_integrity_mode,
+            RasterIntegrityMode::UncheckedTestOnly
+        );
+    }
+
+    #[cfg(feature = "unchecked-raster-integrity")]
+    #[test]
+    fn parse_raster_unchecked_test_mode_with_raster_at() {
+        let args = CliArgs::parse([
+            "--raster-at=prefill.layer".to_string(),
             "--raster-unchecked-test-mode".to_string(),
             "model".to_string(),
             "tokenizer.json".to_string(),
@@ -542,7 +675,7 @@ mod tests {
         #[cfg(feature = "unchecked-raster-integrity")]
         assert!(error
             .to_string()
-            .contains("--raster-unchecked-test-mode requires --raster"));
+            .contains("--raster-unchecked-test-mode requires --raster or --raster-at"));
 
         #[cfg(not(feature = "unchecked-raster-integrity"))]
         assert!(error
@@ -660,7 +793,7 @@ mod tests {
         .expect_err("BPE pair chunk flag should require raster");
         assert!(pair_error
             .to_string()
-            .contains("--raster-tokenizer-bpe-pairs-per-tile requires --raster"));
+            .contains("--raster-tokenizer-bpe-pairs-per-tile requires --raster or --raster-at"));
 
         let piece_error = CliArgs::parse([
             "--raster-tokenizer-bpe-pieces-per-tile=3".to_string(),
@@ -673,7 +806,7 @@ mod tests {
         .expect_err("BPE piece chunk flag should require raster");
         assert!(piece_error
             .to_string()
-            .contains("--raster-tokenizer-bpe-pieces-per-tile requires --raster"));
+            .contains("--raster-tokenizer-bpe-pieces-per-tile requires --raster or --raster-at"));
     }
 
     #[test]
@@ -723,9 +856,9 @@ mod tests {
         ])
         .expect_err("output byte flush chunk flag should require raster");
 
-        assert!(error
-            .to_string()
-            .contains("--raster-output-byte-flush-bytes-per-tile requires --raster"));
+        assert!(error.to_string().contains(
+            "--raster-output-byte-flush-bytes-per-tile requires --raster or --raster-at"
+        ));
     }
 
     #[test]
@@ -743,6 +876,38 @@ mod tests {
         .expect("cli args should parse");
 
         assert_eq!(args.raster_projection_rows_per_tile, Some(4));
+    }
+
+    #[test]
+    fn parse_raster_sizing_flags_with_raster_at() {
+        let args = CliArgs::parse([
+            "--raster-at=prefill.layer:2".to_string(),
+            "--raster-projection-rows-per-tile=4".to_string(),
+            "--raster-attention-kv-rows-per-tile=8".to_string(),
+            "--raster-sequence-rows-per-tile=3".to_string(),
+            "--raster-head-rows-per-tile=2".to_string(),
+            "--raster-tokenizer-bpe-pairs-per-tile=5".to_string(),
+            "--raster-tokenizer-bpe-pieces-per-tile=6".to_string(),
+            "--raster-output-byte-flush-bytes-per-tile=1048576".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(args.raster_projection_rows_per_tile, Some(4));
+        assert_eq!(args.raster_attention_kv_rows_per_tile, Some(8));
+        assert_eq!(args.raster_sequence_rows_per_tile, Some(3));
+        assert_eq!(args.raster_head_rows_per_tile, Some(2));
+        assert_eq!(args.raster_tokenizer_bpe_pairs_per_tile, Some(5));
+        assert_eq!(args.raster_tokenizer_bpe_pieces_per_tile, Some(6));
+        assert_eq!(
+            args.raster_output_byte_flush_bytes_per_tile,
+            Some(1_048_576)
+        );
+        assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
     }
 
     #[test]
@@ -791,7 +956,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("--raster-attention-kv-rows-per-tile requires --raster"));
+            .contains("--raster-attention-kv-rows-per-tile requires --raster or --raster-at"));
     }
 
     #[test]
@@ -853,7 +1018,7 @@ mod tests {
         .expect_err("sequence rows flag should require raster");
         assert!(sequence_error
             .to_string()
-            .contains("--raster-sequence-rows-per-tile requires --raster"));
+            .contains("--raster-sequence-rows-per-tile requires --raster or --raster-at"));
 
         let head_error = CliArgs::parse([
             "--raster-head-rows-per-tile=4".to_string(),
@@ -866,7 +1031,7 @@ mod tests {
         .expect_err("head rows flag should require raster");
         assert!(head_error
             .to_string()
-            .contains("--raster-head-rows-per-tile requires --raster"));
+            .contains("--raster-head-rows-per-tile requires --raster or --raster-at"));
     }
 
     #[test]
@@ -897,7 +1062,9 @@ mod tests {
         ])
         .expect_err("raster rows per tile should require raster mode");
 
-        assert!(error.to_string().contains("requires --raster"));
+        assert!(error
+            .to_string()
+            .contains("requires --raster or --raster-at"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::runtime::checkpoints::RasterDetourController;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
@@ -102,13 +103,29 @@ pub(crate) fn run_with_mode_internal(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_with_mode_internal_with_detour(input_activations, model, ple_inputs, execution_mode, None)
+}
+
+pub(crate) fn run_with_mode_internal_with_detour(
+    input_activations: InternalActivationSequence,
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    execution_mode: InferenceExecutionMode,
+    detour_controller: Option<&mut RasterDetourController>,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     model.validate_execution_mode(execution_mode)?;
     match execution_mode {
         InferenceExecutionMode::Fp32 => {
             native::run(input_activations.as_f32_slice(), model, ple_inputs)
         }
-        InferenceExecutionMode::Deterministic => {
-            native::deterministic_tiles::run_internal(input_activations, model, ple_inputs)
-        }
+        InferenceExecutionMode::Deterministic => match detour_controller {
+            Some(detour_controller) => native::deterministic_tiles::run_internal_with_detour(
+                input_activations,
+                model,
+                ple_inputs,
+                Some(detour_controller),
+            ),
+            None => native::deterministic_tiles::run_internal(input_activations, model, ple_inputs),
+        },
     }
 }

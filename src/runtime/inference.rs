@@ -4,7 +4,7 @@ use serde_json::json;
 use tokenizers::Tokenizer;
 
 use crate::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
-use crate::runtime::checkpoints::PhaseId;
+use crate::runtime::checkpoints::{PhaseId, RasterDetourController, RasterDetourSpec, RoutineId};
 use crate::runtime::{pipeline, trace};
 use crate::shared::api::input::{
     InferenceExecutionMode, InferenceRequest, ModelSpec, PromptPreparationState,
@@ -45,6 +45,7 @@ pub struct InferenceControls {
     pub commit_checkpoints: bool,
     pub terminal_checkpoint: Option<String>,
     pub raster: bool,
+    pub raster_detour: Option<RasterDetourSpec>,
     pub raster_tokenizer_source: Option<AuthenticatedGemmaTokenizer>,
     pub raster_projection_rows_per_tile: Option<usize>,
     pub raster_attention_kv_rows_per_tile: Option<usize>,
@@ -228,9 +229,19 @@ pub fn run_inference_with_controls(
             if controls.raster && request.execution_mode != InferenceExecutionMode::Deterministic {
                 anyhow::bail!("raster tile inference requires deterministic execution");
             }
+            if controls.raster && controls.raster_detour.is_some() {
+                anyhow::bail!("--raster and selective raster detour cannot be used together");
+            }
+            if controls.raster_detour.is_some()
+                && request.execution_mode != InferenceExecutionMode::Deterministic
+            {
+                anyhow::bail!("selective raster detour requires deterministic execution");
+            }
+            let mut raster_detour_controller = RasterDetourController::new(controls.raster_detour);
             let use_raster_prefill = controls.raster;
             let use_raster_decode = controls.raster;
-            let raster_sizing_controls = if controls.raster {
+            let raster_sizing_controls = if controls.raster || raster_detour_controller.is_active()
+            {
                 Some(controls.raster_sizing_controls()?)
             } else {
                 None
@@ -248,6 +259,7 @@ pub fn run_inference_with_controls(
                 "terminal_checkpoint_occurrence": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.occurrence()),
                 "commit_checkpoints": controls.commit_checkpoints,
                 "tile_dsl_mode": if use_raster_prefill { "raster" } else { "native" },
+                "raster_detour": raster_detour_controller.selected_spec().map(|spec| spec.to_string()),
                 "raster_integrity_mode": current_raster_integrity_mode().label(),
                 "raster_sizing_controls": raster_sizing_controls,
             }));
@@ -270,6 +282,8 @@ pub fn run_inference_with_controls(
                 trace::phase_started(PhaseId::InputEmbedding);
                 let mut raster_prompt_preparation_for_embedding = None;
                 let mut raster_prompt_preparation_roots_for_embedding = None;
+                raster_detour_controller
+                    .reject_if_selected_unsupported(RoutineId::PromptPrepare)?;
                 let prompt_preparation = if use_raster_prefill {
                     let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
                         "raster tile inference requires an authenticated Gemma tokenizer",
@@ -350,6 +364,8 @@ pub fn run_inference_with_controls(
                     }
                     prompt_preparation
                 };
+                raster_detour_controller
+                    .reject_if_selected_unsupported(RoutineId::InputEmbedding)?;
                 let (token_embeddings, raster_input_embedding_refs) = if use_raster_prefill {
                     let raster_prompt_preparation = raster_prompt_preparation_for_embedding
                         .as_ref()
@@ -443,6 +459,8 @@ pub fn run_inference_with_controls(
                 let prefill = if use_raster_prefill {
                     let raster_sizing =
                         raster_sizing_controls.expect("raster sizing controls should be validated");
+                    raster_detour_controller
+                        .reject_if_selected_unsupported(RoutineId::PrefillPrepareAux)?;
                     let ple_source = AuthenticatedGemmaPleSource::from_model(
                         model.model_id.clone(),
                         transformer_model,
@@ -472,6 +490,8 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
+                    raster_detour_controller
+                        .reject_if_selected_unsupported(RoutineId::PrefillLayer)?;
                     let (layer_roots, layer_refs) = prefill_layer::run_raster(
                         layer_roots,
                         &input_embedding_output.refs,
@@ -494,6 +514,8 @@ pub fn run_inference_with_controls(
                         model.model_id.clone(),
                         transformer_model,
                     )?;
+                    raster_detour_controller
+                        .reject_if_selected_unsupported(RoutineId::PrefillFinalize)?;
                     let prefill_output = prefill_finalize::run_raster(
                         layer_roots,
                         prompt_preparation.prompt_token_ids.len(),
@@ -530,6 +552,8 @@ pub fn run_inference_with_controls(
                     )?);
                     prefill_finalize::materialize_raster_output_refs_for_api(&prefill_output)?
                 } else {
+                    raster_detour_controller
+                        .reject_if_selected_unsupported(RoutineId::PrefillPrepareAux)?;
                     let ple_inputs = if let Some(input_embedding_output) =
                         raster_input_embedding_refs.as_ref()
                     {
@@ -565,11 +589,12 @@ pub fn run_inference_with_controls(
                         }));
                     }
                     let (final_hidden_states, layer_caches) =
-                        prefill_layer::run_with_mode_internal(
+                        prefill_layer::run_with_mode_internal_with_detour(
                             token_embeddings.clone_internal(),
                             transformer_model,
                             ple_inputs.as_ref(),
                             request.execution_mode,
+                            Some(&mut raster_detour_controller),
                         )?;
                     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                         trace::phase_paused(PhaseId::TransformerStateTransition);
@@ -581,6 +606,8 @@ pub fn run_inference_with_controls(
                             raster_tile_invocations: None,
                         }));
                     }
+                    raster_detour_controller
+                        .reject_if_selected_unsupported(RoutineId::PrefillFinalize)?;
                     prefill_finalize::run(
                         &prompt_preparation.prompt_token_ids,
                         transformer_model,
@@ -617,13 +644,14 @@ pub fn run_inference_with_controls(
                         raster_sizing_controls.expect("raster sizing controls should be validated"),
                     )?
                 } else {
-                    pipeline::run_output_decode_with_mode(
+                    pipeline::run_output_decode_with_mode_and_detour(
                         &prompt_preparation.prompt_token_ids,
                         &prefill,
                         &request.sampling,
                         tokenizer,
                         transformer_model,
                         request.execution_mode,
+                        Some(&mut raster_detour_controller),
                     )?
                 };
                 transformer_state_transition
@@ -641,6 +669,7 @@ pub fn run_inference_with_controls(
                 }
                 trace::phase_finished(PhaseId::OutputDecode);
 
+                raster_detour_controller.ensure_matched_if_active()?;
                 Ok(InferenceRunOutcome::Completed(InferenceState {
                     input_embedding,
                     transformer_state_transition,
@@ -775,8 +804,8 @@ mod tests {
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
         Gemma4PleLayerWeights, Gemma4TransformerModel, GemmaBpeMerge, GemmaTokenizerSpec,
         GemmaVocabEntry, InferenceControls, InferenceExecutionMode, InferenceRequest,
-        InferenceRunOutcome, MatrixF32, ModelSpec, OutputDecodeStopReason, SamplingConfig,
-        TextDecodingPolicy,
+        InferenceRunOutcome, MatrixF32, ModelSpec, OutputDecodeStopReason, RasterDetourSpec,
+        SamplingConfig, TextDecodingPolicy,
     };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -890,6 +919,244 @@ mod tests {
     }
 
     #[test]
+    fn run_inference_rejects_raster_detour_without_deterministic_execution() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_model = test_transformer_model();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Fp32,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("input.embedding").expect("detour should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("detour should require deterministic execution");
+
+        assert!(error
+            .to_string()
+            .contains("selective raster detour requires deterministic execution"));
+    }
+
+    #[test]
+    fn run_inference_reports_unsupported_selected_raster_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(1),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prompt.prepare").expect("detour should parse"),
+                ),
+                raster_projection_rows_per_tile: Some(4),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("unimplemented detour should fail");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("selective raster detour for prompt.prepare is not implemented yet"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn run_inference_reports_unmatched_selected_raster_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prefill.layer:999").expect("detour should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("unmatched detour should fail");
+
+        assert!(error
+            .to_string()
+            .contains("selective raster detour target prefill.layer:999 was not reached"));
+    }
+
+    #[test]
+    fn run_inference_counts_prefill_layer_detour_occurrences() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let mut transformer_fixture = deterministic_no_ple_model_fixture();
+        transformer_fixture
+            .model
+            .layers
+            .push(transformer_fixture.model.layers[0].clone());
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prefill.layer:2").expect("detour should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("second prefill layer detour should be selected");
+
+        assert!(error
+            .to_string()
+            .contains("selective raster detour for prefill.layer:2 is not implemented yet"));
+    }
+
+    #[test]
+    fn run_inference_rejects_full_raster_with_raster_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster: true,
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prompt.prepare").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("full raster and detour should conflict");
+
+        assert!(error
+            .to_string()
+            .contains("--raster and selective raster detour cannot be used together"));
+    }
+
+    #[test]
+    fn run_inference_validates_raster_sizing_for_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = InferenceRequest {
+            prompt_bytes: b"prompt".to_vec(),
+            text_decoding_policy: TextDecodingPolicy::Utf8,
+            add_generation_prompt: false,
+            add_special_tokens: false,
+            execution_mode: InferenceExecutionMode::Deterministic,
+            sampling: SamplingConfig {
+                max_new_tokens: Some(0),
+                temperature: Some(1.0),
+                top_k: None,
+                top_p: None,
+            },
+        };
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prompt.prepare").expect("detour should parse"),
+                ),
+                raster_projection_rows_per_tile: Some(0),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("zero raster sizing should fail for detour");
+
+        assert!(error
+            .to_string()
+            .contains("raster projection rows per tile must be greater than zero"));
+    }
+
+    #[test]
     fn run_inference_with_controls_pauses_after_prompt_prepare_checkpoint() {
         let tokenizer = test_tokenizer();
         let model = test_model_spec();
@@ -917,6 +1184,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prompt.prepare".to_string()),
                 raster: false,
+                raster_detour: None,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -973,6 +1241,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prompt.prepare".to_string()),
                 raster: false,
+                raster_detour: None,
                 raster_tokenizer_source: Some(tokenizer_source.clone()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1245,6 +1514,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("input.embedding".to_string()),
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1305,6 +1575,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.prepare_aux".to_string()),
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1365,6 +1636,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.layer".to_string()),
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1420,6 +1692,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.layer:2".to_string()),
                 raster: false,
+                raster_detour: None,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1471,6 +1744,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1527,6 +1801,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1587,6 +1862,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("decode.finalize".to_string()),
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1652,6 +1928,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1705,6 +1982,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("output.finalize".to_string()),
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(2),
                 raster_attention_kv_rows_per_tile: None,
@@ -1758,6 +2036,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1803,6 +2082,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1846,6 +2126,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: Some(0),
                 raster_attention_kv_rows_per_tile: None,
@@ -1889,6 +2170,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: Some(0),
@@ -1932,6 +2214,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -1975,6 +2258,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: None,
                 raster: true,
+                raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
                 raster_projection_rows_per_tile: None,
                 raster_attention_kv_rows_per_tile: None,
@@ -2051,6 +2335,7 @@ mod tests {
                 commit_checkpoints: false,
                 terminal_checkpoint: Some("prefill.finalize".to_string()),
                 raster: false,
+                raster_detour: None,
                 raster_tokenizer_source: None,
                 raster_projection_rows_per_tile: Some(0),
                 raster_attention_kv_rows_per_tile: None,

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
+use crate::runtime::checkpoints::{RasterDetourController, RoutineId};
 use crate::shared::api::input::{InferenceExecutionMode, PromptPreparationState, SamplingConfig};
 use crate::shared::api::output::OutputDecodeState;
 use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
@@ -291,6 +292,27 @@ pub fn run_output_decode_with_mode(
         tokenizer,
         transformer_model,
         execution_mode,
+        None,
+    )
+}
+
+pub(crate) fn run_output_decode_with_mode_and_detour(
+    prompt_token_ids: &[u32],
+    initial_transformer_state: &TransformerPrefillResult,
+    sampling: &SamplingConfig,
+    tokenizer: &Tokenizer,
+    transformer_model: &Gemma4TransformerModel,
+    execution_mode: InferenceExecutionMode,
+    detour_controller: Option<&mut RasterDetourController>,
+) -> Result<OutputDecodeState> {
+    run_output_decode_with_mode_internal(
+        prompt_token_ids,
+        initial_transformer_state,
+        sampling,
+        tokenizer,
+        transformer_model,
+        execution_mode,
+        detour_controller,
     )
 }
 
@@ -385,6 +407,7 @@ fn run_output_decode_with_mode_internal(
     tokenizer: &Tokenizer,
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
+    mut detour_controller: Option<&mut RasterDetourController>,
 ) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
@@ -412,17 +435,26 @@ fn run_output_decode_with_mode_internal(
         )
         .is_some()
         {
+            if let Some(controller) = detour_controller.as_deref_mut() {
+                controller.reject_if_selected_unsupported(RoutineId::FinalizeOutput)?;
+            }
             trace_event("output.detokenize");
             let mut output_decode_state = crate::output_finalize::run(decode_state, tokenizer)?;
             output_decode_state.decode_transition_states = decode_transition_states;
             return Ok(output_decode_state);
         }
 
+        if let Some(controller) = detour_controller.as_deref_mut() {
+            controller.reject_if_selected_unsupported(RoutineId::SelectOutputToken)?;
+        }
         trace_event("decode.select_token");
         let next_token =
             crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
                 .expect("stop condition should have returned earlier");
 
+        if let Some(controller) = detour_controller.as_deref_mut() {
+            controller.reject_if_selected_unsupported(RoutineId::DecodeTransition)?;
+        }
         trace_event("decode.step");
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
         let decode_transition = crate::decode_transition::run_with_mode(

@@ -26,7 +26,10 @@ pub use routines::{
     prefill_layer, prefill_prepare_aux, prompt_prepare,
 };
 pub use runtime::checkpoints;
-pub use runtime::checkpoints::{classify_checkpoint, CheckpointTaxonomy, PhaseId, RoutineId};
+pub use runtime::checkpoints::{
+    classify_checkpoint, CheckpointTaxonomy, PhaseId, RasterDetourController, RasterDetourSpec,
+    RoutineId,
+};
 pub use runtime::inference::{
     run_inference, run_inference_with_controls, InferenceControls, InferenceRunOutcome,
     InferenceState, InputEmbeddingState, PausedInferenceState, RasterPromptPreparedState,
