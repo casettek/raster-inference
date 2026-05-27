@@ -5,10 +5,12 @@ use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
 use crate::shared::artifacts::raster_artifact_store::{
-    read_token_id_from_ref_roots, RasterSelectedTokenRef, RasterTokenIdSequenceRef,
+    read_token_id_from_ref_roots, RasterArtifactStoreRoots, RasterSelectedTokenRef,
+    RasterTokenIdSequenceRef,
 };
 use crate::shared::model::transformer::{
-    Gemma4TransformerModel, InternalLogits, TransformerDecodeState, TransformerDecodeStepResult,
+    Gemma4TransformerModel, InternalLogits, LayerKvCache, TransformerDecodeState,
+    TransformerDecodeStepResult,
 };
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
 use crate::shared::tensors::raster_tensor_artifacts::{
@@ -163,6 +165,27 @@ pub fn run_raster(
         output.token_count,
         Some(output.final_hidden_state_ref),
     )
+}
+
+pub(crate) fn insert_decode_layer_cache_refs_from_native(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    layer_caches: &[LayerKvCache],
+    source_name_prefix: &str,
+) -> Result<(RasterArtifactStoreRoots, Vec<raster::DecodeLayerCacheSlot>)> {
+    let mut artifact_store_roots = artifact_store_roots;
+    let mut raster_layer_caches = Vec::with_capacity(layer_caches.len());
+    for (layer_idx, cache) in layer_caches.iter().enumerate() {
+        let raster_cache = raster::raster_cache_from_layer_cache(cache)?;
+        let (next_roots, cache_slot) = raster::register_decode_layer_cache_with_roots(
+            &artifact_store_roots,
+            source_name_prefix,
+            layer_idx,
+            raster_cache,
+        )?;
+        artifact_store_roots = next_roots;
+        raster_layer_caches.push(cache_slot);
+    }
+    Ok((artifact_store_roots, raster_layer_caches))
 }
 
 pub fn finalize(decode_state: &DecodeState) -> Result<()> {

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 
 use crate::runtime::checkpoints::{RasterDetourController, RoutineId};
@@ -293,6 +293,7 @@ pub fn run_output_decode_with_mode(
         transformer_model,
         execution_mode,
         None,
+        None,
     )
 }
 
@@ -304,6 +305,7 @@ pub(crate) fn run_output_decode_with_mode_and_detour(
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
     detour_controller: Option<&mut RasterDetourController>,
+    raster_sizing: Option<RasterSizingControls>,
 ) -> Result<OutputDecodeState> {
     run_output_decode_with_mode_internal(
         prompt_token_ids,
@@ -313,6 +315,7 @@ pub(crate) fn run_output_decode_with_mode_and_detour(
         transformer_model,
         execution_mode,
         detour_controller,
+        raster_sizing,
     )
 }
 
@@ -356,8 +359,11 @@ pub(crate) fn run_output_decode_with_raster_state(
         }
 
         trace_event("decode.select_token");
-        let (selected_state, select_output) =
-            crate::decode_select_token::run_raster(decode_state, max_new_tokens)?;
+        let (selected_state, select_output) = crate::decode_select_token::run_raster_with_sizing(
+            decode_state,
+            max_new_tokens,
+            raster_sizing,
+        )?;
         let select_output = select_output.expect("stop condition should have returned earlier");
         crate::decode_select_token::trace_raster_checkpoint_from_state(
             &selected_state,
@@ -408,6 +414,7 @@ fn run_output_decode_with_mode_internal(
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
     mut detour_controller: Option<&mut RasterDetourController>,
+    raster_sizing: Option<RasterSizingControls>,
 ) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = validate_sampling_config(sampling)?;
@@ -444,13 +451,23 @@ fn run_output_decode_with_mode_internal(
             return Ok(output_decode_state);
         }
 
-        if let Some(controller) = detour_controller.as_deref_mut() {
-            controller.reject_if_selected_unsupported(RoutineId::SelectOutputToken)?;
-        }
+        let detour_select_token = detour_controller
+            .as_deref_mut()
+            .is_some_and(|controller| controller.should_detour(RoutineId::SelectOutputToken));
         trace_event("decode.select_token");
-        let next_token =
+        let next_token = if detour_select_token {
+            let raster_sizing = raster_sizing.context(
+                "selective raster decode.select_token detour requires raster sizing controls",
+            )?;
+            crate::decode_select_token::run_selected_raster_detour_from_native_boundary(
+                &mut decode_state,
+                max_new_tokens,
+                raster_sizing,
+            )?
+        } else {
             crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
-                .expect("stop condition should have returned earlier");
+                .expect("stop condition should have returned earlier")
+        };
 
         if let Some(controller) = detour_controller.as_deref_mut() {
             controller.reject_if_selected_unsupported(RoutineId::DecodeTransition)?;

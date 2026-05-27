@@ -1,26 +1,22 @@
-#[cfg(test)]
-use anyhow::anyhow;
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
-#[cfg(test)]
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 #[cfg(test)]
+use crate::shared::artifacts::raster_artifact_store::read_token_id_from_ref_roots;
 use crate::shared::artifacts::raster_artifact_store::{
-    activation_row_leaf, read_token_id_from_ref_roots, token_id_leaf,
-    RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
-    RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
+    activation_row_leaf, token_id_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
+    RasterArtifactMetadata, RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
-#[cfg(test)]
 use crate::shared::raster_kernels::transformer::RasterActivationRow;
-#[cfg(test)]
 use crate::shared::tensors::raster_tensor_artifacts::{
     activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
 };
+use crate::RasterSizingControls;
 
 pub mod native;
 pub mod raster;
@@ -112,6 +108,36 @@ pub fn run_raster(
     RasterDecodeLoopState,
     Option<raster::RasterDecodeSelectOutputRefs>,
 )> {
+    run_raster_with_decode_select_sizing(
+        decode_state,
+        max_new_tokens,
+        DecodeSelectRasterSizing::default(),
+    )
+}
+
+pub(crate) fn run_raster_with_sizing(
+    decode_state: RasterDecodeLoopState,
+    max_new_tokens: usize,
+    raster_sizing: RasterSizingControls,
+) -> Result<(
+    RasterDecodeLoopState,
+    Option<raster::RasterDecodeSelectOutputRefs>,
+)> {
+    run_raster_with_decode_select_sizing(
+        decode_state,
+        max_new_tokens,
+        DecodeSelectRasterSizing::from(raster_sizing),
+    )
+}
+
+fn run_raster_with_decode_select_sizing(
+    decode_state: RasterDecodeLoopState,
+    max_new_tokens: usize,
+    raster_sizing: DecodeSelectRasterSizing,
+) -> Result<(
+    RasterDecodeLoopState,
+    Option<raster::RasterDecodeSelectOutputRefs>,
+)> {
     let _routine = crate::trace::routine_scope(
         RoutineId::SelectOutputToken,
         format!(
@@ -123,7 +149,8 @@ pub fn run_raster(
         return Ok((decode_state, None));
     }
 
-    let input_roots = prepare_raster_decode_select_input_roots_from_state(decode_state.clone());
+    let input_roots =
+        prepare_raster_decode_select_input_roots_from_state(decode_state.clone(), raster_sizing);
     let output = raster::main(input_roots)?;
     let next_state = RasterDecodeLoopState::new(
         output.artifact_store_roots.clone(),
@@ -139,6 +166,31 @@ pub fn run_raster(
         decode_state.activation_state_ref,
     )?;
     Ok((next_state, Some(output)))
+}
+
+pub(crate) fn run_selected_raster_detour_from_native_boundary(
+    decode_state: &mut DecodeState,
+    max_new_tokens: usize,
+    raster_sizing: RasterSizingControls,
+) -> Result<u32> {
+    let original_current_logits = decode_state.current_logits.clone();
+    let raster_state = prepare_raster_decode_loop_state_from_native(decode_state)?;
+    let (next_state, output) = run_raster_with_sizing(raster_state, max_new_tokens, raster_sizing)?;
+    let output = output.context(
+        "selective raster decode.select_token detour reached stop condition unexpectedly",
+    )?;
+
+    let mut materialized =
+        crate::decode_transition::materialize_decode_state_from_raster_state_for_trace(
+            &next_state,
+        )?;
+    materialized.current_logits = original_current_logits;
+    crate::trace::trace_checkpoint(
+        "decode.select_token",
+        &decode_select_checkpoint_state(&materialized, output.next_token, max_new_tokens)?,
+    );
+    *decode_state = materialized;
+    Ok(output.next_token)
 }
 
 pub(crate) fn trace_raster_checkpoint_from_state(
@@ -159,6 +211,7 @@ pub(crate) fn trace_raster_checkpoint_from_state(
 
 fn prepare_raster_decode_select_input_roots_from_state(
     decode_state: RasterDecodeLoopState,
+    raster_sizing: DecodeSelectRasterSizing,
 ) -> raster::RasterDecodeSelectInputRoots {
     let source_prefix = format!(
         "decode.select_token.position_{}.step_{}",
@@ -171,14 +224,83 @@ fn prepare_raster_decode_select_input_roots_from_state(
         full_token_count: decode_state.full_token_count,
         generated_token_ids_ref: decode_state.generated_token_ids_ref,
         generated_token_count: decode_state.generated_token_count,
-        logits_per_tile: raster::DEFAULT_DECODE_SELECT_LOGITS_PER_TILE,
-        token_ids_per_tile: raster::DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE,
+        logits_per_tile: raster_sizing.logits_per_tile,
+        token_ids_per_tile: raster_sizing.token_ids_per_tile,
         output_full_token_ids_source_name: format!("{source_prefix}.output.full_token_ids"),
         output_generated_token_ids_source_name: format!(
             "{source_prefix}.output.generated_token_ids"
         ),
         output_selected_token_source_name: format!("{source_prefix}.output.selected_token"),
     }
+}
+
+#[derive(Clone, Copy)]
+struct DecodeSelectRasterSizing {
+    logits_per_tile: usize,
+    token_ids_per_tile: usize,
+}
+
+impl Default for DecodeSelectRasterSizing {
+    fn default() -> Self {
+        Self {
+            logits_per_tile: raster::DEFAULT_DECODE_SELECT_LOGITS_PER_TILE,
+            token_ids_per_tile: raster::DEFAULT_DECODE_SELECT_TOKEN_IDS_PER_TILE,
+        }
+    }
+}
+
+impl From<RasterSizingControls> for DecodeSelectRasterSizing {
+    fn from(raster_sizing: RasterSizingControls) -> Self {
+        Self {
+            logits_per_tile: raster_sizing.sequence_rows_per_tile,
+            token_ids_per_tile: raster_sizing.sequence_rows_per_tile,
+        }
+    }
+}
+
+fn prepare_raster_decode_loop_state_from_native(
+    decode_state: &DecodeState,
+) -> Result<RasterDecodeLoopState> {
+    let position = decode_state.transformer_decode_state.position;
+    let generated_count = decode_state.generated_token_ids.len();
+    let source_prefix =
+        format!("decode.select_token.detour.position_{position}.step_{generated_count}");
+    let artifact_store_roots = ArtifactIo::export_store_roots();
+    let (artifact_store_roots, full_token_ids_ref) = insert_token_ids_artifact_with_roots(
+        artifact_store_roots,
+        format!("{source_prefix}.input.full_token_ids"),
+        &decode_state.full_token_ids,
+    )?;
+    let (artifact_store_roots, generated_token_ids_ref) = insert_token_ids_artifact_with_roots(
+        artifact_store_roots,
+        format!("{source_prefix}.input.generated_token_ids"),
+        &decode_state.generated_token_ids,
+    )?;
+    let (artifact_store_roots, logits_ref, logit_count) = insert_logits_artifact_with_roots(
+        artifact_store_roots,
+        format!("{source_prefix}.input.logits"),
+        decode_state,
+    )?;
+    let (artifact_store_roots, layer_caches) =
+        crate::decode_transition::insert_decode_layer_cache_refs_from_native(
+            artifact_store_roots,
+            &decode_state.transformer_decode_state.layer_caches,
+            &format!("{source_prefix}.input.layer_cache"),
+        )?;
+
+    RasterDecodeLoopState::new(
+        artifact_store_roots,
+        full_token_ids_ref,
+        decode_state.full_token_ids.len(),
+        generated_token_ids_ref,
+        decode_state.generated_token_ids.len(),
+        logits_ref,
+        logit_count,
+        layer_caches,
+        decode_state.transformer_decode_state.position,
+        decode_state.transformer_decode_state.token_count,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -199,7 +321,7 @@ fn prepare_raster_decode_select_input_roots(
         format!("{source_prefix}.input.generated_token_ids"),
         &decode_state.generated_token_ids,
     )?;
-    let (artifact_store_roots, logits_ref) = insert_logits_artifact_with_roots(
+    let (artifact_store_roots, logits_ref, _) = insert_logits_artifact_with_roots(
         artifact_store_roots,
         format!("{source_prefix}.input.logits"),
         decode_state,
@@ -222,7 +344,6 @@ fn prepare_raster_decode_select_input_roots(
     })
 }
 
-#[cfg(test)]
 fn insert_token_ids_artifact_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     source_name: String,
@@ -244,12 +365,11 @@ fn insert_token_ids_artifact_with_roots(
     ))
 }
 
-#[cfg(test)]
 fn insert_logits_artifact_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     source_name: String,
     decode_state: &DecodeState,
-) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef, usize)> {
     let logits = decode_state.clone_internal_logits();
     let det_logits = logits.det_values().ok_or_else(|| {
         anyhow!("raster decode select token requires canonical deterministic logits")
@@ -272,7 +392,7 @@ fn insert_logits_artifact_with_roots(
         RasterTensorId::new(source_name)?,
         RasterActivationSequenceArtifactRef::new(logits_artifact_ref)?,
     )?;
-    Ok((artifact_store_roots, logits_ref))
+    Ok((artifact_store_roots, logits_ref, det_logits.len()))
 }
 
 #[cfg(test)]

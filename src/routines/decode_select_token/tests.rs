@@ -1,4 +1,7 @@
-use super::{decode_select_checkpoint_state, materialize_run_raster_for_api, run_raster};
+use super::{
+    decode_select_checkpoint_state, materialize_run_raster_for_api, run_raster_with_sizing,
+    run_selected_raster_detour_from_native_boundary,
+};
 use crate::shared::api::output::DecodeState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -13,6 +16,7 @@ use crate::shared::raster_kernels::transformer::RasterActivationRow;
 use crate::shared::tensors::raster_tensor_artifacts::{
     activation_sequence_ref_from_artifact, RasterActivationSequenceRef, RasterTensorId,
 };
+use crate::{InferenceControls, RasterSizingControls};
 
 #[test]
 fn run_raster_appends_selected_token_to_decode_state() {
@@ -128,7 +132,8 @@ fn run_raster_state_threads_refs_without_host_decode_state_mutation() {
     )
     .unwrap();
 
-    let (next_state, output) = run_raster(decode_state, 1).expect("raster state select should run");
+    let (next_state, output) = run_raster_with_sizing(decode_state, 1, raster_sizing_controls())
+        .expect("raster state select should run");
     let output = output.expect("should select token");
 
     assert_eq!(output.next_token, 1);
@@ -154,15 +159,125 @@ fn run_raster_state_threads_refs_without_host_decode_state_mutation() {
     );
 }
 
+#[test]
+fn selected_detour_from_native_boundary_materializes_decode_state() {
+    let mut decode_state = decode_state_with_position_and_logits(
+        1,
+        1,
+        vec![Act::from_bits(1), Act::from_bits(9), Act::from_bits(3)],
+    );
+
+    let selected = run_selected_raster_detour_from_native_boundary(
+        &mut decode_state,
+        1,
+        raster_sizing_controls(),
+    )
+    .expect("selected detour should run");
+
+    assert_eq!(selected, 1);
+    assert_eq!(decode_state.full_token_ids, vec![7, 1]);
+    assert_eq!(decode_state.generated_token_ids, vec![1]);
+    assert_eq!(decode_state.transformer_decode_state.position, 1);
+    assert_eq!(decode_state.transformer_decode_state.token_count, 1);
+}
+
+#[test]
+fn selected_detour_rejects_f32_only_logits_without_mutating_decode_state() {
+    let mut decode_state = DecodeState::new(
+        vec![7],
+        vec![0.0, 1.0],
+        TransformerDecodeState {
+            layer_caches: Vec::new(),
+            position: 1,
+            token_count: 1,
+        },
+    );
+    let original = decode_state.clone();
+
+    let error = run_selected_raster_detour_from_native_boundary(
+        &mut decode_state,
+        1,
+        raster_sizing_controls(),
+    )
+    .expect_err("f32-only logits should fail in selected detour");
+
+    assert!(error.to_string().contains("canonical deterministic logits"));
+    assert_eq!(decode_state, original);
+}
+
+#[test]
+fn selected_detour_rejects_empty_canonical_logits_without_mutating_decode_state() {
+    let internal = InternalLogits::from_det_values(Vec::new());
+    let mut decode_state = DecodeState::new(
+        vec![7],
+        internal.clone_f32(),
+        TransformerDecodeState {
+            layer_caches: Vec::new(),
+            position: 1,
+            token_count: 1,
+        },
+    );
+    decode_state.set_internal_logits(internal);
+    let original = decode_state.clone();
+
+    let error = run_selected_raster_detour_from_native_boundary(
+        &mut decode_state,
+        1,
+        raster_sizing_controls(),
+    )
+    .expect_err("empty canonical logits should fail in selected detour");
+
+    assert!(error.to_string().contains("at least one canonical logit"));
+    assert_eq!(decode_state, original);
+}
+
+#[test]
+fn selected_detour_rejects_unexpected_stop_without_mutating_decode_state() {
+    let mut decode_state = decode_state_with_position_and_logits(
+        1,
+        1,
+        vec![Act::from_bits(1), Act::from_bits(9), Act::from_bits(3)],
+    );
+    let original = decode_state.clone();
+
+    let error = run_selected_raster_detour_from_native_boundary(
+        &mut decode_state,
+        0,
+        raster_sizing_controls(),
+    )
+    .expect_err("selected detour helper should reject unexpected stop");
+
+    assert!(error.to_string().contains("stop condition unexpectedly"));
+    assert_eq!(decode_state, original);
+}
+
 fn decode_state_with_logits(det_logits: Vec<Act>) -> DecodeState {
+    decode_state_with_position_and_logits(0, 0, det_logits)
+}
+
+fn decode_state_with_position_and_logits(
+    position: usize,
+    token_count: usize,
+    det_logits: Vec<Act>,
+) -> DecodeState {
     let internal = InternalLogits::from_det_values(det_logits);
     let mut decode_state = DecodeState::new(
         vec![7],
         internal.clone_f32(),
-        TransformerDecodeState::default(),
+        TransformerDecodeState {
+            layer_caches: Vec::new(),
+            position,
+            token_count,
+        },
     );
     decode_state.set_internal_logits(internal);
     decode_state
+}
+
+fn raster_sizing_controls() -> RasterSizingControls {
+    InferenceControls::default()
+        .raster_sizing_controls()
+        .expect("default raster sizing should be valid")
 }
 
 fn insert_token_ids(

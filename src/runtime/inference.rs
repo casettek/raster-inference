@@ -735,6 +735,7 @@ pub fn run_inference_with_controls(
                         transformer_model,
                         request.execution_mode,
                         Some(&mut raster_detour_controller),
+                        raster_sizing_controls,
                     )?
                 };
                 transformer_state_transition
@@ -1195,6 +1196,61 @@ mod tests {
         assert!(error
             .to_string()
             .contains("selective raster detour target prefill.layer:999 was not reached"));
+    }
+
+    #[test]
+    fn run_inference_reports_unmatched_decode_select_token_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("decode.select_token:2").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("second decode select token detour should be unmatched");
+
+        assert!(error
+            .to_string()
+            .contains("selective raster detour target decode.select_token:2 was not reached"));
+    }
+
+    #[test]
+    fn run_inference_validates_sequence_sizing_for_decode_select_token_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("decode.select_token").expect("detour should parse"),
+                ),
+                raster_sequence_rows_per_tile: Some(0),
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("zero sequence rows should fail");
+
+        assert!(error
+            .to_string()
+            .contains("raster sequence rows per tile must be greater than zero"));
     }
 
     #[test]
@@ -2321,6 +2377,127 @@ mod tests {
         assert!(
             detour.raster_tile_invocations.unwrap_or(0) > 0,
             "detour should expose raster tile telemetry outside committed checkpoints"
+        );
+    }
+
+    fn assert_decode_select_detour_matches_native(
+        test_name: &str,
+        max_new_tokens: usize,
+        detour_spec: &str,
+        expected_decode_select_checkpoints: usize,
+    ) {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let _trace_dir = TraceDirGuard::new(test_name);
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let tokenizer_source = test_gemma_tokenizer_source();
+        let request = deterministic_prompt_request(max_new_tokens);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_tokenizer_source: Some(tokenizer_source.clone()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("native deterministic inference should complete");
+        let native_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let detour = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_detour: Some(
+                    RasterDetourSpec::parse(detour_spec).expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(tokenizer_source),
+                raster_sequence_rows_per_tile: Some(2),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("decode select token detour inference should complete");
+        let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        assert_eq!(native_payload, detour_payload);
+        assert_eq!(
+            checkpoint_commitments(&native_payload, "decode.select_token").len(),
+            expected_decode_select_checkpoints
+        );
+
+        let native = expect_completed_state(native, "native inference");
+        let detour = expect_completed_state(detour, "decode select token detour inference");
+        assert_output_decode_matches(&native, &detour);
+        assert!(
+            detour.raster_tile_invocations.unwrap_or(0) > 0,
+            "detour should expose raster tile telemetry outside committed checkpoints"
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_trace_matches_decode_select_token_detour_trace() {
+        assert_decode_select_detour_matches_native(
+            "decode-select-token-detour-trace",
+            2,
+            "decode.select_token",
+            2,
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_trace_matches_second_decode_select_token_detour_trace() {
+        assert_decode_select_detour_matches_native(
+            "second-decode-select-token-detour-trace",
+            2,
+            "decode.select_token:2",
+            2,
+        );
+    }
+
+    #[cfg(feature = "unchecked-raster-integrity")]
+    #[test]
+    fn run_inference_decode_select_token_detour_runs_in_unchecked_integrity_mode() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::integrity_mode::with_raster_integrity_mode(
+            crate::RasterIntegrityMode::UncheckedTestOnly,
+            || {
+                crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+                let detour = run_inference_with_controls(
+                    &request,
+                    &model,
+                    &tokenizer,
+                    &transformer_fixture.model,
+                    &InferenceControls {
+                        raster_detour: Some(
+                            RasterDetourSpec::parse("decode.select_token")
+                                .expect("detour should parse"),
+                        ),
+                        raster_sequence_rows_per_tile: Some(1),
+                        raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                        ..InferenceControls::default()
+                    },
+                )
+                .expect("unchecked decode select token detour should complete");
+
+                let detour = expect_completed_state(detour, "unchecked decode select token detour");
+                assert!(
+                    detour.raster_tile_invocations.unwrap_or(0) > 0,
+                    "unchecked decode select token detour should count raster tiles"
+                );
+            },
         );
     }
 
