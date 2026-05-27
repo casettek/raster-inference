@@ -255,6 +255,8 @@ pub fn reached_terminal_checkpoint_id() -> Option<String> {
 #[derive(Default)]
 struct TraceCollector {
     checkpoints: Vec<Value>,
+    #[cfg(test)]
+    completed_checkpoints: Option<Value>,
     completed_trace_path: Option<PathBuf>,
 }
 
@@ -274,6 +276,7 @@ pub fn start_inference_trace<T: Serialize>(run_metadata: &T) {
         .lock()
         .expect("trace collector mutex should not be poisoned");
     collector.checkpoints.clear();
+    clear_completed_checkpoints_for_tests(&mut collector);
     collector.completed_trace_path = None;
 }
 
@@ -339,6 +342,7 @@ pub fn finish_inference_trace<T: Serialize>(summary: &T) {
         .lock()
         .expect("trace collector mutex should not be poisoned");
     let payload = Value::Array(std::mem::take(&mut collector.checkpoints));
+    store_completed_checkpoints_for_tests(&mut collector, &payload);
     collector.completed_trace_path = write_checkpoint_bundle(&payload).ok();
     emit_checkpoint_bundle(&payload, collector.completed_trace_path.as_deref());
 }
@@ -353,6 +357,7 @@ pub fn abort_inference_trace(error: &anyhow::Error) {
         .lock()
         .expect("trace collector mutex should not be poisoned");
     let payload = Value::Array(std::mem::take(&mut collector.checkpoints));
+    store_completed_checkpoints_for_tests(&mut collector, &payload);
     collector.completed_trace_path = write_checkpoint_bundle(&payload).ok();
     emit_checkpoint_bundle(&payload, collector.completed_trace_path.as_deref());
 }
@@ -366,6 +371,33 @@ pub(crate) fn checkpoint_payload_for_tests() -> Value {
         .clone();
     Value::Array(checkpoints)
 }
+
+#[cfg(test)]
+pub(crate) fn take_completed_checkpoint_payload_for_tests() -> Value {
+    let mut collector = trace_collector()
+        .lock()
+        .expect("trace collector mutex should not be poisoned");
+    collector
+        .completed_checkpoints
+        .take()
+        .unwrap_or_else(|| Value::Array(Vec::new()))
+}
+
+#[cfg(test)]
+fn clear_completed_checkpoints_for_tests(collector: &mut TraceCollector) {
+    collector.completed_checkpoints = None;
+}
+
+#[cfg(not(test))]
+fn clear_completed_checkpoints_for_tests(_collector: &mut TraceCollector) {}
+
+#[cfg(test)]
+fn store_completed_checkpoints_for_tests(collector: &mut TraceCollector, payload: &Value) {
+    collector.completed_checkpoints = Some(payload.clone());
+}
+
+#[cfg(not(test))]
+fn store_completed_checkpoints_for_tests(_collector: &mut TraceCollector, _payload: &Value) {}
 
 pub fn serialize_layer_caches(
     layer_caches: &[crate::shared::model::transformer::LayerKvCache],

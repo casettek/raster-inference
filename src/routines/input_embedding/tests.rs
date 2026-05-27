@@ -11,23 +11,8 @@ use crate::shared::numerics::det_num::Act;
 fn raster_input_embedding_consumes_prompt_token_root() {
     ArtifactIo::reset_store();
     let token_ids = insert_token_ids(&[1, 0]);
-    let prompt_preparation = RasterPromptPreparationState {
-        prompt_bytes_root: "prompt-bytes".to_string(),
-        prompt_text_root: "prompt-text".to_string(),
-        rendered_prompt_root: "rendered-prompt".to_string(),
-        normalized_prompt_root: "normalized-prompt".to_string(),
-        prompt_token_ids_root: token_ids.root().to_string(),
-        prompt_token_count: token_ids.token_count(),
-    };
-    let source = AuthenticatedGemmaInputEmbeddingSource::from_canonical_rows(
-        "embedding-fixture",
-        vec![
-            vec![Act::from_num(1.0), Act::from_num(2.0)],
-            vec![Act::from_num(3.0), Act::from_num(4.0)],
-        ],
-        Act::from_num(1.0),
-    )
-    .expect("embedding source should build");
+    let prompt_preparation = prompt_preparation_for_token_ids(&token_ids, token_ids.token_count());
+    let source = embedding_source_fixture();
 
     let output = run_raster(
         ArtifactIo::export_store_roots(),
@@ -55,23 +40,8 @@ fn raster_input_embedding_consumes_prompt_token_root() {
 fn native_input_embedding_checkpoint_refs_match_raster_refs() {
     ArtifactIo::reset_store();
     let token_ids = insert_token_ids(&[1, 0]);
-    let prompt_preparation = RasterPromptPreparationState {
-        prompt_bytes_root: "prompt-bytes".to_string(),
-        prompt_text_root: "prompt-text".to_string(),
-        rendered_prompt_root: "rendered-prompt".to_string(),
-        normalized_prompt_root: "normalized-prompt".to_string(),
-        prompt_token_ids_root: token_ids.root().to_string(),
-        prompt_token_count: token_ids.token_count(),
-    };
-    let source = AuthenticatedGemmaInputEmbeddingSource::from_canonical_rows(
-        "embedding-fixture",
-        vec![
-            vec![Act::from_num(1.0), Act::from_num(2.0)],
-            vec![Act::from_num(3.0), Act::from_num(4.0)],
-        ],
-        Act::from_num(1.0),
-    )
-    .expect("embedding source should build");
+    let prompt_preparation = prompt_preparation_for_token_ids(&token_ids, token_ids.token_count());
+    let source = embedding_source_fixture();
     let raster_refs = run_raster(
         ArtifactIo::export_store_roots(),
         &prompt_preparation,
@@ -113,6 +83,71 @@ fn native_input_embedding_checkpoint_refs_match_raster_refs() {
         native_refs.embedded_prompt_activations_ref.width(),
         raster_refs.embedded_prompt_activations_ref.width()
     );
+}
+
+#[test]
+fn raster_input_embedding_rejects_prompt_token_count_mismatch() {
+    ArtifactIo::reset_store();
+    let token_ids = insert_token_ids(&[1, 0]);
+    let prompt_preparation =
+        prompt_preparation_for_token_ids(&token_ids, token_ids.token_count() + 1);
+    let source = embedding_source_fixture();
+
+    let error = run_raster(
+        ArtifactIo::export_store_roots(),
+        &prompt_preparation,
+        &source,
+    )
+    .expect_err("token count mismatch should fail");
+
+    assert!(error
+        .to_string()
+        .contains("input embedding token-id artifact has 2 tokens, expected 3"));
+}
+
+#[test]
+fn raster_input_embedding_rejects_out_of_range_token_id() {
+    ArtifactIo::reset_store();
+    let token_ids = insert_token_ids(&[9]);
+    let prompt_preparation = prompt_preparation_for_token_ids(&token_ids, token_ids.token_count());
+    let source = embedding_source_fixture();
+
+    let error = run_raster(
+        ArtifactIo::export_store_roots(),
+        &prompt_preparation,
+        &source,
+    )
+    .expect_err("out-of-range token id should fail");
+
+    assert!(error
+        .to_string()
+        .contains("external source response is not committed"));
+}
+
+fn prompt_preparation_for_token_ids(
+    token_ids: &RasterTokenIdSequenceRef,
+    prompt_token_count: usize,
+) -> RasterPromptPreparationState {
+    RasterPromptPreparationState {
+        prompt_bytes_root: "prompt-bytes".to_string(),
+        prompt_text_root: "prompt-text".to_string(),
+        rendered_prompt_root: "rendered-prompt".to_string(),
+        normalized_prompt_root: "normalized-prompt".to_string(),
+        prompt_token_ids_root: token_ids.root().to_string(),
+        prompt_token_count,
+    }
+}
+
+fn embedding_source_fixture() -> AuthenticatedGemmaInputEmbeddingSource {
+    AuthenticatedGemmaInputEmbeddingSource::from_canonical_rows(
+        "embedding-fixture",
+        vec![
+            vec![Act::from_num(1.0), Act::from_num(2.0)],
+            vec![Act::from_num(3.0), Act::from_num(4.0)],
+        ],
+        Act::from_num(1.0),
+    )
+    .expect("embedding source should build")
 }
 
 fn insert_token_ids(token_ids: &[u32]) -> RasterTokenIdSequenceRef {
