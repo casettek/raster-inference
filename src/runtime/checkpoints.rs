@@ -371,6 +371,13 @@ mod tests {
 
         assert!(error.to_string().contains("unknown routine id"));
         assert!(error.to_string().contains("decode.transition"));
+
+        let error = "output.finalize.detokenize"
+            .parse::<RoutineId>()
+            .expect_err("output finalize sub-checkpoints should not parse as routine ids");
+
+        assert!(error.to_string().contains("unknown routine id"));
+        assert!(error.to_string().contains("output.finalize"));
     }
 
     #[test]

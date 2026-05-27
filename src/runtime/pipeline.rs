@@ -290,6 +290,7 @@ pub fn run_output_decode_with_mode(
         initial_transformer_state,
         sampling,
         tokenizer,
+        None,
         transformer_model,
         execution_mode,
         None,
@@ -302,6 +303,7 @@ pub(crate) fn run_output_decode_with_mode_and_detour(
     initial_transformer_state: &TransformerPrefillResult,
     sampling: &SamplingConfig,
     tokenizer: &Tokenizer,
+    raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
     detour_controller: Option<&mut RasterDetourController>,
@@ -312,6 +314,7 @@ pub(crate) fn run_output_decode_with_mode_and_detour(
         initial_transformer_state,
         sampling,
         tokenizer,
+        raster_tokenizer,
         transformer_model,
         execution_mode,
         detour_controller,
@@ -411,6 +414,7 @@ fn run_output_decode_with_mode_internal(
     initial_transformer_state: &TransformerPrefillResult,
     sampling: &SamplingConfig,
     tokenizer: &Tokenizer,
+    raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
     mut detour_controller: Option<&mut RasterDetourController>,
@@ -442,11 +446,25 @@ fn run_output_decode_with_mode_internal(
         )
         .is_some()
         {
-            if let Some(controller) = detour_controller.as_deref_mut() {
-                controller.reject_if_selected_unsupported(RoutineId::FinalizeOutput)?;
-            }
+            let detour_finalize_output = detour_controller
+                .as_deref_mut()
+                .is_some_and(|controller| controller.should_detour(RoutineId::FinalizeOutput));
             trace_event("output.detokenize");
-            let mut output_decode_state = crate::output_finalize::run(decode_state, tokenizer)?;
+            let mut output_decode_state = if detour_finalize_output {
+                let raster_sizing = raster_sizing.context(
+                    "selective raster output.finalize detour requires raster sizing controls",
+                )?;
+                let raster_tokenizer = raster_tokenizer.context(
+                    "selective raster output.finalize detour requires an authenticated Gemma tokenizer",
+                )?;
+                crate::output_finalize::run_selected_raster_detour_from_native_boundary(
+                    decode_state,
+                    raster_tokenizer,
+                    raster_sizing,
+                )?
+            } else {
+                crate::output_finalize::run(decode_state, tokenizer)?
+            };
             output_decode_state.decode_transition_states = decode_transition_states;
             return Ok(output_decode_state);
         }

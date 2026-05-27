@@ -732,6 +732,7 @@ pub fn run_inference_with_controls(
                         &prefill,
                         &request.sampling,
                         tokenizer,
+                        controls.raster_tokenizer_source.as_ref(),
                         transformer_model,
                         request.execution_mode,
                         Some(&mut raster_detour_controller),
@@ -1818,6 +1819,169 @@ mod tests {
     }
 
     #[test]
+    fn run_inference_executes_output_finalize_raster_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls::default(),
+        )
+        .expect("native deterministic inference should complete");
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let detour = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("output.finalize").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(test_native_matching_gemma_tokenizer_source()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("output finalize detour should complete");
+
+        let native = expect_completed_state(native, "native inference");
+        let detour = expect_completed_state(detour, "output finalize detour inference");
+        assert_output_decode_matches(&native, &detour);
+        assert!(
+            detour.raster_tile_invocations.unwrap_or(0) > 0,
+            "output finalize detour should count raster tiles"
+        );
+    }
+
+    #[test]
+    fn run_inference_output_finalize_detour_requires_authenticated_tokenizer_source() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("output.finalize").expect("detour should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("output finalize detour requires tokenizer source");
+
+        assert!(error.to_string().contains(
+            "selective raster output.finalize detour requires an authenticated Gemma tokenizer"
+        ));
+    }
+
+    #[test]
+    fn run_inference_reports_unmatched_second_output_finalize_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(0);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("output.finalize:2").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("second output finalize detour should be unmatched");
+
+        assert!(error
+            .to_string()
+            .contains("selective raster detour target output.finalize:2 was not reached"));
+    }
+
+    #[test]
+    fn run_inference_validates_output_byte_flush_sizing_for_output_finalize_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("output.finalize").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_output_byte_flush_bytes_per_tile: Some(0),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("zero output byte flush bytes should fail for output finalize detour");
+
+        assert!(error
+            .to_string()
+            .contains("raster output byte flush bytes per tile must be greater than zero"));
+    }
+
+    #[cfg(feature = "unchecked-raster-integrity")]
+    #[test]
+    fn run_inference_output_finalize_detour_runs_in_unchecked_integrity_mode() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::integrity_mode::with_raster_integrity_mode(
+            crate::RasterIntegrityMode::UncheckedTestOnly,
+            || {
+                crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+                let detour =
+                    run_inference_with_controls(
+                        &request,
+                        &model,
+                        &tokenizer,
+                        &transformer_fixture.model,
+                        &InferenceControls {
+                            raster_detour: Some(
+                                RasterDetourSpec::parse("output.finalize")
+                                    .expect("detour should parse"),
+                            ),
+                            raster_tokenizer_source: Some(
+                                test_native_matching_gemma_tokenizer_source(),
+                            ),
+                            ..InferenceControls::default()
+                        },
+                    )
+                    .expect("unchecked output finalize detour should complete");
+
+                let detour = expect_completed_state(detour, "unchecked output finalize detour");
+                assert!(
+                    detour.raster_tile_invocations.unwrap_or(0) > 0,
+                    "unchecked output finalize detour should count raster tiles"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn run_inference_input_embedding_detour_requires_prompt_artifact_roots() {
         let tokenizer = test_tokenizer();
         let model = test_model_spec();
@@ -2402,6 +2566,69 @@ mod tests {
 
         let native = expect_completed_state(native, "native inference");
         let detour = expect_completed_state(detour, "prefill finalize detour inference");
+        assert_output_decode_matches(&native, &detour);
+        assert!(
+            detour.raster_tile_invocations.unwrap_or(0) > 0,
+            "detour should expose raster tile telemetry outside committed checkpoints"
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_trace_matches_output_finalize_detour_trace() {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let _trace_dir = TraceDirGuard::new("output-finalize-detour-trace");
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let tokenizer_source = test_native_matching_gemma_tokenizer_source();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_tokenizer_source: Some(tokenizer_source.clone()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("native deterministic inference should complete");
+        let native_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let detour = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_detour: Some(
+                    RasterDetourSpec::parse("output.finalize").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(tokenizer_source),
+                raster_output_byte_flush_bytes_per_tile: Some(1),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("output finalize detour inference should complete");
+        let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        assert_eq!(native_payload, detour_payload);
+        assert_eq!(
+            checkpoint_commitments(&native_payload, "output.finalize").len(),
+            1
+        );
+        assert_eq!(
+            checkpoint_commitments(&detour_payload, "output.finalize").len(),
+            1
+        );
+
+        let native = expect_completed_state(native, "native inference");
+        let detour = expect_completed_state(detour, "output finalize detour inference");
         assert_output_decode_matches(&native, &detour);
         assert!(
             detour.raster_tile_invocations.unwrap_or(0) > 0,
@@ -4240,12 +4467,20 @@ mod tests {
         AuthenticatedGemmaTokenizer::new(test_gemma_tokenizer_spec())
     }
 
+    fn test_native_matching_gemma_tokenizer_source() -> AuthenticatedGemmaTokenizer {
+        AuthenticatedGemmaTokenizer::new(test_gemma_tokenizer_spec_with_output_token("hello"))
+    }
+
     fn test_gemma_tokenizer_spec() -> GemmaTokenizerSpec {
+        test_gemma_tokenizer_spec_with_output_token("raster-hello")
+    }
+
+    fn test_gemma_tokenizer_spec_with_output_token(output_token: &str) -> GemmaTokenizerSpec {
         GemmaTokenizerSpec::new(
             "digest".to_string(),
             vec![
                 GemmaVocabEntry {
-                    token: "raster-hello".to_string(),
+                    token: output_token.to_string(),
                     id: 0,
                 },
                 GemmaVocabEntry {

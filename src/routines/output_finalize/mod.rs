@@ -6,10 +6,11 @@ use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::output::{DecodeState, OutputDecodeState};
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
-    RasterArtifactId, RasterArtifactMetadata, RasterTokenIdSequenceRef,
+    token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterTokenIdSequenceRef,
 };
 use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
+use crate::RasterSizingControls;
 
 pub mod native;
 pub mod raster;
@@ -152,10 +153,38 @@ pub fn run_raster(
     raster::main(input_roots, tokenizer)
 }
 
+pub(crate) fn run_selected_raster_detour_from_native_boundary(
+    decode_state: DecodeState,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+    raster_sizing: RasterSizingControls,
+) -> Result<OutputDecodeState> {
+    let input_roots = prepare_raster_output_finalize_input_roots_from_native_detour(
+        &decode_state,
+        tokenizer,
+        raster_sizing.output_byte_flush_bytes_per_tile,
+    )?;
+    let output_refs = raster::main(input_roots, tokenizer)?;
+    materialize_output_decode_state_from_refs(&decode_state.full_token_ids, output_refs)
+}
+
 /// Public API boundary for the refs-first raster decode loop.
 /// This is intentionally allowed to materialize token/text refs into `OutputDecodeState`.
 pub fn materialize_output_decode_state_for_api(
     decode_state: RasterDecodeLoopState,
+    output_refs: raster::RasterOutputFinalizeOutput,
+) -> Result<OutputDecodeState> {
+    let full_token_ids = match decode_state.full_token_ids_ref.as_ref() {
+        Some(full_token_ids_ref) => raster::materialize_token_ids_from_roots(
+            &output_refs.artifact_store_roots,
+            full_token_ids_ref,
+        )?,
+        None => Vec::new(),
+    };
+    materialize_output_decode_state_from_refs(&full_token_ids, output_refs)
+}
+
+fn materialize_output_decode_state_from_refs(
+    full_token_ids: &[u32],
     output_refs: raster::RasterOutputFinalizeOutput,
 ) -> Result<OutputDecodeState> {
     let generated_token_ids = raster::materialize_token_ids_from_roots(
@@ -175,12 +204,44 @@ pub fn materialize_output_decode_state_for_api(
         stop_reason,
         decode_transition_states: Vec::new(),
     };
-    trace_raster_output_finalize_from_refs(
-        &decode_state.with_roots(output_refs.artifact_store_roots),
-        &output.generated_token_ids,
-        &output,
-    )?;
+    trace_raster_output_finalize_from_refs(full_token_ids, &output.generated_token_ids, &output)?;
     Ok(output)
+}
+
+fn prepare_raster_output_finalize_input_roots_from_native_detour(
+    decode_state: &DecodeState,
+    tokenizer: &AuthenticatedGemmaTokenizer,
+    byte_flush_bytes_per_tile: usize,
+) -> Result<raster::RasterOutputFinalizeInputRoots> {
+    raster::validate_output_byte_flush_bytes_per_tile(byte_flush_bytes_per_tile)?;
+    let position = decode_state.transformer_decode_state.position;
+    let generated_count = decode_state.generated_token_ids.len();
+    let source_prefix =
+        format!("output.finalize.detour.position_{position}.step_{generated_count}");
+    let artifact_store_roots = ArtifactIo::export_store_roots();
+
+    let leaves = decode_state
+        .generated_token_ids
+        .iter()
+        .copied()
+        .map(token_id_leaf)
+        .collect::<Vec<_>>();
+    let (artifact_store_roots, generated_token_ids_ref) = ArtifactIo::insert_artifact_with_roots(
+        &artifact_store_roots,
+        RasterArtifactId::new(format!("{source_prefix}.input.generated_token_ids"))?,
+        RasterArtifactMetadata::token_ids(decode_state.generated_token_ids.len()),
+        leaves,
+    )?;
+
+    Ok(raster::RasterOutputFinalizeInputRoots {
+        artifact_store_roots,
+        generated_token_ids_ref: RasterTokenIdSequenceRef::new(generated_token_ids_ref)?,
+        tokenizer_source_root: tokenizer.raster_source_root_for_current_integrity_mode()?,
+        output_text_source_name: format!("{source_prefix}.output.text"),
+        pending_bytes_source_prefix: format!("{source_prefix}.output.pending_bytes"),
+        byte_flush_bytes_per_tile,
+        stop_reason: crate::shared::api::output::OutputDecodeStopReason::MaxNewTokens,
+    })
 }
 
 fn prepare_raster_output_finalize_input_roots_from_state(
@@ -215,22 +276,15 @@ fn prepare_raster_output_finalize_input_roots_from_state(
 }
 
 fn trace_raster_output_finalize_from_refs(
-    decode_state: &RasterDecodeLoopState,
+    full_token_ids: &[u32],
     generated_token_ids: &[u32],
     output: &OutputDecodeState,
 ) -> Result<()> {
-    let full_token_ids = match decode_state.full_token_ids_ref.as_ref() {
-        Some(full_token_ids_ref) => raster::materialize_token_ids_from_roots(
-            &decode_state.artifact_store_roots,
-            full_token_ids_ref,
-        )?,
-        None => Vec::new(),
-    };
     crate::trace::trace_checkpoint(
         "output.finalize",
         &json!({
             "full_token_ids": full_token_ids,
-            "full_token_ids_sha256": crate::trace::sha256_hex(&full_token_ids),
+            "full_token_ids_sha256": crate::trace::sha256_hex(&full_token_ids.to_vec()),
             "generated_token_ids": generated_token_ids,
             "generated_token_ids_sha256": output.generated_token_ids_sha256.clone(),
             "generated_text": output.generated_text.clone(),

@@ -175,7 +175,7 @@ pub(in super::super) fn flush_pending_byte_chunk_with_roots(
         .byte_flush_bytes_per_tile
         .min(pending_ref.byte_count() - next_byte_idx);
     let advanced = if valid_utf8 {
-        let bytes = read_pending_byte_range_from_ref_roots(
+        let mut bytes = read_pending_byte_range_from_ref_roots(
             &state.artifact_store_roots,
             &pending_ref,
             next_byte_idx,
@@ -184,6 +184,17 @@ pub(in super::super) fn flush_pending_byte_chunk_with_roots(
         let mut end = bytes.len();
         while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
             end -= 1;
+        }
+        while end == 0 && next_byte_idx + bytes.len() < pending_ref.byte_count() {
+            bytes.push(read_pending_byte_from_ref_roots(
+                &state.artifact_store_roots,
+                &pending_ref,
+                next_byte_idx + bytes.len(),
+            )?);
+            end = bytes.len();
+            while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+                end -= 1;
+            }
         }
         if end == 0 {
             bail!("raster output UTF-8 flush could not find a valid chunk boundary");
