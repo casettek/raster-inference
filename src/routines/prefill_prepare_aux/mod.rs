@@ -144,6 +144,12 @@ pub fn format_native_prefill_prepare_aux_as_raster_checkpoint_for_trace(
 pub fn materialize_prefill_ple_input_refs_for_trace(
     ple_input_refs: Option<&RasterPrefillPleInputRefs>,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
+    materialize_prefill_ple_inputs(ple_input_refs)
+}
+
+pub(crate) fn materialize_prefill_ple_inputs(
+    ple_input_refs: Option<&RasterPrefillPleInputRefs>,
+) -> Result<Option<Gemma4PrefillPleInputs>> {
     let Some(ple_input_refs) = ple_input_refs else {
         return Ok(None);
     };

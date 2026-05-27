@@ -577,9 +577,35 @@ pub fn run_inference_with_controls(
                     )?);
                     prefill_finalize::materialize_raster_output_refs_for_api(&prefill_output)?
                 } else {
-                    raster_detour_controller
-                        .reject_if_selected_unsupported(RoutineId::PrefillPrepareAux)?;
-                    let ple_inputs = if let Some(input_embedding_output) =
+                    let detour_prefill_prepare_aux =
+                        raster_detour_controller.should_detour(RoutineId::PrefillPrepareAux);
+                    let ple_inputs = if detour_prefill_prepare_aux {
+                        let input_embedding_output = raster_input_embedding_refs.as_ref().context(
+                            "selective raster prefill.prepare_aux detour requires input embedding raster refs",
+                        )?;
+                        let raster_sizing = raster_sizing_controls
+                            .expect("raster sizing controls should be validated");
+                        let ple_source = AuthenticatedGemmaPleSource::from_model(
+                            model.model_id.clone(),
+                            transformer_model,
+                        )?;
+                        let ple_output = prefill_prepare_aux::run_raster(
+                            input_embedding_output.artifact_store_roots.clone(),
+                            &input_embedding_output.refs,
+                            &ple_source,
+                            raster_sizing,
+                        )?;
+                        let (artifact_store_roots, ple_input_manifest_root) =
+                            ple_output.into_parts();
+                        let ple_input_refs =
+                            prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
+                                artifact_store_roots,
+                                ple_input_manifest_root.as_deref(),
+                            )?;
+                        prefill_prepare_aux::materialize_prefill_ple_inputs(
+                            ple_input_refs.as_ref(),
+                        )?
+                    } else if let Some(input_embedding_output) =
                         raster_input_embedding_refs.as_ref()
                     {
                         let ple_source = AuthenticatedGemmaPleSource::from_model(
@@ -877,6 +903,42 @@ mod tests {
                 env::remove_var("RASTER_TRACE_DIR");
             }
         }
+    }
+
+    fn expect_completed_state(
+        outcome: InferenceRunOutcome,
+        description: &str,
+    ) -> super::InferenceState {
+        let InferenceRunOutcome::Completed(state) = outcome else {
+            panic!("expected {description} to complete");
+        };
+        state
+    }
+
+    fn assert_output_decode_matches(
+        native: &super::InferenceState,
+        detour: &super::InferenceState,
+    ) {
+        assert_eq!(
+            native.output_decode.generated_token_ids,
+            detour.output_decode.generated_token_ids
+        );
+        assert_eq!(
+            native.output_decode.generated_token_ids_sha256,
+            detour.output_decode.generated_token_ids_sha256
+        );
+        assert_eq!(
+            native.output_decode.generated_text,
+            detour.output_decode.generated_text
+        );
+        assert_eq!(
+            crate::trace::sha256_hex(&native.output_decode.generated_text),
+            crate::trace::sha256_hex(&detour.output_decode.generated_text)
+        );
+        assert_eq!(
+            native.output_decode.generated_token_count,
+            detour.output_decode.generated_token_count
+        );
     }
 
     fn deterministic_prompt_request(max_new_tokens: usize) -> InferenceRequest {
@@ -1403,6 +1465,132 @@ mod tests {
     }
 
     #[test]
+    fn run_inference_executes_prefill_prepare_aux_raster_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_ple_model_fixture();
+        let tokenizer_source = test_gemma_tokenizer_source();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls::default(),
+        )
+        .expect("native deterministic inference should complete");
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let detour = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prefill.prepare_aux").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(tokenizer_source),
+                raster_projection_rows_per_tile: Some(2),
+                raster_sequence_rows_per_tile: Some(2),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("prefill prepare aux detour should complete");
+
+        let native = expect_completed_state(native, "native inference");
+        let detour = expect_completed_state(detour, "prefill prepare aux detour inference");
+        assert_output_decode_matches(&native, &detour);
+        assert!(
+            detour.raster_tile_invocations.unwrap_or(0) > 0,
+            "prefill prepare aux detour should count raster tiles"
+        );
+    }
+
+    #[test]
+    fn run_inference_prefill_prepare_aux_detour_requires_input_embedding_refs() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prefill.prepare_aux").expect("detour should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("prefill prepare aux detour requires input embedding refs");
+
+        assert!(error.to_string().contains(
+            "selective raster prefill.prepare_aux detour requires input embedding raster refs"
+        ));
+    }
+
+    #[test]
+    fn run_inference_reports_unmatched_second_prefill_prepare_aux_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(0);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prefill.prepare_aux:2").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("second prefill prepare aux detour should be unmatched");
+
+        assert!(error
+            .to_string()
+            .contains("selective raster detour target prefill.prepare_aux:2 was not reached"));
+    }
+
+    #[test]
+    fn run_inference_validates_sequence_sizing_for_prefill_prepare_aux_detour() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(0);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prefill.prepare_aux").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                raster_sequence_rows_per_tile: Some(0),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("zero sequence rows should fail for prepare aux detour");
+
+        assert!(error
+            .to_string()
+            .contains("raster sequence rows per tile must be greater than zero"));
+    }
+
+    #[test]
     fn deterministic_cpu_trace_matches_input_embedding_detour_trace() {
         let _trace_guard = trace_test_lock().lock().expect("trace test lock");
         let _trace_dir = TraceDirGuard::new("input-embedding-detour-trace");
@@ -1440,12 +1628,7 @@ mod tests {
                 ),
                 raster_tokenizer_source: Some(tokenizer_source),
                 raster_projection_rows_per_tile: Some(2),
-                raster_attention_kv_rows_per_tile: Some(2),
                 raster_sequence_rows_per_tile: Some(2),
-                raster_head_rows_per_tile: Some(2),
-                raster_tokenizer_bpe_pairs_per_tile: Some(2),
-                raster_tokenizer_bpe_pieces_per_tile: Some(2),
-                raster_output_byte_flush_bytes_per_tile: Some(2),
                 ..InferenceControls::default()
             },
         )
@@ -1459,6 +1642,75 @@ mod tests {
         );
         assert_eq!(
             checkpoint_commitments(&detour_payload, "input.embedding").len(),
+            1
+        );
+
+        let native = expect_completed_state(native, "native inference");
+        let detour = expect_completed_state(detour, "prefill prepare aux detour inference");
+        assert_output_decode_matches(&native, &detour);
+        assert!(
+            detour.raster_tile_invocations.unwrap_or(0) > 0,
+            "detour should expose raster tile telemetry outside committed checkpoints"
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_trace_matches_prefill_prepare_aux_detour_trace() {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let _trace_dir = TraceDirGuard::new("prefill-prepare-aux-detour-trace");
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_ple_model_fixture();
+        let tokenizer_source = test_gemma_tokenizer_source();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_tokenizer_source: Some(tokenizer_source.clone()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("native deterministic inference should complete");
+        let native_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let detour = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prefill.prepare_aux").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(tokenizer_source),
+                raster_projection_rows_per_tile: Some(2),
+                raster_attention_kv_rows_per_tile: Some(2),
+                raster_sequence_rows_per_tile: Some(2),
+                raster_head_rows_per_tile: Some(2),
+                raster_tokenizer_bpe_pairs_per_tile: Some(2),
+                raster_tokenizer_bpe_pieces_per_tile: Some(2),
+                raster_output_byte_flush_bytes_per_tile: Some(2),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("prefill prepare aux detour inference should complete");
+        let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        assert_eq!(native_payload, detour_payload);
+        assert_eq!(
+            checkpoint_commitments(&native_payload, "prefill.prepare_aux").len(),
+            1
+        );
+        assert_eq!(
+            checkpoint_commitments(&detour_payload, "prefill.prepare_aux").len(),
             1
         );
 
@@ -1492,6 +1744,64 @@ mod tests {
             detour.raster_tile_invocations.unwrap_or(0) > 0,
             "detour should expose raster tile telemetry outside committed checkpoints"
         );
+    }
+
+    #[test]
+    fn deterministic_cpu_trace_matches_no_ple_prefill_prepare_aux_detour_trace() {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let _trace_dir = TraceDirGuard::new("no-ple-prefill-prepare-aux-detour-trace");
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let tokenizer_source = test_gemma_tokenizer_source();
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_tokenizer_source: Some(tokenizer_source.clone()),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("native deterministic inference should complete");
+        let native_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let detour = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                raster_detour: Some(
+                    RasterDetourSpec::parse("prefill.prepare_aux").expect("detour should parse"),
+                ),
+                raster_tokenizer_source: Some(tokenizer_source),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("no-PLE prefill prepare aux detour should complete");
+        let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        assert_eq!(native_payload, detour_payload);
+        assert_eq!(
+            checkpoint_commitments(&native_payload, "prefill.prepare_aux").len(),
+            1
+        );
+        assert_eq!(
+            checkpoint_commitments(&detour_payload, "prefill.prepare_aux").len(),
+            1
+        );
+
+        let native = expect_completed_state(native, "native inference");
+        let detour = expect_completed_state(detour, "no-PLE prefill prepare aux detour inference");
+        assert_output_decode_matches(&native, &detour);
     }
 
     #[test]
