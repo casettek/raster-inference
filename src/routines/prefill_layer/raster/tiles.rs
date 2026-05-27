@@ -74,14 +74,6 @@ pub fn compute_next_prefill_layer_sequence_with_roots(
     layer_state: PrefillLayerRasterState,
     layer_source: &RasterPrefillLayerSource<'_>,
 ) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
-    let layer_idx = layer_state.next_layer_idx;
-    let _routine = routine_scope(
-        RoutineId::PrefillLayer,
-        format!(
-            "mode=raster layer={layer_idx} of {}",
-            layer_state.layer_count
-        ),
-    );
     let (artifact_store_roots, layer_step) = call_tile!(
         init_prefill_layer_step,
         artifact_store_roots,
@@ -3235,6 +3227,14 @@ fn init_prefill_layer_step(
         ));
     }
 
+    let layer_idx = layer_state.next_layer_idx;
+    let _routine = routine_scope(
+        RoutineId::PrefillLayer,
+        format!(
+            "mode=raster layer={layer_idx} of {}",
+            layer_state.layer_count
+        ),
+    );
     let context = prepare_next_prefill_layer_context(&layer_state, layer_source)?;
     if let Some(per_layer_input) = context.per_layer_input.as_ref() {
         read_sequence_row_from_roots(

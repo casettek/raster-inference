@@ -373,6 +373,12 @@ pub(crate) fn checkpoint_payload_for_tests() -> Value {
 }
 
 #[cfg(test)]
+pub(crate) fn test_trace_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
 pub(crate) fn take_completed_checkpoint_payload_for_tests() -> Value {
     let mut collector = trace_collector()
         .lock()
@@ -682,6 +688,9 @@ mod tests {
 
     #[test]
     fn lazy_checkpoint_builds_state_when_checkpointing_enabled() {
+        let _trace_guard = super::test_trace_lock()
+            .lock()
+            .expect("trace test lock should not be poisoned");
         let mut built = false;
 
         super::with_checkpointing_enabled(true, || {

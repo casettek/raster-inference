@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
+use crate::routines::prefill_layer::PrefillLayerRasterDetour;
 use crate::runtime::checkpoints::RasterDetourController;
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::model::transformer::{
@@ -39,6 +40,7 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
         model,
         ple_inputs,
         None,
+        None,
     )
 }
 
@@ -47,6 +49,7 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     mut detour_controller: Option<&mut RasterDetourController>,
+    raster_detour: Option<PrefillLayerRasterDetour<'_>>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     if model.layers.is_empty() {
         bail!("transformer prefill requires at least one layer");
@@ -57,8 +60,32 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
     let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     let mut completed_layer_output_det_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
-        if let Some(controller) = detour_controller.as_deref_mut() {
-            controller.reject_if_selected_unsupported(RoutineId::PrefillLayer)?;
+        let selected_for_raster = detour_controller
+            .as_deref_mut()
+            .is_some_and(|controller| controller.should_detour(RoutineId::PrefillLayer));
+        if selected_for_raster {
+            let detour = raster_detour.ok_or_else(|| {
+                anyhow!(
+                    "selective raster prefill.layer detour requires an authenticated prefill layer source"
+                )
+            })?;
+            let output = crate::prefill_layer::run_selected_raster_detour_from_native_boundary(
+                &xs,
+                layer_idx,
+                &layer_caches,
+                &completed_layer_output_sha256s,
+                &completed_layer_output_det_sha256s,
+                ple_inputs,
+                detour,
+            )?;
+            xs = output.final_hidden_states.clone_internal();
+            layer_caches = output.layer_caches;
+            completed_layer_output_sha256s = output.completed_layer_output_sha256s;
+            completed_layer_output_det_sha256s = output.completed_layer_output_det_sha256s;
+            if crate::trace::reached_terminal_checkpoint_id().is_some() {
+                break;
+            }
+            continue;
         }
         let xs_values = xs.clone_f32();
         let _routine = routine_scope(
@@ -166,12 +193,14 @@ pub(crate) fn run_internal_with_detour(
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     detour_controller: Option<&mut RasterDetourController>,
+    raster_detour: Option<PrefillLayerRasterDetour<'_>>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     run_text_layers_prefill_with_cache_internal_and_detour(
         input_activations,
         model,
         ple_inputs,
         detour_controller,
+        raster_detour,
     )
 }
 

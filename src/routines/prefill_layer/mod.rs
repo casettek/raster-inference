@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::runtime::checkpoints::RasterDetourController;
 use crate::shared::api::input::InferenceExecutionMode;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence,
@@ -12,12 +13,27 @@ use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLay
 use crate::RasterSizingControls;
 
 use self::raster::utils::{
+    insert_activation_sequence_ref_with_roots, insert_prefill_layer_cache_with_roots,
     layer_cache_from_raster, materialize_prefill_activation_sequence_from_roots,
-    materialize_prefill_layer_cache_from_roots, raster_sequence_acts,
+    materialize_prefill_layer_cache_from_roots, raster_activation_sequence_from_internal,
+    raster_sequence_acts,
 };
 
 pub mod native;
 pub mod raster;
+
+#[derive(Clone, Copy)]
+pub(crate) struct PrefillLayerRasterDetour<'a> {
+    pub(crate) layer_source: &'a AuthenticatedGemmaPrefillLayerSource,
+    pub(crate) raster_sizing: RasterSizingControls,
+}
+
+pub(crate) struct PrefillLayerNativeDetourOutput {
+    pub(crate) final_hidden_states: ActivationSequence,
+    pub(crate) layer_caches: Vec<LayerKvCache>,
+    pub(crate) completed_layer_output_sha256s: Vec<String>,
+    pub(crate) completed_layer_output_det_sha256s: Vec<Option<String>>,
+}
 
 pub fn run(
     input_activations: &[Vec<f32>],
@@ -97,13 +113,130 @@ pub fn run_raster(
     )
 }
 
+pub(crate) fn run_selected_raster_detour_from_native_boundary(
+    input_activations: &InternalActivationSequence,
+    layer_idx: usize,
+    layer_caches: &[LayerKvCache],
+    completed_layer_output_sha256s: &[String],
+    completed_layer_output_det_sha256s: &[Option<String>],
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    detour: PrefillLayerRasterDetour<'_>,
+) -> Result<PrefillLayerNativeDetourOutput> {
+    if layer_caches.len() != layer_idx {
+        bail!(
+            "selective raster prefill.layer detour at layer {layer_idx} received {} prior caches",
+            layer_caches.len()
+        );
+    }
+    if completed_layer_output_sha256s.len() != layer_idx
+        || completed_layer_output_det_sha256s.len() != layer_idx
+    {
+        bail!(
+            "selective raster prefill.layer detour at layer {layer_idx} received inconsistent completed layer commitments"
+        );
+    }
+
+    let layer_source =
+        crate::shared::raster_contracts::prefill_layer::RasterPrefillLayerSource::for_current_integrity_mode(detour.layer_source)?;
+    let artifact_store_roots = ArtifactIo::export_store_roots();
+    let input_sequence =
+        raster_activation_sequence_from_internal(input_activations, "current activations")?;
+    let (mut artifact_store_roots, current_activations_ref) =
+        insert_activation_sequence_ref_with_roots(
+            &artifact_store_roots,
+            format!("prefill.layer.detour.input.{layer_idx}"),
+            input_sequence,
+        )?;
+
+    let mut raster_layer_caches = Vec::with_capacity(layer_caches.len());
+    for (cache_idx, cache) in layer_caches.iter().enumerate() {
+        let (next_roots, cache_slot) = insert_prefill_layer_cache_with_roots(
+            &artifact_store_roots,
+            &format!("prefill.layer.detour.cache.{cache_idx}"),
+            cache,
+        )?;
+        artifact_store_roots = next_roots;
+        raster_layer_caches.push(cache_slot);
+    }
+
+    let mut per_layer_inputs = vec![None; layer_idx + 1];
+    if let Some(per_layer_input) =
+        ple_inputs.and_then(|inputs| inputs.clone_layer_internal(layer_idx))
+    {
+        let input_sequence =
+            raster_activation_sequence_from_internal(&per_layer_input, "PLE input rows")?;
+        let (next_roots, input_ref) = insert_activation_sequence_ref_with_roots(
+            &artifact_store_roots,
+            format!("prefill.layer.detour.ple.{layer_idx}"),
+            input_sequence,
+        )?;
+        artifact_store_roots = next_roots;
+        per_layer_inputs[layer_idx] = Some(input_ref);
+    }
+
+    let layer_state = raster::PrefillLayerRasterState {
+        current_activations_ref,
+        next_layer_idx: layer_idx,
+        layer_count: layer_idx + 1,
+        layer_caches: raster_layer_caches,
+        per_layer_inputs,
+        completed_layer_output_sha256s: completed_layer_output_sha256s.to_vec(),
+        completed_layer_output_det_sha256s: completed_layer_output_det_sha256s.to_vec(),
+        projection_rows_per_tile: detour.raster_sizing.projection_rows_per_tile,
+        attention_kv_rows_per_tile: detour.raster_sizing.attention_kv_rows_per_tile,
+        sequence_rows_per_tile: detour.raster_sizing.sequence_rows_per_tile,
+        head_rows_per_tile: detour.raster_sizing.head_rows_per_tile,
+    };
+
+    let mut complete = false;
+    let mut layer_state = layer_state;
+    while !complete {
+        let (next_complete, next_roots, next_state) =
+            raster::compute_next_prefill_layer_sequence_with_roots(
+                artifact_store_roots,
+                layer_state,
+                &layer_source,
+            )?;
+        complete = next_complete;
+        artifact_store_roots = next_roots;
+        layer_state = next_state;
+    }
+    if layer_state.next_layer_idx != layer_idx + 1 {
+        bail!(
+            "selective raster prefill.layer detour finalized after {} layers, expected {}",
+            layer_state.next_layer_idx,
+            layer_idx + 1
+        );
+    }
+
+    let completed_layer_output_sha256s = layer_state.completed_layer_output_sha256s.clone();
+    let completed_layer_output_det_sha256s = layer_state.completed_layer_output_det_sha256s.clone();
+    let refs = raster::finalize_prefill_layer_refs(layer_state)?;
+    let (final_hidden_states, layer_caches) =
+        materialize_prefill_layer_output_refs_from_roots_for_trace(&artifact_store_roots, &refs)?;
+
+    Ok(PrefillLayerNativeDetourOutput {
+        final_hidden_states,
+        layer_caches,
+        completed_layer_output_sha256s,
+        completed_layer_output_det_sha256s,
+    })
+}
+
 pub(crate) fn run_with_mode_internal(
     input_activations: InternalActivationSequence,
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     execution_mode: InferenceExecutionMode,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    run_with_mode_internal_with_detour(input_activations, model, ple_inputs, execution_mode, None)
+    run_with_mode_internal_with_detour(
+        input_activations,
+        model,
+        ple_inputs,
+        execution_mode,
+        None,
+        None,
+    )
 }
 
 pub(crate) fn run_with_mode_internal_with_detour(
@@ -112,6 +245,7 @@ pub(crate) fn run_with_mode_internal_with_detour(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     execution_mode: InferenceExecutionMode,
     detour_controller: Option<&mut RasterDetourController>,
+    raster_detour: Option<PrefillLayerRasterDetour<'_>>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     model.validate_execution_mode(execution_mode)?;
     match execution_mode {
@@ -124,6 +258,7 @@ pub(crate) fn run_with_mode_internal_with_detour(
                 model,
                 ple_inputs,
                 Some(detour_controller),
+                raster_detour,
             ),
             None => native::deterministic_tiles::run_internal(input_activations, model, ple_inputs),
         },

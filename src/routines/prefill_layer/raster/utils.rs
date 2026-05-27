@@ -1,13 +1,17 @@
 use std::collections::VecDeque;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 
 use super::types::*;
 use crate::dsl::prelude::auth_read;
-use crate::shared::artifacts::raster_artifact_store::RasterActivationSequenceArtifactRef;
+use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
-use crate::shared::model::transformer::LayerKvCache;
+use crate::shared::artifacts::raster_artifact_store::{
+    activation_row_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
+    RasterArtifactMetadata,
+};
+use crate::shared::model::transformer::{InternalActivationSequence, LayerKvCache};
 use crate::shared::raster_contracts::prefill_layer::{
     GemmaPrefillLayerMetadata, GemmaPrefillLayerMetadataRequest,
     GemmaPrefillLayerSourceMetadataRequest, RasterPrefillLayerSource,
@@ -17,9 +21,9 @@ use crate::shared::raster_kernels::transformer::{
     validate_projection_rows_per_tile, RasterActivationSequence, RasterKvCache,
 };
 use crate::shared::tensors::raster_tensor_artifacts::{
-    activation_sequence_ref_from_artifact, read_kv_row_from_roots, read_sequence_row_from_roots,
-    RasterActivationSequenceRef, RasterAttentionHeadsRef, RasterKvRowKind, RasterKvRowRequest,
-    RasterSequenceRowRequest, RasterTensorId,
+    activation_sequence_ref_from_artifact, kv_cache_ref_from_artifacts, read_kv_row_from_roots,
+    read_sequence_row_from_roots, RasterActivationSequenceRef, RasterAttentionHeadsRef,
+    RasterKvRowKind, RasterKvRowRequest, RasterSequenceRowRequest, RasterTensorId,
 };
 use crate::RasterSizingControls;
 
@@ -373,6 +377,169 @@ pub(in super::super) fn raster_sequence_acts(
     sequence: &RasterActivationSequence,
 ) -> Vec<Vec<crate::shared::numerics::det_num::Act>> {
     sequence.rows().iter().map(|row| row.acts()).collect()
+}
+
+pub(in super::super) fn raster_activation_sequence_from_internal(
+    sequence: &InternalActivationSequence,
+    description: &str,
+) -> Result<RasterActivationSequence> {
+    let rows = sequence.det_values().with_context(|| {
+        format!("selective raster prefill.layer detour requires deterministic {description}")
+    })?;
+    Ok(RasterActivationSequence::from_acts(rows.to_vec()))
+}
+
+pub(in super::super) fn insert_activation_sequence_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    id: RasterArtifactId,
+    sequence: RasterActivationSequence,
+) -> Result<(
+    RasterArtifactStoreRoots,
+    RasterActivationSequenceArtifactRef,
+)> {
+    let width = sequence.width()?;
+    let leaves = sequence
+        .rows()
+        .iter()
+        .map(activation_row_leaf)
+        .collect::<Vec<_>>();
+    let (roots, artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        roots,
+        id,
+        RasterArtifactMetadata::activation_rows(sequence.len(), width)?,
+        leaves,
+    )?;
+    Ok((
+        roots,
+        RasterActivationSequenceArtifactRef::new(artifact_ref)?,
+    ))
+}
+
+pub(in super::super) fn insert_activation_sequence_ref_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name: impl Into<String>,
+    sequence: RasterActivationSequence,
+) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
+    let source_name = source_name.into();
+    let tensor_id = RasterTensorId::new(source_name.clone())?;
+    let (roots, artifact_ref) = insert_activation_sequence_with_roots(
+        roots,
+        RasterArtifactId::new(source_name)?,
+        sequence,
+    )?;
+    let sequence_ref = activation_sequence_ref_from_artifact(tensor_id, artifact_ref)?;
+    Ok((roots, sequence_ref))
+}
+
+pub(in super::super) fn insert_prefill_layer_cache_with_roots(
+    roots: &RasterArtifactStoreRoots,
+    source_name_prefix: &str,
+    cache: &LayerKvCache,
+) -> Result<(RasterArtifactStoreRoots, PrefillLayerCacheSlot)> {
+    let head_count = cache.keys.len();
+    if head_count != cache.values.len() {
+        bail!(
+            "selective raster prefill.layer detour KV cache has {} key heads and {} value heads",
+            head_count,
+            cache.values.len()
+        );
+    }
+
+    let current_len = cache.current_len();
+    if current_len == 0 {
+        return Ok((
+            roots.clone(),
+            PrefillLayerCacheSlot::Empty {
+                num_kv_heads: head_count,
+            },
+        ));
+    }
+
+    let mut key_rows = Vec::with_capacity(head_count * current_len);
+    let mut value_rows = Vec::with_capacity(head_count * current_len);
+    let mut head_dim = None;
+
+    for head_idx in 0..head_count {
+        let keys = cache
+            .det_key_rows_window(head_idx, 0, current_len)
+            .with_context(|| {
+                format!(
+                    "selective raster prefill.layer detour requires deterministic key rows for cache head {head_idx}"
+                )
+            })?;
+        let values = cache
+            .det_value_rows_window(head_idx, 0, current_len)
+            .with_context(|| {
+                format!(
+                    "selective raster prefill.layer detour requires deterministic value rows for cache head {head_idx}"
+                )
+            })?;
+        if keys.len() != current_len || values.len() != current_len {
+            bail!(
+                "selective raster prefill.layer detour KV cache head {head_idx} has inconsistent row counts"
+            );
+        }
+
+        for row in keys {
+            match head_dim {
+                Some(expected) if row.len() != expected => bail!(
+                    "selective raster prefill.layer detour key row width {}, expected {expected}",
+                    row.len()
+                ),
+                None => head_dim = Some(row.len()),
+                _ => {}
+            }
+            key_rows.push(
+                crate::shared::raster_kernels::transformer::RasterActivationRow::from_acts(row),
+            );
+        }
+        for row in values {
+            match head_dim {
+                Some(expected) if row.len() != expected => bail!(
+                    "selective raster prefill.layer detour value row width {}, expected {expected}",
+                    row.len()
+                ),
+                None => head_dim = Some(row.len()),
+                _ => {}
+            }
+            value_rows.push(
+                crate::shared::raster_kernels::transformer::RasterActivationRow::from_acts(row),
+            );
+        }
+    }
+
+    let head_dim = head_dim.ok_or_else(|| {
+        anyhow!("selective raster prefill.layer detour KV cache rows are missing")
+    })?;
+    let key_leaves = key_rows.iter().map(activation_row_leaf).collect::<Vec<_>>();
+    let value_leaves = value_rows
+        .iter()
+        .map(activation_row_leaf)
+        .collect::<Vec<_>>();
+    let keys_source_name = format!("{source_name_prefix}.keys");
+    let values_source_name = format!("{source_name_prefix}.values");
+    let (roots, keys_artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        roots,
+        RasterArtifactId::new(keys_source_name.clone())?,
+        RasterArtifactMetadata::activation_rows(head_count * current_len, head_dim)?,
+        key_leaves,
+    )?;
+    let (roots, values_artifact_ref) = ArtifactIo::insert_artifact_with_roots(
+        &roots,
+        RasterArtifactId::new(values_source_name.clone())?,
+        RasterArtifactMetadata::activation_rows(head_count * current_len, head_dim)?,
+        value_leaves,
+    )?;
+    let cache_ref = kv_cache_ref_from_artifacts(
+        RasterTensorId::new(keys_source_name)?,
+        RasterTensorId::new(values_source_name)?,
+        RasterActivationSequenceArtifactRef::new(keys_artifact_ref)?,
+        RasterActivationSequenceArtifactRef::new(values_artifact_ref)?,
+        head_count,
+        current_len,
+        head_dim,
+    )?;
+    Ok((roots, PrefillLayerCacheSlot::Ref(cache_ref)))
 }
 
 pub(in super::super) fn layer_cache_from_raster(cache: RasterKvCache) -> LayerKvCache {
