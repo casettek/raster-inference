@@ -113,6 +113,46 @@ pub fn run_raster(
     )
 }
 
+pub(crate) fn insert_prefill_layer_output_refs_from_native(
+    final_hidden_states: &ActivationSequence,
+    layer_caches: &[LayerKvCache],
+    source_name_prefix: &str,
+    detour_routine: &str,
+) -> Result<(RasterArtifactStoreRoots, raster::PrefillLayerOutputRefs)> {
+    let mut artifact_store_roots = ArtifactIo::export_store_roots();
+    let final_hidden_states_sequence = raster_activation_sequence_from_internal(
+        &final_hidden_states.clone_internal(),
+        detour_routine,
+        "final hidden states",
+    )?;
+    let (next_roots, final_hidden_states_ref) = insert_activation_sequence_ref_with_roots(
+        &artifact_store_roots,
+        format!("{source_name_prefix}.final_hidden_states"),
+        final_hidden_states_sequence,
+    )?;
+    artifact_store_roots = next_roots;
+
+    let mut raster_layer_caches = Vec::with_capacity(layer_caches.len());
+    for (cache_idx, cache) in layer_caches.iter().enumerate() {
+        let (next_roots, cache_slot) = insert_prefill_layer_cache_with_roots(
+            &artifact_store_roots,
+            &format!("{source_name_prefix}.cache.{cache_idx}"),
+            cache,
+            detour_routine,
+        )?;
+        artifact_store_roots = next_roots;
+        raster_layer_caches.push(cache_slot);
+    }
+
+    Ok((
+        artifact_store_roots,
+        raster::PrefillLayerOutputRefs {
+            final_hidden_states_ref,
+            layer_caches: raster_layer_caches,
+        },
+    ))
+}
+
 pub(crate) fn run_selected_raster_detour_from_native_boundary(
     input_activations: &InternalActivationSequence,
     layer_idx: usize,
@@ -139,8 +179,11 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
     let layer_source =
         crate::shared::raster_contracts::prefill_layer::RasterPrefillLayerSource::for_current_integrity_mode(detour.layer_source)?;
     let artifact_store_roots = ArtifactIo::export_store_roots();
-    let input_sequence =
-        raster_activation_sequence_from_internal(input_activations, "current activations")?;
+    let input_sequence = raster_activation_sequence_from_internal(
+        input_activations,
+        "prefill.layer",
+        "current activations",
+    )?;
     let (mut artifact_store_roots, current_activations_ref) =
         insert_activation_sequence_ref_with_roots(
             &artifact_store_roots,
@@ -154,6 +197,7 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
             &artifact_store_roots,
             &format!("prefill.layer.detour.cache.{cache_idx}"),
             cache,
+            "prefill.layer",
         )?;
         artifact_store_roots = next_roots;
         raster_layer_caches.push(cache_slot);
@@ -163,8 +207,11 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
     if let Some(per_layer_input) =
         ple_inputs.and_then(|inputs| inputs.clone_layer_internal(layer_idx))
     {
-        let input_sequence =
-            raster_activation_sequence_from_internal(&per_layer_input, "PLE input rows")?;
+        let input_sequence = raster_activation_sequence_from_internal(
+            &per_layer_input,
+            "prefill.layer",
+            "PLE input rows",
+        )?;
         let (next_roots, input_ref) = insert_activation_sequence_ref_with_roots(
             &artifact_store_roots,
             format!("prefill.layer.detour.ple.{layer_idx}"),

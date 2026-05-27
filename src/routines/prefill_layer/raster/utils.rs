@@ -381,10 +381,11 @@ pub(in super::super) fn raster_sequence_acts(
 
 pub(in super::super) fn raster_activation_sequence_from_internal(
     sequence: &InternalActivationSequence,
+    detour_routine: &str,
     description: &str,
 ) -> Result<RasterActivationSequence> {
     let rows = sequence.det_values().with_context(|| {
-        format!("selective raster prefill.layer detour requires deterministic {description}")
+        format!("selective raster {detour_routine} detour requires deterministic {description}")
     })?;
     Ok(RasterActivationSequence::from_acts(rows.to_vec()))
 }
@@ -435,11 +436,12 @@ pub(in super::super) fn insert_prefill_layer_cache_with_roots(
     roots: &RasterArtifactStoreRoots,
     source_name_prefix: &str,
     cache: &LayerKvCache,
+    detour_routine: &str,
 ) -> Result<(RasterArtifactStoreRoots, PrefillLayerCacheSlot)> {
     let head_count = cache.keys.len();
     if head_count != cache.values.len() {
         bail!(
-            "selective raster prefill.layer detour KV cache has {} key heads and {} value heads",
+            "selective raster {detour_routine} detour KV cache has {} key heads and {} value heads",
             head_count,
             cache.values.len()
         );
@@ -464,26 +466,26 @@ pub(in super::super) fn insert_prefill_layer_cache_with_roots(
             .det_key_rows_window(head_idx, 0, current_len)
             .with_context(|| {
                 format!(
-                    "selective raster prefill.layer detour requires deterministic key rows for cache head {head_idx}"
+                    "selective raster {detour_routine} detour requires deterministic key rows for cache head {head_idx}"
                 )
             })?;
         let values = cache
             .det_value_rows_window(head_idx, 0, current_len)
             .with_context(|| {
                 format!(
-                    "selective raster prefill.layer detour requires deterministic value rows for cache head {head_idx}"
+                    "selective raster {detour_routine} detour requires deterministic value rows for cache head {head_idx}"
                 )
             })?;
         if keys.len() != current_len || values.len() != current_len {
             bail!(
-                "selective raster prefill.layer detour KV cache head {head_idx} has inconsistent row counts"
+                "selective raster {detour_routine} detour KV cache head {head_idx} has inconsistent row counts"
             );
         }
 
         for row in keys {
             match head_dim {
                 Some(expected) if row.len() != expected => bail!(
-                    "selective raster prefill.layer detour key row width {}, expected {expected}",
+                    "selective raster {detour_routine} detour key row width {}, expected {expected}",
                     row.len()
                 ),
                 None => head_dim = Some(row.len()),
@@ -496,7 +498,7 @@ pub(in super::super) fn insert_prefill_layer_cache_with_roots(
         for row in values {
             match head_dim {
                 Some(expected) if row.len() != expected => bail!(
-                    "selective raster prefill.layer detour value row width {}, expected {expected}",
+                    "selective raster {detour_routine} detour value row width {}, expected {expected}",
                     row.len()
                 ),
                 None => head_dim = Some(row.len()),
@@ -509,7 +511,7 @@ pub(in super::super) fn insert_prefill_layer_cache_with_roots(
     }
 
     let head_dim = head_dim.ok_or_else(|| {
-        anyhow!("selective raster prefill.layer detour KV cache rows are missing")
+        anyhow!("selective raster {detour_routine} detour KV cache rows are missing")
     })?;
     let key_leaves = key_rows.iter().map(activation_row_leaf).collect::<Vec<_>>();
     let value_leaves = value_rows

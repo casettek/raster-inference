@@ -611,6 +611,89 @@ fn ref_backed_finalize_materializes_public_activation_and_layer_cache() {
 }
 
 #[test]
+fn native_prefill_layer_output_adapter_feeds_raster_finalize_detour() {
+    let model = untied_model(false);
+    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("detour", &model)
+        .expect("source should build");
+    let final_hidden_states =
+        activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+    let layer_cache = LayerKvCache::from_det_heads(
+        vec![VecDeque::from(vec![vec![Act::from_num(0.25)]])],
+        vec![VecDeque::from(vec![vec![Act::from_num(-0.25)]])],
+    );
+
+    ArtifactIo::reset_store();
+    let (roots, layer_refs) = crate::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
+        &final_hidden_states,
+        std::slice::from_ref(&layer_cache),
+    )
+    .expect("native layer output should convert to raster refs");
+    let raster_output = crate::prefill_finalize::run_raster(
+        roots,
+        1,
+        &source,
+        layer_refs.final_hidden_states_ref,
+        layer_refs.layer_caches,
+        1,
+    )
+    .expect("raster finalize should run from adapted native refs");
+    let raster = crate::prefill_finalize::materialize_raster_output_refs_for_api(&raster_output)
+        .expect("raster finalize output should materialize");
+    let native = crate::prefill_finalize::run(
+        &[1],
+        &model,
+        final_hidden_states,
+        vec![layer_cache],
+        InferenceExecutionMode::Deterministic,
+    )
+    .expect("native finalize should run");
+
+    assert_eq!(raster, native);
+}
+
+#[test]
+fn native_prefill_layer_output_adapter_requires_deterministic_hidden_states() {
+    let final_hidden_states = ActivationSequence::from_values(
+        vec![vec![1.0, 0.0]],
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&vec![vec![
+            1.0, 0.0,
+        ]]),
+    );
+
+    ArtifactIo::reset_store();
+    let error = crate::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
+        &final_hidden_states,
+        &[],
+    )
+    .expect_err("f32-only hidden states should not convert to raster refs");
+
+    assert!(error.to_string().contains(
+        "selective raster prefill.finalize detour requires deterministic final hidden states"
+    ));
+}
+
+#[test]
+fn native_prefill_layer_output_adapter_requires_deterministic_cache_rows() {
+    let final_hidden_states =
+        activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
+    let layer_cache = LayerKvCache::from_f32_heads(
+        vec![VecDeque::from(vec![vec![0.25]])],
+        vec![VecDeque::from(vec![vec![-0.25]])],
+    );
+
+    ArtifactIo::reset_store();
+    let error = crate::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
+        &final_hidden_states,
+        &[layer_cache],
+    )
+    .expect_err("f32-only cache rows should not convert to raster refs");
+
+    assert!(error
+        .to_string()
+        .contains("selective raster prefill.finalize detour requires deterministic key rows"));
+}
+
+#[test]
 fn proof_shaped_finalize_signatures_stay_ref_backed() {
     let source = include_str!("tiles.rs");
 

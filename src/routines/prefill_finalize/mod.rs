@@ -82,6 +82,43 @@ pub fn run_raster(
     )
 }
 
+pub(crate) fn run_selected_raster_detour_from_native_boundary(
+    model_id: impl Into<String>,
+    model: &Gemma4TransformerModel,
+    prompt_token_count: usize,
+    final_hidden_states: ActivationSequence,
+    layer_caches: Vec<LayerKvCache>,
+    projection_rows_per_tile: usize,
+) -> Result<TransformerPrefillResult> {
+    let finalize_source = AuthenticatedGemmaPrefillFinalizeSource::from_model(model_id, model)?;
+    let (artifact_store_roots, layer_refs) =
+        insert_prefill_layer_output_refs_for_detour(&final_hidden_states, &layer_caches)?;
+    let output = run_raster(
+        artifact_store_roots,
+        prompt_token_count,
+        &finalize_source,
+        layer_refs.final_hidden_states_ref,
+        layer_refs.layer_caches,
+        projection_rows_per_tile,
+    )?;
+    materialize_raster_output_refs_for_api(&output)
+}
+
+fn insert_prefill_layer_output_refs_for_detour(
+    final_hidden_states: &ActivationSequence,
+    layer_caches: &[LayerKvCache],
+) -> Result<(
+    RasterArtifactStoreRoots,
+    crate::prefill_layer::raster::PrefillLayerOutputRefs,
+)> {
+    crate::prefill_layer::insert_prefill_layer_output_refs_from_native(
+        final_hidden_states,
+        layer_caches,
+        "prefill.finalize.detour",
+        "prefill.finalize",
+    )
+}
+
 /// Compatibility boundary: materializes raster prefill refs into the public
 /// `TransformerPrefillResult` shape used by checkpoints and non-ref callers.
 pub fn materialize_raster_output_refs_for_api(
