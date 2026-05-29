@@ -20,11 +20,7 @@ enum TraceMode {
     Verbose,
 }
 
-pub struct TraceSpan {
-    label: String,
-    start: Instant,
-    enabled: bool,
-}
+pub struct TraceSpan;
 
 pub struct RoutineSpan {
     label: String,
@@ -32,26 +28,11 @@ pub struct RoutineSpan {
     enabled: bool,
 }
 
-impl TraceSpan {
-    pub fn new(label: impl Into<String>) -> Self {
-        let label = label.into();
-        let enabled = trace_logging_enabled();
-        if enabled {
-            emit("start", &label, None);
-        }
-        Self {
-            label,
-            start: Instant::now(),
-            enabled,
-        }
-    }
-}
+pub struct NativeSpan;
 
-impl Drop for TraceSpan {
-    fn drop(&mut self) {
-        if self.enabled {
-            emit("end", &self.label, Some(self.start.elapsed()));
-        }
+impl TraceSpan {
+    pub fn new(_label: impl Into<String>) -> Self {
+        Self
     }
 }
 
@@ -93,6 +74,12 @@ impl Drop for RoutineSpan {
     }
 }
 
+impl NativeSpan {
+    pub fn new(_label: impl Into<String>) -> Self {
+        Self
+    }
+}
+
 pub fn trace_scope(label: impl Into<String>) -> TraceSpan {
     TraceSpan::new(label)
 }
@@ -101,33 +88,32 @@ pub fn routine_scope(routine_id: RoutineId, details: impl Into<String>) -> Routi
     RoutineSpan::new(routine_id, details)
 }
 
-pub fn trace_event(label: impl AsRef<str>) {
-    let label = label.as_ref();
-    if !should_emit_trace_event(label) {
-        return;
-    }
-    if trace_logging_enabled() {
-        let label = match active_routine_label() {
-            Some(routine) => format!("{label} routine={routine}"),
-            None => label.to_string(),
-        };
-        emit("event", &label, None);
-    }
+pub fn native_scope(label: impl Into<String>) -> NativeSpan {
+    NativeSpan::new(label)
 }
+
+pub fn trace_event(_label: impl AsRef<str>) {}
+
+pub fn trace_native(_label: impl AsRef<str>) {}
 
 pub fn tile_invoked(invocation_kind: &str, name: &str, ordinal: u64) {
     if !trace_logging_enabled() {
         return;
     }
 
+    let tile_label = if invocation_kind == "tile" {
+        name.to_string()
+    } else {
+        format!("{invocation_kind} {name}")
+    };
     let routine = active_routine_label();
     let label = match routine {
         Some(routine) => {
-            format!("{invocation_kind} {name} count={ordinal} routine={routine}")
+            format!("{tile_label} count={ordinal} routine={routine}")
         }
-        None => format!("{invocation_kind} {name} count={ordinal}"),
+        None => format!("{tile_label} count={ordinal}"),
     };
-    emit("tile", &label, None);
+    emit("raster-tile", &label, None);
 }
 
 pub fn with_trace_logging_enabled<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
@@ -149,17 +135,11 @@ pub fn with_trace_logging_enabled<T>(enabled: bool, f: impl FnOnce() -> T) -> T 
     })
 }
 
-pub fn phase_started(phase_id: PhaseId) {
-    emit("phase-start", phase_id.as_str(), None);
-}
+pub fn phase_started(_phase_id: PhaseId) {}
 
-pub fn phase_finished(phase_id: PhaseId) {
-    emit("phase-end", phase_id.as_str(), None);
-}
+pub fn phase_finished(_phase_id: PhaseId) {}
 
-pub fn phase_paused(phase_id: PhaseId) {
-    emit("phase-pause", phase_id.as_str(), None);
-}
+pub fn phase_paused(_phase_id: PhaseId) {}
 
 pub fn raster_tile_invocations_finished(total: u64) {
     emit("tiles", &format!("total {total}"), None);
@@ -509,21 +489,17 @@ fn active_routine_label() -> Option<String> {
     ACTIVE_ROUTINES.with(|active_routines| active_routines.borrow().last().cloned())
 }
 
-fn should_emit_trace_event(label: &str) -> bool {
-    !label.starts_with("progress ")
-}
-
 fn emit(kind: &str, label: &str, duration: Option<Duration>) {
     let elapsed = process_start().elapsed().as_secs_f64();
     match duration {
         Some(duration) => {
             eprintln!(
-                "[raster-trace +{elapsed:>8.3}s] {kind:<11} {label} ({:.3}s)",
+                "[{kind:<16} {elapsed:>8.3}s] {label} ({:.3}s)",
                 duration.as_secs_f64()
             );
         }
         None => {
-            eprintln!("[raster-trace +{elapsed:>8.3}s] {kind:<11} {label}");
+            eprintln!("[{kind:<16} {elapsed:>8.3}s] {label}");
         }
     }
 }
@@ -538,7 +514,7 @@ fn emit_routine(kind: &str, label: &str, details: &str, duration: Option<Duratio
 }
 
 fn emit_checkpoint(checkpoint_name: &str) {
-    emit("checkpoint", &format!("hit {checkpoint_name}"), None);
+    emit("checkpoint", checkpoint_name, None);
 }
 
 fn emit_checkpoint_bundle(payload: &Value, saved_path: Option<&std::path::Path>) {
@@ -547,16 +523,18 @@ fn emit_checkpoint_bundle(payload: &Value, saved_path: Option<&std::path::Path>)
         Ok(serialized) => {
             if let Some(saved_path) = saved_path {
                 eprintln!(
-                    "[raster-trace +{elapsed:>8.3}s] checkpoints saved={}\n{serialized}",
+                    "[{:<16} {elapsed:>8.3}s] saved={}\n{serialized}",
+                    "checkpoints",
                     saved_path.display()
                 );
             } else {
-                eprintln!("[raster-trace +{elapsed:>8.3}s] checkpoints\n{serialized}");
+                eprintln!("[{:<16} {elapsed:>8.3}s]\n{serialized}", "checkpoints");
             }
         }
         Err(error) => {
             eprintln!(
-                "[raster-trace +{elapsed:>8.3}s] checkpoints <serialization failed: {error}>"
+                "[{:<16} {elapsed:>8.3}s] <serialization failed: {error}>",
+                "checkpoints"
             );
         }
     }
@@ -780,13 +758,5 @@ mod tests {
             assert_eq!(super::trace_mode(), super::TraceMode::Verbose);
         });
         assert_eq!(super::trace_mode(), super::TraceMode::Off);
-    }
-
-    #[test]
-    fn progress_trace_events_are_suppressed_by_default() {
-        assert!(!super::should_emit_trace_event(
-            "progress prefill.attention.scores head=0 token=0"
-        ));
-        assert!(super::should_emit_trace_event("decode.select_token"));
     }
 }

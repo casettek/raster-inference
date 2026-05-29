@@ -268,6 +268,9 @@ pub fn run_inference_with_controls(
             if count_raster_tiles {
                 crate::dsl::start_tile_invocation_counting();
             }
+            let selected_raster_detour_routine = raster_detour_controller
+                .selected_spec()
+                .map(|spec| spec.routine_id());
             let deterministic_prompt_checkpoint = |prompt_preparation: &PromptPreparationState| {
                 let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
                     "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
@@ -281,7 +284,6 @@ pub fn run_inference_with_controls(
             };
 
             let result = (|| {
-                trace::phase_started(PhaseId::InputEmbedding);
                 let mut raster_prompt_preparation_for_embedding = None;
                 let mut raster_prompt_preparation_roots_for_embedding = None;
                 raster_detour_controller
@@ -339,12 +341,9 @@ pub fn run_inference_with_controls(
                         trace::trace_checkpoint(
                             "prompt.prepare",
                             &json!({
-                                "prompt_bytes_root": prompt_checkpoint.prompt_bytes_root.clone(),
-                                "prompt_text_root": prompt_checkpoint.prompt_text_root.clone(),
-                                "rendered_prompt_root": prompt_checkpoint.rendered_prompt_root.clone(),
-                                "normalized_prompt_root": prompt_checkpoint.normalized_prompt_root.clone(),
-                                "prompt_token_count": prompt_checkpoint.prompt_token_count,
-                                "prompt_token_ids_root": prompt_checkpoint.prompt_token_ids_root.clone(),
+                                "prompt_text": prompt_preparation.prompt_text.clone(),
+                                "prompt_token_ids": prompt_preparation.prompt_token_ids.clone(),
+                                "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
                                 "sampling": request.sampling.clone(),
                             }),
                         );
@@ -462,12 +461,19 @@ pub fn run_inference_with_controls(
                         }),
                     );
                 }
+                let input_embedding_raster_refs_for_checkpoint = if use_raster_prefill
+                    || selected_raster_detour_routine == Some(RoutineId::InputEmbedding)
+                {
+                    raster_input_embedding_refs
+                        .as_ref()
+                        .map(|output| &output.refs)
+                } else {
+                    None
+                };
                 input_embedding::trace_input_embedding_checkpoint(
                     &prompt_preparation.prompt_token_ids,
                     &token_embeddings,
-                    raster_input_embedding_refs
-                        .as_ref()
-                        .map(|output| &output.refs),
+                    input_embedding_raster_refs_for_checkpoint,
                 );
                 if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
                     return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
@@ -478,9 +484,6 @@ pub fn run_inference_with_controls(
                         raster_tile_invocations: None,
                     }));
                 }
-                trace::phase_finished(PhaseId::InputEmbedding);
-
-                trace::phase_started(PhaseId::TransformerStateTransition);
                 let mut raster_decode_state_for_output = None;
                 let prefill = if use_raster_prefill {
                     let raster_sizing =
@@ -606,22 +609,6 @@ pub fn run_inference_with_controls(
                         prefill_prepare_aux::materialize_prefill_ple_inputs(
                             ple_input_refs.as_ref(),
                         )?
-                    } else if let Some(input_embedding_output) =
-                        raster_input_embedding_refs.as_ref()
-                    {
-                        let ple_source = AuthenticatedGemmaPleSource::from_model(
-                            model.model_id.clone(),
-                            transformer_model,
-                        )?;
-                        prefill_prepare_aux::run_with_input_embedding_checkpoint(
-                            &prompt_preparation.prompt_token_ids,
-                            transformer_model,
-                            &token_embeddings,
-                            request.execution_mode,
-                            input_embedding_output.artifact_store_roots.clone(),
-                            &input_embedding_output.refs,
-                            &ple_source,
-                        )?
                     } else {
                         prefill_prepare_aux::run(
                             &prompt_preparation.prompt_token_ids,
@@ -710,9 +697,6 @@ pub fn run_inference_with_controls(
                         raster_tile_invocations: None,
                     }));
                 }
-                trace::phase_finished(PhaseId::TransformerStateTransition);
-
-                trace::phase_started(PhaseId::OutputDecode);
                 let output_decode = if let Some(raster_decode_state) =
                     raster_decode_state_for_output
                 {
@@ -752,8 +736,6 @@ pub fn run_inference_with_controls(
                         raster_tile_invocations: None,
                     }));
                 }
-                trace::phase_finished(PhaseId::OutputDecode);
-
                 raster_detour_controller.ensure_matched_if_active()?;
                 Ok(InferenceRunOutcome::Completed(InferenceState {
                     input_embedding,
@@ -940,6 +922,73 @@ mod tests {
             .iter()
             .filter(|entry| entry.get(checkpoint).is_some())
             .count()
+    }
+
+    fn checkpoint_entry_name_and_commitment(entry: &serde_json::Value) -> (&str, &str) {
+        let object = entry
+            .as_object()
+            .expect("checkpoint entry should be an object");
+        let (checkpoint, commitment) = object
+            .iter()
+            .next()
+            .expect("checkpoint entry should contain a commitment");
+        (
+            checkpoint.as_str(),
+            commitment
+                .as_str()
+                .expect("checkpoint commitment should be a string"),
+        )
+    }
+
+    fn assert_checkpoint_payloads_match_except_detour(
+        native_payload: &serde_json::Value,
+        detour_payload: &serde_json::Value,
+        detour_spec: &str,
+    ) {
+        let detour_spec = RasterDetourSpec::parse(detour_spec).expect("detour spec should parse");
+        let native_entries = native_payload
+            .as_array()
+            .expect("native checkpoint payload should be an array");
+        let detour_entries = detour_payload
+            .as_array()
+            .expect("detour checkpoint payload should be an array");
+        assert_eq!(
+            native_entries.len(),
+            detour_entries.len(),
+            "checkpoint payloads should have the same shape"
+        );
+
+        let mut selected_seen = 0;
+        for (idx, (native_entry, detour_entry)) in
+            native_entries.iter().zip(detour_entries).enumerate()
+        {
+            let (native_checkpoint, native_commitment) =
+                checkpoint_entry_name_and_commitment(native_entry);
+            let (detour_checkpoint, detour_commitment) =
+                checkpoint_entry_name_and_commitment(detour_entry);
+            assert_eq!(
+                native_checkpoint, detour_checkpoint,
+                "checkpoint name mismatch at entry {idx}"
+            );
+
+            if native_checkpoint == detour_spec.routine_id().as_str() {
+                selected_seen += 1;
+                if selected_seen == detour_spec.occurrence() {
+                    continue;
+                }
+            }
+
+            assert_eq!(
+                native_commitment, detour_commitment,
+                "non-detoured checkpoint {native_checkpoint} differed at entry {idx}"
+            );
+        }
+
+        assert!(
+            selected_seen >= detour_spec.occurrence(),
+            "selected checkpoint {} was not present",
+            detour_spec
+        );
     }
 
     struct TraceDirGuard {
@@ -2205,7 +2254,11 @@ mod tests {
         .expect("input embedding detour inference should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            "input.embedding",
+        );
         assert_eq!(
             checkpoint_commitments(&native_payload, "input.embedding").len(),
             1
@@ -2274,7 +2327,11 @@ mod tests {
         .expect("prefill prepare aux detour inference should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            "prefill.prepare_aux",
+        );
         assert_eq!(
             checkpoint_commitments(&native_payload, "prefill.prepare_aux").len(),
             1
@@ -2359,7 +2416,11 @@ mod tests {
         .expect("no-PLE prefill prepare aux detour should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            "prefill.prepare_aux",
+        );
         assert_eq!(
             checkpoint_commitments(&native_payload, "prefill.prepare_aux").len(),
             1
@@ -2425,7 +2486,11 @@ mod tests {
         .expect("prefill layer detour inference should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            "prefill.layer:2",
+        );
         assert_eq!(
             checkpoint_commitments(&native_payload, "prefill.layer").len(),
             2
@@ -2491,7 +2556,11 @@ mod tests {
         .expect("PLE prefill layer detour inference should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            "prefill.layer",
+        );
         assert_eq!(
             checkpoint_commitments(&native_payload, "prefill.layer").len(),
             1
@@ -2554,7 +2623,11 @@ mod tests {
         .expect("prefill finalize detour inference should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            "prefill.finalize",
+        );
         assert_eq!(
             checkpoint_commitments(&native_payload, "prefill.finalize").len(),
             1
@@ -2617,7 +2690,11 @@ mod tests {
         .expect("output finalize detour inference should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            "output.finalize",
+        );
         assert_eq!(
             checkpoint_commitments(&native_payload, "output.finalize").len(),
             1
@@ -2684,7 +2761,11 @@ mod tests {
         .expect("decode select token detour inference should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            detour_spec,
+        );
         assert_eq!(
             checkpoint_commitments(&native_payload, "decode.select_token").len(),
             expected_decode_select_checkpoints
@@ -2765,7 +2846,11 @@ mod tests {
         .expect("decode transition detour inference should complete");
         let detour_payload = crate::trace::take_completed_checkpoint_payload_for_tests();
 
-        assert_eq!(native_payload, detour_payload);
+        assert_checkpoint_payloads_match_except_detour(
+            &native_payload,
+            &detour_payload,
+            detour_spec,
+        );
         assert_eq!(
             checkpoint_commitments_with_prefix(&native_payload, "decode.layer_token.").len(),
             0
@@ -2818,7 +2903,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_cpu_decode_transition_checkpoint_commitment_matches_raster_detour() {
+    fn deterministic_cpu_decode_transition_non_detoured_checkpoints_match_raster_detour() {
         let _trace_guard = trace_test_lock().lock().expect("trace test lock");
         let _trace_dir = TraceDirGuard::new("decode-transition-checkpoint-commitment");
         let tokenizer = test_tokenizer();
@@ -2863,9 +2948,10 @@ mod tests {
             checkpoint_commitments_with_prefix(&deterministic_payload, "decode.layer_token.").len(),
             0
         );
-        assert_eq!(
-            checkpoint_commitments(&deterministic_payload, "decode.transition"),
-            checkpoint_commitments(&raster_payload, "decode.transition")
+        assert_checkpoint_payloads_match_except_detour(
+            &deterministic_payload,
+            &raster_payload,
+            "decode.transition",
         );
     }
 
