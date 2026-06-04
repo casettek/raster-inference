@@ -1,6 +1,6 @@
 mod tiles;
 mod types;
-pub(super) mod utils;
+pub(crate) mod utils;
 
 pub use tiles::*;
 pub use types::*;

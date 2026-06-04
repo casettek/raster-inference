@@ -15,13 +15,14 @@ The selector uses routine ids, not arbitrary checkpoint ids:
 - `prompt.prepare`
 - `input.embedding`
 - `prefill.prepare_aux`
-- `prefill.layer`
+- `prefill.range`
+- `prefill.range_finalize`
 - `prefill.finalize`
 - `decode.select_token`
 - `decode.transition`
 - `output.finalize`
 
-Occurrence suffixes follow the existing `id:N` convention, for example `prefill.layer:2`. Sub-checkpoints such as `prefill.layer_token.layer_0.token_0` are not routine ids and are not valid detour targets.
+Occurrence suffixes follow the existing `id:N` convention, for example `prefill.range_finalize:2`. Sub-checkpoints such as `prefill.layer_token.layer_0.token_0` are not routine ids and are not valid detour targets.
 
 ## Execution Shape
 
@@ -44,6 +45,7 @@ The shared setup provides the selector, CLI/API control plumbing, raster sizing 
 - attention KV rows per tile
 - sequence rows per tile
 - head rows per tile
+- prefill token range width
 - tokenizer BPE chunk sizes
 - output byte flush chunk size
 - raster integrity mode

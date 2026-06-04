@@ -642,7 +642,7 @@ mod tests {
         assert!(!should_commit_checkpoint(
             "prefill.layer_token.layer_0.token_0"
         ));
-        assert!(should_commit_checkpoint("prefill.layer"));
+        assert!(should_commit_checkpoint("prefill.range_finalize"));
         assert!(!should_commit_checkpoint(
             "decode.layer_token.layer_0.position_0"
         ));
@@ -697,38 +697,38 @@ mod tests {
 
     #[test]
     fn terminal_checkpoint_spec_accepts_occurrence_suffix() {
-        let spec =
-            TerminalCheckpointSpec::parse("prefill.layer:2").expect("checkpoint should parse");
+        let spec = TerminalCheckpointSpec::parse("prefill.range_finalize:2")
+            .expect("checkpoint should parse");
 
-        assert_eq!(spec.checkpoint_id(), "prefill.layer");
+        assert_eq!(spec.checkpoint_id(), "prefill.range_finalize");
         assert_eq!(spec.occurrence(), 2);
     }
 
     #[test]
     fn terminal_checkpoint_spec_rejects_zero_occurrence() {
-        let error = TerminalCheckpointSpec::parse("prefill.layer:0").expect_err("zero should fail");
+        let error = TerminalCheckpointSpec::parse("prefill.range:0").expect_err("zero should fail");
 
         assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]
     fn terminal_checkpoint_tracking_reaches_requested_occurrence() {
-        let spec =
-            TerminalCheckpointSpec::parse("prefill.layer:2").expect("checkpoint should parse");
+        let spec = TerminalCheckpointSpec::parse("prefill.range_finalize:2")
+            .expect("checkpoint should parse");
 
         super::with_terminal_checkpoint(Some(spec), || {
             assert!(!super::trace_checkpoint(
-                "prefill.layer",
+                "prefill.range_finalize",
                 &json!({ "index": 0 })
             ));
             assert_eq!(super::reached_terminal_checkpoint_id(), None);
             assert!(super::trace_checkpoint(
-                "prefill.layer",
+                "prefill.range_finalize",
                 &json!({ "index": 1 })
             ));
             assert_eq!(
                 super::reached_terminal_checkpoint_id().as_deref(),
-                Some("prefill.layer")
+                Some("prefill.range_finalize")
             );
         });
     }
@@ -737,16 +737,16 @@ mod tests {
     fn routine_occurrence_labels_match_terminal_checkpoint_suffixes() {
         super::with_trace_logging_enabled(true, || {
             assert_eq!(
-                super::next_routine_label(RoutineId::PrefillLayer),
-                "prefill.layer"
+                super::next_routine_label(RoutineId::PrefillRangeFinalize),
+                "prefill.range_finalize"
             );
             assert_eq!(
-                super::next_routine_label(RoutineId::PrefillLayer),
-                "prefill.layer:2"
+                super::next_routine_label(RoutineId::PrefillRangeFinalize),
+                "prefill.range_finalize:2"
             );
             assert_eq!(
-                super::next_routine_label(RoutineId::PrefillLayer),
-                "prefill.layer:3"
+                super::next_routine_label(RoutineId::PrefillRangeFinalize),
+                "prefill.range_finalize:3"
             );
         });
     }

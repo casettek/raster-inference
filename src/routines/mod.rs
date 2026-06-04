@@ -3,8 +3,9 @@ pub mod decode_transition;
 pub mod input_embedding;
 pub mod output_finalize;
 pub mod prefill_finalize;
-pub mod prefill_layer;
 pub mod prefill_prepare_aux;
+pub mod prefill_range;
+pub mod prefill_range_finalize;
 pub mod prompt_prepare;
 
 #[cfg(test)]
@@ -21,11 +22,11 @@ mod tests {
         ("input_embedding", include_str!("input_embedding/mod.rs")),
         ("output_finalize", include_str!("output_finalize/mod.rs")),
         ("prefill_finalize", include_str!("prefill_finalize/mod.rs")),
-        ("prefill_layer", include_str!("prefill_layer/mod.rs")),
         (
             "prefill_prepare_aux",
             include_str!("prefill_prepare_aux/mod.rs"),
         ),
+        ("prefill_range", include_str!("prefill_range/mod.rs")),
         ("prompt_prepare", include_str!("prompt_prepare/mod.rs")),
     ];
 

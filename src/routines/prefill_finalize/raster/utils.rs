@@ -15,12 +15,12 @@ pub fn build_prefill_result_from_root_refs(
     roots: &RasterArtifactStoreRoots,
     refs: &RasterPrefillFinalizeRefs,
 ) -> Result<TransformerPrefillResult> {
-    let layer_refs = crate::prefill_layer::raster::PrefillLayerOutputRefs {
+    let layer_refs = crate::prefill_range::raster::PrefillLayerOutputRefs {
         final_hidden_states_ref: refs.final_hidden_states_ref.clone(),
         layer_caches: refs.layer_caches.clone(),
     };
     let (final_hidden_states, layer_caches) =
-        crate::prefill_layer::materialize_prefill_layer_output_refs_from_roots_for_trace(
+        crate::prefill_range::materialize_prefill_layer_output_refs_from_roots_for_trace(
             roots,
             &layer_refs,
         )?;
@@ -110,10 +110,10 @@ fn materialize_prefill_logits_from_roots(
 
 pub(in super::super) fn validate_layer_cache_roots(
     roots: &RasterArtifactStoreRoots,
-    layer_caches: &[crate::prefill_layer::raster::PrefillLayerCacheSlot],
+    layer_caches: &[crate::prefill_range::raster::PrefillLayerCacheSlot],
 ) -> Result<()> {
     for cache in layer_caches {
-        if let crate::prefill_layer::raster::PrefillLayerCacheSlot::Ref(cache_ref) = cache {
+        if let crate::prefill_range::raster::PrefillLayerCacheSlot::Ref(cache_ref) = cache {
             ensure_artifact_root_present(roots, cache_ref.keys().det_commitment())?;
             ensure_artifact_root_present(roots, cache_ref.values().det_commitment())?;
         }

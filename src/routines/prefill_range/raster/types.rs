@@ -15,17 +15,18 @@ use crate::shared::tensors::raster_tensor_artifacts::{
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PrefillLayerRasterState {
-    pub(in super::super) current_activations_ref: RasterActivationSequenceRef,
-    pub(in super::super) next_layer_idx: usize,
-    pub(in super::super) layer_count: usize,
-    pub(in super::super) layer_caches: Vec<PrefillLayerCacheSlot>,
-    pub(in super::super) per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
-    pub(in super::super) completed_layer_output_sha256s: Vec<String>,
-    pub(in super::super) completed_layer_output_det_sha256s: Vec<Option<String>>,
-    pub(in super::super) projection_rows_per_tile: usize,
-    pub(in super::super) attention_kv_rows_per_tile: usize,
-    pub(in super::super) sequence_rows_per_tile: usize,
-    pub(in super::super) head_rows_per_tile: usize,
+    pub(crate) current_activations_ref: RasterActivationSequenceRef,
+    pub(crate) next_layer_idx: usize,
+    pub(crate) layer_count: usize,
+    pub(crate) layer_caches: Vec<PrefillLayerCacheSlot>,
+    pub(crate) per_layer_inputs: Vec<Option<RasterActivationSequenceRef>>,
+    pub(crate) completed_layer_output_sha256s: Vec<String>,
+    pub(crate) completed_layer_output_det_sha256s: Vec<Option<String>>,
+    pub(crate) projection_rows_per_tile: usize,
+    pub(crate) attention_kv_rows_per_tile: usize,
+    pub(crate) sequence_rows_per_tile: usize,
+    pub(crate) head_rows_per_tile: usize,
+    pub(crate) prefill_token_range_width: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -41,7 +42,7 @@ pub struct PrefillLayerOutputRefs {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub(in super::super) enum PrefillLayerStep {
+pub(crate) enum PrefillLayerStep {
     Complete {
         layer_state: PrefillLayerRasterState,
     },

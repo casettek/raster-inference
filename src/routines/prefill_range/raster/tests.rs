@@ -1,7 +1,7 @@
 use crate::dsl::prelude::auth_read;
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
-use crate::prefill_layer::native::deterministic_tiles;
-use crate::prefill_layer::{
+use crate::prefill_range::native::deterministic_tiles;
+use crate::prefill_range::{
     materialize_prefill_layer_output_refs_from_roots_for_trace, run_raster,
 };
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -28,6 +28,7 @@ fn raster_sizing(projection_rows_per_tile: usize) -> RasterSizingControls {
         attention_kv_rows_per_tile: usize::MAX,
         sequence_rows_per_tile: 1,
         head_rows_per_tile: 1,
+        prefill_token_range_width: crate::InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
         tokenizer_bpe_pairs_per_tile:
             crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
         tokenizer_bpe_pieces_per_tile:

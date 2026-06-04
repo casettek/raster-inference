@@ -82,7 +82,7 @@ pub fn init_prefill_finalize_state(
     prompt_token_count: usize,
     finalize_source_root: String,
     final_hidden_states_ref: RasterActivationSequenceRef,
-    layer_caches: &[crate::prefill_layer::raster::PrefillLayerCacheSlot],
+    layer_caches: &[crate::prefill_range::raster::PrefillLayerCacheSlot],
     projection_rows_per_tile: usize,
     finalize_source: &RasterPrefillFinalizeSource<'_>,
 ) -> Result<PrefillFinalizeRasterState> {
@@ -279,7 +279,7 @@ pub fn project_next_prefill_logit_chunk(
 #[tile]
 pub fn finalize_prefill_finalize_refs(
     finalize_state: PrefillFinalizeRasterState,
-    layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    layer_caches: Vec<crate::prefill_range::raster::PrefillLayerCacheSlot>,
 ) -> Result<(RasterArtifactStoreRoots, RasterPrefillFinalizeRefs)> {
     let normalized_final_position_ref = finalize_state
         .normalized_final_position_ref

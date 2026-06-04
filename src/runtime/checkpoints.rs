@@ -47,7 +47,8 @@ pub enum RoutineId {
     PromptPrepare,
     InputEmbedding,
     PrefillPrepareAux,
-    PrefillLayer,
+    PrefillRange,
+    PrefillRangeFinalize,
     PrefillFinalize,
     SelectOutputToken,
     DecodeTransition,
@@ -55,11 +56,12 @@ pub enum RoutineId {
 }
 
 impl RoutineId {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::PromptPrepare,
         Self::InputEmbedding,
         Self::PrefillPrepareAux,
-        Self::PrefillLayer,
+        Self::PrefillRange,
+        Self::PrefillRangeFinalize,
         Self::PrefillFinalize,
         Self::SelectOutputToken,
         Self::DecodeTransition,
@@ -71,7 +73,8 @@ impl RoutineId {
             Self::PromptPrepare => "prompt.prepare",
             Self::InputEmbedding => "input.embedding",
             Self::PrefillPrepareAux => "prefill.prepare_aux",
-            Self::PrefillLayer => "prefill.layer",
+            Self::PrefillRange => "prefill.range",
+            Self::PrefillRangeFinalize => "prefill.range_finalize",
             Self::PrefillFinalize => "prefill.finalize",
             Self::SelectOutputToken => "decode.select_token",
             Self::DecodeTransition => "decode.transition",
@@ -256,9 +259,13 @@ pub fn classify_checkpoint(checkpoint_name: &str) -> Option<CheckpointTaxonomy> 
             phase_id: PhaseId::TransformerStateTransition,
             routine_id: RoutineId::PrefillPrepareAux,
         }),
-        "prefill.layer" => Some(CheckpointTaxonomy {
+        "prefill.range" => Some(CheckpointTaxonomy {
             phase_id: PhaseId::TransformerStateTransition,
-            routine_id: RoutineId::PrefillLayer,
+            routine_id: RoutineId::PrefillRange,
+        }),
+        "prefill.range_finalize" => Some(CheckpointTaxonomy {
+            phase_id: PhaseId::TransformerStateTransition,
+            routine_id: RoutineId::PrefillRangeFinalize,
         }),
         "prefill.finalize" => Some(CheckpointTaxonomy {
             phase_id: PhaseId::TransformerStateTransition,
@@ -278,7 +285,7 @@ pub fn classify_checkpoint(checkpoint_name: &str) -> Option<CheckpointTaxonomy> 
         }),
         _ if checkpoint_name.starts_with("prefill.layer_token.") => Some(CheckpointTaxonomy {
             phase_id: PhaseId::TransformerStateTransition,
-            routine_id: RoutineId::PrefillLayer,
+            routine_id: RoutineId::PrefillRangeFinalize,
         }),
         _ => None,
     }
@@ -297,7 +304,7 @@ mod tests {
             classify_checkpoint("prefill.layer_token.layer_3.token_9"),
             Some(CheckpointTaxonomy {
                 phase_id: PhaseId::TransformerStateTransition,
-                routine_id: RoutineId::PrefillLayer,
+                routine_id: RoutineId::PrefillRangeFinalize,
             })
         );
     }
@@ -347,8 +354,12 @@ mod tests {
     #[test]
     fn routine_id_parses_canonical_ids() {
         assert_eq!(
-            "prefill.layer".parse::<RoutineId>().unwrap(),
-            RoutineId::PrefillLayer
+            "prefill.range".parse::<RoutineId>().unwrap(),
+            RoutineId::PrefillRange
+        );
+        assert_eq!(
+            "prefill.range_finalize".parse::<RoutineId>().unwrap(),
+            RoutineId::PrefillRangeFinalize
         );
         assert_eq!(
             "decode.transition".parse::<RoutineId>().unwrap(),
@@ -363,7 +374,7 @@ mod tests {
             .expect_err("sub-checkpoints should not parse as routine ids");
 
         assert!(error.to_string().contains("unknown routine id"));
-        assert!(error.to_string().contains("prefill.layer"));
+        assert!(error.to_string().contains("prefill.range_finalize"));
 
         let error = "decode.layer_token.layer_0.position_0"
             .parse::<RoutineId>()
@@ -391,55 +402,55 @@ mod tests {
 
     #[test]
     fn raster_detour_spec_parses_occurrence_suffix() {
-        let spec = RasterDetourSpec::parse("prefill.layer:2").expect("spec should parse");
+        let spec = RasterDetourSpec::parse("prefill.range:2").expect("spec should parse");
 
-        assert_eq!(spec.routine_id(), RoutineId::PrefillLayer);
+        assert_eq!(spec.routine_id(), RoutineId::PrefillRange);
         assert_eq!(spec.occurrence(), 2);
-        assert_eq!(spec.to_string(), "prefill.layer:2");
+        assert_eq!(spec.to_string(), "prefill.range:2");
     }
 
     #[test]
     fn raster_detour_spec_rejects_invalid_occurrence() {
         let zero =
-            RasterDetourSpec::parse("prefill.layer:0").expect_err("zero occurrence should fail");
+            RasterDetourSpec::parse("prefill.range:0").expect_err("zero occurrence should fail");
         assert!(zero.to_string().contains("greater than zero"));
 
-        let non_numeric = RasterDetourSpec::parse("prefill.layer:abc")
+        let non_numeric = RasterDetourSpec::parse("prefill.range:abc")
             .expect_err("non-numeric occurrence should fail");
         assert!(non_numeric.to_string().contains("positive integer"));
     }
 
     #[test]
     fn raster_detour_controller_matches_selected_occurrence_once() {
-        let spec = RasterDetourSpec::parse("prefill.layer:2").expect("spec should parse");
+        let spec = RasterDetourSpec::parse("prefill.range:2").expect("spec should parse");
         let mut controller = RasterDetourController::new(Some(spec));
 
-        assert!(!controller.should_detour(RoutineId::PrefillLayer));
-        assert!(controller.should_detour(RoutineId::PrefillLayer));
-        assert!(!controller.should_detour(RoutineId::PrefillLayer));
+        assert!(!controller.should_detour(RoutineId::PrefillRange));
+        assert!(controller.should_detour(RoutineId::PrefillRange));
+        assert!(!controller.should_detour(RoutineId::PrefillRange));
     }
 
     #[test]
     fn raster_detour_controller_ignores_other_routines() {
-        let spec = RasterDetourSpec::parse("prefill.layer").expect("spec should parse");
+        let spec = RasterDetourSpec::parse("prefill.range").expect("spec should parse");
         let mut controller = RasterDetourController::new(Some(spec));
 
         assert!(!controller.should_detour(RoutineId::InputEmbedding));
-        assert!(controller.should_detour(RoutineId::PrefillLayer));
+        assert!(controller.should_detour(RoutineId::PrefillRange));
     }
 
     #[test]
     fn raster_detour_controller_reports_unmatched_active_target() {
-        let spec = RasterDetourSpec::parse("prefill.layer:2").expect("spec should parse");
+        let spec = RasterDetourSpec::parse("prefill.range:2").expect("spec should parse");
         let mut controller = RasterDetourController::new(Some(spec));
 
-        assert!(!controller.should_detour(RoutineId::PrefillLayer));
+        assert!(!controller.should_detour(RoutineId::PrefillRange));
         let error = controller
             .ensure_matched_if_active()
             .expect_err("active unmatched detour should fail");
 
         assert!(error
             .to_string()
-            .contains("selective raster detour target prefill.layer:2 was not reached"));
+            .contains("selective raster detour target prefill.range:2 was not reached"));
     }
 }

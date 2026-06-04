@@ -1,12 +1,12 @@
-use anyhow::{anyhow, bail, Result};
-use serde_json::json;
-
+use crate::routines::prefill_range_finalize::PrefillRangeFinalizeCheckpoint;
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::model::transformer::{
     ActivationSequence, Gemma4LayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
     LayerKvCache,
 };
 use crate::trace::routine_scope;
+use anyhow::{anyhow, bail, Result};
+use serde_json::json;
 
 pub fn run_text_layers_prefill(
     input_activations: &[Vec<f32>],
@@ -21,6 +21,20 @@ pub fn run_text_layers_prefill_with_cache(
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_text_layers_prefill_with_cache_with_range_width(
+        input_activations,
+        model,
+        ple_inputs,
+        crate::InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
+    )
+}
+
+pub fn run_text_layers_prefill_with_cache_with_range_width(
+    input_activations: &[Vec<f32>],
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    prefill_token_range_width: usize,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     if model.layers.is_empty() {
         bail!("transformer prefill requires at least one layer");
     }
@@ -30,7 +44,7 @@ pub fn run_text_layers_prefill_with_cache(
     let mut completed_layer_output_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         let _routine = routine_scope(
-            RoutineId::PrefillLayer,
+            RoutineId::PrefillRange,
             format!(
                 "layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
                 xs.len(),
@@ -53,18 +67,33 @@ pub fn run_text_layers_prefill_with_cache(
                 crate::shared::api::input::InferenceExecutionMode::Fp32,
             )?;
         xs = layer_output.activations;
+        if crate::prefill_range::trace_checkpoints(
+            layer_idx,
+            &ActivationSequence::from_values(
+                xs.clone(),
+                crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs),
+            ),
+            prefill_token_range_width,
+            None,
+        )? {
+            layer_caches.push(layer_cache);
+            completed_layer_output_sha256s.push(layer_output.activations_sha256);
+            break;
+        }
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
-        if crate::trace::trace_checkpoint(
-            "prefill.layer",
-            &json!({
-                "next_layer_idx": layer_idx + 1,
-                "current_activations": xs.clone(),
-                "current_activations_sha256": crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs),
-                "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-                "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
-            }),
-        ) {
+        let current_activations = ActivationSequence::from_values(
+            xs.clone(),
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs),
+        );
+        if crate::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
+            execution_mode: None,
+            layer_idx,
+            current_activations: &current_activations,
+            layer_caches: &layer_caches,
+            completed_layer_output_sha256s: completed_layer_output_sha256s.clone(),
+            completed_layer_output_det_sha256s: None,
+        }) {
             break;
         }
         let mut reached_terminal_checkpoint = false;
@@ -102,6 +131,20 @@ pub fn run(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     run_text_layers_prefill_with_cache(input_activations, model, ple_inputs)
+}
+
+pub fn run_with_range_width(
+    input_activations: &[Vec<f32>],
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    prefill_token_range_width: usize,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_text_layers_prefill_with_cache_with_range_width(
+        input_activations,
+        model,
+        ple_inputs,
+        prefill_token_range_width,
+    )
 }
 
 fn resolve_prefill_donor_cache<'a>(

@@ -44,7 +44,7 @@ Today the implemented routines map onto checkpoint families like this:
 
 - `prompt_prepare` -> `prompt.prepare`
 - `prefill_prepare_aux` -> `prefill.prepare_aux`
-- `prefill_layer` -> `prefill.layer` and `prefill.layer_token.*`
+- `prefill_layer` -> `prefill.range`, `prefill.range_finalize`, and `prefill.layer_token.*`
 - `prefill_finalize` -> `prefill.finalize`
 - `select_output_token` -> `decode.select_token`
 - `decode_transition` -> `decode.layer_token.*` and `decode.finalize`
@@ -119,13 +119,14 @@ cargo run -- \
   "Hello from Raster"
 ```
 
-To stop after a specific checkpoint, pass `--terminal-checkpoint <checkpoint-id>`. For example, `--terminal-checkpoint prefill.finalize` stops after the prefill finalize checkpoint has been emitted. Add `:N` to stop after a later occurrence of a repeated checkpoint, such as `--terminal-checkpoint prefill.layer:2` for the second prefill layer checkpoint.
+To stop after a specific checkpoint, pass `--terminal-checkpoint <checkpoint-id>`. For example, `--terminal-checkpoint prefill.finalize` stops after the prefill finalize checkpoint has been emitted. Add `:N` to stop after a later occurrence of a repeated checkpoint, such as `--terminal-checkpoint prefill.range_finalize:2` for the second finalized prefill layer.
 
 The raster-authored path is opt-in while routines are ported one at a time:
 
 ```bash
 cargo run -- \
   --raster \
+  --prefill-token-range-width 100 \
   --raster-projection-rows-per-tile 1 \
   google/gemma-4-test \
   /path/to/tokenizer.json \
@@ -134,7 +135,7 @@ cargo run -- \
   "Hello from Raster"
 ```
 
-For now, `--raster` implies the deterministic model/runtime path and routes the implemented raster-authored routines through separate raster tile modules. Prompt preparation, prefill preparation/finalization work, prefill layers, and decode token selection use raster-authored tiles where available. Decode transition still uses the native deterministic path until it is separately converted. Use `--raster-projection-rows-per-tile` to bound how many projection rows a raster projection tile reads at once; lower values reduce zkVM memory pressure, and the default is `1`.
+For now, `--raster` implies the deterministic model/runtime path and routes the implemented raster-authored routines through separate raster tile modules. Prompt preparation, prefill preparation/finalization work, prefill range checkpoints, and decode token selection use raster-authored tiles where available. Decode transition still uses the native deterministic path until it is separately converted. Use `--prefill-token-range-width` to bound how many prompt tokens each `prefill.range` checkpoint covers. Use `--raster-projection-rows-per-tile` to bound how many projection rows a raster projection tile reads at once; lower values reduce zkVM memory pressure, and the default is `1`.
 
 When `--deterministic` is set, the model path must point to either:
 

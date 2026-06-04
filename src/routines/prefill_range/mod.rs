@@ -1,7 +1,5 @@
-use anyhow::{bail, Result};
-
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
-use crate::runtime::checkpoints::RasterDetourController;
+use crate::runtime::checkpoints::{RasterDetourController, RoutineId};
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
@@ -11,6 +9,8 @@ use crate::shared::model::transformer::{
 };
 use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
 use crate::RasterSizingControls;
+use anyhow::{bail, Result};
+use serde_json::json;
 
 use self::raster::utils::{
     insert_activation_sequence_ref_with_roots, insert_prefill_layer_cache_with_roots,
@@ -21,6 +21,59 @@ use self::raster::utils::{
 
 pub mod native;
 pub mod raster;
+
+pub(crate) fn range_bounds(
+    token_count: usize,
+    prefill_token_range_width: usize,
+) -> Vec<(usize, usize)> {
+    let width = prefill_token_range_width.max(1).min(token_count.max(1));
+    (0..token_count)
+        .step_by(width)
+        .map(|start| (start, start.saturating_add(width).min(token_count)))
+        .collect()
+}
+
+pub(crate) fn trace_checkpoints(
+    layer_idx: usize,
+    layer_output: &ActivationSequence,
+    prefill_token_range_width: usize,
+    execution_mode: Option<&str>,
+) -> Result<bool> {
+    let activations = &layer_output.activations;
+    let internal = layer_output.clone_internal();
+    let det_rows = internal.det_values();
+    for (range_start, range_end) in range_bounds(activations.len(), prefill_token_range_width) {
+        let _routine = crate::trace::routine_scope(
+            RoutineId::PrefillRange,
+            format!(
+                "layer={layer_idx} tokens={range_start}..{range_end}/{}",
+                activations.len()
+            ),
+        );
+        let range_activations = activations[range_start..range_end].to_vec();
+        let det_range_activations_sha256 = det_rows.map(|rows| {
+            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
+                &rows[range_start..range_end],
+            )
+        });
+        let mut payload = json!({
+            "layer_idx": layer_idx,
+            "range_start": range_start,
+            "range_end": range_end,
+            "token_count": activations.len(),
+            "range_activations": range_activations,
+            "range_activations_sha256": crate::shared::numerics::transformer_kernels::build_activation_commitment(&activations[range_start..range_end]),
+            "det_range_activations_sha256": det_range_activations_sha256,
+        });
+        if let Some(execution_mode) = execution_mode {
+            payload["execution_mode"] = json!(execution_mode);
+        }
+        if crate::trace::trace_checkpoint("prefill.range", &payload) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct PrefillLayerRasterDetour<'a> {
@@ -233,6 +286,7 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
         attention_kv_rows_per_tile: detour.raster_sizing.attention_kv_rows_per_tile,
         sequence_rows_per_tile: detour.raster_sizing.sequence_rows_per_tile,
         head_rows_per_tile: detour.raster_sizing.head_rows_per_tile,
+        prefill_token_range_width: detour.raster_sizing.prefill_token_range_width,
     };
 
     let mut complete = false;
@@ -283,6 +337,7 @@ pub(crate) fn run_with_mode_internal(
         execution_mode,
         None,
         None,
+        crate::InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
     )
 }
 
@@ -293,12 +348,16 @@ pub(crate) fn run_with_mode_internal_with_detour(
     execution_mode: InferenceExecutionMode,
     detour_controller: Option<&mut RasterDetourController>,
     raster_detour: Option<PrefillLayerRasterDetour<'_>>,
+    prefill_token_range_width: usize,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     model.validate_execution_mode(execution_mode)?;
     match execution_mode {
-        InferenceExecutionMode::Fp32 => {
-            native::run(input_activations.as_f32_slice(), model, ple_inputs)
-        }
+        InferenceExecutionMode::Fp32 => native::run_with_range_width(
+            input_activations.as_f32_slice(),
+            model,
+            ple_inputs,
+            prefill_token_range_width,
+        ),
         InferenceExecutionMode::Deterministic => match detour_controller {
             Some(detour_controller) => native::deterministic_tiles::run_internal_with_detour(
                 input_activations,
@@ -306,8 +365,14 @@ pub(crate) fn run_with_mode_internal_with_detour(
                 ple_inputs,
                 Some(detour_controller),
                 raster_detour,
+                prefill_token_range_width,
             ),
-            None => native::deterministic_tiles::run_internal(input_activations, model, ple_inputs),
+            None => native::deterministic_tiles::run_internal_with_range_width(
+                input_activations,
+                model,
+                ple_inputs,
+                prefill_token_range_width,
+            ),
         },
     }
 }

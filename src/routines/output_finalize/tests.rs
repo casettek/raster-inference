@@ -285,6 +285,7 @@ fn raster_sizing(output_byte_flush_bytes_per_tile: usize) -> crate::RasterSizing
                 InferenceControls::DEFAULT_RASTER_ATTENTION_KV_ROWS_PER_TILE,
             sequence_rows_per_tile: InferenceControls::DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE,
             head_rows_per_tile: InferenceControls::DEFAULT_RASTER_HEAD_ROWS_PER_TILE,
+            prefill_token_range_width: InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
             tokenizer_bpe_pairs_per_tile:
                 InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
             tokenizer_bpe_pieces_per_tile:

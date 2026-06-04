@@ -1,0 +1,55 @@
+use serde_json::json;
+
+use crate::runtime::checkpoints::RoutineId;
+use crate::shared::model::transformer::{ActivationSequence, LayerKvCache};
+
+pub mod raster;
+
+pub(crate) struct PrefillRangeFinalizeCheckpoint<'a> {
+    pub execution_mode: Option<&'a str>,
+    pub layer_idx: usize,
+    pub current_activations: &'a ActivationSequence,
+    pub layer_caches: &'a [LayerKvCache],
+    pub completed_layer_output_sha256s: Vec<String>,
+    pub completed_layer_output_det_sha256s: Option<Vec<Option<String>>>,
+}
+
+pub(crate) fn trace_checkpoint(input: PrefillRangeFinalizeCheckpoint<'_>) -> bool {
+    let _routine = crate::trace::routine_scope(
+        RoutineId::PrefillRangeFinalize,
+        format!(
+            "{}layer={} tokens={}",
+            input
+                .execution_mode
+                .map(|mode| format!("mode={mode} "))
+                .unwrap_or_default(),
+            input.layer_idx,
+            input.current_activations.activations.len()
+        ),
+    );
+    let current_internal = input.current_activations.clone_internal();
+    let current_activations = input.current_activations.activations.clone();
+    let current_activations_sha256 =
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(
+            &current_activations,
+        );
+    let det_current_activations_sha256 = current_internal
+        .det_values()
+        .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
+    let mut payload = json!({
+        "next_layer_idx": input.layer_idx + 1,
+        "current_activations": current_activations,
+        "current_activations_sha256": current_activations_sha256,
+        "det_current_activations_sha256": det_current_activations_sha256,
+        "layer_caches": crate::trace::serialize_layer_caches(input.layer_caches),
+        "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(input.layer_caches),
+        "completed_layer_output_sha256s": input.completed_layer_output_sha256s,
+    });
+    if let Some(execution_mode) = input.execution_mode {
+        payload["execution_mode"] = json!(execution_mode);
+    }
+    if let Some(completed_layer_output_det_sha256s) = input.completed_layer_output_det_sha256s {
+        payload["completed_layer_output_det_sha256s"] = json!(completed_layer_output_det_sha256s);
+    }
+    crate::trace::trace_checkpoint("prefill.range_finalize", &payload)
+}

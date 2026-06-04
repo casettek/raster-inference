@@ -16,7 +16,7 @@ pub struct RasterPrefillFinalizeInputRoots {
     pub prompt_token_count: usize,
     pub finalize_source_root: String,
     pub final_hidden_states_ref: RasterActivationSequenceRef,
-    pub layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    pub layer_caches: Vec<crate::prefill_range::raster::PrefillLayerCacheSlot>,
     pub projection_rows_per_tile: usize,
 }
 
@@ -26,7 +26,7 @@ pub struct RasterPrefillFinalizeRefs {
     pub finalize_source_root: String,
     pub prompt_token_count: usize,
     pub final_hidden_states_ref: RasterActivationSequenceRef,
-    pub layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    pub layer_caches: Vec<crate::prefill_range::raster::PrefillLayerCacheSlot>,
     pub normalized_final_position_ref: RasterActivationSequenceRef,
     pub logits_ref: RasterActivationSequenceRef,
     pub logit_count: usize,

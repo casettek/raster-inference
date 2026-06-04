@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
-use crate::routines::prefill_layer::PrefillLayerRasterDetour;
+use crate::routines::prefill_range::PrefillLayerRasterDetour;
+use crate::routines::prefill_range_finalize::PrefillRangeFinalizeCheckpoint;
 use crate::runtime::checkpoints::RasterDetourController;
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::model::transformer::{
@@ -35,12 +36,27 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal(
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_text_layers_prefill_with_cache_internal_with_range_width(
+        input_activations,
+        model,
+        ple_inputs,
+        crate::InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
+    )
+}
+
+pub(crate) fn run_text_layers_prefill_with_cache_internal_with_range_width(
+    input_activations: InternalActivationSequence,
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    prefill_token_range_width: usize,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     run_text_layers_prefill_with_cache_internal_and_detour(
         input_activations,
         model,
         ple_inputs,
         None,
         None,
+        prefill_token_range_width,
     )
 }
 
@@ -50,6 +66,7 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     mut detour_controller: Option<&mut RasterDetourController>,
     raster_detour: Option<PrefillLayerRasterDetour<'_>>,
+    prefill_token_range_width: usize,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     if model.layers.is_empty() {
         bail!("transformer prefill requires at least one layer");
@@ -62,14 +79,14 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
     for (layer_idx, layer) in model.layers.iter().enumerate() {
         let selected_for_raster = detour_controller
             .as_deref_mut()
-            .is_some_and(|controller| controller.should_detour(RoutineId::PrefillLayer));
+            .is_some_and(|controller| controller.should_detour(RoutineId::PrefillRange));
         if selected_for_raster {
             let detour = raster_detour.ok_or_else(|| {
                 anyhow!(
-                    "selective raster prefill.layer detour requires an authenticated prefill layer source"
+                    "selective raster prefill.range detour requires an authenticated prefill layer source"
                 )
             })?;
-            let output = crate::prefill_layer::run_selected_raster_detour_from_native_boundary(
+            let output = crate::prefill_range::run_selected_raster_detour_from_native_boundary(
                 &xs,
                 layer_idx,
                 &layer_caches,
@@ -89,7 +106,7 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
         }
         let xs_values = xs.clone_f32();
         let _routine = routine_scope(
-            RoutineId::PrefillLayer,
+            RoutineId::PrefillRange,
             format!(
                 "mode=det layer={layer_idx} tokens={} attention={:?} ple={} donor={:?}",
                 xs_values.len(),
@@ -111,26 +128,36 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
             )?;
         xs = layer_output.clone_internal();
         let xs_values = xs.clone_f32();
+        if crate::prefill_range::trace_checkpoints(
+            layer_idx,
+            &layer_output,
+            prefill_token_range_width,
+            Some("deterministic"),
+        )? {
+            layer_caches.push(layer_cache);
+            completed_layer_output_sha256s.push(layer_output.activations_sha256);
+            completed_layer_output_det_sha256s.push(layer_output.det_activations_sha256.clone());
+            break;
+        }
         let det_current_activations_sha256 = xs
             .det_values()
             .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
         completed_layer_output_det_sha256s.push(layer_output.det_activations_sha256.clone());
-        if crate::trace::trace_checkpoint(
-            "prefill.layer",
-            &json!({
-                "execution_mode": "deterministic",
-                "next_layer_idx": layer_idx + 1,
-                "current_activations": xs_values.clone(),
-                "current_activations_sha256": crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs_values),
-                "det_current_activations_sha256": det_current_activations_sha256,
-                "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-                "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
-                "completed_layer_output_sha256s": completed_layer_output_sha256s.clone(),
-                "completed_layer_output_det_sha256s": completed_layer_output_det_sha256s.clone(),
-            }),
-        ) {
+        let mut current_activations = ActivationSequence::from_internal(
+            xs.clone(),
+            crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs_values),
+        );
+        current_activations.det_activations_sha256 = det_current_activations_sha256;
+        if crate::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
+            execution_mode: Some("deterministic"),
+            layer_idx,
+            current_activations: &current_activations,
+            layer_caches: &layer_caches,
+            completed_layer_output_sha256s: completed_layer_output_sha256s.clone(),
+            completed_layer_output_det_sha256s: Some(completed_layer_output_det_sha256s.clone()),
+        }) {
             break;
         }
         let mut reached_terminal_checkpoint = false;
@@ -188,12 +215,27 @@ pub(crate) fn run_internal(
     run_text_layers_prefill_with_cache_internal(input_activations, model, ple_inputs)
 }
 
+pub(crate) fn run_internal_with_range_width(
+    input_activations: InternalActivationSequence,
+    model: &Gemma4TransformerModel,
+    ple_inputs: Option<&Gemma4PrefillPleInputs>,
+    prefill_token_range_width: usize,
+) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
+    run_text_layers_prefill_with_cache_internal_with_range_width(
+        input_activations,
+        model,
+        ple_inputs,
+        prefill_token_range_width,
+    )
+}
+
 pub(crate) fn run_internal_with_detour(
     input_activations: InternalActivationSequence,
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     detour_controller: Option<&mut RasterDetourController>,
     raster_detour: Option<PrefillLayerRasterDetour<'_>>,
+    prefill_token_range_width: usize,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
     run_text_layers_prefill_with_cache_internal_and_detour(
         input_activations,
@@ -201,6 +243,7 @@ pub(crate) fn run_internal_with_detour(
         ple_inputs,
         detour_controller,
         raster_detour,
+        prefill_token_range_width,
     )
 }
 

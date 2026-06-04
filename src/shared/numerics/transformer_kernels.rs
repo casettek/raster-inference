@@ -921,10 +921,18 @@ pub fn run_text_layers_prefill_with_cache(
             InferenceExecutionMode::Fp32,
         )?;
         xs = layer_output.activations;
+        if crate::prefill_range::trace_checkpoints(
+            layer_idx,
+            &ActivationSequence::from_values(xs.clone(), build_activation_commitment(&xs)),
+            crate::InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
+            None,
+        )? {
+            break;
+        }
         layer_caches.push(layer_cache);
         completed_layer_output_sha256s.push(layer_output.activations_sha256);
         if crate::trace::trace_checkpoint(
-            "prefill.layer",
+            "prefill.range_finalize",
             &json!({
                 "next_layer_idx": layer_idx + 1,
                 "current_activations": xs.clone(),

@@ -15,10 +15,10 @@ const CLI_TEMPERATURE: f32 = 1.0;
 
 fn print_usage() {
     eprintln!(
-        "Usage: raster-inference [--deterministic] [--raster] [--raster-at <routine-id[:occurrence]>] [--raster-unchecked-test-mode] [--raster-trace-tiles] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
+        "Usage: raster-inference [--deterministic] [--raster] [--raster-at <routine-id[:occurrence]>] [--raster-unchecked-test-mode] [--raster-trace-tiles] [--prefill-token-range-width <tokens>] [--raster-projection-rows-per-tile <rows>] [--raster-attention-kv-rows-per-tile <rows>] [--raster-sequence-rows-per-tile <rows>] [--raster-head-rows-per-tile <rows>] [--raster-tokenizer-bpe-pairs-per-tile <pairs>] [--raster-tokenizer-bpe-pieces-per-tile <pieces>] [--raster-output-byte-flush-bytes-per-tile <bytes>] [--commit-checkpoints] [--terminal-checkpoint <checkpoint-id[:occurrence]>] <model-id> <tokenizer.json> <chat-template.jinja> <model-path> <prompt...>"
     );
     eprintln!(
-        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.layer:2 for the second occurrence. Pass --raster to use the single root-backed raster tile inference path. Pass --raster-at to run native deterministic CPU with one selected raster routine occurrence. Pass --raster-unchecked-test-mode to use synthetic raster handles and skip Merkle proof work in test builds. Pass --raster-trace-tiles to print verbose routine, progress, and individual tile execution logs. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
+        "Pass --commit-checkpoints to emit the checkpoint trace file at the end of the run. Pass --terminal-checkpoint to stop after a named checkpoint such as prefill.finalize, or prefill.range_finalize:2 for the second finalized prefill layer. Pass --raster to use the single root-backed raster tile inference path. Pass --raster-at to run native deterministic CPU with one selected raster routine occurrence. Pass --raster-unchecked-test-mode to use synthetic raster handles and skip Merkle proof work in test builds. Pass --raster-trace-tiles to print verbose routine, progress, and individual tile execution logs. Pass --prefill-token-range-width to bound prompt tokens covered by each prefill.range routine. Pass --raster-projection-rows-per-tile to bound raster projection row chunks. Pass --raster-attention-kv-rows-per-tile to bound visible key/value rows read by each raster attention tile. Pass --raster-sequence-rows-per-tile and --raster-head-rows-per-tile to batch independent row ops. Pass --raster-tokenizer-bpe-pairs-per-tile and --raster-tokenizer-bpe-pieces-per-tile to bound tokenizer BPE scan and apply chunks. Pass --raster-output-byte-flush-bytes-per-tile to bound byte-fallback output flush chunks."
     );
 }
 
@@ -87,6 +87,7 @@ fn run() -> anyhow::Result<()> {
         raster_attention_kv_rows_per_tile: cli_args.raster_attention_kv_rows_per_tile,
         raster_sequence_rows_per_tile: cli_args.raster_sequence_rows_per_tile,
         raster_head_rows_per_tile: cli_args.raster_head_rows_per_tile,
+        prefill_token_range_width: cli_args.prefill_token_range_width,
         raster_tokenizer_bpe_pairs_per_tile: cli_args.raster_tokenizer_bpe_pairs_per_tile,
         raster_tokenizer_bpe_pieces_per_tile: cli_args.raster_tokenizer_bpe_pieces_per_tile,
         raster_output_byte_flush_bytes_per_tile: cli_args.raster_output_byte_flush_bytes_per_tile,
@@ -128,6 +129,7 @@ struct CliArgs {
     raster_attention_kv_rows_per_tile: Option<usize>,
     raster_sequence_rows_per_tile: Option<usize>,
     raster_head_rows_per_tile: Option<usize>,
+    prefill_token_range_width: Option<usize>,
     raster_tokenizer_bpe_pairs_per_tile: Option<usize>,
     raster_tokenizer_bpe_pieces_per_tile: Option<usize>,
     raster_output_byte_flush_bytes_per_tile: Option<usize>,
@@ -152,6 +154,7 @@ impl CliArgs {
         let mut raster_attention_kv_rows_per_tile = None;
         let mut raster_sequence_rows_per_tile = None;
         let mut raster_head_rows_per_tile = None;
+        let mut prefill_token_range_width = None;
         let mut raster_tokenizer_bpe_pairs_per_tile = None;
         let mut raster_tokenizer_bpe_pieces_per_tile = None;
         let mut raster_output_byte_flush_bytes_per_tile = None;
@@ -181,6 +184,19 @@ impl CliArgs {
                 }
                 "--raster-decode-only" => raster_decode_only = true,
                 "--raster-trace-tiles" => raster_trace_tiles = true,
+                "--prefill-token-range-width" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("expected a token count after {arg}"))?;
+                    prefill_token_range_width = Some(parse_prefill_token_range_width(&value)?);
+                }
+                _ if arg.starts_with("--prefill-token-range-width=") => {
+                    let value = arg
+                        .split_once('=')
+                        .map(|(_, value)| value)
+                        .expect("split_once should succeed for --prefill-token-range-width=value");
+                    prefill_token_range_width = Some(parse_prefill_token_range_width(value)?);
+                }
                 "--raster-projection-rows-per-tile" => {
                     let value = args
                         .next()
@@ -355,6 +371,7 @@ impl CliArgs {
             raster_attention_kv_rows_per_tile,
             raster_sequence_rows_per_tile,
             raster_head_rows_per_tile,
+            prefill_token_range_width,
             raster_tokenizer_bpe_pairs_per_tile,
             raster_tokenizer_bpe_pieces_per_tile,
             raster_output_byte_flush_bytes_per_tile,
@@ -420,6 +437,16 @@ fn parse_raster_head_rows_per_tile(value: &str) -> anyhow::Result<usize> {
         anyhow::bail!("raster head rows per tile must be greater than zero");
     }
     Ok(rows)
+}
+
+fn parse_prefill_token_range_width(value: &str) -> anyhow::Result<usize> {
+    let tokens = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("prefill token range width must be a positive integer"))?;
+    if tokens == 0 {
+        anyhow::bail!("prefill token range width must be greater than zero");
+    }
+    Ok(tokens)
 }
 
 fn parse_raster_tokenizer_bpe_pairs_per_tile(value: &str) -> anyhow::Result<usize> {
@@ -501,7 +528,7 @@ mod tests {
     fn parse_terminal_checkpoint_occurrence_suffix() {
         let args = CliArgs::parse([
             "--terminal-checkpoint".to_string(),
-            "prefill.layer:2".to_string(),
+            "prefill.range_finalize:2".to_string(),
             "model".to_string(),
             "tokenizer.json".to_string(),
             "chat_template.jinja".to_string(),
@@ -510,7 +537,10 @@ mod tests {
         ])
         .expect("cli args should parse");
 
-        assert_eq!(args.terminal_checkpoint.as_deref(), Some("prefill.layer:2"));
+        assert_eq!(
+            args.terminal_checkpoint.as_deref(),
+            Some("prefill.range_finalize:2")
+        );
     }
 
     #[test]
@@ -537,7 +567,7 @@ mod tests {
     fn parse_raster_at_flag() {
         let args = CliArgs::parse([
             "--raster-at".to_string(),
-            "prefill.layer:2".to_string(),
+            "prefill.range:2".to_string(),
             "model".to_string(),
             "tokenizer.json".to_string(),
             "chat_template.jinja".to_string(),
@@ -547,7 +577,7 @@ mod tests {
         .expect("cli args should parse");
 
         let detour = args.raster_detour.expect("detour should be parsed");
-        assert_eq!(detour.routine_id(), RoutineId::PrefillLayer);
+        assert_eq!(detour.routine_id(), RoutineId::PrefillRange);
         assert_eq!(detour.occurrence(), 2);
         assert_eq!(args.execution_mode, InferenceExecutionMode::Deterministic);
         assert!(!args.raster);
@@ -575,7 +605,7 @@ mod tests {
     fn parse_raster_at_rejects_full_raster() {
         let error = CliArgs::parse([
             "--raster".to_string(),
-            "--raster-at=prefill.layer".to_string(),
+            "--raster-at=prefill.range".to_string(),
             "model".to_string(),
             "tokenizer.json".to_string(),
             "chat_template.jinja".to_string(),
@@ -617,7 +647,7 @@ mod tests {
         .expect_err("unknown detour target should fail");
 
         assert!(error.to_string().contains("unknown routine id"));
-        assert!(error.to_string().contains("prefill.layer"));
+        assert!(error.to_string().contains("prefill.range"));
     }
 
     #[cfg(feature = "unchecked-raster-integrity")]
@@ -644,7 +674,7 @@ mod tests {
     #[test]
     fn parse_raster_unchecked_test_mode_with_raster_at() {
         let args = CliArgs::parse([
-            "--raster-at=prefill.layer".to_string(),
+            "--raster-at=prefill.range".to_string(),
             "--raster-unchecked-test-mode".to_string(),
             "model".to_string(),
             "tokenizer.json".to_string(),
@@ -732,6 +762,50 @@ mod tests {
         .expect("cli args should parse");
 
         assert!(args.raster_trace_tiles);
+    }
+
+    #[test]
+    fn parse_prefill_token_range_width_flag() {
+        let args = CliArgs::parse([
+            "--deterministic".to_string(),
+            "--prefill-token-range-width".to_string(),
+            "100".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(args.prefill_token_range_width, Some(100));
+
+        let args = CliArgs::parse([
+            "--prefill-token-range-width=64".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cli args should parse");
+
+        assert_eq!(args.prefill_token_range_width, Some(64));
+    }
+
+    #[test]
+    fn parse_prefill_token_range_width_rejects_zero() {
+        let error = CliArgs::parse([
+            "--prefill-token-range-width=0".to_string(),
+            "model".to_string(),
+            "tokenizer.json".to_string(),
+            "chat_template.jinja".to_string(),
+            "model-path".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("zero range width should fail");
+
+        assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]
@@ -881,7 +955,7 @@ mod tests {
     #[test]
     fn parse_raster_sizing_flags_with_raster_at() {
         let args = CliArgs::parse([
-            "--raster-at=prefill.layer:2".to_string(),
+            "--raster-at=prefill.range:2".to_string(),
             "--raster-projection-rows-per-tile=4".to_string(),
             "--raster-attention-kv-rows-per-tile=8".to_string(),
             "--raster-sequence-rows-per-tile=3".to_string(),

@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::json;
 
 use super::types::*;
 use crate::dsl::prelude::auth_read;
@@ -68,45 +67,6 @@ pub(in super::super) fn prepare_next_prefill_layer_context(
         donor_cache,
         per_layer_input,
     })
-}
-
-pub(in super::super) fn update_prefill_layer_state_refs_with_roots(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    mut layer_state: PrefillLayerRasterState,
-    layer_idx: usize,
-    layer_output_ref: RasterActivationSequenceRef,
-    layer_cache: PrefillLayerCacheSlot,
-) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
-    if layer_idx != layer_state.next_layer_idx {
-        bail!(
-            "cannot update prefill layer {layer_idx} while next layer is {}",
-            layer_state.next_layer_idx
-        );
-    }
-
-    layer_state.current_activations_ref = layer_output_ref;
-    layer_state.layer_caches.push(layer_cache);
-
-    let completed_layer_output =
-        trace_prefill_layer_checkpoint_with_roots(&artifact_store_roots, &layer_state, layer_idx)?;
-    if let Some((sha256, det_sha256)) = completed_layer_output {
-        layer_state.completed_layer_output_sha256s.push(sha256);
-        layer_state
-            .completed_layer_output_det_sha256s
-            .push(det_sha256);
-    }
-
-    if trace_prefill_layer_token_checkpoints_with_roots(
-        &artifact_store_roots,
-        &layer_state,
-        layer_idx,
-    )? {
-        layer_state.next_layer_idx += 1;
-        layer_state.layer_count = layer_state.next_layer_idx;
-        return Ok((true, artifact_store_roots, layer_state));
-    }
-    layer_state.next_layer_idx += 1;
-    Ok((false, artifact_store_roots, layer_state))
 }
 
 pub(in super::super) fn init_prefill_layer_state_from_activation_ref_with_roots(
@@ -221,6 +181,7 @@ pub(in super::super) fn init_prefill_layer_state_from_activation_ref_with_roots(
             attention_kv_rows_per_tile: raster_sizing.attention_kv_rows_per_tile,
             sequence_rows_per_tile: raster_sizing.sequence_rows_per_tile,
             head_rows_per_tile: raster_sizing.head_rows_per_tile,
+            prefill_token_range_width: raster_sizing.prefill_token_range_width,
         },
     ))
 }
@@ -303,7 +264,7 @@ pub(in super::super) fn resolve_prefill_donor_cache_index(
         .transpose()
 }
 
-pub(in super::super) fn materialize_prefill_activation_sequence_from_roots(
+pub(crate) fn materialize_prefill_activation_sequence_from_roots(
     roots: &RasterArtifactStoreRoots,
     sequence_ref: &RasterActivationSequenceRef,
 ) -> Result<RasterActivationSequence> {
@@ -363,7 +324,7 @@ pub(in super::super) fn materialize_prefill_layer_cache_from_roots(
     }
 }
 
-pub(in super::super) fn materialize_prefill_layer_caches_from_roots(
+pub(crate) fn materialize_prefill_layer_caches_from_roots(
     roots: &RasterArtifactStoreRoots,
     caches: &[PrefillLayerCacheSlot],
 ) -> Result<Vec<RasterKvCache>> {
@@ -373,7 +334,7 @@ pub(in super::super) fn materialize_prefill_layer_caches_from_roots(
         .collect()
 }
 
-pub(in super::super) fn raster_sequence_acts(
+pub(crate) fn raster_sequence_acts(
     sequence: &RasterActivationSequence,
 ) -> Vec<Vec<crate::shared::numerics::det_num::Act>> {
     sequence.rows().iter().map(|row| row.acts()).collect()
@@ -563,7 +524,7 @@ pub(in super::super) fn layer_cache_from_raster(cache: RasterKvCache) -> LayerKv
     )
 }
 
-pub(in super::super) fn layer_caches_from_raster(caches: &[RasterKvCache]) -> Vec<LayerKvCache> {
+pub(crate) fn layer_caches_from_raster(caches: &[RasterKvCache]) -> Vec<LayerKvCache> {
     caches
         .iter()
         .cloned()
@@ -579,100 +540,6 @@ pub(in super::super) fn ensure_artifact_root_present(
         return Ok(());
     }
     bail!("raster artifact root {root} is not present in the store roots snapshot")
-}
-
-pub(in super::super) fn trace_prefill_layer_checkpoint(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    state: &PrefillLayerRasterState,
-    layer_idx: usize,
-) -> Result<Option<(String, Option<String>)>> {
-    let mut completed_layer_output = None;
-    let reached = crate::trace::trace_checkpoint_lazy_result("prefill.layer", || {
-        let current_activations = materialize_prefill_activation_sequence_from_roots(
-            artifact_store_roots,
-            &state.current_activations_ref,
-        )?;
-        let current_values = current_activations.to_f32_values();
-        let current_det_activations = raster_sequence_acts(&current_activations);
-        let current_sha256 =
-            crate::shared::numerics::transformer_kernels::build_activation_commitment(
-                &current_values,
-            );
-        let current_det_sha256 = Some(
-            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
-                &current_det_activations,
-            ),
-        );
-        let raster_layer_caches =
-            materialize_prefill_layer_caches_from_roots(artifact_store_roots, &state.layer_caches)?;
-        let layer_caches = layer_caches_from_raster(&raster_layer_caches);
-        let mut completed_layer_output_sha256s = state.completed_layer_output_sha256s.clone();
-        completed_layer_output_sha256s.push(current_sha256.clone());
-        let mut completed_layer_output_det_sha256s =
-            state.completed_layer_output_det_sha256s.clone();
-        completed_layer_output_det_sha256s.push(current_det_sha256.clone());
-        completed_layer_output = Some((current_sha256.clone(), current_det_sha256.clone()));
-        Ok(json!({
-            "execution_mode": "deterministic",
-            "next_layer_idx": layer_idx + 1,
-            "current_activations": current_values,
-            "current_activations_sha256": current_sha256,
-            "det_current_activations_sha256": current_det_sha256,
-            "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-            "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
-            "completed_layer_output_sha256s": completed_layer_output_sha256s,
-            "completed_layer_output_det_sha256s": completed_layer_output_det_sha256s,
-        }))
-    })?;
-    if reached {
-        return Ok(completed_layer_output);
-    }
-    Ok(completed_layer_output)
-}
-
-pub(in super::super) fn trace_prefill_layer_checkpoint_with_roots(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    state: &PrefillLayerRasterState,
-    layer_idx: usize,
-) -> Result<Option<(String, Option<String>)>> {
-    trace_prefill_layer_checkpoint(artifact_store_roots, state, layer_idx)
-}
-
-pub(in super::super) fn trace_prefill_layer_token_checkpoints_with_roots(
-    artifact_store_roots: &RasterArtifactStoreRoots,
-    state: &PrefillLayerRasterState,
-    layer_idx: usize,
-) -> Result<bool> {
-    let (token_count, _) = state
-        .current_activations_ref
-        .tensor_ref()
-        .shape()
-        .sequence_metadata()?;
-    for token_idx in 0..token_count {
-        let checkpoint_name = format!("prefill.layer_token.layer_{layer_idx}.token_{token_idx}");
-        if crate::trace::trace_checkpoint_lazy_result(&checkpoint_name, || {
-            let token_row = read_sequence_row_from_roots(
-                artifact_store_roots,
-                RasterSequenceRowRequest {
-                    tensor_ref: state.current_activations_ref.clone(),
-                    row_idx: token_idx,
-                },
-            )?;
-            let token_activation = token_row.to_f32_values();
-            let det_token_activation = token_row.acts();
-            Ok(json!({
-                "execution_mode": "deterministic",
-                "layer_idx": layer_idx,
-                "token_idx": token_idx,
-                "token_count": token_count,
-                "token_activation": token_activation,
-                "det_token_activation_sha256": crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_token_activation),
-            }))
-        })? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 pub(in super::super) fn active_prefill_layer_work(

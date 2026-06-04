@@ -683,6 +683,7 @@ fn raster_sizing_with_attention(
         attention_kv_rows_per_tile,
         sequence_rows_per_tile: 1,
         head_rows_per_tile: 1,
+        prefill_token_range_width: crate::InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
         tokenizer_bpe_pairs_per_tile:
             crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
         tokenizer_bpe_pieces_per_tile:

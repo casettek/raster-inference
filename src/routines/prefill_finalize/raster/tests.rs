@@ -7,7 +7,7 @@ use super::{
 use crate::prefill_finalize::raster::auth_source::{
     AuthenticatedGemmaPrefillFinalizeSource, RasterPrefillFinalizeSource,
 };
-use crate::prefill_layer::raster::PrefillLayerCacheSlot;
+use crate::prefill_range::raster::PrefillLayerCacheSlot;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{

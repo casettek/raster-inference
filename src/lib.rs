@@ -16,14 +16,14 @@ pub use io::{
 };
 pub use output_finalize::run as run_output_finalize;
 pub use prefill_finalize::run as run_prefill_finalize;
-pub use prefill_layer::native::{run_text_layers_prefill, run_text_layers_prefill_with_cache};
-pub use prefill_layer::run as run_prefill_layer;
-pub use prefill_layer::run_with_mode as run_prefill_layer_with_mode;
 pub use prefill_prepare_aux::run as run_prefill_prepare_aux;
+pub use prefill_range::native::{run_text_layers_prefill, run_text_layers_prefill_with_cache};
+pub use prefill_range::run as run_prefill_range;
+pub use prefill_range::run_with_mode as run_prefill_range_with_mode;
 pub use prompt_prepare::run as run_prompt_prepare;
 pub use routines::{
     decode_select_token, decode_transition, input_embedding, output_finalize, prefill_finalize,
-    prefill_layer, prefill_prepare_aux, prompt_prepare,
+    prefill_prepare_aux, prefill_range, prefill_range_finalize, prompt_prepare,
 };
 pub use runtime::checkpoints;
 pub use runtime::checkpoints::{

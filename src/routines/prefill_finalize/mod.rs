@@ -39,7 +39,7 @@ pub(crate) fn materialize_raster_input_roots_for_api(
     prompt_token_count: usize,
     finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
     final_hidden_states_ref: RasterActivationSequenceRef,
-    layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    layer_caches: Vec<crate::prefill_range::raster::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
 ) -> Result<TransformerPrefillResult> {
     let finalize_source_ref = finalize_source.committed_source_ref()?;
@@ -58,7 +58,7 @@ pub fn run_raster(
     prompt_token_count: usize,
     finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
     final_hidden_states_ref: RasterActivationSequenceRef,
-    layer_caches: Vec<crate::prefill_layer::raster::PrefillLayerCacheSlot>,
+    layer_caches: Vec<crate::prefill_range::raster::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
 ) -> Result<raster::RasterPrefillFinalizeOutput> {
     let _routine = crate::trace::routine_scope(
@@ -109,9 +109,9 @@ fn insert_prefill_layer_output_refs_for_detour(
     layer_caches: &[LayerKvCache],
 ) -> Result<(
     RasterArtifactStoreRoots,
-    crate::prefill_layer::raster::PrefillLayerOutputRefs,
+    crate::prefill_range::raster::PrefillLayerOutputRefs,
 )> {
-    crate::prefill_layer::insert_prefill_layer_output_refs_from_native(
+    crate::prefill_range::insert_prefill_layer_output_refs_from_native(
         final_hidden_states,
         layer_caches,
         "prefill.finalize.detour",

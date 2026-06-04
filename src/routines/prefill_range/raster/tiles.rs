@@ -4,6 +4,7 @@ use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
 use crate::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::prefill_range_finalize::raster::finalize_prefill_range_step_with_roots;
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::raster_contracts::prefill_layer::{
@@ -87,7 +88,7 @@ pub fn compute_next_prefill_layer_sequence_with_roots(
         layer_source
     )?;
     call_tile!(
-        finalize_prefill_layer_step,
+        finalize_prefill_range_step_with_roots,
         artifact_store_roots,
         layer_step
     )
@@ -3229,7 +3230,7 @@ fn init_prefill_layer_step(
 
     let layer_idx = layer_state.next_layer_idx;
     let _routine = routine_scope(
-        RoutineId::PrefillLayer,
+        RoutineId::PrefillRange,
         format!(
             "mode=raster layer={layer_idx} of {}",
             layer_state.layer_count
@@ -3258,34 +3259,6 @@ fn init_prefill_layer_step(
             context,
         },
     ))
-}
-
-#[tile]
-fn finalize_prefill_layer_step(
-    artifact_store_roots: RasterArtifactStoreRoots,
-    layer_step: PrefillLayerStep,
-) -> Result<(bool, RasterArtifactStoreRoots, PrefillLayerRasterState)> {
-    match layer_step {
-        PrefillLayerStep::Complete { layer_state } => Ok((true, artifact_store_roots, layer_state)),
-        PrefillLayerStep::Compute { layer_state, .. } => {
-            bail!(
-                "prefill layer {} reached finalization before compute completed",
-                layer_state.next_layer_idx
-            )
-        }
-        PrefillLayerStep::Computed {
-            layer_state,
-            layer_idx,
-            layer_output_ref,
-            layer_cache,
-        } => update_prefill_layer_state_refs_with_roots(
-            artifact_store_roots,
-            layer_state,
-            layer_idx,
-            layer_output_ref,
-            layer_cache,
-        ),
-    }
 }
 
 #[tile]

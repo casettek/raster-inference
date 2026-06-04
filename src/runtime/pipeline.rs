@@ -79,7 +79,7 @@ fn run_prefill_pass_for_token_ids(
     let ple_inputs =
         crate::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     trace_event("prefill.layer_stack");
-    let (final_hidden_states, layer_caches) = crate::prefill_layer::run_with_mode_internal(
+    let (final_hidden_states, layer_caches) = crate::prefill_range::run_with_mode_internal(
         token_embeddings.clone_internal(),
         model,
         ple_inputs.as_ref(),
