@@ -5,8 +5,7 @@ pub mod runtime;
 pub mod shared;
 
 pub use decode_select_token::run as run_decode_select_token;
-pub use decode_transition::native::run_text_layers_decode_step;
-pub use decode_transition::{finalize as finalize_decode_transition, run as run_decode_transition};
+pub use decode_transition_finalize::trace_checkpoint as finalize_decode_transition;
 pub use input_embedding::run as run_input_embedding;
 pub use io::{
     load_chat_template, load_embedding_table_from_gemma_model_path, load_embedding_table_from_path,
@@ -22,8 +21,9 @@ pub use prefill_range::run as run_prefill_range;
 pub use prefill_range::run_with_mode as run_prefill_range_with_mode;
 pub use prompt_prepare::run as run_prompt_prepare;
 pub use routines::{
-    decode_select_token, decode_transition, input_embedding, output_finalize, prefill_finalize,
-    prefill_prepare_aux, prefill_range, prefill_range_finalize, prompt_prepare,
+    decode_layer_range, decode_select_token, decode_transition_finalize, input_embedding,
+    output_finalize, prefill_finalize, prefill_prepare_aux, prefill_range, prefill_range_finalize,
+    prompt_prepare,
 };
 pub use runtime::checkpoints;
 pub use runtime::checkpoints::{

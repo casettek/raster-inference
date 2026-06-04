@@ -191,73 +191,51 @@ pub fn decode_step_with_mode(
 ) -> Result<TransformerDecodeStepResult> {
     model.validate_execution_mode(execution_mode)?;
     let _trace = trace_scope("decode.step");
-    let TransformerDecodeState {
-        layer_caches,
-        position,
-        token_count,
-    } = transformer_decode_state;
     trace_event(format!(
         "decode.summary token={} position={} layers={}",
         next_token,
-        position,
+        transformer_decode_state.position,
         model.layers.len()
     ));
-    let embedded_token = embed_token_id_sequence_with_mode(next_token, model, execution_mode)?;
     trace_event("decode.layer_stack");
-    let final_hidden_state = match execution_mode {
+    let mut range_state = match execution_mode {
         InferenceExecutionMode::Fp32 => {
-            let embedded_token = embedded_token.activations.first().ok_or_else(|| {
-                anyhow::anyhow!("transformer embedding returned no activation rows")
-            })?;
-            crate::decode_transition::native::run_text_layers_decode_step(
-                embedded_token,
+            crate::decode_layer_range::native::init_state_with_mode(
+                transformer_decode_state,
                 next_token,
                 model,
-                layer_caches,
-                position,
+                execution_mode,
             )?
         }
         InferenceExecutionMode::Deterministic => {
-            let embedded_token = embedded_token.clone_internal().last_row().ok_or_else(|| {
-                anyhow::anyhow!("transformer embedding returned no activation rows")
-            })?;
-            crate::decode_transition::native::deterministic_tiles::run_text_layers_decode_step_internal(
-                embedded_token,
+            crate::decode_layer_range::native::deterministic_tiles::init_state(
+                transformer_decode_state,
                 next_token,
                 model,
-                layer_caches,
-                position,
             )?
         }
     };
+    while !range_state.is_complete() {
+        let (next_range_state, _) = match execution_mode {
+            InferenceExecutionMode::Fp32 => crate::decode_layer_range::native::run_range_with_mode(
+                range_state,
+                model,
+                crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH,
+                execution_mode,
+                None,
+            )?,
+            InferenceExecutionMode::Deterministic => {
+                crate::decode_layer_range::native::deterministic_tiles::run_range(
+                    range_state,
+                    model,
+                    crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH,
+                )?
+            }
+        };
+        range_state = next_range_state;
+    }
     trace_event("decode.project_to_logits");
-    let final_position =
-        crate::shared::numerics::transformer_kernels::select_final_position_internal(
-            &final_hidden_state.activation_state.clone_internal(),
-        )?;
-    let prefill_logits =
-        crate::shared::numerics::transformer_kernels::project_internal_decode_hidden_to_logits(
-            final_position,
-            &model.final_norm_weight,
-            model.final_norm_weight_det.as_deref(),
-            model.rms_norm_eps,
-            model.rms_norm_eps_det,
-            &model.logits_projection,
-            model.embedding_source.as_ref(),
-            execution_mode,
-            model.final_logit_softcapping,
-            model.final_logit_softcapping_det,
-        )?;
-
-    Ok(TransformerDecodeStepResult {
-        transformer_decode_state: TransformerDecodeState {
-            layer_caches: final_hidden_state.layer_caches,
-            position: position + 1,
-            token_count: token_count + 1,
-        },
-        activation_state: final_hidden_state.activation_state,
-        prefill_logits,
-    })
+    crate::decode_transition_finalize::native::run_with_mode(range_state, model, execution_mode)
 }
 
 pub fn run_output_decode(
@@ -376,21 +354,34 @@ pub(crate) fn run_output_decode_with_raster_state(
 
         trace_event("decode.step");
         let source =
-            crate::decode_transition::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource::from_model(
-                format!("decode.transition.position_{}", selected_state.position),
+            crate::decode_layer_range::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource::from_model(
+                format!("decode.layer_range.position_{}", selected_state.position),
                 transformer_model,
             )?;
-        decode_state = crate::decode_transition::run_raster(
+        let selected_state_for_finalize = selected_state.clone();
+        let mut range_state = crate::decode_layer_range::init_raster_state_from_decode_loop(
             selected_state,
             select_output.selected_token_ref,
             &source,
             raster_sizing,
         )?;
+        while !range_state.is_complete() {
+            range_state = crate::decode_layer_range::run_raster(
+                range_state,
+                &source,
+                raster_sizing.decode_layer_range_width,
+            )?;
+        }
+        decode_state = crate::decode_transition_finalize::run_raster(
+            selected_state_for_finalize,
+            range_state,
+            &source,
+        )?;
         if let Some(activation_ref) = decode_state.activation_state_ref.clone() {
             decode_transition_state_refs
                 .push((decode_state.artifact_store_roots.clone(), activation_ref));
         }
-        crate::decode_transition::finalize_raster_state_for_trace(&decode_state)?;
+        crate::decode_transition_finalize::finalize_raster_state_for_trace(&decode_state)?;
         if crate::trace::reached_terminal_checkpoint_id().is_some() {
             let materialized_transition_states = decode_transition_state_refs
                 .into_iter()
@@ -487,26 +478,98 @@ fn run_output_decode_with_mode_internal(
                 .expect("stop condition should have returned earlier")
         };
 
-        let detour_decode_transition = detour_controller
-            .as_deref_mut()
-            .is_some_and(|controller| controller.should_detour(RoutineId::DecodeTransition));
         trace_event("decode.step");
-        let decode_transition = if detour_decode_transition {
+        let decode_layer_range_width = raster_sizing
+            .map(|sizing| sizing.decode_layer_range_width)
+            .unwrap_or(crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH);
+        let decode_state_before_transition = decode_state.clone();
+        let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
+        let mut range_state = match execution_mode {
+            InferenceExecutionMode::Fp32 => {
+                crate::decode_layer_range::native::init_state_with_mode(
+                    transformer_decode_state,
+                    next_token,
+                    transformer_model,
+                    execution_mode,
+                )?
+            }
+            InferenceExecutionMode::Deterministic => {
+                crate::decode_layer_range::native::deterministic_tiles::init_state(
+                    transformer_decode_state,
+                    next_token,
+                    transformer_model,
+                )?
+            }
+        };
+        while !range_state.is_complete() {
+            let detour_decode_layer_range = detour_controller
+                .as_deref_mut()
+                .is_some_and(|controller| controller.should_detour(RoutineId::DecodeLayerRange));
+            if detour_decode_layer_range {
+                let raster_sizing = raster_sizing.context(
+                    "selective raster decode.layer_range detour requires raster sizing controls",
+                )?;
+                let source =
+                    crate::decode_layer_range::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource::from_model(
+                        format!(
+                            "decode.layer_range.detour.position_{}.layer_{}",
+                            range_state.position, range_state.next_layer_idx
+                        ),
+                        transformer_model,
+                    )?;
+                range_state =
+                    crate::decode_layer_range::run_selected_raster_detour_from_native_boundary(
+                        range_state,
+                        &source,
+                        raster_sizing,
+                    )?;
+            } else {
+                let (next_range_state, _reached_terminal) = match execution_mode {
+                    InferenceExecutionMode::Fp32 => {
+                        crate::decode_layer_range::native::run_range_with_mode(
+                            range_state,
+                            transformer_model,
+                            decode_layer_range_width,
+                            execution_mode,
+                            None,
+                        )?
+                    }
+                    InferenceExecutionMode::Deterministic => {
+                        crate::decode_layer_range::native::deterministic_tiles::run_range(
+                            range_state,
+                            transformer_model,
+                            decode_layer_range_width,
+                        )?
+                    }
+                };
+                range_state = next_range_state;
+            }
+        }
+        let detour_decode_transition_finalize =
+            detour_controller.as_deref_mut().is_some_and(|controller| {
+                controller.should_detour(RoutineId::DecodeTransitionFinalize)
+            });
+        let decode_transition = if detour_decode_transition_finalize {
             let raster_sizing = raster_sizing.context(
-                "selective raster decode.transition detour requires raster sizing controls",
+                "selective raster decode.transition_finalize detour requires raster sizing controls",
             )?;
-            crate::decode_transition::run_selected_raster_detour_from_native_boundary(
-                &decode_state,
-                next_token,
-                transformer_model,
+            let source =
+                crate::decode_transition_finalize::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource::from_model(
+                    format!(
+                        "decode.transition_finalize.detour.position_{}",
+                        range_state.position
+                    ),
+                    transformer_model,
+                )?;
+            crate::decode_transition_finalize::run_selected_raster_detour_from_native_boundary(
+                &decode_state_before_transition,
+                range_state,
+                &source,
                 raster_sizing,
             )?
         } else {
-            let transformer_decode_state =
-                std::mem::take(&mut decode_state.transformer_decode_state);
-            crate::decode_transition::run_with_mode(
-                transformer_decode_state,
-                next_token,
+            crate::decode_transition_finalize::native::run_with_mode(
+                range_state,
                 transformer_model,
                 execution_mode,
             )?
@@ -514,7 +577,7 @@ fn run_output_decode_with_mode_internal(
         decode_transition_states.push(decode_transition.activation_state.clone());
         decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
         decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
-        crate::decode_transition::finalize(&decode_state)?;
+        crate::decode_transition_finalize::trace_checkpoint(&decode_state)?;
         if crate::trace::reached_terminal_checkpoint_id().is_some() {
             let mut output_decode_state =
                 build_current_output_decode_state(&decode_state, tokenizer)?;

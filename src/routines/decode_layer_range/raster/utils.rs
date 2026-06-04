@@ -4,10 +4,10 @@ use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::decode_transition::raster::auth_source::{
+use crate::decode_layer_range::raster::auth_source::{
     GemmaDecodeLayerMatrixRowRequest, GemmaDecodeLayerMetadata,
     GemmaDecodePleModelProjectionRowRequest, GemmaDecodeProjectionRowRequest,
-    RasterDecodeTransitionSource,
+    RasterDecodeLayerRangeSource,
 };
 use crate::dsl::prelude::auth_read;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -17,8 +17,8 @@ use crate::shared::artifacts::raster_artifact_store::{
     RasterTokenIdSequenceRef,
 };
 use crate::shared::model::transformer::{
-    ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerDecodeState,
-    TransformerDecodeStepResult,
+    ActivationSequence, InternalActivationSequence, InternalLogits, LayerKvCache, PrefillLogits,
+    TransformerDecodeState, TransformerDecodeStepResult,
 };
 use crate::shared::numerics::det_num::{
     acc_add_sat, add_sat, attention_score as det_attention_score, attention_softmax_exp_term,
@@ -64,7 +64,7 @@ pub(in super::super) fn init_decode_attention_score_phase_with_roots(
 }
 
 pub(in super::super) fn read_decode_projection_row(
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     projection_kind: &DecodeProjectionKind,
     row_idx: usize,
 ) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
@@ -131,7 +131,7 @@ pub(in super::super) fn init_decode_row_projection_artifact_state(
 pub(in super::super) fn project_next_decode_projection_artifact_chunk(
     artifact_store_roots: RasterArtifactStoreRoots,
     mut projection_state: DecodeRowProjectionArtifactState,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -1042,7 +1042,7 @@ pub(in super::super) fn reshape_row_heads(
     )
 }
 
-pub(in super::super) fn register_decode_layer_cache_with_roots(
+pub(crate) fn register_decode_layer_cache_with_roots(
     roots: &RasterArtifactStoreRoots,
     id_prefix: &str,
     layer_idx: usize,
@@ -1153,7 +1153,7 @@ pub fn materialize_decode_layer_caches_from_roots(
 
 pub(in super::super) fn materialize_decode_checkpoint_caches_from_roots(
     roots: &RasterArtifactStoreRoots,
-    state: &DecodeTransitionRasterState,
+    state: &DecodeLayerRangeRasterState,
     layer_idx: usize,
 ) -> Result<Vec<LayerKvCache>> {
     let mut caches = state
@@ -1196,9 +1196,7 @@ pub(in super::super) fn resolve_decode_donor_cache_slot<'a>(
         .transpose()
 }
 
-pub(in super::super) fn raster_cache_from_layer_cache(
-    cache: &LayerKvCache,
-) -> Result<RasterKvCache> {
+pub(crate) fn raster_cache_from_layer_cache(cache: &LayerKvCache) -> Result<RasterKvCache> {
     if cache.current_len() == 0 {
         return Ok(RasterKvCache::empty(cache.keys.len()));
     }
@@ -1256,7 +1254,7 @@ pub(in super::super) fn layer_cache_from_raster(cache: RasterKvCache) -> LayerKv
     )
 }
 
-pub(in super::super) fn insert_decode_activation_row_with_roots(
+pub(crate) fn insert_decode_activation_row_with_roots(
     roots: &RasterArtifactStoreRoots,
     source_name: String,
     row: &RasterActivationRow,
@@ -1274,7 +1272,7 @@ pub(in super::super) fn insert_decode_activation_row_with_roots(
     Ok((roots, activation_ref))
 }
 
-pub(in super::super) fn insert_decode_selected_token_with_roots(
+pub(crate) fn insert_decode_selected_token_with_roots(
     roots: &RasterArtifactStoreRoots,
     source_name: String,
     token_id: u32,
@@ -1352,7 +1350,7 @@ pub(in super::super) fn read_activation_row_from_ref_roots(
 ) -> Result<RasterActivationRow> {
     let (row_count, _width) = activation_ref.tensor_ref().shape().sequence_metadata()?;
     if row_count != 1 {
-        bail!("raster decode transition activation ref contains {row_count} rows, expected one");
+        bail!("raster decode layer range activation ref contains {row_count} rows, expected one");
     }
     read_sequence_row_from_roots(
         roots,
@@ -1543,7 +1541,7 @@ pub(in super::super) fn validate_row_width(
     Ok(())
 }
 
-pub(in super::super) fn finalize_decode_transition_result_values_from_roots(
+pub(in super::super) fn finalize_decode_layer_range_result_values_from_roots(
     artifact_store_roots: &RasterArtifactStoreRoots,
     logits_ref: RasterActivationSequenceRef,
     transformer_decode_state: TransformerDecodeState,
@@ -1573,11 +1571,11 @@ pub(in super::super) fn finalize_decode_transition_result_values_from_roots(
 
 pub(in super::super) fn update_decode_layer_state_refs(
     artifact_store_roots: RasterArtifactStoreRoots,
-    mut decode_state: DecodeTransitionRasterState,
+    mut decode_state: DecodeLayerRangeRasterState,
     layer_idx: usize,
     layer_output_ref: RasterActivationSequenceRef,
     updated_cache: DecodeLayerCacheSlot,
-) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeLayerRangeRasterState)> {
     if layer_idx != decode_state.next_layer_idx {
         bail!(
             "cannot update decode layer {layer_idx} while next layer is {}",
@@ -1597,10 +1595,64 @@ pub(in super::super) fn update_decode_layer_state_refs(
         ),
     );
     decode_state.completed_layer_output_det_sha256s.push(Some(
-        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
-            &current_activation_acts,
-        ),
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&[
+            current_activation_acts,
+        ]),
     ));
     decode_state.next_layer_idx += 1;
     Ok((false, artifact_store_roots, decode_state))
+}
+
+pub(crate) fn materialize_activation_sequence_from_ref(
+    roots: &RasterArtifactStoreRoots,
+    activation_ref: &RasterActivationSequenceRef,
+) -> Result<ActivationSequence> {
+    let (row_count, _) = activation_ref.tensor_ref().shape().sequence_metadata()?;
+    let rows = (0..row_count)
+        .map(|row_idx| {
+            read_sequence_row_from_roots(
+                roots,
+                RasterSequenceRowRequest {
+                    tensor_ref: activation_ref.clone(),
+                    row_idx,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let det_rows = rows.iter().map(|row| row.acts()).collect::<Vec<_>>();
+    let values = rows
+        .iter()
+        .map(|row| row.to_f32_values())
+        .collect::<Vec<_>>();
+    let mut activation_sequence = ActivationSequence::from_internal(
+        InternalActivationSequence::from_det_values(det_rows.clone()),
+        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
+    );
+    activation_sequence.det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&det_rows),
+    );
+    Ok(activation_sequence)
+}
+
+pub(crate) fn trace_raster_checkpoint(
+    state: &DecodeLayerRangeRasterState,
+    layer_start: usize,
+) -> Result<bool> {
+    let current_activation =
+        materialize_activation_sequence_from_ref(state.artifact_store_roots(), state.current_activation_ref())?;
+    let layer_caches =
+        materialize_decode_layer_caches_from_roots(state.artifact_store_roots(), &state.effective_layer_caches())?;
+    crate::decode_layer_range::trace_checkpoint_payload(
+        state.next_token(),
+        state.position(),
+        state.token_count(),
+        layer_start,
+        state.next_layer_idx(),
+        state.layer_count(),
+        &current_activation,
+        &layer_caches,
+        state.completed_layer_output_sha256s().to_vec(),
+        Some(state.completed_layer_output_det_sha256s().to_vec()),
+        Some("deterministic"),
+    )
 }

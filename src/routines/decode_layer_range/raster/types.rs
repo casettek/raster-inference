@@ -1,4 +1,4 @@
-use crate::decode_transition::raster::auth_source::{
+use crate::decode_layer_range::raster::auth_source::{
     GemmaDecodeLayerMatrixKind, GemmaDecodeLayerMetadata, GemmaDecodePleScalars,
 };
 use crate::shared::artifacts::raster_artifact_store::{
@@ -16,7 +16,7 @@ use crate::RasterSizingControls;
 // Types and constants used by the raster sequences and tiles.
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DecodeTransitionRasterState {
+pub struct DecodeLayerRangeRasterState {
     pub(in super::super) artifact_store_roots: RasterArtifactStoreRoots,
     pub(in super::super) decode_input_ref: RasterActivationSequenceRef,
     pub(in super::super) current_activation_ref: RasterActivationSequenceRef,
@@ -34,36 +34,135 @@ pub struct DecodeTransitionRasterState {
     pub(in super::super) output_source_prefix: String,
 }
 
+pub type RasterDecodeLayerRangeState = DecodeLayerRangeRasterState;
+
+impl DecodeLayerRangeRasterState {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.next_layer_idx >= self.layer_count
+    }
+
+    pub(crate) fn next_layer_idx(&self) -> usize {
+        self.next_layer_idx
+    }
+
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    pub(crate) fn next_token(&self) -> u32 {
+        self.next_token
+    }
+
+    pub(crate) fn current_activation_ref(&self) -> &RasterActivationSequenceRef {
+        &self.current_activation_ref
+    }
+
+    pub(crate) fn decode_input_ref(&self) -> &RasterActivationSequenceRef {
+        &self.decode_input_ref
+    }
+
+    pub(crate) fn artifact_store_roots(&self) -> &RasterArtifactStoreRoots {
+        &self.artifact_store_roots
+    }
+
+    pub(crate) fn effective_layer_caches(&self) -> Vec<DecodeLayerCacheSlot> {
+        let mut caches = self.updated_layer_caches.clone();
+        caches.extend(
+            self.original_layer_caches
+                .iter()
+                .skip(self.updated_layer_caches.len())
+                .cloned(),
+        );
+        caches
+    }
+
+    pub(crate) fn updated_layer_caches(&self) -> &[DecodeLayerCacheSlot] {
+        &self.updated_layer_caches
+    }
+
+    pub(crate) fn completed_layer_output_sha256s(&self) -> &[String] {
+        &self.completed_layer_output_sha256s
+    }
+
+    pub(crate) fn completed_layer_output_det_sha256s(&self) -> &[Option<String>] {
+        &self.completed_layer_output_det_sha256s
+    }
+
+    pub(crate) fn from_parts(
+        artifact_store_roots: RasterArtifactStoreRoots,
+        decode_input_ref: RasterActivationSequenceRef,
+        current_activation_ref: RasterActivationSequenceRef,
+        next_token: u32,
+        position: usize,
+        token_count: usize,
+        next_layer_idx: usize,
+        layer_count: usize,
+        original_layer_caches: Vec<DecodeLayerCacheSlot>,
+        updated_layer_caches: Vec<DecodeLayerCacheSlot>,
+        completed_layer_output_sha256s: Vec<String>,
+        completed_layer_output_det_sha256s: Vec<Option<String>>,
+        projection_rows_per_tile: usize,
+        attention_kv_rows_per_tile: usize,
+        output_source_prefix: String,
+    ) -> Self {
+        Self {
+            artifact_store_roots,
+            decode_input_ref,
+            current_activation_ref,
+            next_token,
+            position,
+            token_count,
+            next_layer_idx,
+            layer_count,
+            original_layer_caches,
+            updated_layer_caches,
+            completed_layer_output_sha256s,
+            completed_layer_output_det_sha256s,
+            projection_rows_per_tile,
+            attention_kv_rows_per_tile,
+            output_source_prefix,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct RasterDecodeTransitionInputRoots {
+pub struct RasterDecodeLayerRangeInputRoots {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub transformer_decode_state: TransformerDecodeState,
     pub selected_token_ref: RasterSelectedTokenRef,
-    pub decode_transition_source_root: String,
+    pub decode_layer_range_source_root: String,
     pub output_source_prefix: String,
     pub raster_sizing: RasterSizingControls,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterDecodeTransitionInputRefs {
+pub struct RasterDecodeLayerRangeInputRefs {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub position: usize,
     pub token_count: usize,
     pub layer_caches: Vec<DecodeLayerCacheSlot>,
     pub selected_token_ref: RasterSelectedTokenRef,
-    pub decode_transition_source_root: String,
+    pub decode_layer_range_source_root: String,
     pub output_source_prefix: String,
     pub raster_sizing: RasterSizingControls,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RasterDecodeTransitionOutputRefs {
+pub struct RasterDecodeLayerRangeOutputRefs {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub transition_result: TransformerDecodeStepResult,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct RasterDecodeTransitionOutputStateRefs {
+pub struct RasterDecodeTransitionFinalizeOutputRefs {
     pub artifact_store_roots: RasterArtifactStoreRoots,
     pub final_hidden_state_ref: RasterActivationSequenceRef,
     pub logits_ref: RasterActivationSequenceRef,
@@ -169,12 +268,12 @@ pub(in super::super) struct DecodeLayerContext {
 }
 
 pub(in super::super) enum DecodeLayerWork {
-    Complete(DecodeTransitionRasterState),
+    Complete(DecodeLayerRangeRasterState),
     Active(DecodeActiveLayerWork),
 }
 
 pub(in super::super) struct DecodeActiveLayerWork {
-    pub(in super::super) decode_state: DecodeTransitionRasterState,
+    pub(in super::super) decode_state: DecodeLayerRangeRasterState,
     pub(in super::super) layer_idx: usize,
     pub(in super::super) layer: GemmaDecodeLayerMetadata,
     pub(in super::super) cache_slot: DecodeLayerCacheSlot,

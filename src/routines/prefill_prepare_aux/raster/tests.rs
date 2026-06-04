@@ -993,6 +993,7 @@ fn raster_sizing_with_projection_rows(projection_rows_per_tile: usize) -> Raster
         sequence_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE,
         head_rows_per_tile: crate::InferenceControls::DEFAULT_RASTER_HEAD_ROWS_PER_TILE,
         prefill_token_range_width: crate::InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
+        decode_layer_range_width: crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH,
         tokenizer_bpe_pairs_per_tile:
             crate::InferenceControls::DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE,
         tokenizer_bpe_pieces_per_tile:

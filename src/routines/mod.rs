@@ -1,5 +1,6 @@
+pub mod decode_layer_range;
 pub mod decode_select_token;
-pub mod decode_transition;
+pub mod decode_transition_finalize;
 pub mod input_embedding;
 pub mod output_finalize;
 pub mod prefill_finalize;
@@ -16,8 +17,12 @@ mod tests {
             include_str!("decode_select_token/mod.rs"),
         ),
         (
-            "decode_transition",
-            include_str!("decode_transition/mod.rs"),
+            "decode_layer_range",
+            include_str!("decode_layer_range/mod.rs"),
+        ),
+        (
+            "decode_transition_finalize",
+            include_str!("decode_transition_finalize/mod.rs"),
         ),
         ("input_embedding", include_str!("input_embedding/mod.rs")),
         ("output_finalize", include_str!("output_finalize/mod.rs")),

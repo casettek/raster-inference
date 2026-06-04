@@ -1,12 +1,12 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::decode_transition::raster::auth_source::{
+use crate::decode_layer_range::raster::auth_source::{
     GemmaDecodeAttentionKind, GemmaDecodeEmbeddingRowRequest, GemmaDecodeFinalNormWeightsRequest,
     GemmaDecodeFinalScalarsRequest, GemmaDecodeLayerMatrixKind, GemmaDecodeLayerMetadata,
     GemmaDecodeLayerMetadataRequest, GemmaDecodeLayerNormKind, GemmaDecodeLayerNormWeightsRequest,
     GemmaDecodeLayerScalarsRequest, GemmaDecodePleProjectionNormWeightsRequest,
     GemmaDecodePleScalarsRequest, GemmaDecodePleTokenEmbeddingRowRequest,
-    GemmaDecodeTransitionMetadataRequest, RasterDecodeTransitionSource,
+    GemmaDecodeLayerRangeMetadataRequest, RasterDecodeLayerRangeSource,
 };
 use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
@@ -40,7 +40,7 @@ use crate::shared::tensors::raster_tensor_artifacts::{
 };
 use crate::RasterSizingControls;
 
-use super::super::native::ActivationSequenceWithCache;
+use crate::shared::numerics::transformer_kernels::ActivationSequenceWithCache;
 
 use super::types::*;
 use super::utils::*;
@@ -49,11 +49,11 @@ use super::utils::*;
 
 #[sequence]
 pub fn main(
-    input_roots: RasterDecodeTransitionInputRoots,
-    source: &RasterDecodeTransitionSource<'_>,
-) -> Result<RasterDecodeTransitionOutputRefs> {
+    input_roots: RasterDecodeLayerRangeInputRoots,
+    source: &RasterDecodeLayerRangeSource<'_>,
+) -> Result<RasterDecodeLayerRangeOutputRefs> {
     let (_artifact_store_roots, decode_state) = call_tile!(
-        init_decode_transition_state_refs_from_input_roots,
+        init_decode_layer_range_state_refs_from_input_roots,
         input_roots,
         source
     )?;
@@ -63,7 +63,7 @@ pub fn main(
         source
     )?;
     let final_work = call_tile!(
-        init_decode_transition_final_work_with_roots,
+        init_decode_layer_range_final_work_with_roots,
         artifact_store_roots,
         decode_state
     )?;
@@ -72,15 +72,15 @@ pub fn main(
         final_work,
         source
     )?;
-    call_tile!(finalize_decode_transition_output_refs, final_work)
+    call_tile!(finalize_decode_layer_range_output_refs, final_work)
 }
 
 #[sequence(kind = recursive)]
 pub fn compute_next_decode_layer_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    decode_state: DecodeTransitionRasterState,
-    source: &RasterDecodeTransitionSource<'_>,
-) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+    decode_state: DecodeLayerRangeRasterState,
+    source: &RasterDecodeLayerRangeSource<'_>,
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeLayerRangeRasterState)> {
     let (artifact_store_roots, layer_work) = call_tile!(
         init_next_decode_layer_work,
         artifact_store_roots,
@@ -104,7 +104,7 @@ pub fn compute_next_decode_layer_with_roots(
 fn run_decode_layer_work_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, layer_work) = call_seq!(
         compute_decode_ple_input_work_with_roots,
@@ -124,7 +124,7 @@ fn run_decode_layer_work_with_roots(
 fn compute_decode_ple_input_work_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, ple_work) = call_tile!(
         init_decode_ple_input_work,
@@ -159,7 +159,7 @@ fn compute_decode_ple_input_work_with_roots(
 fn project_ref_with_decode_source_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_ref: RasterActivationSequenceRef,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     projection_kind: DecodeProjectionKind,
     projection_rows: usize,
     rows_per_tile: usize,
@@ -192,7 +192,7 @@ fn project_ref_with_decode_source_with_roots(
 fn project_decode_projection_work_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     projection_work: DecodeProjectionWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeProjectionContinuation)> {
     let (artifact_store_roots, projection_work) = call_recur_tile!(
         project_next_decode_projection_work_chunk_with_roots,
@@ -209,7 +209,7 @@ fn project_decode_projection_work_with_roots(
 #[sequence]
 fn compute_decode_final_logits_work_with_roots(
     final_work: DecodeTransitionFinalWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<DecodeTransitionFinalWork> {
     let final_work = call_tile!(normalize_decode_final_work_with_roots, final_work, source)?;
     let (artifact_store_roots, projection_work) =
@@ -231,7 +231,7 @@ fn compute_decode_final_logits_work_with_roots(
 fn run_basic_decode_layer_work_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, layer_work) = call_tile!(
         prepare_basic_decode_layer_work,
@@ -423,7 +423,7 @@ fn run_basic_decode_layer_work_with_roots(
 fn project_decode_attention_query_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_attention_query_work,
@@ -447,7 +447,7 @@ fn project_decode_attention_query_work(
 fn project_decode_attention_key_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_attention_key_work,
@@ -471,7 +471,7 @@ fn project_decode_attention_key_work(
 fn project_decode_attention_value_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_attention_value_work,
@@ -537,7 +537,7 @@ fn compute_decode_attention_scores_work(
 fn project_decode_attention_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_attention_output_work,
@@ -561,7 +561,7 @@ fn project_decode_attention_output_work(
 fn project_decode_mlp_gate_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_mlp_gate_work,
@@ -585,7 +585,7 @@ fn project_decode_mlp_gate_work(
 fn project_decode_mlp_up_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_mlp_up_work,
@@ -609,7 +609,7 @@ fn project_decode_mlp_up_work(
 fn project_decode_mlp_down_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_mlp_down_work,
@@ -633,7 +633,7 @@ fn project_decode_mlp_down_work(
 fn project_decode_ple_gate_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_ple_gate_work,
@@ -657,7 +657,7 @@ fn project_decode_ple_gate_work(
 fn project_decode_ple_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let (artifact_store_roots, projection_work) = call_tile!(
         init_project_decode_ple_output_work,
@@ -681,27 +681,27 @@ fn project_decode_ple_output_work(
 pub fn run(
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     raster_sizing: RasterSizingControls,
 ) -> Result<TransformerDecodeStepResult> {
     let input_roots = call_tile!(
-        init_decode_transition_run_input_roots,
+        init_decode_layer_range_run_input_roots,
         transformer_decode_state,
         next_token,
         source,
         raster_sizing
     )?;
     let output = call_seq!(main, input_roots, source)?;
-    call_tile!(finalize_decode_transition_run_output, output)
+    call_tile!(finalize_decode_layer_range_run_output, output)
 }
 
 #[sequence]
 pub fn main_state_refs(
-    input_roots: RasterDecodeTransitionInputRefs,
-    source: &RasterDecodeTransitionSource<'_>,
-) -> Result<RasterDecodeTransitionOutputStateRefs> {
+    input_roots: RasterDecodeLayerRangeInputRefs,
+    source: &RasterDecodeLayerRangeSource<'_>,
+) -> Result<RasterDecodeTransitionFinalizeOutputRefs> {
     let (_artifact_store_roots, decode_state) = call_tile!(
-        init_decode_transition_state_from_input_refs,
+        init_decode_layer_range_state_from_input_refs,
         input_roots,
         source
     )?;
@@ -711,7 +711,7 @@ pub fn main_state_refs(
         source
     )?;
     let final_work = call_tile!(
-        init_decode_transition_final_work_with_roots,
+        init_decode_layer_range_final_work_with_roots,
         artifact_store_roots,
         decode_state
     )?;
@@ -720,7 +720,26 @@ pub fn main_state_refs(
         final_work,
         source
     )?;
-    call_tile!(finalize_decode_transition_output_state_refs, final_work)
+    call_tile!(finalize_decode_layer_range_output_state_refs, final_work)
+}
+
+#[sequence]
+pub fn finalize_state_refs_with_roots(
+    artifact_store_roots: RasterArtifactStoreRoots,
+    decode_state: DecodeLayerRangeRasterState,
+    source: &RasterDecodeLayerRangeSource<'_>,
+) -> Result<RasterDecodeTransitionFinalizeOutputRefs> {
+    let final_work = call_tile!(
+        init_decode_layer_range_final_work_with_roots,
+        artifact_store_roots,
+        decode_state
+    )?;
+    let final_work = call_seq!(
+        compute_decode_final_logits_work_with_roots,
+        final_work,
+        source
+    )?;
+    call_tile!(finalize_decode_layer_range_output_state_refs, final_work)
 }
 
 // Raster execution tiles, ordered by the sequence calls that reach them.
@@ -754,7 +773,7 @@ fn prepare_basic_decode_layer_work(
 fn normalize_decode_attention_input_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1025,7 +1044,7 @@ fn reshape_decode_attention_value_heads_work(
 fn normalize_decode_attention_query_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1062,7 +1081,7 @@ fn normalize_decode_attention_query_heads_work(
 fn normalize_decode_attention_key_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1099,7 +1118,7 @@ fn normalize_decode_attention_key_heads_work(
 fn normalize_decode_attention_value_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1129,7 +1148,7 @@ fn normalize_decode_attention_value_heads_work(
 fn rope_decode_attention_query_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1165,7 +1184,7 @@ fn rope_decode_attention_query_heads_work(
 fn rope_decode_attention_key_heads_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1454,7 +1473,7 @@ fn init_project_decode_attention_output_work(
 fn normalize_decode_attention_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1508,7 +1527,7 @@ fn add_decode_attention_residual_work(
 fn normalize_decode_mlp_input_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1691,7 +1710,7 @@ fn init_project_decode_mlp_down_work(
 fn normalize_decode_mlp_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1896,7 +1915,7 @@ fn init_project_decode_ple_output_work(
 fn normalize_decode_ple_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1956,7 +1975,7 @@ fn add_decode_ple_residual_work(
 fn scale_decode_layer_output_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     let mut work = match layer_work {
         DecodeLayerWork::Complete(_) => return Ok((artifact_store_roots, layer_work)),
@@ -1988,15 +2007,15 @@ fn read_decode_selected_token(
 }
 
 #[tile]
-fn init_decode_transition_state_refs_from_input_roots(
-    input_roots: RasterDecodeTransitionInputRoots,
-    source: &RasterDecodeTransitionSource<'_>,
-) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    if input_roots.decode_transition_source_root != source.root() {
+fn init_decode_layer_range_state_refs_from_input_roots(
+    input_roots: RasterDecodeLayerRangeInputRoots,
+    source: &RasterDecodeLayerRangeSource<'_>,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerRangeRasterState)> {
+    if input_roots.decode_layer_range_source_root != source.root() {
         bail!(
-            "raster decode transition source root {} does not match input source root {}",
+            "raster decode layer range source root {} does not match input source root {}",
             source.root(),
-            input_roots.decode_transition_source_root
+            input_roots.decode_layer_range_source_root
         );
     }
     let next_token = read_selected_token_from_roots(
@@ -2005,7 +2024,7 @@ fn init_decode_transition_state_refs_from_input_roots(
     )?;
     validate_projection_rows_per_tile(input_roots.raster_sizing.projection_rows_per_tile)?;
     validate_attention_kv_rows_per_tile(input_roots.raster_sizing.attention_kv_rows_per_tile)?;
-    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    let metadata = auth_read!(source, GemmaDecodeLayerRangeMetadataRequest)?;
     if metadata.layer_count == 0 {
         bail!("transformer decode requires at least one layer");
     }
@@ -2061,7 +2080,7 @@ fn init_decode_transition_state_refs_from_input_roots(
 
     Ok((
         artifact_store_roots.clone(),
-        DecodeTransitionRasterState {
+        DecodeLayerRangeRasterState {
             artifact_store_roots,
             decode_input_ref: decode_input_ref.clone(),
             current_activation_ref: decode_input_ref,
@@ -2082,15 +2101,15 @@ fn init_decode_transition_state_refs_from_input_roots(
 }
 
 #[tile]
-fn init_decode_transition_state_from_input_refs(
-    input_roots: RasterDecodeTransitionInputRefs,
-    source: &RasterDecodeTransitionSource<'_>,
-) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
-    if input_roots.decode_transition_source_root != source.root() {
+fn init_decode_layer_range_state_from_input_refs(
+    input_roots: RasterDecodeLayerRangeInputRefs,
+    source: &RasterDecodeLayerRangeSource<'_>,
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerRangeRasterState)> {
+    if input_roots.decode_layer_range_source_root != source.root() {
         bail!(
-            "raster decode transition source root {} does not match input source root {}",
+            "raster decode layer range source root {} does not match input source root {}",
             source.root(),
-            input_roots.decode_transition_source_root
+            input_roots.decode_layer_range_source_root
         );
     }
     let next_token = read_selected_token_from_roots(
@@ -2099,7 +2118,7 @@ fn init_decode_transition_state_from_input_refs(
     )?;
     validate_projection_rows_per_tile(input_roots.raster_sizing.projection_rows_per_tile)?;
     validate_attention_kv_rows_per_tile(input_roots.raster_sizing.attention_kv_rows_per_tile)?;
-    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    let metadata = auth_read!(source, GemmaDecodeLayerRangeMetadataRequest)?;
     if metadata.layer_count == 0 {
         bail!("transformer decode requires at least one layer");
     }
@@ -2135,7 +2154,7 @@ fn init_decode_transition_state_from_input_refs(
 
     Ok((
         artifact_store_roots.clone(),
-        DecodeTransitionRasterState {
+        DecodeLayerRangeRasterState {
             artifact_store_roots,
             decode_input_ref: decode_input_ref.clone(),
             current_activation_ref: decode_input_ref,
@@ -2156,12 +2175,12 @@ fn init_decode_transition_state_from_input_refs(
 }
 
 #[tile]
-fn init_decode_transition_run_input_roots(
+fn init_decode_layer_range_run_input_roots(
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     raster_sizing: RasterSizingControls,
-) -> Result<RasterDecodeTransitionInputRoots> {
+) -> Result<RasterDecodeLayerRangeInputRoots> {
     ArtifactIo::reset_store();
     let roots = ArtifactIo::export_store_roots();
     let output_source_prefix = format!(
@@ -2173,35 +2192,35 @@ fn init_decode_transition_run_input_roots(
         format!("{output_source_prefix}.input.selected_token"),
         next_token,
     )?;
-    Ok(RasterDecodeTransitionInputRoots {
+    Ok(RasterDecodeLayerRangeInputRoots {
         artifact_store_roots,
         transformer_decode_state,
         selected_token_ref,
-        decode_transition_source_root: source.root().to_string(),
+        decode_layer_range_source_root: source.root().to_string(),
         output_source_prefix,
         raster_sizing,
     })
 }
 
 #[tile]
-fn finalize_decode_transition_run_output(
-    output: RasterDecodeTransitionOutputRefs,
+fn finalize_decode_layer_range_run_output(
+    output: RasterDecodeLayerRangeOutputRefs,
 ) -> Result<TransformerDecodeStepResult> {
     Ok(output.transition_result)
 }
 
 #[tile]
-pub fn init_decode_transition_state_refs_with_roots(
+pub fn init_decode_layer_range_state_refs_with_roots(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     raster_sizing: RasterSizingControls,
     output_source_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerRangeRasterState)> {
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
     validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
-    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    let metadata = auth_read!(source, GemmaDecodeLayerRangeMetadataRequest)?;
     if metadata.layer_count == 0 {
         bail!("transformer decode requires at least one layer");
     }
@@ -2247,7 +2266,7 @@ pub fn init_decode_transition_state_refs_with_roots(
 
     Ok((
         artifact_store_roots.clone(),
-        DecodeTransitionRasterState {
+        DecodeLayerRangeRasterState {
             artifact_store_roots,
             decode_input_ref: decode_input_ref.clone(),
             current_activation_ref: decode_input_ref,
@@ -2271,7 +2290,7 @@ pub fn init_decode_transition_state_refs_with_roots(
 fn normalize_decode_final_position_ref_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     final_hidden_states_ref: RasterActivationSequenceRef,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     output_source_name: String,
 ) -> Result<(RasterArtifactStoreRoots, RasterActivationSequenceRef)> {
     let final_hidden_state =
@@ -2290,9 +2309,9 @@ fn normalize_decode_final_position_ref_with_roots(
 }
 
 #[tile]
-fn init_decode_transition_final_work_with_roots(
+fn init_decode_layer_range_final_work_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    decode_state: DecodeTransitionRasterState,
+    decode_state: DecodeLayerRangeRasterState,
 ) -> Result<DecodeTransitionFinalWork> {
     if decode_state.next_layer_idx != decode_state.layer_count {
         bail!(
@@ -2324,7 +2343,7 @@ fn init_decode_transition_final_work_with_roots(
 #[tile]
 fn normalize_decode_final_work_with_roots(
     mut final_work: DecodeTransitionFinalWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<DecodeTransitionFinalWork> {
     let final_hidden_state = read_activation_row_from_ref_roots(
         &final_work.artifact_store_roots,
@@ -2353,13 +2372,13 @@ fn normalize_decode_final_work_with_roots(
 #[tile]
 fn init_decode_final_logits_projection_work(
     final_work: DecodeTransitionFinalWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeProjectionWork)> {
     let normalized_ref = final_work
         .normalized_ref
         .clone()
         .ok_or_else(|| anyhow!("decode final logits projection requires normalized ref"))?;
-    let projection_rows = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?.projection_rows;
+    let projection_rows = auth_read!(source, GemmaDecodeLayerRangeMetadataRequest)?.projection_rows;
     let softcap_bits = auth_read!(source, GemmaDecodeFinalScalarsRequest)?
         .final_logit_softcapping
         .map(Act::to_bits);
@@ -2402,9 +2421,9 @@ fn finalize_decode_final_logits_projection_work(
 }
 
 #[tile]
-fn finalize_decode_transition_output_refs(
+fn finalize_decode_layer_range_output_refs(
     final_work: DecodeTransitionFinalWork,
-) -> Result<RasterDecodeTransitionOutputRefs> {
+) -> Result<RasterDecodeLayerRangeOutputRefs> {
     let current_activation = read_activation_row_from_ref_roots(
         &final_work.artifact_store_roots,
         &final_work.final_hidden_state_ref,
@@ -2421,7 +2440,7 @@ fn finalize_decode_transition_output_refs(
     );
     let logits_ref = final_work
         .logits_ref
-        .ok_or_else(|| anyhow!("decode transition output requires logits ref"))?;
+        .ok_or_else(|| anyhow!("decode layer range output requires logits ref"))?;
     let layer_caches = final_work
         .layer_caches
         .iter()
@@ -2432,7 +2451,7 @@ fn finalize_decode_transition_output_refs(
         .into_iter()
         .map(layer_cache_from_raster)
         .collect();
-    let transition_result = finalize_decode_transition_result_values_from_roots(
+    let transition_result = finalize_decode_layer_range_result_values_from_roots(
         &final_work.artifact_store_roots,
         logits_ref,
         TransformerDecodeState {
@@ -2442,26 +2461,26 @@ fn finalize_decode_transition_output_refs(
         },
         activation_state,
     )?;
-    Ok(RasterDecodeTransitionOutputRefs {
+    Ok(RasterDecodeLayerRangeOutputRefs {
         artifact_store_roots: final_work.artifact_store_roots,
         transition_result,
     })
 }
 
 #[tile]
-fn finalize_decode_transition_output_state_refs(
+fn finalize_decode_layer_range_output_state_refs(
     final_work: DecodeTransitionFinalWork,
-) -> Result<RasterDecodeTransitionOutputStateRefs> {
+) -> Result<RasterDecodeTransitionFinalizeOutputRefs> {
     let logits_ref = final_work
         .logits_ref
-        .ok_or_else(|| anyhow!("decode transition state output requires logits ref"))?;
+        .ok_or_else(|| anyhow!("decode layer range state output requires logits ref"))?;
     let (row_count, width) = logits_ref.tensor_ref().shape().sequence_metadata()?;
     let logit_count = match (row_count, width) {
         (rows, 1) => rows,
         (1, cols) => cols,
-        _ => bail!("raster decode transition logits shape {row_count}x{width} must be Nx1 or 1xN"),
+        _ => bail!("raster decode layer range logits shape {row_count}x{width} must be Nx1 or 1xN"),
     };
-    Ok(RasterDecodeTransitionOutputStateRefs {
+    Ok(RasterDecodeTransitionFinalizeOutputRefs {
         artifact_store_roots: final_work.artifact_store_roots,
         final_hidden_state_ref: final_work.final_hidden_state_ref,
         logits_ref,
@@ -2473,13 +2492,13 @@ fn finalize_decode_transition_output_state_refs(
 }
 
 #[tile]
-fn decode_projection_row_count(source: &RasterDecodeTransitionSource<'_>) -> Result<usize> {
-    Ok(auth_read!(source, GemmaDecodeTransitionMetadataRequest)?.projection_rows)
+fn decode_projection_row_count(source: &RasterDecodeLayerRangeSource<'_>) -> Result<usize> {
+    Ok(auth_read!(source, GemmaDecodeLayerRangeMetadataRequest)?.projection_rows)
 }
 
 #[tile]
 fn decode_final_logit_softcap_bits(
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<Option<i32>> {
     Ok(auth_read!(source, GemmaDecodeFinalScalarsRequest)?
         .final_logit_softcapping
@@ -2489,7 +2508,7 @@ fn decode_final_logit_softcap_bits(
 #[tile]
 pub fn finalize_decode_layer_state_with_roots(
     roots: &RasterArtifactStoreRoots,
-    decode_state: DecodeTransitionRasterState,
+    decode_state: DecodeLayerRangeRasterState,
 ) -> Result<ActivationSequenceWithCache> {
     if decode_state.next_layer_idx != decode_state.layer_count {
         bail!(
@@ -2533,13 +2552,13 @@ pub fn finalize_decode_layer_state_with_roots(
 }
 
 #[tile]
-fn finalize_decode_transition_result_from_roots(
+fn finalize_decode_layer_range_result_from_roots(
     artifact_store_roots: &RasterArtifactStoreRoots,
     logits_ref: RasterActivationSequenceRef,
     transformer_decode_state: TransformerDecodeState,
     final_hidden_state: ActivationSequence,
 ) -> Result<TransformerDecodeStepResult> {
-    finalize_decode_transition_result_values_from_roots(
+    finalize_decode_layer_range_result_values_from_roots(
         artifact_store_roots,
         logits_ref,
         transformer_decode_state,
@@ -2549,8 +2568,8 @@ fn finalize_decode_transition_result_from_roots(
 
 #[tile]
 pub(in super::super) fn prepare_next_decode_layer_context(
-    decode_state: &DecodeTransitionRasterState,
-    source: &RasterDecodeTransitionSource<'_>,
+    decode_state: &DecodeLayerRangeRasterState,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<DecodeLayerContext> {
     let layer_idx = decode_state.next_layer_idx;
     let layer = auth_read!(source, GemmaDecodeLayerMetadataRequest { layer_idx })?;
@@ -2573,8 +2592,8 @@ pub(in super::super) fn prepare_next_decode_layer_context(
 #[tile]
 fn init_next_decode_layer_work(
     artifact_store_roots: RasterArtifactStoreRoots,
-    decode_state: DecodeTransitionRasterState,
-    source: &RasterDecodeTransitionSource<'_>,
+    decode_state: DecodeLayerRangeRasterState,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodeLayerWork)> {
     if decode_state.next_layer_idx >= decode_state.layer_count {
         return Ok((
@@ -2639,7 +2658,7 @@ fn init_next_decode_layer_work(
 fn finalize_next_decode_layer_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeLayerRangeRasterState)> {
     match layer_work {
         DecodeLayerWork::Complete(decode_state) => Ok((true, artifact_store_roots, decode_state)),
         DecodeLayerWork::Active(work) => {
@@ -2663,11 +2682,11 @@ fn finalize_next_decode_layer_work(
 #[tile]
 fn update_decode_layer_state_refs_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    decode_state: DecodeTransitionRasterState,
+    decode_state: DecodeLayerRangeRasterState,
     layer_idx: usize,
     layer_output_ref: RasterActivationSequenceRef,
     updated_cache: DecodeLayerCacheSlot,
-) -> Result<(bool, RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+) -> Result<(bool, RasterArtifactStoreRoots, DecodeLayerRangeRasterState)> {
     update_decode_layer_state_refs(
         artifact_store_roots,
         decode_state,
@@ -2689,7 +2708,7 @@ fn decode_ple_input_gate_rows(layer: &GemmaDecodeLayerMetadata) -> Result<usize>
 fn init_decode_ple_input_work(
     artifact_store_roots: RasterArtifactStoreRoots,
     layer_work: DecodeLayerWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(RasterArtifactStoreRoots, DecodePleInputWork)> {
     let work = match layer_work {
         DecodeLayerWork::Complete(_) => {
@@ -2854,21 +2873,21 @@ fn finalize_decode_ple_input_work(
 
 #[tile]
 fn read_decode_ple_scalars(
-    source: &RasterDecodeTransitionSource<'_>,
-) -> Result<crate::decode_transition::raster::auth_source::GemmaDecodePleScalars> {
+    source: &RasterDecodeLayerRangeSource<'_>,
+) -> Result<crate::decode_layer_range::raster::auth_source::GemmaDecodePleScalars> {
     auth_read!(source, GemmaDecodePleScalarsRequest)
 }
 
 #[tile]
 fn read_decode_ple_projection_norm_weights(
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
     auth_read!(source, GemmaDecodePleProjectionNormWeightsRequest)
 }
 
 #[tile]
 fn read_decode_ple_token_embedding(
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     layer_idx: usize,
     token_id: u32,
 ) -> Result<RasterActivationRow> {
@@ -2956,7 +2975,7 @@ pub fn init_decode_row_projection_artifact(
 pub fn project_next_decode_projection_chunk_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     projection_state: DecodeRowProjectionArtifactState,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(
     bool,
     RasterArtifactStoreRoots,
@@ -2977,7 +2996,7 @@ pub fn finalize_decode_row_projection_ref_with_roots(
 fn project_next_decode_projection_work_chunk_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
     projection_work: DecodeProjectionWork,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<(bool, RasterArtifactStoreRoots, DecodeProjectionWork)> {
     match projection_work {
         DecodeProjectionWork::Skip { continuation } => Ok((
@@ -3026,9 +3045,9 @@ fn finalize_decode_projection_work_with_roots(
 
 #[tile]
 fn read_decode_layer_scalars(
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     layer_idx: usize,
-) -> Result<crate::decode_transition::raster::auth_source::GemmaDecodeLayerScalars> {
+) -> Result<crate::decode_layer_range::raster::auth_source::GemmaDecodeLayerScalars> {
     auth_read!(source, GemmaDecodeLayerScalarsRequest { layer_idx })
 }
 
@@ -3050,7 +3069,7 @@ fn validate_decode_attention_context(
 
 #[tile]
 fn read_decode_layer_norm_weights(
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     layer_idx: usize,
     norm: GemmaDecodeLayerNormKind,
 ) -> Result<Vec<crate::shared::numerics::det_num::Wgt>> {
@@ -3845,19 +3864,19 @@ fn decode_ple_layer_projection_rows(layer: &GemmaDecodeLayerMetadata) -> Result<
 }
 
 #[tile]
-pub fn init_decode_transition_state_from_refs_with_roots(
+pub fn init_decode_layer_range_state_from_refs_with_roots(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     position: usize,
     token_count: usize,
     original_layer_caches: Vec<DecodeLayerCacheSlot>,
     next_token: u32,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
     raster_sizing: RasterSizingControls,
     output_source_prefix: String,
-) -> Result<(RasterArtifactStoreRoots, DecodeTransitionRasterState)> {
+) -> Result<(RasterArtifactStoreRoots, DecodeLayerRangeRasterState)> {
     validate_projection_rows_per_tile(raster_sizing.projection_rows_per_tile)?;
     validate_attention_kv_rows_per_tile(raster_sizing.attention_kv_rows_per_tile)?;
-    let metadata = auth_read!(source, GemmaDecodeTransitionMetadataRequest)?;
+    let metadata = auth_read!(source, GemmaDecodeLayerRangeMetadataRequest)?;
     if metadata.layer_count == 0 {
         bail!("transformer decode requires at least one layer");
     }
@@ -3891,7 +3910,7 @@ pub fn init_decode_transition_state_from_refs_with_roots(
 
     Ok((
         artifact_store_roots.clone(),
-        DecodeTransitionRasterState {
+        DecodeLayerRangeRasterState {
             artifact_store_roots,
             decode_input_ref: decode_input_ref.clone(),
             current_activation_ref: decode_input_ref,
@@ -3913,7 +3932,7 @@ pub fn init_decode_transition_state_from_refs_with_roots(
 
 #[tile]
 pub fn finalize_decode_layer_refs_with_roots(
-    decode_state: DecodeTransitionRasterState,
+    decode_state: DecodeLayerRangeRasterState,
 ) -> Result<(Vec<DecodeLayerCacheSlot>, usize, usize)> {
     if decode_state.next_layer_idx != decode_state.layer_count {
         bail!(
@@ -3956,7 +3975,7 @@ fn rms_norm_decode_row(
 
 #[tile]
 fn read_decode_single_activation_row(
-    decode_state: &DecodeTransitionRasterState,
+    decode_state: &DecodeLayerRangeRasterState,
     activation_ref: &RasterActivationSequenceRef,
 ) -> Result<RasterActivationRow> {
     read_activation_row_from_ref_roots(&decode_state.artifact_store_roots, activation_ref)
@@ -3965,7 +3984,7 @@ fn read_decode_single_activation_row(
 #[tile]
 pub fn normalize_decode_final_position(
     final_hidden_state: &ActivationSequence,
-    source: &RasterDecodeTransitionSource<'_>,
+    source: &RasterDecodeLayerRangeSource<'_>,
 ) -> Result<RasterActivationRow> {
     let internal = final_hidden_state.clone_internal();
     let det_rows = internal.det_values().ok_or_else(|| {

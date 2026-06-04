@@ -51,12 +51,13 @@ pub enum RoutineId {
     PrefillRangeFinalize,
     PrefillFinalize,
     SelectOutputToken,
-    DecodeTransition,
+    DecodeLayerRange,
+    DecodeTransitionFinalize,
     FinalizeOutput,
 }
 
 impl RoutineId {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::PromptPrepare,
         Self::InputEmbedding,
         Self::PrefillPrepareAux,
@@ -64,7 +65,8 @@ impl RoutineId {
         Self::PrefillRangeFinalize,
         Self::PrefillFinalize,
         Self::SelectOutputToken,
-        Self::DecodeTransition,
+        Self::DecodeLayerRange,
+        Self::DecodeTransitionFinalize,
         Self::FinalizeOutput,
     ];
 
@@ -77,7 +79,8 @@ impl RoutineId {
             Self::PrefillRangeFinalize => "prefill.range_finalize",
             Self::PrefillFinalize => "prefill.finalize",
             Self::SelectOutputToken => "decode.select_token",
-            Self::DecodeTransition => "decode.transition",
+            Self::DecodeLayerRange => "decode.layer_range",
+            Self::DecodeTransitionFinalize => "decode.transition_finalize",
             Self::FinalizeOutput => "output.finalize",
         }
     }
@@ -275,9 +278,13 @@ pub fn classify_checkpoint(checkpoint_name: &str) -> Option<CheckpointTaxonomy> 
             phase_id: PhaseId::OutputDecode,
             routine_id: RoutineId::SelectOutputToken,
         }),
-        "decode.transition" => Some(CheckpointTaxonomy {
-            phase_id: PhaseId::TransformerStateTransition,
-            routine_id: RoutineId::DecodeTransition,
+        "decode.layer_range" => Some(CheckpointTaxonomy {
+            phase_id: PhaseId::OutputDecode,
+            routine_id: RoutineId::DecodeLayerRange,
+        }),
+        "decode.transition_finalize" => Some(CheckpointTaxonomy {
+            phase_id: PhaseId::OutputDecode,
+            routine_id: RoutineId::DecodeTransitionFinalize,
         }),
         "output.finalize" => Some(CheckpointTaxonomy {
             phase_id: PhaseId::OutputDecode,
@@ -330,10 +337,17 @@ mod tests {
             })
         );
         assert_eq!(
-            classify_checkpoint("decode.transition"),
+            classify_checkpoint("decode.layer_range"),
             Some(CheckpointTaxonomy {
-                phase_id: PhaseId::TransformerStateTransition,
-                routine_id: RoutineId::DecodeTransition,
+                phase_id: PhaseId::OutputDecode,
+                routine_id: RoutineId::DecodeLayerRange,
+            })
+        );
+        assert_eq!(
+            classify_checkpoint("decode.transition_finalize"),
+            Some(CheckpointTaxonomy {
+                phase_id: PhaseId::OutputDecode,
+                routine_id: RoutineId::DecodeTransitionFinalize,
             })
         );
         assert_eq!(
@@ -362,8 +376,12 @@ mod tests {
             RoutineId::PrefillRangeFinalize
         );
         assert_eq!(
-            "decode.transition".parse::<RoutineId>().unwrap(),
-            RoutineId::DecodeTransition
+            "decode.layer_range".parse::<RoutineId>().unwrap(),
+            RoutineId::DecodeLayerRange
+        );
+        assert_eq!(
+            "decode.transition_finalize".parse::<RoutineId>().unwrap(),
+            RoutineId::DecodeTransitionFinalize
         );
     }
 
@@ -381,7 +399,7 @@ mod tests {
             .expect_err("decode sub-checkpoints should not parse as routine ids");
 
         assert!(error.to_string().contains("unknown routine id"));
-        assert!(error.to_string().contains("decode.transition"));
+        assert!(error.to_string().contains("decode.layer_range"));
 
         let error = "output.finalize.detokenize"
             .parse::<RoutineId>()

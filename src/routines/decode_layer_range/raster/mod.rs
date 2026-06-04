@@ -6,6 +6,3 @@ pub(super) mod utils;
 pub use tiles::*;
 pub use types::*;
 pub use utils::*;
-
-#[cfg(test)]
-mod tests;

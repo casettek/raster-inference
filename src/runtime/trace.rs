@@ -646,7 +646,8 @@ mod tests {
         assert!(!should_commit_checkpoint(
             "decode.layer_token.layer_0.position_0"
         ));
-        assert!(should_commit_checkpoint("decode.transition"));
+        assert!(should_commit_checkpoint("decode.layer_range"));
+        assert!(should_commit_checkpoint("decode.transition_finalize"));
     }
 
     #[test]

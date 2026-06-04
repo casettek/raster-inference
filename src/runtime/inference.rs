@@ -53,6 +53,7 @@ pub struct InferenceControls {
     pub raster_sequence_rows_per_tile: Option<usize>,
     pub raster_head_rows_per_tile: Option<usize>,
     pub prefill_token_range_width: Option<usize>,
+    pub decode_layer_range_width: Option<usize>,
     pub raster_tokenizer_bpe_pairs_per_tile: Option<usize>,
     pub raster_tokenizer_bpe_pieces_per_tile: Option<usize>,
     pub raster_output_byte_flush_bytes_per_tile: Option<usize>,
@@ -65,6 +66,7 @@ pub struct RasterSizingControls {
     pub sequence_rows_per_tile: usize,
     pub head_rows_per_tile: usize,
     pub prefill_token_range_width: usize,
+    pub decode_layer_range_width: usize,
     pub tokenizer_bpe_pairs_per_tile: usize,
     pub tokenizer_bpe_pieces_per_tile: usize,
     pub output_byte_flush_bytes_per_tile: usize,
@@ -76,6 +78,7 @@ impl InferenceControls {
     pub const DEFAULT_RASTER_SEQUENCE_ROWS_PER_TILE: usize = 1;
     pub const DEFAULT_RASTER_HEAD_ROWS_PER_TILE: usize = 1;
     pub const DEFAULT_PREFILL_TOKEN_RANGE_WIDTH: usize = usize::MAX;
+    pub const DEFAULT_DECODE_LAYER_RANGE_WIDTH: usize = usize::MAX;
     pub const DEFAULT_RASTER_TOKENIZER_BPE_PAIRS_PER_TILE: usize =
         crate::prompt_prepare::raster::DEFAULT_BPE_PAIRS_PER_TILE;
     pub const DEFAULT_RASTER_TOKENIZER_BPE_PIECES_PER_TILE: usize =
@@ -125,6 +128,14 @@ impl InferenceControls {
         }
     }
 
+    pub fn decode_layer_range_width(&self) -> Result<usize> {
+        match self.decode_layer_range_width {
+            Some(0) => anyhow::bail!("decode layer range width must be greater than zero"),
+            Some(width) => Ok(width),
+            None => Ok(Self::DEFAULT_DECODE_LAYER_RANGE_WIDTH),
+        }
+    }
+
     pub fn raster_tokenizer_bpe_pairs_per_tile(&self) -> Result<usize> {
         match self.raster_tokenizer_bpe_pairs_per_tile {
             Some(0) => {
@@ -162,6 +173,7 @@ impl InferenceControls {
             sequence_rows_per_tile: self.raster_sequence_rows_per_tile()?,
             head_rows_per_tile: self.raster_head_rows_per_tile()?,
             prefill_token_range_width: self.prefill_token_range_width()?,
+            decode_layer_range_width: self.decode_layer_range_width()?,
             tokenizer_bpe_pairs_per_tile: self.raster_tokenizer_bpe_pairs_per_tile()?,
             tokenizer_bpe_pieces_per_tile: self.raster_tokenizer_bpe_pieces_per_tile()?,
             output_byte_flush_bytes_per_tile: self.raster_output_byte_flush_bytes_per_tile()?,
@@ -169,10 +181,20 @@ impl InferenceControls {
     }
 
     fn terminal_checkpoint_spec(&self) -> Result<Option<trace::TerminalCheckpointSpec>> {
-        self.terminal_checkpoint
+        let spec = self
+            .terminal_checkpoint
             .as_deref()
             .map(trace::TerminalCheckpointSpec::parse)
-            .transpose()
+            .transpose()?;
+        if spec
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.checkpoint_id() == "decode.layer_range")
+        {
+            anyhow::bail!(
+                "terminal checkpoint decode.layer_range is not supported because paused state cannot yet carry an in-progress decode transition"
+            );
+        }
+        Ok(spec)
     }
 }
 
@@ -254,7 +276,10 @@ pub fn run_inference_with_controls(
             let use_raster_prefill = controls.raster;
             let use_raster_decode = controls.raster;
             let count_raster_tiles = use_raster_decode || raster_detour_controller.is_active();
-            let raster_sizing_controls = if controls.raster || raster_detour_controller.is_active()
+            let raster_sizing_controls = if controls.raster
+                || raster_detour_controller.is_active()
+                || controls.prefill_token_range_width.is_some()
+                || controls.decode_layer_range_width.is_some()
             {
                 Some(controls.raster_sizing_controls()?)
             } else {
@@ -883,8 +908,8 @@ mod tests {
     use crate::shared::raster_kernels::transformer::RasterActivationSequence;
     use crate::shared::tensors::raster_tensor_artifacts::insert_activation_sequence_artifact_ref;
     use crate::{
-        embed_input_tokens, finalize_decode_transition, run_decode_select_token,
-        run_decode_transition, run_inference, run_inference_with_controls, run_output_finalize,
+        decode_step_with_mode, embed_input_tokens, finalize_decode_transition,
+        run_decode_select_token, run_inference, run_inference_with_controls, run_output_finalize,
         run_prefill_finalize, run_prefill_prepare_aux, run_prefill_range, run_prompt_prepare,
         AuthenticatedGemmaTokenizer, DecodeState, EmbeddingTable, Gemma4AttentionKind,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
@@ -2879,17 +2904,25 @@ mod tests {
             0
         );
         assert_eq!(
-            checkpoint_name_count(&native_payload, "decode.transition"),
+            checkpoint_name_count(&native_payload, "decode.layer_range"),
             expected_decode_transitions
         );
         assert_eq!(
-            checkpoint_name_count(&detour_payload, "decode.transition"),
+            checkpoint_name_count(&detour_payload, "decode.layer_range"),
+            expected_decode_transitions
+        );
+        assert_eq!(
+            checkpoint_name_count(&native_payload, "decode.transition_finalize"),
+            expected_decode_transitions
+        );
+        assert_eq!(
+            checkpoint_name_count(&detour_payload, "decode.transition_finalize"),
             expected_decode_transitions
         );
         assert!(
             checkpoint_name_count(&native_payload, "decode.finalize") == 0
                 && checkpoint_name_count(&detour_payload, "decode.finalize") == 0,
-            "decode.transition is the routine checkpoint; decode.finalize should not be committed"
+            "decode.transition_finalize is the decode finalization checkpoint; decode.finalize should not be committed"
         );
 
         let native = expect_completed_state(native, "native inference");
@@ -2906,7 +2939,7 @@ mod tests {
         assert_decode_transition_detour_matches_native(
             "decode-transition-detour-trace",
             2,
-            "decode.transition",
+            "decode.layer_range",
             2,
         );
     }
@@ -2916,7 +2949,7 @@ mod tests {
         assert_decode_transition_detour_matches_native(
             "second-decode-transition-detour-trace",
             2,
-            "decode.transition:2",
+            "decode.layer_range:2",
             2,
         );
     }
@@ -2953,7 +2986,7 @@ mod tests {
             &InferenceControls {
                 commit_checkpoints: true,
                 raster_detour: Some(
-                    RasterDetourSpec::parse("decode.transition").expect("detour should parse"),
+                    RasterDetourSpec::parse("decode.layer_range").expect("detour should parse"),
                 ),
                 raster_projection_rows_per_tile: Some(3),
                 raster_attention_kv_rows_per_tile: Some(2),
@@ -2970,7 +3003,42 @@ mod tests {
         assert_checkpoint_payloads_match_except_detour(
             &deterministic_payload,
             &raster_payload,
-            "decode.transition",
+            "decode.layer_range",
+        );
+    }
+
+    #[test]
+    fn deterministic_cpu_decode_layer_range_width_splits_checkpoints() {
+        let _trace_guard = trace_test_lock().lock().expect("trace test lock");
+        let _trace_dir = TraceDirGuard::new("decode-layer-range-width");
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let mut transformer_fixture = deterministic_no_ple_model_fixture();
+        transformer_fixture
+            .model
+            .layers
+            .push(transformer_fixture.model.layers[0].clone());
+        let request = deterministic_prompt_request(1);
+
+        crate::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                commit_checkpoints: true,
+                decode_layer_range_width: Some(1),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("native deterministic inference should complete");
+        let payload = crate::trace::take_completed_checkpoint_payload_for_tests();
+
+        assert_eq!(checkpoint_name_count(&payload, "decode.layer_range"), 2);
+        assert_eq!(
+            checkpoint_name_count(&payload, "decode.transition_finalize"),
+            1
         );
     }
 
@@ -2988,7 +3056,7 @@ mod tests {
             &transformer_fixture.model,
             &InferenceControls {
                 raster_detour: Some(
-                    RasterDetourSpec::parse("decode.transition:2").expect("detour should parse"),
+                    RasterDetourSpec::parse("decode.layer_range:2").expect("detour should parse"),
                 ),
                 ..InferenceControls::default()
             },
@@ -2997,7 +3065,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("selective raster detour target decode.transition:2 was not reached"));
+            .contains("selective raster detour target decode.layer_range:2 was not reached"));
     }
 
     #[test]
@@ -3026,7 +3094,7 @@ mod tests {
             &transformer_model,
             &InferenceControls {
                 raster_detour: Some(
-                    RasterDetourSpec::parse("decode.transition").expect("detour should parse"),
+                    RasterDetourSpec::parse("decode.layer_range").expect("detour should parse"),
                 ),
                 ..InferenceControls::default()
             },
@@ -3052,7 +3120,7 @@ mod tests {
             &transformer_fixture.model,
             &InferenceControls {
                 raster_detour: Some(
-                    RasterDetourSpec::parse("decode.transition").expect("detour should parse"),
+                    RasterDetourSpec::parse("decode.layer_range").expect("detour should parse"),
                 ),
                 raster_projection_rows_per_tile: Some(0),
                 ..InferenceControls::default()
@@ -3079,7 +3147,7 @@ mod tests {
             &transformer_fixture.model,
             &InferenceControls {
                 raster_detour: Some(
-                    RasterDetourSpec::parse("decode.transition").expect("detour should parse"),
+                    RasterDetourSpec::parse("decode.layer_range").expect("detour should parse"),
                 ),
                 raster_attention_kv_rows_per_tile: Some(0),
                 ..InferenceControls::default()
@@ -3090,6 +3158,46 @@ mod tests {
         assert!(error
             .to_string()
             .contains("raster attention KV rows per tile must be greater than zero"));
+    }
+
+    #[test]
+    fn run_inference_decode_transition_finalize_detour_matches_native() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let native = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls::default(),
+        )
+        .expect("native inference should complete");
+
+        let detour = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse("decode.transition_finalize")
+                        .expect("detour should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect("decode transition finalize detour should complete");
+
+        let native = expect_completed_state(native, "native inference");
+        let detour = expect_completed_state(detour, "decode transition finalize detour");
+        assert_output_decode_matches(&native, &detour);
+        assert!(
+            detour.raster_tile_invocations.unwrap_or(0) > 0,
+            "finalize detour should execute raster tiles"
+        );
     }
 
     #[cfg(feature = "unchecked-raster-integrity")]
@@ -3111,7 +3219,7 @@ mod tests {
                     &transformer_fixture.model,
                     &InferenceControls {
                         raster_detour: Some(
-                            RasterDetourSpec::parse("decode.transition")
+                            RasterDetourSpec::parse("decode.layer_range")
                                 .expect("detour should parse"),
                         ),
                         raster_projection_rows_per_tile: Some(1),
@@ -3203,6 +3311,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -3261,6 +3370,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -3549,6 +3659,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -3611,6 +3722,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -3673,6 +3785,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -3730,6 +3843,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -3783,6 +3897,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -3841,6 +3956,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -3894,7 +4010,7 @@ mod tests {
             &transformer_fixture.model,
             &InferenceControls {
                 commit_checkpoints: false,
-                terminal_checkpoint: Some("decode.transition".to_string()),
+                terminal_checkpoint: Some("decode.transition_finalize".to_string()),
                 raster: true,
                 raster_detour: None,
                 raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
@@ -3903,16 +4019,17 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
             },
         )
-        .expect("raster inference should pause after decode transition");
+        .expect("raster inference should pause after decode transition finalize");
 
         match paused {
             InferenceRunOutcome::Paused(state) => {
-                assert_eq!(state.terminal_checkpoint_id, "decode.transition");
+                assert_eq!(state.terminal_checkpoint_id, "decode.transition_finalize");
                 let output_decode = state
                     .output_decode
                     .expect("partial output decode state should be present");
@@ -3925,6 +4042,31 @@ mod tests {
                 panic!("expected paused raster inference")
             }
         }
+    }
+
+    #[test]
+    fn run_inference_rejects_decode_layer_range_terminal_checkpoint() {
+        let tokenizer = test_tokenizer();
+        let model = test_model_spec();
+        let transformer_fixture = deterministic_no_ple_model_fixture();
+        let request = deterministic_prompt_request(1);
+
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                terminal_checkpoint: Some("decode.layer_range".to_string()),
+                decode_layer_range_width: Some(1),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("decode layer range terminal checkpoint should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("terminal checkpoint decode.layer_range is not supported"));
     }
 
     #[test]
@@ -3970,6 +4112,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4025,6 +4168,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4080,6 +4224,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4127,6 +4272,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4172,6 +4318,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4217,6 +4364,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4262,6 +4410,7 @@ mod tests {
                 raster_sequence_rows_per_tile: Some(0),
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4307,6 +4456,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: Some(0),
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4385,6 +4535,7 @@ mod tests {
                 raster_sequence_rows_per_tile: None,
                 raster_head_rows_per_tile: None,
                 prefill_token_range_width: None,
+                decode_layer_range_width: None,
                 raster_tokenizer_bpe_pairs_per_tile: None,
                 raster_tokenizer_bpe_pieces_per_tile: None,
                 raster_output_byte_flush_bytes_per_tile: None,
@@ -4555,10 +4706,11 @@ mod tests {
             run_decode_select_token(&mut decode_state, 1, InferenceExecutionMode::Fp32)
                 .expect("decode select token");
         let next_token = next_token.expect("should select a token");
-        let decode_transition = run_decode_transition(
+        let decode_transition = decode_step_with_mode(
             std::mem::take(&mut decode_state.transformer_decode_state),
             next_token,
             &transformer_model,
+            InferenceExecutionMode::Fp32,
         )
         .expect("decode transition");
         decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());

@@ -176,7 +176,7 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
     )?;
 
     let mut materialized =
-        crate::decode_transition::materialize_decode_state_from_raster_state_for_trace(
+        crate::decode_layer_range::materialize_decode_state_from_raster_state_for_trace(
             &next_state,
         )?;
     materialized.current_logits = original_current_logits;
@@ -194,7 +194,7 @@ pub(crate) fn trace_raster_checkpoint_from_state(
     max_new_tokens: usize,
 ) -> Result<()> {
     let decode_state =
-        crate::decode_transition::materialize_decode_state_from_raster_state_for_trace(
+        crate::decode_layer_range::materialize_decode_state_from_raster_state_for_trace(
             decode_state,
         )?;
     crate::trace::trace_checkpoint(
@@ -262,26 +262,26 @@ fn prepare_raster_decode_loop_state_from_native(
         format!("decode.select_token.detour.position_{position}.step_{generated_count}");
     let artifact_store_roots = ArtifactIo::export_store_roots();
     let (artifact_store_roots, full_token_ids_ref) =
-        crate::decode_transition::insert_decode_token_ids_artifact_with_roots(
+        crate::decode_layer_range::insert_decode_token_ids_artifact_with_roots(
             artifact_store_roots,
             format!("{source_prefix}.input.full_token_ids"),
             &decode_state.full_token_ids,
         )?;
     let (artifact_store_roots, generated_token_ids_ref) =
-        crate::decode_transition::insert_decode_token_ids_artifact_with_roots(
+        crate::decode_layer_range::insert_decode_token_ids_artifact_with_roots(
             artifact_store_roots,
             format!("{source_prefix}.input.generated_token_ids"),
             &decode_state.generated_token_ids,
         )?;
     let (artifact_store_roots, logits_ref, logit_count) =
-        crate::decode_transition::insert_decode_logits_artifact_with_roots(
+        crate::decode_layer_range::insert_decode_logits_artifact_with_roots(
             artifact_store_roots,
             format!("{source_prefix}.input.logits"),
             decode_state,
             "raster decode select token",
         )?;
     let (artifact_store_roots, layer_caches) =
-        crate::decode_transition::insert_decode_layer_cache_refs_from_native(
+        crate::decode_layer_range::insert_decode_layer_cache_refs_from_native(
             artifact_store_roots,
             &decode_state.transformer_decode_state.layer_caches,
             &format!("{source_prefix}.input.layer_cache"),
@@ -311,19 +311,19 @@ fn prepare_raster_decode_select_input_roots(
     let generated_count = decode_state.generated_token_ids.len();
     let source_prefix = format!("decode.select_token.position_{position}.step_{generated_count}");
     let (artifact_store_roots, full_token_ids_ref) =
-        crate::decode_transition::insert_decode_token_ids_artifact_with_roots(
+        crate::decode_layer_range::insert_decode_token_ids_artifact_with_roots(
             artifact_store_roots,
             format!("{source_prefix}.input.full_token_ids"),
             &decode_state.full_token_ids,
         )?;
     let (artifact_store_roots, generated_token_ids_ref) =
-        crate::decode_transition::insert_decode_token_ids_artifact_with_roots(
+        crate::decode_layer_range::insert_decode_token_ids_artifact_with_roots(
             artifact_store_roots,
             format!("{source_prefix}.input.generated_token_ids"),
             &decode_state.generated_token_ids,
         )?;
     let (artifact_store_roots, logits_ref, _) =
-        crate::decode_transition::insert_decode_logits_artifact_with_roots(
+        crate::decode_layer_range::insert_decode_logits_artifact_with_roots(
             artifact_store_roots,
             format!("{source_prefix}.input.logits"),
             decode_state,
