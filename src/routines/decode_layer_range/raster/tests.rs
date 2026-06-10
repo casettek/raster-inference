@@ -772,7 +772,8 @@ fn det_num_matrix(rows: Vec<Vec<Wgt>>) -> DetNumMatrix {
         values: rows
             .into_iter()
             .flat_map(|row| row.into_iter().map(|value| value.to_bits()))
-            .collect(),
+            .collect::<Vec<_>>()
+            .into(),
     }
 }
 

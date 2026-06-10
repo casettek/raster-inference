@@ -1,19 +1,71 @@
 use super::types::{Acc, Act, Wgt, ACC_FRACTIONAL_BITS, ACT_FRACTIONAL_BITS};
 
+// Debug-only guard marking a single-track deterministic region: any f32<->Act
+// conversion inside the region trips a debug assertion, enforcing the spec v1
+// rule that deterministic mode performs no f32 work downstream of weight and
+// input load.
+#[cfg(debug_assertions)]
+thread_local! {
+    static DET_SINGLE_TRACK_REGION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard for the single-track deterministic region (debug builds only).
+pub struct DetSingleTrackRegionGuard {
+    #[cfg(debug_assertions)]
+    previous: bool,
+}
+
+/// Enters a single-track deterministic region; f32↔Act conversions on this
+/// thread debug-assert until the returned guard is dropped.
+pub fn enter_det_single_track_region() -> DetSingleTrackRegionGuard {
+    #[cfg(debug_assertions)]
+    {
+        let previous = DET_SINGLE_TRACK_REGION.with(|region| region.replace(true));
+        DetSingleTrackRegionGuard { previous }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        DetSingleTrackRegionGuard {}
+    }
+}
+
+impl Drop for DetSingleTrackRegionGuard {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        DET_SINGLE_TRACK_REGION.with(|region| region.set(self.previous));
+    }
+}
+
+#[cfg(debug_assertions)]
+fn assert_outside_det_single_track_region(operation: &str) {
+    DET_SINGLE_TRACK_REGION.with(|region| {
+        debug_assert!(
+            !region.get(),
+            "{operation} is forbidden inside a single-track deterministic region"
+        );
+    });
+}
+
+#[cfg(not(debug_assertions))]
+fn assert_outside_det_single_track_region(_operation: &str) {}
+
 /// Converts a finite FP32 value into the canonical `det_num` v0 Q16.16 activation.
 pub fn f32_to_act(x: f32) -> Act {
+    assert_outside_det_single_track_region("f32_to_act");
     assert!(x.is_finite(), "f32_to_act requires a finite source value");
     Act::from_bits(f32_to_q16_16_bits(x))
 }
 
 /// Converts a finite FP32 value into the canonical `det_num` v0 Q32.32 accumulator.
 pub fn f32_to_acc(x: f32) -> Acc {
+    assert_outside_det_single_track_region("f32_to_acc");
     assert!(x.is_finite(), "f32_to_acc requires a finite source value");
     Acc::from_bits(f32_to_q32_32_bits(x))
 }
 
 /// Converts a canonical Q16.16 activation back into FP32 for host-side APIs.
 pub fn act_to_f32(x: Act) -> f32 {
+    assert_outside_det_single_track_region("act_to_f32");
     x.to_bits() as f32 / (1_u32 << ACT_FRACTIONAL_BITS) as f32
 }
 

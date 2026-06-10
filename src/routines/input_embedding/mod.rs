@@ -52,16 +52,13 @@ pub fn materialize_input_embedding_refs_for_trace(
 ) -> Result<ActivationSequence> {
     let sequence = raster::utils::materialize_sequence(&refs.embedded_prompt_activations_ref)?;
     let internal = raster::utils::internal_sequence_from_raster(sequence);
-    let activations = internal.clone_f32();
     let det_activations_sha256 = internal
         .det_values()
         .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
-    let mut activation_sequence = ActivationSequence::from_internal(
+    Ok(ActivationSequence::from_det_internal(
         internal,
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(&activations),
-    );
-    activation_sequence.det_activations_sha256 = det_activations_sha256;
-    Ok(activation_sequence)
+        det_activations_sha256,
+    ))
 }
 
 pub fn format_native_input_embedding_as_raster_checkpoint_for_trace(
@@ -117,14 +114,21 @@ fn input_embedding_checkpoint_payload(
         })
     });
 
-    json!({
+    let mut payload = json!({
         "prompt_token_ids": prompt_token_ids,
         "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
-        "embedded_prompt_activations": token_embeddings.activations.clone(),
-        "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
         "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
         "raster": raster_payload,
-    })
+    });
+    if let Some(embedded_prompt_activations_sha256) = token_embeddings.activations_sha256.as_ref()
+    {
+        // Deterministic-mode payloads carry only canonical commitments
+        // (spec v1); fp32 mode keeps the compatibility fields.
+        payload["embedded_prompt_activations"] = json!(token_embeddings.activations.clone());
+        payload["embedded_prompt_activations_sha256"] =
+            json!(embedded_prompt_activations_sha256.clone());
+    }
+    payload
 }
 
 #[cfg(test)]

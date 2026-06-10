@@ -341,16 +341,18 @@ fn deterministic_mode_matches_fp32_path_on_representable_fixture() {
         det_state.output_decode.generated_text,
         fp32_state.output_decode.generated_text
     );
-    assert_eq!(
-        det_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256,
-        fp32_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256
-    );
+    // Spec v1: deterministic runs no longer emit f32 compatibility
+    // commitments; parity is asserted over generated tokens below.
+    assert!(det_state
+        .transformer_state_transition
+        .prefill_logits
+        .final_logits_sha256
+        .is_none());
+    assert!(det_state
+        .transformer_state_transition
+        .prefill_logits
+        .det_final_logits_sha256
+        .is_some());
     assert_eq!(
         det_state.output_decode.generated_token_ids_sha256,
         fp32_state.output_decode.generated_token_ids_sha256
@@ -526,16 +528,13 @@ fn deterministic_mode_exercises_softcap_sensitive_fixture() {
         det_state.output_decode.generated_text,
         fp32_state.output_decode.generated_text
     );
-    assert_ne!(
-        det_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256,
-        fp32_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256
-    );
+    // Spec v1: deterministic runs no longer emit f32 compatibility
+    // commitments.
+    assert!(det_state
+        .transformer_state_transition
+        .prefill_logits
+        .final_logits_sha256
+        .is_none());
     assert!(fp32_state
         .transformer_state_transition
         .prefill_logits
@@ -545,9 +544,8 @@ fn deterministic_mode_exercises_softcap_sensitive_fixture() {
     assert!(det_state
         .transformer_state_transition
         .prefill_logits
-        .logits
-        .iter()
-        .any(|value| *value != 0.0));
+        .det_final_logits_sha256
+        .is_some());
 }
 
 #[test]
@@ -756,9 +754,8 @@ fn deterministic_mode_matches_fp32_path_on_nonzero_ple_fixture() {
     assert!(det_state
         .transformer_state_transition
         .prefill_logits
-        .logits
-        .iter()
-        .any(|value| *value != 0.0));
+        .det_final_logits_sha256
+        .is_some());
     assert_eq!(
         det_state.output_decode.generated_token_ids_sha256,
         fp32_state.output_decode.generated_token_ids_sha256
@@ -934,16 +931,13 @@ fn deterministic_mode_exercises_rope_sensitive_fixture() {
         det_state.output_decode.generated_text,
         fp32_state.output_decode.generated_text
     );
-    assert_ne!(
-        det_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256,
-        fp32_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256
-    );
+    // Spec v1: deterministic runs no longer emit f32 compatibility
+    // commitments.
+    assert!(det_state
+        .transformer_state_transition
+        .prefill_logits
+        .final_logits_sha256
+        .is_none());
 }
 
 #[test]
@@ -1111,22 +1105,18 @@ fn deterministic_mode_exercises_attention_sensitive_fixture() {
         det_state.output_decode.generated_text,
         fp32_state.output_decode.generated_text
     );
-    assert_ne!(
-        det_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256,
-        fp32_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256
-    );
+    // Spec v1: deterministic runs no longer emit f32 compatibility
+    // commitments.
     assert!(det_state
         .transformer_state_transition
         .prefill_logits
-        .logits
-        .iter()
-        .any(|value| *value != 0.0));
+        .final_logits_sha256
+        .is_none());
+    assert!(det_state
+        .transformer_state_transition
+        .prefill_logits
+        .det_final_logits_sha256
+        .is_some());
 }
 
 #[test]
@@ -1290,16 +1280,13 @@ fn deterministic_mode_exercises_mlp_sensitive_fixture() {
         det_state.output_decode.generated_token_count,
         fp32_state.output_decode.generated_token_count
     );
-    assert_ne!(
-        det_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256,
-        fp32_state
-            .transformer_state_transition
-            .prefill_logits
-            .final_logits_sha256
-    );
+    // Spec v1: deterministic runs no longer emit f32 compatibility
+    // commitments.
+    assert!(det_state
+        .transformer_state_transition
+        .prefill_logits
+        .final_logits_sha256
+        .is_none());
     assert!(fp32_state
         .transformer_state_transition
         .prefill_logits
@@ -1309,9 +1296,8 @@ fn deterministic_mode_exercises_mlp_sensitive_fixture() {
     assert!(det_state
         .transformer_state_transition
         .prefill_logits
-        .logits
-        .iter()
-        .any(|value| *value != 0.0));
+        .det_final_logits_sha256
+        .is_some());
 }
 
 fn create_temp_dir(label: &str) -> PathBuf {

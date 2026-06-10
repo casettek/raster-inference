@@ -1,11 +1,9 @@
 use anyhow::{bail, Result};
-use serde_json::json;
 
 use crate::prefill_finalize::raster::{RasterPrefillFinalizeRefs, PREFILL_LOGITS_ARTIFACT_NAME};
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
-    ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerDecodeState,
-    TransformerPrefillResult, TransformerStateTransitionState,
+    ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerPrefillResult,
 };
 use crate::shared::tensors::raster_tensor_artifacts::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
@@ -25,13 +23,12 @@ pub fn build_prefill_result_from_root_refs(
             &layer_refs,
         )?;
     let det_logits = materialize_prefill_logits_from_roots(roots, &refs.logits_ref)?;
-    let internal_logits = InternalLogits::from_det_values(det_logits.clone());
-    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
-        internal_logits.as_f32_slice(),
-    );
-    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
+    // Deterministic logits carry only the canonical commitment (spec v1).
+    let prefill_logits = PrefillLogits::from_det_internal(
+        InternalLogits::from_det_values_only(det_logits.clone()),
+        Some(
+            crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
+        ),
     );
 
     build_prefill_result(
@@ -48,33 +45,14 @@ pub fn build_prefill_result(
     layer_caches: Vec<LayerKvCache>,
     prefill_logits: PrefillLogits,
 ) -> Result<TransformerPrefillResult> {
-    crate::trace::trace_checkpoint(
-        "prefill.finalize",
-        &json!({
-            "final_hidden_states": final_hidden_states.activations.clone(),
-            "final_hidden_states_sha256": final_hidden_states.activations_sha256.clone(),
-            "det_final_hidden_states_sha256": final_hidden_states.det_activations_sha256.clone(),
-            "prefill_logits": prefill_logits.logits.clone(),
-            "prefill_logits_sha256": prefill_logits.final_logits_sha256.clone(),
-            "det_prefill_logits_sha256": prefill_logits.det_final_logits_sha256.clone(),
-            "decode_position": prompt_token_count,
-            "decode_token_count": prompt_token_count,
-            "layer_caches": crate::trace::serialize_layer_caches(&layer_caches),
-            "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(&layer_caches),
-        }),
-    );
-
-    Ok(TransformerPrefillResult {
-        transformer_decode_state: TransformerDecodeState {
-            layer_caches,
-            position: prompt_token_count,
-            token_count: prompt_token_count,
-        },
-        transformer_state: TransformerStateTransitionState {
-            activation_states: vec![final_hidden_states],
-            prefill_logits,
-        },
-    })
+    // Delegates to the shared checkpoint/result builder so native and raster
+    // prefill.finalize payloads stay in lockstep.
+    crate::prefill_finalize::native::build_prefill_result(
+        prompt_token_count,
+        final_hidden_states,
+        layer_caches,
+        prefill_logits,
+    )
 }
 
 fn materialize_prefill_logits_from_roots(

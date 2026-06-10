@@ -27,7 +27,11 @@ use crate::{
 pub struct InputEmbeddingState {
     #[serde(flatten)]
     pub prompt_preparation: PromptPreparationState,
-    pub embedded_prompt_activations_sha256: String,
+    /// f32 compatibility commitment. Always `Some` in fp32 mode; `None` for
+    /// deterministic-mode runs (spec v1 retires f32 compatibility commitments
+    /// on the deterministic path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_prompt_activations_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub det_embedded_prompt_activations_sha256: Option<String>,
 }
@@ -4632,15 +4636,17 @@ mod tests {
         assert_eq!(
             inference_state
                 .input_embedding
-                .embedded_prompt_activations_sha256,
-            "embed-digest"
+                .embedded_prompt_activations_sha256
+                .as_deref(),
+            Some("embed-digest")
         );
         assert_eq!(
             inference_state
                 .transformer_state_transition
                 .prefill_logits
-                .final_logits_sha256,
-            "logits-digest"
+                .final_logits_sha256
+                .as_deref(),
+            Some("logits-digest")
         );
         assert_eq!(inference_state.output_decode.generated_text, "hello");
     }
@@ -4905,7 +4911,7 @@ mod tests {
             det_weight: Some(Arc::new(DetNumMatrix {
                 rows: 3,
                 cols: 4,
-                values: vec![Wgt::from_num(0.0).to_bits(); 12],
+                values: vec![Wgt::from_num(0.0).to_bits(); 12].into(),
             })),
         };
         model.rms_norm_eps_det = Some(f32_to_acc(model.rms_norm_eps));

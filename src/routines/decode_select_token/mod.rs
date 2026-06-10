@@ -364,20 +364,29 @@ fn decode_select_checkpoint_state(
     selected_next_token: u32,
     max_new_tokens: usize,
 ) -> Result<Value> {
-    Ok(json!({
+    // Deterministic-mode payloads carry only canonical commitments (spec v1);
+    // fp32 mode keeps the compatibility fields.
+    let deterministic = decode_state.clone_internal_logits().det_values().is_some();
+    let mut payload = json!({
         "full_token_ids": decode_state.full_token_ids.clone(),
         "full_token_ids_sha256": crate::trace::sha256_hex(&decode_state.full_token_ids),
         "generated_token_ids": decode_state.generated_token_ids.clone(),
         "generated_token_ids_sha256": crate::output_finalize::native::build_output_decode_commitment(&decode_state.generated_token_ids)?,
-        "current_logits": decode_state.current_logits.clone(),
-        "current_logits_sha256": crate::trace::sha256_hex(&decode_state.current_logits),
         "det_current_logits_sha256": current_det_logits_commitment(decode_state),
         "selected_next_token": selected_next_token,
         "decode_position": decode_state.transformer_decode_state.position,
         "decode_token_count": decode_state.transformer_decode_state.token_count,
-        "layer_caches": crate::trace::serialize_layer_caches(&decode_state.transformer_decode_state.layer_caches),
         "max_new_tokens": max_new_tokens,
-    }))
+    });
+    if !deterministic {
+        payload["current_logits"] = json!(decode_state.current_logits.clone());
+        payload["current_logits_sha256"] =
+            json!(crate::trace::sha256_hex(&decode_state.current_logits));
+        payload["layer_caches"] = json!(crate::trace::serialize_layer_caches(
+            &decode_state.transformer_decode_state.layer_caches
+        ));
+    }
+    Ok(payload)
 }
 
 fn current_det_logits_commitment(decode_state: &DecodeState) -> Option<String> {

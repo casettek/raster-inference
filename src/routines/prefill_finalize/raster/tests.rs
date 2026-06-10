@@ -766,24 +766,14 @@ fn run_ref_backed_finalize_with_roots(
 }
 
 fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {
-    let internal = InternalActivationSequence::from_det_values(rows.clone());
-    let mut sequence = ActivationSequence::from_internal(
-        internal,
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(
-            &rows
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .copied()
-                        .map(crate::shared::numerics::det_num::act_to_f32)
-                        .collect()
-                })
-                .collect::<Vec<Vec<_>>>(),
-        ),
+    // Single-track deterministic fixture: canonical commitment only.
+    let det_activations_sha256 = Some(
+        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&rows),
     );
-    sequence.det_activations_sha256 =
-        Some(crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&rows));
-    sequence
+    ActivationSequence::from_det_internal(
+        InternalActivationSequence::from_det_values_only(rows),
+        det_activations_sha256,
+    )
 }
 
 fn insert_activation_ref(
@@ -873,7 +863,7 @@ fn untied_model(with_softcap: bool) -> Gemma4TransformerModel {
                     Wgt::from_num(0.0).to_bits(),
                     Wgt::from_num(0.0).to_bits(),
                     Wgt::from_num(1.0).to_bits(),
-                ],
+                ].into(),
             })),
         },
         None,

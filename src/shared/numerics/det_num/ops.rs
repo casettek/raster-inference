@@ -86,36 +86,48 @@ pub fn div_acc_by_u32(value: Acc, divisor: u32) -> Acc {
 
 /// Computes deterministic weighted RMSNorm over Q16.16 activations.
 pub fn rms_norm(input: &[Act], weight: &[Wgt], eps: Acc) -> Vec<Act> {
+    let mut output = input.to_vec();
+    rms_norm_in_place(&mut output, weight, eps);
+    output
+}
+
+/// In-place twin of [`rms_norm`]; identical canonical arithmetic and order.
+pub fn rms_norm_in_place(values: &mut [Act], weight: &[Wgt], eps: Acc) {
     assert!(
-        !input.is_empty(),
+        !values.is_empty(),
         "rms_norm requires a non-empty input slice"
     );
     assert_eq!(
-        input.len(),
+        values.len(),
         weight.len(),
         "rms_norm requires input and weight slices to have matching widths"
     );
 
-    let scale = rms_norm_scale(input, eps);
-    input
-        .iter()
-        .zip(weight)
-        .map(|(value, norm_weight)| {
-            let scaled = mul_sat(*value, scale);
-            mul_sat(scaled, Act::from_bits(norm_weight.to_bits()))
-        })
-        .collect()
+    let scale = rms_norm_scale(values, eps);
+    for (value, norm_weight) in values.iter_mut().zip(weight) {
+        let scaled = mul_sat(*value, scale);
+        *value = mul_sat(scaled, Act::from_bits(norm_weight.to_bits()));
+    }
 }
 
 /// Computes deterministic weightless RMS normalization over Q16.16 activations.
 pub fn value_rms_norm(input: &[Act], eps: Acc) -> Vec<Act> {
+    let mut output = input.to_vec();
+    value_rms_norm_in_place(&mut output, eps);
+    output
+}
+
+/// In-place twin of [`value_rms_norm`]; identical canonical arithmetic and order.
+pub fn value_rms_norm_in_place(values: &mut [Act], eps: Acc) {
     assert!(
-        !input.is_empty(),
+        !values.is_empty(),
         "value_rms_norm requires a non-empty input slice"
     );
 
-    let scale = rms_norm_scale(input, eps);
-    input.iter().map(|value| mul_sat(*value, scale)).collect()
+    let scale = rms_norm_scale(values, eps);
+    for value in values.iter_mut() {
+        *value = mul_sat(*value, scale);
+    }
 }
 
 /// Rotates the RoPE prefix of a row under the deterministic fixed-point contract.
@@ -126,8 +138,25 @@ pub fn rope_rotate_pairs(
     base: Acc,
     position: usize,
 ) -> Vec<Act> {
+    let mut output = input.to_vec();
+    rope_rotate_pairs_in_place(&mut output, rotary_dim, freq_base_dim, base, position);
+    output
+}
+
+/// In-place twin of [`rope_rotate_pairs`]; identical canonical arithmetic.
+///
+/// Each rotated pair `(dim_idx, dim_idx + half_dim)` is read before it is
+/// written and pairs are disjoint, so in-place rotation matches the
+/// copy-then-rotate result exactly.
+pub fn rope_rotate_pairs_in_place(
+    values: &mut [Act],
+    rotary_dim: usize,
+    freq_base_dim: usize,
+    base: Acc,
+    position: usize,
+) {
     if rotary_dim == 0 {
-        return input.to_vec();
+        return;
     }
 
     assert!(
@@ -135,7 +164,7 @@ pub fn rope_rotate_pairs(
         "rope_rotate_pairs requires an even rotary_dim"
     );
     assert!(
-        rotary_dim <= input.len(),
+        rotary_dim <= values.len(),
         "rope_rotate_pairs requires rotary_dim to fit within the input width"
     );
     assert!(
@@ -148,25 +177,22 @@ pub fn rope_rotate_pairs(
     );
 
     if position == 0 {
-        return input.to_vec();
+        return;
     }
 
     let half_dim = rotary_dim / 2;
-    let mut output = input.to_vec();
     let mut inv_frequency = one_acc();
     let frequency_step = rope_frequency_step(base, freq_base_dim);
 
     for dim_idx in 0..half_dim {
         let angle = mul_usize_by_acc(position, inv_frequency);
         let (cos, sin) = sin_cos_acc(angle);
-        let lhs = input[dim_idx];
-        let rhs = input[dim_idx + half_dim];
-        output[dim_idx] = sub_sat(mul_sat(lhs, cos), mul_sat(rhs, sin));
-        output[dim_idx + half_dim] = add_sat(mul_sat(rhs, cos), mul_sat(lhs, sin));
+        let lhs = values[dim_idx];
+        let rhs = values[dim_idx + half_dim];
+        values[dim_idx] = sub_sat(mul_sat(lhs, cos), mul_sat(rhs, sin));
+        values[dim_idx + half_dim] = add_sat(mul_sat(rhs, cos), mul_sat(lhs, sin));
         inv_frequency = acc_mul(inv_frequency, frequency_step);
     }
-
-    output
 }
 
 /// Computes a deterministic q·k attention score with widening accumulation.
@@ -192,6 +218,16 @@ pub fn attention_score(query: &[Act], key: &[Act]) -> Act {
 
 /// Computes deterministic softmax weights over attention logits.
 pub fn attention_softmax(logits: &[Act]) -> Vec<Act> {
+    let mut exp_scratch = Vec::new();
+    let mut weights = Vec::new();
+    attention_softmax_into(logits, &mut exp_scratch, &mut weights);
+    weights
+}
+
+/// Scratch-buffer twin of [`attention_softmax`]; identical canonical
+/// arithmetic and order. `exp_scratch` and `weights` are cleared and refilled,
+/// so callers can reuse capacity across invocations without reallocating.
+pub fn attention_softmax_into(logits: &[Act], exp_scratch: &mut Vec<Acc>, weights: &mut Vec<Act>) {
     assert!(
         !logits.is_empty(),
         "attention_softmax requires a non-empty logits slice"
@@ -199,23 +235,26 @@ pub fn attention_softmax(logits: &[Act]) -> Vec<Act> {
 
     let max_index = argmax_first(logits);
     let max_logit = logits[max_index];
-    let exp_terms = logits
-        .iter()
-        .map(|logit| attention_softmax_exp_term(*logit, max_logit))
-        .collect::<Vec<_>>();
-    let sum_exp = exp_terms
+    exp_scratch.clear();
+    exp_scratch.extend(
+        logits
+            .iter()
+            .map(|logit| attention_softmax_exp_term(*logit, max_logit)),
+    );
+    let sum_exp = exp_scratch
         .iter()
         .copied()
         .fold(Acc::from_bits(0), acc_add_sat);
 
-    let mut weights = exp_terms
-        .iter()
-        .map(|term| attention_softmax_raw_weight(*term, sum_exp))
-        .collect::<Vec<_>>();
+    weights.clear();
+    weights.extend(
+        exp_scratch
+            .iter()
+            .map(|term| attention_softmax_raw_weight(*term, sum_exp)),
+    );
     let summed_weights = weights.iter().copied().fold(Act::from_bits(0), add_sat);
     let residual = attention_softmax_residual(summed_weights);
     weights[max_index] = add_sat(weights[max_index], residual);
-    weights
 }
 
 /// Computes the canonical exp term for one logit after shifting by the softmax max.
@@ -257,17 +296,54 @@ pub fn attention_weighted_sum(weights: &[Act], value_rows: &[Vec<Act>]) -> Vec<A
         );
     }
 
-    (0..width)
-        .map(|dim_idx| {
-            let acc_bits = weights
-                .iter()
-                .zip(value_rows)
-                .fold(0_i64, |acc_bits, (weight, row)| {
-                    mac_bits(acc_bits, row[dim_idx].to_bits(), weight.to_bits())
-                });
-            requantize(Acc::from_bits(acc_bits))
-        })
-        .collect()
+    let mut output = vec![Act::from_bits(0); width];
+    attention_weighted_sum_core(weights, |row_idx| &value_rows[row_idx], width, &mut output);
+    output
+}
+
+/// Flat twin of [`attention_weighted_sum`]: `value_rows` is `weights.len()`
+/// contiguous rows of `width` values. Writes into `output` (length `width`)
+/// with identical canonical MAC order to the nested variant.
+pub fn attention_weighted_sum_flat_into(
+    weights: &[Act],
+    value_rows: &[Act],
+    width: usize,
+    output: &mut [Act],
+) {
+    assert!(
+        !weights.is_empty(),
+        "attention_weighted_sum requires a non-empty weights slice"
+    );
+    assert_eq!(
+        weights.len() * width,
+        value_rows.len(),
+        "attention_weighted_sum requires matching weight and value row counts"
+    );
+    assert_eq!(
+        output.len(),
+        width,
+        "attention_weighted_sum output width mismatch"
+    );
+
+    attention_weighted_sum_core(
+        weights,
+        |row_idx| &value_rows[row_idx * width..(row_idx + 1) * width],
+        width,
+        output,
+    );
+}
+
+fn attention_weighted_sum_core<'a, F>(weights: &[Act], row_at: F, width: usize, output: &mut [Act])
+where
+    F: Fn(usize) -> &'a [Act],
+{
+    for (dim_idx, out) in output.iter_mut().enumerate().take(width) {
+        let mut acc_bits = 0_i64;
+        for (row_idx, weight) in weights.iter().enumerate() {
+            acc_bits = mac_bits(acc_bits, row_at(row_idx)[dim_idx].to_bits(), weight.to_bits());
+        }
+        *out = requantize(Acc::from_bits(acc_bits));
+    }
 }
 
 /// Materializes deterministic tanh over a canonical activation input.

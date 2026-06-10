@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::numerics::det_num::{act_to_f32, f32_to_act, f32_to_wgt, Acc, Act, Wgt};
+use crate::shared::numerics::det_tensor::DetKvCacheData;
 
 fn default_embedding_scale() -> f32 {
     1.0
@@ -23,11 +24,85 @@ pub struct MatrixF32 {
     pub values: Vec<f32>,
 }
 
+/// Storage for canonical weight payloads: either an owned copy or a borrowed
+/// view into the mmapped `.detwgt` artifact (zero-copy weight loading).
+///
+/// The in-memory representation is not contract surface; both variants expose
+/// the same `&[i32]` payload via `Deref`.
+#[derive(Clone)]
+pub enum DetNumValues {
+    Owned(Vec<i32>),
+    Mmap {
+        map: Arc<Mmap>,
+        /// Byte offset of the payload within the map; 4-byte aligned by
+        /// construction (loaders fall back to `Owned` on misalignment).
+        byte_offset: usize,
+        /// Payload length in i32 elements.
+        len: usize,
+    },
+}
+
+impl DetNumValues {
+    pub fn as_slice(&self) -> &[i32] {
+        match self {
+            Self::Owned(values) => values,
+            Self::Mmap {
+                map,
+                byte_offset,
+                len,
+            } => {
+                let bytes = &map[*byte_offset..*byte_offset + *len * 4];
+                debug_assert_eq!(bytes.as_ptr() as usize % std::mem::align_of::<i32>(), 0);
+                // SAFETY: alignment and bounds are validated at load time; the
+                // payload is encoded as little-endian i32 and this view is
+                // only constructed on little-endian hosts.
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i32, *len) }
+            }
+        }
+    }
+
+    pub fn is_mmap_backed(&self) -> bool {
+        matches!(self, Self::Mmap { .. })
+    }
+}
+
+impl std::ops::Deref for DetNumValues {
+    type Target = [i32];
+
+    fn deref(&self) -> &[i32] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<i32>> for DetNumValues {
+    fn from(values: Vec<i32>) -> Self {
+        Self::Owned(values)
+    }
+}
+
+impl std::fmt::Debug for DetNumValues {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DetNumValues")
+            .field("mmap_backed", &self.is_mmap_backed())
+            .field("values", &self.as_slice())
+            .finish()
+    }
+}
+
+impl PartialEq for DetNumValues {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for DetNumValues {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetNumMatrix {
     pub rows: usize,
     pub cols: usize,
-    pub values: Vec<i32>,
+    pub values: DetNumValues,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +168,11 @@ pub struct ActivationSequence {
     pub activations: Vec<Vec<f32>>,
     #[serde(skip, default)]
     pub(crate) internal: InternalActivationSequence,
-    pub activations_sha256: String,
+    /// f32 compatibility commitment. Always `Some` in fp32 mode; `None` for
+    /// deterministic-mode runs (spec v1 retires f32 compatibility commitments
+    /// on the deterministic path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activations_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub det_activations_sha256: Option<String>,
 }
@@ -106,8 +185,22 @@ impl ActivationSequence {
         Self {
             activations: internal.clone_f32(),
             internal,
-            activations_sha256,
+            activations_sha256: Some(activations_sha256),
             det_activations_sha256: None,
+        }
+    }
+
+    /// Deterministic-mode constructor: canonical commitment only, no f32 view
+    /// commitment.
+    pub(crate) fn from_det_internal(
+        internal: InternalActivationSequence,
+        det_activations_sha256: Option<String>,
+    ) -> Self {
+        Self {
+            activations: internal.clone_f32(),
+            internal,
+            activations_sha256: None,
+            det_activations_sha256,
         }
     }
 
@@ -119,7 +212,10 @@ impl ActivationSequence {
     }
 
     pub(crate) fn clone_internal(&self) -> InternalActivationSequence {
-        if self.internal.as_f32_slice().is_empty() && !self.activations.is_empty() {
+        if self.internal.as_f32_slice().is_empty()
+            && self.internal.det_values().is_none()
+            && !self.activations.is_empty()
+        {
             // Older deserialized payloads only carry the public f32 view.
             return InternalActivationSequence::from_values(self.activations.clone());
         }
@@ -140,8 +236,7 @@ pub struct TransformerStateTransitionState {
 pub struct LayerKvCache {
     pub keys: Vec<VecDeque<Vec<f32>>>,
     pub values: Vec<VecDeque<Vec<f32>>>,
-    pub(crate) det_keys: Option<Vec<VecDeque<Vec<Act>>>>,
-    pub(crate) det_values: Option<Vec<VecDeque<Vec<Act>>>>,
+    pub(crate) det: Option<DetKvCacheData>,
 }
 
 impl LayerKvCache {
@@ -149,8 +244,7 @@ impl LayerKvCache {
         Self {
             keys: vec![VecDeque::new(); num_kv_heads],
             values: vec![VecDeque::new(); num_kv_heads],
-            det_keys: None,
-            det_values: None,
+            det: None,
         }
     }
 
@@ -161,8 +255,7 @@ impl LayerKvCache {
         Self {
             keys,
             values,
-            det_keys: None,
-            det_values: None,
+            det: None,
         }
     }
 
@@ -170,23 +263,48 @@ impl LayerKvCache {
         det_keys: Vec<VecDeque<Vec<Act>>>,
         det_values: Vec<VecDeque<Vec<Act>>>,
     ) -> Self {
+        let nested_keys = det_keys
+            .into_iter()
+            .map(|head| head.into_iter().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let nested_values = det_values
+            .into_iter()
+            .map(|head| head.into_iter().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        Self::from_det_data(DetKvCacheData::from_nested_rows(
+            &nested_keys,
+            &nested_values,
+            0,
+        ))
+    }
+
+    pub(crate) fn from_det_data(det: DetKvCacheData) -> Self {
+        let num_kv_heads = det.num_heads();
         Self {
-            keys: det_heads_to_f32(&det_keys),
-            values: det_heads_to_f32(&det_values),
-            det_keys: Some(det_keys),
-            det_values: Some(det_values),
+            keys: vec![VecDeque::new(); num_kv_heads],
+            values: vec![VecDeque::new(); num_kv_heads],
+            det: Some(det),
         }
     }
 
     pub fn current_len(&self) -> usize {
-        self.keys.first().map(VecDeque::len).unwrap_or(0)
+        match &self.det {
+            Some(det) => det.len(),
+            None => self.keys.first().map(VecDeque::len).unwrap_or(0),
+        }
+    }
+
+    pub(crate) fn det_data(&self) -> Option<&DetKvCacheData> {
+        self.det.as_ref()
+    }
+
+    fn clamped_window(det: &DetKvCacheData, start: usize, len: usize) -> (usize, usize) {
+        let start = start.min(det.len());
+        (start, len.min(det.len() - start))
     }
 
     pub(crate) fn det_key_rows_from(&self, head_idx: usize, start: usize) -> Option<Vec<Vec<Act>>> {
-        self.det_keys
-            .as_ref()
-            .and_then(|heads| heads.get(head_idx))
-            .map(|rows| rows.iter().skip(start).cloned().collect())
+        self.det_key_rows_window(head_idx, start, usize::MAX)
     }
 
     pub(crate) fn det_key_rows_window(
@@ -195,10 +313,14 @@ impl LayerKvCache {
         start: usize,
         len: usize,
     ) -> Option<Vec<Vec<Act>>> {
-        self.det_keys
-            .as_ref()
-            .and_then(|heads| heads.get(head_idx))
-            .map(|rows| rows.iter().skip(start).take(len).cloned().collect())
+        let det = self.det.as_ref()?;
+        let (start, len) = Self::clamped_window(det, start, len);
+        (head_idx < det.num_heads()).then(|| {
+            det.key_window(head_idx, start, len)
+                .chunks(det.head_dim().max(1))
+                .map(<[Act]>::to_vec)
+                .collect()
+        })
     }
 
     pub(crate) fn det_value_rows_from(
@@ -206,10 +328,7 @@ impl LayerKvCache {
         head_idx: usize,
         start: usize,
     ) -> Option<Vec<Vec<Act>>> {
-        self.det_values
-            .as_ref()
-            .and_then(|heads| heads.get(head_idx))
-            .map(|rows| rows.iter().skip(start).cloned().collect())
+        self.det_value_rows_window(head_idx, start, usize::MAX)
     }
 
     pub(crate) fn det_value_rows_window(
@@ -218,22 +337,15 @@ impl LayerKvCache {
         start: usize,
         len: usize,
     ) -> Option<Vec<Vec<Act>>> {
-        self.det_values
-            .as_ref()
-            .and_then(|heads| heads.get(head_idx))
-            .map(|rows| rows.iter().skip(start).take(len).cloned().collect())
-    }
-}
-
-fn det_heads_to_f32(det_heads: &[VecDeque<Vec<Act>>]) -> Vec<VecDeque<Vec<f32>>> {
-    det_heads
-        .iter()
-        .map(|head| {
-            head.iter()
-                .map(|row| row.iter().copied().map(act_to_f32).collect())
+        let det = self.det.as_ref()?;
+        let (start, len) = Self::clamped_window(det, start, len);
+        (head_idx < det.num_heads()).then(|| {
+            det.value_window(head_idx, start, len)
+                .chunks(det.head_dim().max(1))
+                .map(<[Act]>::to_vec)
                 .collect()
         })
-        .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -625,6 +737,14 @@ impl InternalActivationRow {
         }
     }
 
+    /// Single-track deterministic constructor: no f32 mirror is materialized.
+    pub(crate) fn from_det_values_only(det_values: Vec<Act>) -> Self {
+        Self {
+            values: Vec::new(),
+            det_values: Some(det_values),
+        }
+    }
+
     pub(crate) fn as_f32_slice(&self) -> &[f32] {
         &self.values
     }
@@ -662,6 +782,14 @@ impl InternalActivationSequence {
         }
     }
 
+    /// Single-track deterministic constructor: no f32 mirror is materialized.
+    pub(crate) fn from_det_values_only(det_values: Vec<Vec<Act>>) -> Self {
+        Self {
+            values: Vec::new(),
+            det_values: Some(det_values),
+        }
+    }
+
     pub(crate) fn as_f32_slice(&self) -> &[Vec<f32>] {
         &self.values
     }
@@ -675,12 +803,19 @@ impl InternalActivationSequence {
     }
 
     pub(crate) fn last_row(&self) -> Option<InternalActivationRow> {
+        if let Some(det_rows) = self.det_values.as_ref() {
+            let det_values = det_rows.last()?.clone();
+            let values = self.values.last().cloned().unwrap_or_default();
+            return Some(InternalActivationRow {
+                values,
+                det_values: Some(det_values),
+            });
+        }
         let values = self.values.last()?.clone();
-        let det_values = self
-            .det_values
-            .as_ref()
-            .and_then(|rows| rows.last().cloned());
-        Some(InternalActivationRow { values, det_values })
+        Some(InternalActivationRow {
+            values,
+            det_values: None,
+        })
     }
 }
 
@@ -748,6 +883,14 @@ impl InternalLogits {
         }
     }
 
+    /// Single-track deterministic constructor: no f32 mirror is materialized.
+    pub(crate) fn from_det_values_only(det_values: Vec<Act>) -> Self {
+        Self {
+            values: Vec::new(),
+            det_values: Some(det_values),
+        }
+    }
+
     pub(crate) fn as_f32_slice(&self) -> &[f32] {
         &self.values
     }
@@ -767,7 +910,11 @@ pub struct PrefillLogits {
     pub logits: Vec<f32>,
     #[serde(skip, default)]
     pub(crate) internal: InternalLogits,
-    pub final_logits_sha256: String,
+    /// f32 compatibility commitment. Always `Some` in fp32 mode; `None` for
+    /// deterministic-mode runs (spec v1 retires f32 compatibility commitments
+    /// on the deterministic path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_logits_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub det_final_logits_sha256: Option<String>,
 }
@@ -777,13 +924,30 @@ impl PrefillLogits {
         Self {
             logits: internal.clone_f32(),
             internal,
-            final_logits_sha256,
+            final_logits_sha256: Some(final_logits_sha256),
             det_final_logits_sha256: None,
         }
     }
 
+    /// Deterministic-mode constructor: canonical commitment only, no f32 view
+    /// commitment.
+    pub(crate) fn from_det_internal(
+        internal: InternalLogits,
+        det_final_logits_sha256: Option<String>,
+    ) -> Self {
+        Self {
+            logits: internal.clone_f32(),
+            internal,
+            final_logits_sha256: None,
+            det_final_logits_sha256,
+        }
+    }
+
     pub(crate) fn clone_internal(&self) -> InternalLogits {
-        if self.internal.as_f32_slice().is_empty() && !self.logits.is_empty() {
+        if self.internal.as_f32_slice().is_empty()
+            && self.internal.det_values().is_none()
+            && !self.logits.is_empty()
+        {
             // Older deserialized payloads only carry the public f32 view.
             return InternalLogits::from_values(self.logits.clone());
         }

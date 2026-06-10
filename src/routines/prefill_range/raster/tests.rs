@@ -559,7 +559,10 @@ fn chunked_projection_matches_deterministic_prefill_layer() {
     let deterministic = deterministic_tiles::run_internal(input_internal, &model, None)
         .expect("deterministic prefill layer should run");
 
-    assert_eq!(raster.0.activations, deterministic.0.activations);
+    assert_eq!(
+        raster.0.clone_internal().det_values().map(<[Vec<Act>]>::to_vec),
+        deterministic.0.clone_internal().det_values().map(<[Vec<Act>]>::to_vec)
+    );
     assert_eq!(
         raster.0.det_activations_sha256,
         deterministic.0.det_activations_sha256
@@ -762,7 +765,10 @@ fn assert_raster_matches_deterministic_with_ple(
     let deterministic = deterministic_tiles::run_internal(input_internal, model, ple_inputs)
         .expect("deterministic prefill layer should run");
 
-    assert_eq!(raster.0.activations, deterministic.0.activations);
+    assert_eq!(
+        raster.0.clone_internal().det_values().map(<[Vec<Act>]>::to_vec),
+        deterministic.0.clone_internal().det_values().map(<[Vec<Act>]>::to_vec)
+    );
     assert_eq!(
         raster.0.det_activations_sha256,
         deterministic.0.det_activations_sha256
@@ -863,24 +869,19 @@ fn store_materialized_ple_inputs_with_roots(
 }
 
 fn activation_sequence(rows: Vec<Vec<Act>>) -> ActivationSequence {
-    activation_sequence_from_internal(InternalActivationSequence::from_det_values(rows))
+    activation_sequence_from_internal(InternalActivationSequence::from_det_values_only(rows))
 }
 
 fn activation_sequence_from_internal(
     input_internal: InternalActivationSequence,
 ) -> ActivationSequence {
-    let mut input = ActivationSequence::from_internal(
-        input_internal.clone(),
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(
-            input_internal.as_f32_slice(),
-        ),
-    );
-    input.det_activations_sha256 = Some(
+    // Single-track deterministic fixture: canonical commitment only.
+    let det_activations_sha256 = Some(
         crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
             input_internal.det_values().expect("det input"),
         ),
     );
-    input
+    ActivationSequence::from_det_internal(input_internal, det_activations_sha256)
 }
 
 fn ple_inputs(rows: Vec<Vec<Act>>) -> Gemma4PrefillPleInputs {

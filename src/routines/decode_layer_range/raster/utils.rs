@@ -1200,34 +1200,22 @@ pub(crate) fn raster_cache_from_layer_cache(cache: &LayerKvCache) -> Result<Rast
     if cache.current_len() == 0 {
         return Ok(RasterKvCache::empty(cache.keys.len()));
     }
-    let det_keys = cache.det_keys.as_ref().ok_or_else(|| {
+    let det = cache.det_data().ok_or_else(|| {
         anyhow!("deterministic raster decode requires canonical layer cache keys")
     })?;
-    let det_values = cache.det_values.as_ref().ok_or_else(|| {
-        anyhow!("deterministic raster decode requires canonical layer cache values")
-    })?;
-    if det_keys.len() != det_values.len() {
-        bail!(
-            "layer cache head count mismatch: keys {} values {}",
-            det_keys.len(),
-            det_values.len()
-        );
-    }
     RasterKvCache::from_heads(
-        det_keys
-            .iter()
-            .map(|head| {
-                head.iter()
-                    .cloned()
+        (0..det.num_heads())
+            .map(|head_idx| {
+                det.nested_key_rows(head_idx)
+                    .into_iter()
                     .map(RasterActivationRow::from_acts)
                     .collect()
             })
             .collect(),
-        det_values
-            .iter()
-            .map(|head| {
-                head.iter()
-                    .cloned()
+        (0..det.num_heads())
+            .map(|head_idx| {
+                det.nested_value_rows(head_idx)
+                    .into_iter()
                     .map(RasterActivationRow::from_acts)
                     .collect()
             })
@@ -1549,13 +1537,12 @@ pub(in super::super) fn finalize_decode_layer_range_result_values_from_roots(
 ) -> Result<TransformerDecodeStepResult> {
     let logits_row = read_activation_row_from_ref_roots(artifact_store_roots, &logits_ref)?;
     let det_logits = logits_row.acts();
-    let internal_logits = InternalLogits::from_det_values(det_logits.clone());
-    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
-        internal_logits.as_f32_slice(),
-    );
-    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
+    // Deterministic logits carry only the canonical commitment (spec v1).
+    let prefill_logits = PrefillLogits::from_det_internal(
+        InternalLogits::from_det_values_only(det_logits.clone()),
+        Some(
+            crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&det_logits),
+        ),
     );
 
     Ok(TransformerDecodeStepResult {
@@ -1620,18 +1607,15 @@ pub(crate) fn materialize_activation_sequence_from_ref(
         })
         .collect::<Result<Vec<_>>>()?;
     let det_rows = rows.iter().map(|row| row.acts()).collect::<Vec<_>>();
-    let values = rows
-        .iter()
-        .map(|row| row.to_f32_values())
-        .collect::<Vec<_>>();
-    let mut activation_sequence = ActivationSequence::from_internal(
-        InternalActivationSequence::from_det_values(det_rows.clone()),
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
-    );
-    activation_sequence.det_activations_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&det_rows),
-    );
-    Ok(activation_sequence)
+    // Single-track deterministic materialization: canonical commitment only.
+    Ok(ActivationSequence::from_det_internal(
+        InternalActivationSequence::from_det_values_only(det_rows.clone()),
+        Some(
+            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
+                &det_rows,
+            ),
+        ),
+    ))
 }
 
 pub(crate) fn trace_raster_checkpoint(

@@ -425,15 +425,17 @@ fn materialize_internal_logits_from_ref(
 }
 
 pub(crate) fn prefill_logits_from_internal(internal_logits: InternalLogits) -> PrefillLogits {
-    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
-        internal_logits.as_f32_slice(),
-    );
     let det_final_logits_sha256 = internal_logits
         .det_values()
         .map(crate::shared::numerics::transformer_kernels::build_det_vector_commitment);
-    let mut prefill_logits = PrefillLogits::from_internal(internal_logits, final_logits_sha256);
-    prefill_logits.det_final_logits_sha256 = det_final_logits_sha256;
-    prefill_logits
+    if det_final_logits_sha256.is_some() {
+        // Deterministic logits carry only the canonical commitment (spec v1).
+        return PrefillLogits::from_det_internal(internal_logits, det_final_logits_sha256);
+    }
+    let final_logits_sha256 = crate::shared::numerics::transformer_kernels::build_vector_commitment(
+        internal_logits.as_f32_slice(),
+    );
+    PrefillLogits::from_internal(internal_logits, final_logits_sha256)
 }
 
 #[derive(Debug, Clone)]
@@ -526,20 +528,26 @@ pub(crate) fn layer_range_width(width: usize, layer_count: usize) -> usize {
 }
 
 pub(crate) fn activation_state_from_row(row: &InternalActivationRow) -> ActivationSequence {
-    let values = row.clone_f32();
-    let internal = match row.det_values() {
-        Some(det_values) => InternalActivationSequence::from_det_values(vec![det_values.to_vec()]),
-        None => InternalActivationSequence::from_values(vec![values.clone()]),
-    };
-    let det_activations_sha256 = internal
-        .det_values()
-        .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
-    let mut activation_state = ActivationSequence::from_internal(
-        internal,
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(&[values]),
-    );
-    activation_state.det_activations_sha256 = det_activations_sha256;
-    activation_state
+    match row.det_values() {
+        Some(det_values) => {
+            // Deterministic rows carry only the canonical commitment (spec v1).
+            let internal =
+                InternalActivationSequence::from_det_values(vec![det_values.to_vec()]);
+            let det_activations_sha256 = internal.det_values().map(
+                crate::shared::numerics::transformer_kernels::build_det_activation_commitment,
+            );
+            ActivationSequence::from_det_internal(internal, det_activations_sha256)
+        }
+        None => {
+            let values = row.clone_f32();
+            ActivationSequence::from_internal(
+                InternalActivationSequence::from_values(vec![values.clone()]),
+                crate::shared::numerics::transformer_kernels::build_activation_commitment(&[
+                    values,
+                ]),
+            )
+        }
+    }
 }
 
 pub(crate) fn trace_checkpoint(
@@ -558,19 +566,24 @@ pub(crate) fn trace_checkpoint(
             state.position
         ),
     );
-    trace_checkpoint_payload(
-        state.next_token,
-        state.position,
-        state.token_count,
-        layer_start,
-        state.next_layer_idx,
-        state.layer_count,
-        &state.activation_state(),
-        &state.effective_layer_caches(),
-        state.completed_layer_output_sha256s.clone(),
-        Some(state.completed_layer_output_det_sha256s.clone()),
-        execution_mode,
-    )
+    Ok(crate::trace::trace_checkpoint_lazy(
+        "decode.layer_range",
+        || {
+            decode_layer_range_checkpoint_json(
+                state.next_token,
+                state.position,
+                state.token_count,
+                layer_start,
+                state.next_layer_idx,
+                state.layer_count,
+                &state.activation_state(),
+                &state.effective_layer_caches(),
+                state.completed_layer_output_sha256s.clone(),
+                Some(state.completed_layer_output_det_sha256s.clone()),
+                execution_mode,
+            )
+        },
+    ))
 }
 
 pub(crate) fn trace_checkpoint_payload(
@@ -586,8 +599,41 @@ pub(crate) fn trace_checkpoint_payload(
     completed_layer_output_det_sha256s: Option<Vec<Option<String>>>,
     execution_mode: Option<&str>,
 ) -> Result<bool> {
+    let payload = decode_layer_range_checkpoint_json(
+        next_token,
+        position,
+        token_count,
+        layer_start,
+        layer_end,
+        layer_count,
+        current_activation,
+        layer_caches,
+        completed_layer_output_sha256s,
+        completed_layer_output_det_sha256s,
+        execution_mode,
+    );
+    Ok(crate::trace::trace_checkpoint(
+        "decode.layer_range",
+        &payload,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_layer_range_checkpoint_json(
+    next_token: u32,
+    position: usize,
+    token_count: usize,
+    layer_start: usize,
+    layer_end: usize,
+    layer_count: usize,
+    current_activation: &ActivationSequence,
+    layer_caches: &[LayerKvCache],
+    completed_layer_output_sha256s: Vec<String>,
+    completed_layer_output_det_sha256s: Option<Vec<Option<String>>>,
+    execution_mode: Option<&str>,
+) -> serde_json::Value {
+    let deterministic = execution_mode == Some("deterministic");
     let current_internal = current_activation.clone_internal();
-    let current_activation_values = current_activation.activations.clone();
     let mut payload = json!({
         "next_token": next_token,
         "decode_position": position,
@@ -595,25 +641,26 @@ pub(crate) fn trace_checkpoint_payload(
         "layer_start": layer_start,
         "layer_end": layer_end,
         "layer_count": layer_count,
-        "current_activation": current_activation_values,
-        "current_activation_sha256": current_activation.activations_sha256,
         "det_current_activation_sha256": current_internal
             .det_values()
             .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment),
-        "layer_caches": crate::trace::serialize_layer_caches(layer_caches),
         "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(layer_caches),
-        "completed_layer_output_sha256s": completed_layer_output_sha256s,
     });
+    if !deterministic {
+        // Deterministic-mode payloads carry only canonical commitments
+        // (spec v1); fp32 mode keeps the compatibility fields.
+        payload["current_activation"] = json!(current_activation.activations.clone());
+        payload["current_activation_sha256"] = json!(current_activation.activations_sha256);
+        payload["layer_caches"] = json!(crate::trace::serialize_layer_caches(layer_caches));
+        payload["completed_layer_output_sha256s"] = json!(completed_layer_output_sha256s);
+    }
     if let Some(execution_mode) = execution_mode {
         payload["execution_mode"] = json!(execution_mode);
     }
     if let Some(completed_layer_output_det_sha256s) = completed_layer_output_det_sha256s {
         payload["completed_layer_output_det_sha256s"] = json!(completed_layer_output_det_sha256s);
     }
-    Ok(crate::trace::trace_checkpoint(
-        "decode.layer_range",
-        &payload,
-    ))
+    payload
 }
 
 pub(crate) fn embed_decode_token(

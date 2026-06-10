@@ -77,11 +77,19 @@ pub fn run_text_layers_prefill_with_cache_with_range_width(
             None,
         )? {
             layer_caches.push(layer_cache);
-            completed_layer_output_sha256s.push(layer_output.activations_sha256);
+            completed_layer_output_sha256s.push(
+                layer_output
+                    .activations_sha256
+                    .expect("fp32 prefill layer output carries an f32 commitment"),
+            );
             break;
         }
         layer_caches.push(layer_cache);
-        completed_layer_output_sha256s.push(layer_output.activations_sha256);
+        completed_layer_output_sha256s.push(
+            layer_output
+                .activations_sha256
+                .expect("fp32 prefill layer output carries an f32 commitment"),
+        );
         let current_activations = ActivationSequence::from_values(
             xs.clone(),
             crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs),

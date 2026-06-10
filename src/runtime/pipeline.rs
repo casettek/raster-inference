@@ -604,18 +604,14 @@ fn materialize_activation_sequence_from_ref(
         })
         .collect::<Result<Vec<_>>>()?;
     let det_rows = rows.iter().map(|row| row.acts()).collect::<Vec<_>>();
-    let values = rows
-        .iter()
-        .map(|row| row.to_f32_values())
-        .collect::<Vec<_>>();
-    let mut activation_sequence = ActivationSequence::from_internal(
-        InternalActivationSequence::from_det_values(det_rows.clone()),
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
-    );
-    activation_sequence.det_activations_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(&det_rows),
-    );
-    Ok(activation_sequence)
+    Ok(ActivationSequence::from_det_internal(
+        InternalActivationSequence::from_det_values_only(det_rows.clone()),
+        Some(
+            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
+                &det_rows,
+            ),
+        ),
+    ))
 }
 
 fn build_current_output_decode_state(
@@ -976,7 +972,7 @@ mod tests {
                     0,
                     Act::from_num(1.0).to_bits(),
                     0,
-                ],
+                ].into(),
             })),
         };
         let token_ids = vec![1, 0];
@@ -1785,7 +1781,7 @@ mod tests {
                         Act::from_num(1.0).to_bits(),
                         0,
                         0,
-                    ],
+                    ].into(),
                 })),
             },
             final_logit_softcapping: None,

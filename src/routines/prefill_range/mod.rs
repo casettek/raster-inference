@@ -39,36 +39,48 @@ pub(crate) fn trace_checkpoints(
     prefill_token_range_width: usize,
     execution_mode: Option<&str>,
 ) -> Result<bool> {
-    let activations = &layer_output.activations;
+    let deterministic = execution_mode == Some("deterministic");
     let internal = layer_output.clone_internal();
-    let det_rows = internal.det_values();
-    for (range_start, range_end) in range_bounds(activations.len(), prefill_token_range_width) {
+    let token_count = if deterministic {
+        internal.det_values().map(<[Vec<_>]>::len).unwrap_or(0)
+    } else {
+        layer_output.activations.len()
+    };
+    for (range_start, range_end) in range_bounds(token_count, prefill_token_range_width) {
         let _routine = crate::trace::routine_scope(
             RoutineId::PrefillRange,
-            format!(
-                "layer={layer_idx} tokens={range_start}..{range_end}/{}",
-                activations.len()
-            ),
+            format!("layer={layer_idx} tokens={range_start}..{range_end}/{token_count}"),
         );
-        let range_activations = activations[range_start..range_end].to_vec();
-        let det_range_activations_sha256 = det_rows.map(|rows| {
-            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
-                &rows[range_start..range_end],
-            )
+        let reached = crate::trace::trace_checkpoint_lazy("prefill.range", || {
+            let det_range_activations_sha256 = internal.det_values().map(|rows| {
+                crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
+                    &rows[range_start..range_end],
+                )
+            });
+            let mut payload = json!({
+                "layer_idx": layer_idx,
+                "range_start": range_start,
+                "range_end": range_end,
+                "token_count": token_count,
+                "det_range_activations_sha256": det_range_activations_sha256,
+            });
+            if !deterministic {
+                // Deterministic-mode payloads carry only canonical commitments
+                // (spec v1); fp32 mode keeps the compatibility fields.
+                let activations = &layer_output.activations;
+                payload["range_activations"] = json!(activations[range_start..range_end].to_vec());
+                payload["range_activations_sha256"] = json!(
+                    crate::shared::numerics::transformer_kernels::build_activation_commitment(
+                        &activations[range_start..range_end]
+                    )
+                );
+            }
+            if let Some(execution_mode) = execution_mode {
+                payload["execution_mode"] = json!(execution_mode);
+            }
+            payload
         });
-        let mut payload = json!({
-            "layer_idx": layer_idx,
-            "range_start": range_start,
-            "range_end": range_end,
-            "token_count": activations.len(),
-            "range_activations": range_activations,
-            "range_activations_sha256": crate::shared::numerics::transformer_kernels::build_activation_commitment(&activations[range_start..range_end]),
-            "det_range_activations_sha256": det_range_activations_sha256,
-        });
-        if let Some(execution_mode) = execution_mode {
-            payload["execution_mode"] = json!(execution_mode);
-        }
-        if crate::trace::trace_checkpoint("prefill.range", &payload) {
+        if reached {
             return Ok(true);
         }
     }
@@ -125,14 +137,12 @@ pub fn materialize_prefill_layer_output_refs_from_roots_for_trace(
     let current_activations =
         materialize_prefill_activation_sequence_from_roots(roots, &refs.final_hidden_states_ref)?;
     let det_activations = raster_sequence_acts(&current_activations);
-    let values = current_activations.to_f32_values();
-    let mut activation_sequence = ActivationSequence::from_internal(
-        InternalActivationSequence::from_det_values(det_activations.clone()),
-        crate::shared::numerics::transformer_kernels::build_activation_commitment(&values),
-    );
-    activation_sequence.det_activations_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
-            &det_activations,
+    let activation_sequence = ActivationSequence::from_det_internal(
+        InternalActivationSequence::from_det_values_only(det_activations.clone()),
+        Some(
+            crate::shared::numerics::transformer_kernels::build_det_activation_commitment(
+                &det_activations,
+            ),
         ),
     );
 
@@ -221,7 +231,10 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
             layer_caches.len()
         );
     }
-    if completed_layer_output_sha256s.len() != layer_idx
+    // Deterministic mode no longer collects f32 compatibility commitments, so
+    // an empty f32 commitment list is accepted alongside the canonical list.
+    if (!completed_layer_output_sha256s.is_empty()
+        && completed_layer_output_sha256s.len() != layer_idx)
         || completed_layer_output_det_sha256s.len() != layer_idx
     {
         bail!(

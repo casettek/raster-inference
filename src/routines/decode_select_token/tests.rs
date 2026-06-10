@@ -77,7 +77,6 @@ fn checkpoint_uses_canonical_deterministic_logits_commitment() {
         crate::shared::numerics::transformer_kernels::build_det_vector_commitment(
             internal.det_values().expect("canonical logits"),
         );
-    let expected_public_commitment = crate::trace::sha256_hex(&decode_state.current_logits);
 
     assert_eq!(
         payload
@@ -85,12 +84,10 @@ fn checkpoint_uses_canonical_deterministic_logits_commitment() {
             .and_then(|value| value.as_str()),
         Some(expected_det_commitment.as_str())
     );
-    assert_eq!(
-        payload
-            .get("current_logits_sha256")
-            .and_then(|value| value.as_str()),
-        Some(expected_public_commitment.as_str())
-    );
+    // Deterministic-mode payloads carry only canonical commitments (spec v1).
+    assert!(payload.get("current_logits_sha256").is_none());
+    assert!(payload.get("current_logits").is_none());
+    assert!(payload.get("layer_caches").is_none());
 }
 
 #[test]

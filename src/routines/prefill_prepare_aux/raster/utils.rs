@@ -235,7 +235,8 @@ pub(in super::super) fn raster_activation_sequence_from_internal(
 pub(in super::super) fn internal_sequence_from_raster(
     sequence: RasterActivationSequence,
 ) -> InternalActivationSequence {
-    InternalActivationSequence::from_det_values(
+    // Single-track deterministic materialization: no f32 mirror.
+    InternalActivationSequence::from_det_values_only(
         sequence
             .into_rows()
             .into_iter()

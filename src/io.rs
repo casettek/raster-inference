@@ -1270,9 +1270,9 @@ pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
     } else {
         Gemma4LogitsProjection::UntiedLmHead {
             weight: reader.load_matrix("model.language_model.lm_head.weight")?,
-            det_weight: Some(std::sync::Arc::new(decode_det_num_matrix_from_source(
+            det_weight: Some(std::sync::Arc::new(decode_det_num_matrix_from_source_shared(
                 &reader.resolve_full_matrix_source("model.language_model.lm_head.weight")?,
-                reader.mmap.as_ref(),
+                &reader.mmap,
             )?)),
         }
     };
@@ -1439,11 +1439,10 @@ pub(crate) fn load_ple_token_embedding_row_internal(
         }
         Gemma4PleMatrixSource::DetNumLazy(source) => {
             let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
-            InternalActivationRow::from_det_values(decode_matrix_row_acts_from_det_num_source(
-                source,
-                row_idx,
-                mmap.as_ref(),
-            )?)
+            // Single-track deterministic load: no f32 mirror.
+            InternalActivationRow::from_det_values_only(
+                decode_matrix_row_acts_from_det_num_source(source, row_idx, mmap.as_ref())?,
+            )
         }
     };
     ple_global
@@ -1511,7 +1510,7 @@ pub(crate) fn materialize_det_num_ple_model_projection(
         return Ok(None);
     };
     let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
-    let matrix = std::sync::Arc::new(decode_det_num_matrix_from_source(source, mmap.as_ref())?);
+    let matrix = std::sync::Arc::new(decode_det_num_matrix_from_source_shared(source, &mmap)?);
     ple_global
         .model_projection_det_cache
         .lock()
@@ -1680,13 +1679,13 @@ pub(crate) fn materialize_det_num_layer_matrix_source(
             source.weights_path.display()
         )
     })?;
-    let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
+    let mmap = std::sync::Arc::new(unsafe { Mmap::map(&file) }.with_context(|| {
         format!(
             "failed to mmap deterministic artifact {}",
             source.weights_path.display()
         )
-    })?;
-    let matrix = std::sync::Arc::new(decode_det_num_matrix_from_source(source, &mmap)?);
+    })?);
+    let matrix = std::sync::Arc::new(decode_det_num_matrix_from_source_shared(source, &mmap)?);
     *det_cache
         .lock()
         .map_err(|_| anyhow!("deterministic layer matrix cache is poisoned"))? =
@@ -1908,8 +1907,53 @@ fn decode_det_num_matrix_from_source(
     Ok(DetNumMatrix {
         rows: source.row_count,
         cols: source.col_count,
-        values,
+        values: values.into(),
     })
+}
+
+/// Zero-copy variant of [`decode_det_num_matrix_from_source`]: borrows the
+/// weight payload directly from the mmapped artifact when the slice is
+/// contiguous in the file and 4-byte aligned, falling back to an owned copy
+/// otherwise. detwgt v1 packs payloads after variable-length names, so
+/// alignment is not guaranteed; aligned payloads (and the detwgt v2 format)
+/// take the borrowed path.
+fn decode_det_num_matrix_from_source_shared(
+    source: &DetNumTensorSliceSource,
+    mmap: &std::sync::Arc<Mmap>,
+) -> Result<DetNumMatrix> {
+    let contiguous = source.col_offset == 0 && source.col_count == source.total_cols;
+    if contiguous && cfg!(target_endian = "little") {
+        let row_bytes = source
+            .total_cols
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
+        let byte_offset = source
+            .data_offset
+            .checked_add(source.row_offset * row_bytes)
+            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+        let len = source
+            .row_count
+            .checked_mul(source.col_count)
+            .ok_or_else(|| anyhow!("matrix element count overflowed"))?;
+        let byte_end = byte_offset
+            .checked_add(len * 4)
+            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+        let in_bounds = mmap.get(byte_offset..byte_end).is_some();
+        let aligned =
+            (mmap.as_ptr() as usize + byte_offset) % std::mem::align_of::<i32>() == 0;
+        if in_bounds && aligned {
+            return Ok(DetNumMatrix {
+                rows: source.row_count,
+                cols: source.col_count,
+                values: crate::shared::model::transformer::DetNumValues::Mmap {
+                    map: mmap.clone(),
+                    byte_offset,
+                    len,
+                },
+            });
+        }
+    }
+    decode_det_num_matrix_from_source(source, mmap.as_ref())
 }
 
 fn matrix_row(matrix: &MatrixF32, row_idx: usize) -> Result<Vec<f32>> {
@@ -2236,15 +2280,22 @@ pub fn embed_input_tokens_from_gemma_source_with_mode(
             )
         })?,
     };
-    let activations = internal.clone_f32();
-    let activations_sha256 = build_activation_commitment(&activations);
     let det_activations_sha256 = internal
         .det_values()
         .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
-
-    let mut activation_sequence = ActivationSequence::from_internal(internal, activations_sha256);
-    activation_sequence.det_activations_sha256 = det_activations_sha256;
-    Ok(activation_sequence)
+    Ok(match execution_mode {
+        InferenceExecutionMode::Deterministic => {
+            ActivationSequence::from_det_internal(internal, det_activations_sha256)
+        }
+        InferenceExecutionMode::Fp32 => {
+            let activations = internal.clone_f32();
+            let activations_sha256 = build_activation_commitment(&activations);
+            let mut activation_sequence =
+                ActivationSequence::from_internal(internal, activations_sha256);
+            activation_sequence.det_activations_sha256 = det_activations_sha256;
+            activation_sequence
+        }
+    })
 }
 
 fn build_det_num_embedding_source(
@@ -2450,13 +2501,13 @@ pub(crate) fn materialize_det_num_embedding_matrix(
             source.weights_path.display()
         )
     })?;
-    let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
+    let mmap = std::sync::Arc::new(unsafe { Mmap::map(&file) }.with_context(|| {
         format!(
             "failed to mmap deterministic artifact {}",
             source.weights_path.display()
         )
-    })?;
-    let matrix = std::sync::Arc::new(decode_det_num_matrix_from_source(source, &mmap)?);
+    })?);
+    let matrix = std::sync::Arc::new(decode_det_num_matrix_from_source_shared(source, &mmap)?);
     *det_cache
         .lock()
         .map_err(|_| anyhow!("deterministic embedding cache lock poisoned"))? =
@@ -2569,7 +2620,7 @@ fn decode_embedding_rows_for_token_ids(
 
     Ok(match execution_mode {
         InferenceExecutionMode::Fp32 => InternalActivationSequence::from_values(activations),
-        InferenceExecutionMode::Deterministic => InternalActivationSequence::from_det_values(acts),
+        InferenceExecutionMode::Deterministic => InternalActivationSequence::from_det_values_only(acts),
     })
 }
 
@@ -2643,7 +2694,7 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
 
     Ok(match execution_mode {
         InferenceExecutionMode::Fp32 => InternalActivationSequence::from_values(activations),
-        InferenceExecutionMode::Deterministic => InternalActivationSequence::from_det_values(acts),
+        InferenceExecutionMode::Deterministic => InternalActivationSequence::from_det_values_only(acts),
     })
 }
 
@@ -2950,8 +3001,85 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(det.clone_f32(), vec![vec![0.0]]);
-        assert!(fp32.as_f32_slice()[0][0] > det.as_f32_slice()[0][0]);
+        // Single-track deterministic embedding: no f32 mirror, requantized
+        // scale collapses the sub-resolution value to canonical zero.
+        assert!(det.as_f32_slice().is_empty());
+        assert_eq!(det.det_values().unwrap()[0][0].to_bits(), 0);
+        assert!(fp32.as_f32_slice()[0][0] > 0.0);
+    }
+
+    #[test]
+    fn det_matrix_loader_borrows_aligned_mmap_payloads_and_copies_misaligned() {
+        let model_dir = create_test_model_dir("det-matrix-mmap-view");
+        let weights_path = model_dir.join("weights.detwgt");
+        let payload_values: Vec<i32> = vec![1, -2, 3, 4, -5, 6];
+        let mut bytes = vec![0u8; 8]; // aligned payload offset
+        for value in &payload_values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(&weights_path, &bytes).unwrap();
+        let file = File::open(&weights_path).unwrap();
+        let mmap = std::sync::Arc::new(unsafe { Mmap::map(&file) }.unwrap());
+
+        let aligned_source = DetNumTensorSliceSource {
+            weights_path: weights_path.clone(),
+            total_rows: 2,
+            total_cols: 3,
+            data_offset: 8,
+            row_offset: 0,
+            row_count: 2,
+            col_offset: 0,
+            col_count: 3,
+        };
+        let aligned = super::decode_det_num_matrix_from_source_shared(&aligned_source, &mmap)
+            .expect("aligned matrix should load");
+        assert!(aligned.values.is_mmap_backed());
+        assert_eq!(aligned.values.as_slice(), payload_values.as_slice());
+
+        // Misaligned payload start (detwgt v1 packs payloads after
+        // variable-length names): falls back to an owned copy.
+        let mut misaligned_bytes = vec![0u8; 6];
+        for value in &payload_values {
+            misaligned_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let misaligned_path = model_dir.join("misaligned.detwgt");
+        fs::write(&misaligned_path, &misaligned_bytes).unwrap();
+        let misaligned_file = File::open(&misaligned_path).unwrap();
+        let misaligned_mmap =
+            std::sync::Arc::new(unsafe { Mmap::map(&misaligned_file) }.unwrap());
+        let misaligned_source = DetNumTensorSliceSource {
+            weights_path: misaligned_path,
+            total_rows: 2,
+            total_cols: 3,
+            data_offset: 6,
+            row_offset: 0,
+            row_count: 2,
+            col_offset: 0,
+            col_count: 3,
+        };
+        let copied = super::decode_det_num_matrix_from_source_shared(
+            &misaligned_source,
+            &misaligned_mmap,
+        )
+        .expect("misaligned matrix should load via copy");
+        assert!(!copied.values.is_mmap_backed());
+        assert_eq!(copied.values.as_slice(), payload_values.as_slice());
+
+        // Column slices are not contiguous in the file: copy fallback.
+        let sliced_source = DetNumTensorSliceSource {
+            weights_path,
+            total_rows: 2,
+            total_cols: 3,
+            data_offset: 8,
+            row_offset: 0,
+            row_count: 2,
+            col_offset: 1,
+            col_count: 2,
+        };
+        let sliced = super::decode_det_num_matrix_from_source_shared(&sliced_source, &mmap)
+            .expect("column slice should load via copy");
+        assert!(!sliced.values.is_mmap_backed());
+        assert_eq!(sliced.values.as_slice(), &[-2, 3, -5, 6]);
     }
 
     #[test]
@@ -2984,7 +3112,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(decoded.det_values().unwrap()[0][0], canonical);
-        assert_ne!(f32_to_act(decoded.as_f32_slice()[0][0]), canonical);
+        // Single-track deterministic embedding: no f32 mirror is materialized.
+        assert!(decoded.as_f32_slice().is_empty());
     }
 
     #[test]

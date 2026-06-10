@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
 use serde_json::json;
@@ -930,7 +928,11 @@ pub fn run_text_layers_prefill_with_cache(
             break;
         }
         layer_caches.push(layer_cache);
-        completed_layer_output_sha256s.push(layer_output.activations_sha256);
+        completed_layer_output_sha256s.push(
+            layer_output
+                .activations_sha256
+                .expect("fp32 prefill layer output carries an f32 commitment"),
+        );
         if crate::trace::trace_checkpoint(
             "prefill.range_finalize",
             &json!({
@@ -1413,20 +1415,61 @@ pub(crate) fn build_det_vector_commitment(values: &[Act]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Slab-flavored twin of [`build_det_activation_commitment`]; hashes identical
+/// bytes (domain prefix, u64 LE length headers, canonical Act LE bytes).
+pub(crate) fn build_det_activation_commitment_slab(
+    slab: &crate::shared::numerics::det_tensor::ActSlab,
+) -> String {
+    build_det_activation_commitment_slab_range(slab, 0, slab.rows())
+}
+
+/// Row-range twin of [`build_det_activation_commitment_slab`] hashing rows
+/// `start..end` as their own sequence (identical bytes to hashing the nested
+/// sub-slice).
+pub(crate) fn build_det_activation_commitment_slab_range(
+    slab: &crate::shared::numerics::det_tensor::ActSlab,
+    start: usize,
+    end: usize,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"raster-det-num-act-v1");
+    hasher.update(((end - start) as u64).to_le_bytes());
+    for row_idx in start..end {
+        let row = slab.row(row_idx);
+        hasher.update((row.len() as u64).to_le_bytes());
+        for value in row {
+            hasher.update(act_to_le_bytes(*value));
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Single-row twin of [`build_det_activation_commitment`] hashing one row as a
+/// one-row sequence (identical bytes to `build_det_activation_commitment(&[row])`).
+pub(crate) fn build_det_activation_commitment_row(row: &[Act]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"raster-det-num-act-v1");
+    hasher.update(1u64.to_le_bytes());
+    hasher.update((row.len() as u64).to_le_bytes());
+    for value in row {
+        hasher.update(act_to_le_bytes(*value));
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 pub(crate) fn build_det_kv_cache_commitment(caches: &[LayerKvCache]) -> Option<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"raster-det-num-kv-cache-v1");
     hasher.update((caches.len() as u64).to_le_bytes());
     for cache in caches {
-        let keys = cache.det_keys.as_ref()?;
-        let values = cache.det_values.as_ref()?;
-        hasher.update((keys.len() as u64).to_le_bytes());
-        for (kind, heads) in [(b"k", keys), (b"v", values)] {
+        let det = cache.det_data()?;
+        hasher.update((det.num_heads() as u64).to_le_bytes());
+        for (kind, heads) in [(b"k", det.key_heads()), (b"v", det.value_heads())] {
             hasher.update(kind);
             hasher.update((heads.len() as u64).to_le_bytes());
             for head in heads {
                 hasher.update((head.len() as u64).to_le_bytes());
-                for row in head {
+                for row in head.iter_rows() {
                     hasher.update((row.len() as u64).to_le_bytes());
                     for value in row {
                         hasher.update(act_to_le_bytes(*value));
@@ -1872,11 +1915,7 @@ fn run_causal_attention_decode_buffer(
     for head_idx in 0..layer.num_heads {
         let kv_head_idx = head_idx / kv_groups;
         let key_start = attention_window
-            .map(|window| {
-                attention_cache.keys[kv_head_idx]
-                    .len()
-                    .saturating_sub(window)
-            })
+            .map(|window| attention_cache.current_len().saturating_sub(window))
             .unwrap_or(0);
         let key_rows = attention_cache.keys[kv_head_idx]
             .iter()
@@ -2534,12 +2573,13 @@ fn det_linear_row_acts_from_acts(
         );
     }
 
+    let weight_values = weight.values.as_slice();
     let mut output = Vec::with_capacity(weight.rows);
     for row_idx in 0..weight.rows {
         let row_offset = row_idx * weight.cols;
         let mut acc_bits = 0_i64;
         for (col_idx, act) in quantized_input.iter().enumerate() {
-            acc_bits = mac_bits(acc_bits, act.to_bits(), weight.values[row_offset + col_idx]);
+            acc_bits = mac_bits(acc_bits, act.to_bits(), weight_values[row_offset + col_idx]);
         }
         output.push(requantize(Acc::from_bits(acc_bits)));
     }
@@ -3251,77 +3291,40 @@ fn append_kv_cache_head_buffer_with_mode(
         );
     }
 
-    let mut det_keys = if matches!(execution_mode, InferenceExecutionMode::Deterministic) {
-        Some(match cache.det_keys.take() {
-            Some(det_keys) => det_keys,
-            None if cache.keys.iter().all(|head| head.is_empty()) => {
-                vec![VecDeque::new(); cache.keys.len()]
-            }
-            None => bail!("deterministic decode cache append requires canonical key rows"),
-        })
-    } else {
-        None
-    };
-    let mut det_values = if matches!(execution_mode, InferenceExecutionMode::Deterministic) {
-        Some(match cache.det_values.take() {
-            Some(det_values) => det_values,
-            None if cache.values.iter().all(|head| head.is_empty()) => {
-                vec![VecDeque::new(); cache.values.len()]
-            }
-            None => bail!("deterministic decode cache append requires canonical value rows"),
-        })
-    } else {
-        None
-    };
-
-    let new_key_acts = if matches!(execution_mode, InferenceExecutionMode::Deterministic) {
-        Some(head_row_buffer_acts(new_keys)?)
-    } else {
-        None
-    };
-    let new_value_acts = if matches!(execution_mode, InferenceExecutionMode::Deterministic) {
-        Some(head_row_buffer_acts(new_values)?)
-    } else {
-        None
-    };
-
-    for (head_idx, ((head_keys, head_values), (new_key, new_value))) in cache
-        .keys
-        .iter_mut()
-        .zip(cache.values.iter_mut())
-        .zip(new_keys.values.iter().zip(&new_values.values))
-        .enumerate()
-    {
-        head_keys.push_back(new_key.clone());
-        head_values.push_back(new_value.clone());
-        if let (Some(det_keys), Some(det_values)) = (&mut det_keys, &mut det_values) {
-            det_keys[head_idx].push_back(
-                new_key_acts.as_ref().expect("deterministic new keys")[head_idx].clone(),
-            );
-            det_values[head_idx].push_back(
-                new_value_acts.as_ref().expect("deterministic new values")[head_idx].clone(),
-            );
-        }
-        if let Some(window) = sliding_window {
-            while head_keys.len() > window {
-                head_keys.pop_front();
-                head_values.pop_front();
-                if let (Some(det_keys), Some(det_values)) = (&mut det_keys, &mut det_values) {
-                    det_keys[head_idx].pop_front();
-                    det_values[head_idx].pop_front();
-                }
-            }
-        }
-    }
-
     match execution_mode {
         InferenceExecutionMode::Fp32 => {
-            cache.det_keys = None;
-            cache.det_values = None;
+            for ((head_keys, head_values), (new_key, new_value)) in cache
+                .keys
+                .iter_mut()
+                .zip(cache.values.iter_mut())
+                .zip(new_keys.values.iter().zip(&new_values.values))
+            {
+                head_keys.push_back(new_key.clone());
+                head_values.push_back(new_value.clone());
+                if let Some(window) = sliding_window {
+                    while head_keys.len() > window {
+                        head_keys.pop_front();
+                        head_values.pop_front();
+                    }
+                }
+            }
+            cache.det = None;
         }
         InferenceExecutionMode::Deterministic => {
-            cache.det_keys = det_keys;
-            cache.det_values = det_values;
+            let new_key_acts = head_row_buffer_acts(new_keys)?;
+            let new_value_acts = head_row_buffer_acts(new_values)?;
+            let mut det = match cache.det.take() {
+                Some(det) => det,
+                None if cache.keys.iter().all(|head| head.is_empty()) => {
+                    crate::shared::numerics::det_tensor::DetKvCacheData::new(
+                        cache.keys.len(),
+                        new_key_acts.first().map(Vec::len).unwrap_or(0),
+                    )
+                }
+                None => bail!("deterministic decode cache append requires canonical key rows"),
+            };
+            det.append_step_nested(&new_key_acts, &new_value_acts, sliding_window)?;
+            cache.det = Some(det);
         }
     }
 
@@ -3433,8 +3436,8 @@ mod tests {
 
         assert_eq!(embedded.activations, vec![vec![2.0, 2.5], vec![0.0, 0.5]]);
         assert_eq!(
-            embedded.activations_sha256,
-            "ba27ccacfb427e2f44f9a6d875abe24e064893a5ea6a76d8f6c00a29ec10be6f"
+            embedded.activations_sha256.as_deref(),
+            Some("ba27ccacfb427e2f44f9a6d875abe24e064893a5ea6a76d8f6c00a29ec10be6f")
         );
     }
 
@@ -3476,8 +3479,8 @@ mod tests {
 
         assert_eq!(embedded.activations, vec![vec![3.0, 6.0]]);
         assert_eq!(
-            embedded.activations_sha256,
-            "209a39e983bfd5b06df628da8981625bd58c1342e1543c3641d9873380b9d310"
+            embedded.activations_sha256.as_deref(),
+            Some("209a39e983bfd5b06df628da8981625bd58c1342e1543c3641d9873380b9d310")
         );
     }
 
@@ -3642,7 +3645,7 @@ mod tests {
         let weight = DetNumMatrix {
             rows: 1,
             cols: 2,
-            values: vec![Act::from_num(2).to_bits(), Act::from_num(-1).to_bits()],
+            values: vec![Act::from_num(2).to_bits(), Act::from_num(-1).to_bits()].into(),
         };
 
         let output = det_linear_row(&[1.5, -0.5], &weight).unwrap();
@@ -3655,7 +3658,7 @@ mod tests {
         let weight = DetNumMatrix {
             rows: 1,
             cols: 1,
-            values: vec![Act::from_num(0.5).to_bits()],
+            values: vec![Act::from_num(0.5).to_bits()].into(),
         };
 
         let rounded_down = det_linear_row(&[1.0 / 65_536.0], &weight).unwrap();
@@ -3677,7 +3680,7 @@ mod tests {
                 Act::from_num(-0.75).to_bits(),
                 Act::from_num(0.125).to_bits(),
                 Act::from_num(1.5).to_bits(),
-            ],
+            ].into(),
         };
         let input = [1.5, -0.5, 0.25];
         let quantized_input = input
@@ -3704,7 +3707,7 @@ mod tests {
                 Act::from_num(-0.75).to_bits(),
                 Act::from_num(1.5).to_bits(),
                 Act::from_num(2.0).to_bits(),
-            ],
+            ].into(),
         };
         let inputs = vec![
             vec![1.0, -0.5, 0.25],
@@ -3729,7 +3732,7 @@ mod tests {
         let det_weight = DetNumMatrix {
             rows: 1,
             cols: 1,
-            values: vec![Act::from_num(0.5).to_bits()],
+            values: vec![Act::from_num(0.5).to_bits()].into(),
         };
         let fp32_weight = MatrixF32 {
             rows: 1,
@@ -3959,7 +3962,7 @@ mod tests {
                 0,
                 0,
                 0,
-            ],
+            ].into(),
         }));
 
         let without_det =
@@ -4070,7 +4073,7 @@ mod tests {
                 0,
                 0,
                 0,
-            ],
+            ].into(),
         }));
 
         let without_det =
@@ -4181,7 +4184,7 @@ mod tests {
                 0,
                 0,
                 0,
-            ],
+            ].into(),
         }));
 
         let without_det =
@@ -5261,7 +5264,7 @@ mod tests {
 
         assert_eq!(logits.len(), 2);
         assert_eq!(extracted.logits, logits);
-        assert!(!extracted.final_logits_sha256.is_empty());
+        assert!(extracted.final_logits_sha256.as_deref().is_some_and(|sha| !sha.is_empty()));
     }
 
     #[test]
@@ -5439,7 +5442,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_layer_kv_cache_stores_canonical_rows_with_f32_view() {
+    fn deterministic_layer_kv_cache_stores_canonical_rows_without_f32_mirror() {
         let cache = build_layer_kv_cache(
             &AttentionHeadSequenceBuffer::from_acts(vec![vec![
                 vec![f32_to_act(1.25)],
@@ -5457,10 +5460,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(cache.current_len(), 2);
-        assert_eq!(
-            cache.keys[0].iter().cloned().collect::<Vec<_>>(),
-            vec![vec![2.5], vec![3.75]]
-        );
+        // Single-track deterministic mode: no f32 mirror is materialized.
+        assert!(cache.keys[0].is_empty());
         assert_eq!(
             cache.det_key_rows_from(0, 0).expect("canonical keys"),
             vec![vec![f32_to_act(2.5)], vec![f32_to_act(3.75)],]
@@ -5487,8 +5488,6 @@ mod tests {
 
         assert_eq!(cache.det_key_rows_from(0, 0), Some(vec![vec![key]]));
         assert_eq!(cache.det_value_rows_from(0, 0), Some(vec![vec![value]]));
-        assert_ne!(f32_to_act(cache.keys[0][0][0]), key);
-        assert_ne!(f32_to_act(cache.values[0][0][0]), value);
     }
 
     #[test]
@@ -5511,10 +5510,8 @@ mod tests {
             updated.det_key_rows_from(0, 0).expect("canonical keys"),
             vec![vec![Act::from_bits(7)], vec![f32_to_act(1.0)]]
         );
-        assert_eq!(
-            updated.keys[0].iter().cloned().collect::<Vec<_>>(),
-            vec![vec![act_to_f32(Act::from_bits(7))], vec![1.0]]
-        );
+        // Single-track deterministic mode: the f32 mirror stays empty.
+        assert!(updated.keys[0].is_empty());
     }
 
     #[test]
@@ -5534,6 +5531,99 @@ mod tests {
 
         assert_eq!(updated.det_key_rows_from(0, 0), Some(vec![vec![key]]));
         assert_eq!(updated.det_value_rows_from(0, 0), Some(vec![vec![value]]));
+    }
+
+    #[test]
+    fn slab_activation_commitment_matches_nested_builder() {
+        let rows = vec![
+            vec![Act::from_bits(1), Act::from_bits(-2), Act::from_bits(3)],
+            vec![Act::from_bits(7), Act::from_bits(0), Act::from_bits(i32::MAX)],
+        ];
+        let slab = crate::shared::numerics::det_tensor::ActSlab::from_rows(&rows)
+            .expect("slab should build");
+
+        assert_eq!(
+            super::build_det_activation_commitment_slab(&slab),
+            super::build_det_activation_commitment(&rows)
+        );
+    }
+
+    #[test]
+    fn flat_kv_cache_commitment_matches_nested_reference_bytes() {
+        use sha2::{Digest, Sha256};
+
+        // Reference implementation of the original nested byte layout.
+        fn reference_commitment(caches: &[(Vec<Vec<Vec<Act>>>, Vec<Vec<Vec<Act>>>)]) -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(b"raster-det-num-kv-cache-v1");
+            hasher.update((caches.len() as u64).to_le_bytes());
+            for (keys, values) in caches {
+                hasher.update((keys.len() as u64).to_le_bytes());
+                for (kind, heads) in [(b"k", keys), (b"v", values)] {
+                    hasher.update(kind);
+                    hasher.update((heads.len() as u64).to_le_bytes());
+                    for head in heads {
+                        hasher.update((head.len() as u64).to_le_bytes());
+                        for row in head {
+                            hasher.update((row.len() as u64).to_le_bytes());
+                            for value in row {
+                                hasher.update(crate::shared::numerics::det_num::act_to_le_bytes(
+                                    *value,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            format!("{:x}", hasher.finalize())
+        }
+
+        let act = |bits: i32| Act::from_bits(bits);
+        let keys = vec![
+            vec![vec![act(1), act(2)], vec![act(3), act(4)], vec![act(5), act(6)]],
+            vec![vec![act(7), act(8)], vec![act(9), act(10)], vec![act(11), act(12)]],
+        ];
+        let values = vec![
+            vec![vec![act(-1), act(-2)], vec![act(-3), act(-4)], vec![act(-5), act(-6)]],
+            vec![vec![act(-7), act(-8)], vec![act(-9), act(-10)], vec![act(-11), act(-12)]],
+        ];
+
+        // Exercise the compaction path: append then trim with a sliding window
+        // so the flat buffers carry a non-zero start offset.
+        let mut cache = LayerKvCache::from_det_heads(
+            keys.iter()
+                .map(|head| head.iter().cloned().collect::<VecDeque<_>>())
+                .collect(),
+            values
+                .iter()
+                .map(|head| head.iter().cloned().collect::<VecDeque<_>>())
+                .collect(),
+        );
+        cache = append_kv_cache_head_buffer_with_mode(
+            cache,
+            &AttentionHeadRowBuffer::from_acts(vec![vec![act(13), act(14)], vec![act(15), act(16)]]),
+            &AttentionHeadRowBuffer::from_acts(vec![
+                vec![act(-13), act(-14)],
+                vec![act(-15), act(-16)],
+            ]),
+            Some(2),
+            InferenceExecutionMode::Deterministic,
+        )
+        .expect("append deterministic kv");
+
+        let expected_keys = vec![
+            vec![vec![act(5), act(6)], vec![act(13), act(14)]],
+            vec![vec![act(11), act(12)], vec![act(15), act(16)]],
+        ];
+        let expected_values = vec![
+            vec![vec![act(-5), act(-6)], vec![act(-13), act(-14)]],
+            vec![vec![act(-11), act(-12)], vec![act(-15), act(-16)]],
+        ];
+
+        assert_eq!(
+            super::build_det_kv_cache_commitment(std::slice::from_ref(&cache)),
+            Some(reference_commitment(&[(expected_keys, expected_values)]))
+        );
     }
 
     #[test]
@@ -5890,7 +5980,8 @@ mod tests {
                 .iter()
                 .copied()
                 .map(|value| Act::from_num(value).to_bits())
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         })
     }
 
