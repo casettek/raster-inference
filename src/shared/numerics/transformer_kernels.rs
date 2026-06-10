@@ -6040,6 +6040,7 @@ mod tests {
         bytes.extend_from_slice(&(cols as u64).to_le_bytes());
         bytes.extend_from_slice(&((rows * cols) as u64).to_le_bytes());
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&fixture_max_row_mass(&payload, cols).to_le_bytes());
         let data_offset = bytes.len();
         bytes.extend_from_slice(&payload);
         fs::write(&weights_path, bytes).expect("write det embedding artifact");
@@ -6058,6 +6059,20 @@ mod tests {
             scale: (cols as f32).sqrt(),
             det_cache: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn fixture_max_row_mass(payload: &[u8], cols: usize) -> u64 {
+        payload
+            .chunks_exact(4)
+            .map(|chunk| {
+                i32::from_le_bytes(chunk.try_into().expect("i32 byte width should match"))
+                    .unsigned_abs() as u64
+            })
+            .collect::<Vec<_>>()
+            .chunks(cols.max(1))
+            .map(|row| row.iter().sum::<u64>())
+            .max()
+            .unwrap_or(0)
     }
 
     fn deterministic_tensor_source(
@@ -6091,6 +6106,7 @@ mod tests {
         bytes.extend_from_slice(&(cols as u64).to_le_bytes());
         bytes.extend_from_slice(&((rows * cols) as u64).to_le_bytes());
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&fixture_max_row_mass(&payload, cols).to_le_bytes());
         let data_offset = bytes.len();
         bytes.extend_from_slice(&payload);
         fs::write(&weights_path, bytes).expect("write det tensor artifact");

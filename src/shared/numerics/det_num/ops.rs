@@ -6,14 +6,27 @@ pub fn mul_wide(a: Act, b: Wgt) -> Acc {
     Acc::from_bits(product_bits)
 }
 
-/// Computes saturating MAC directly on raw fixed-point bit patterns.
+/// Computes wrapping MAC directly on raw fixed-point bit patterns.
+///
+/// The widened product of two i32 payloads is always exact in i64; accumulation
+/// uses two's-complement wrapping addition, which is associative and commutative,
+/// so reduction order over MAC terms is not part of the contract.
 pub fn mac_bits(acc_bits: i64, act_bits: i32, wgt_bits: i32) -> i64 {
-    acc_bits.saturating_add(i64::from(act_bits) * i64::from(wgt_bits))
+    acc_bits.wrapping_add(i64::from(act_bits) * i64::from(wgt_bits))
 }
 
-/// Computes a canonical saturating multiply-accumulate in accumulator precision.
+/// Computes a canonical wrapping multiply-accumulate in accumulator precision.
 pub fn mac(acc: Acc, a: Act, b: Wgt) -> Acc {
     Acc::from_bits(mac_bits(acc.to_bits(), a.to_bits(), b.to_bits()))
+}
+
+/// Combines partial MAC accumulators with canonical wrapping addition.
+///
+/// Split-reduction drivers must combine partials with this operation (or
+/// equivalently wrapping i64 addition of the bit patterns); no other
+/// combination operation is conforming.
+pub fn acc_combine(a: Acc, b: Acc) -> Acc {
+    Acc::from_bits(a.to_bits().wrapping_add(b.to_bits()))
 }
 
 /// Adds activation values with saturating overflow semantics.

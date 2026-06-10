@@ -11,7 +11,7 @@ use half::{bf16, f16};
 use memmap2::Mmap;
 use raster_inference::shared::numerics::det_num::{
     f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-    DET_WGT_ARTIFACT_MAGIC,
+    DET_WGT_ARTIFACT_MAGIC, DET_WGT_ROW_MASS_LIMIT,
 };
 use safetensors::{Dtype, SafeTensors};
 
@@ -39,7 +39,33 @@ fn run() -> Result<()> {
         human_bytes(summary.input_tensor_bytes),
         human_bytes(summary.output_tensor_bytes)
     );
+    if args.report_bounds {
+        print_bounds_report(&summary.tensor_bounds);
+    }
     Ok(())
+}
+
+fn print_bounds_report(tensor_bounds: &[TensorBounds]) {
+    println!("Overflow-bound report (row mass limit = {DET_WGT_ROW_MASS_LIMIT}):");
+    for bounds in tensor_bounds {
+        let margin = if bounds.max_row_mass == 0 {
+            "inf".to_string()
+        } else {
+            format!(
+                "{:.2}",
+                DET_WGT_ROW_MASS_LIMIT as f64 / bounds.max_row_mass as f64
+            )
+        };
+        let note = if bounds.mac_bound {
+            ""
+        } else {
+            " (elementwise; bound not enforced)"
+        };
+        println!(
+            "  {} max_row_mass={} margin={}x{note}",
+            bounds.name, bounds.max_row_mass, margin
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +73,7 @@ struct CliArgs {
     input: PathBuf,
     output_dir: PathBuf,
     config: Option<PathBuf>,
+    report_bounds: bool,
 }
 
 impl CliArgs {
@@ -54,6 +81,7 @@ impl CliArgs {
         let mut input = None;
         let mut output_dir = None;
         let mut config = None;
+        let mut report_bounds = false;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -76,6 +104,9 @@ impl CliArgs {
                             .ok_or_else(|| anyhow!("missing value for --config"))?,
                     ));
                 }
+                "--report-bounds" => {
+                    report_bounds = true;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     process::exit(0);
@@ -89,6 +120,7 @@ impl CliArgs {
             output_dir: output_dir
                 .ok_or_else(|| anyhow!("missing required --output-dir argument"))?,
             config,
+            report_bounds,
         })
     }
 }
@@ -106,6 +138,14 @@ struct ConversionSummary {
     output_tensor_bytes: usize,
     output_weights_path: PathBuf,
     output_config_path: PathBuf,
+    tensor_bounds: Vec<TensorBounds>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorBounds {
+    name: String,
+    max_row_mass: u64,
+    mac_bound: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,10 +157,11 @@ struct ConvertedTensor {
 
 fn print_usage() {
     eprintln!(
-        "Usage: gemma-det-num-wgt-converter --input <model-dir-or-safetensors> --output-dir <artifact-dir> [--config <config.json>]"
+        "Usage: gemma-det-num-wgt-converter --input <model-dir-or-safetensors> --output-dir <artifact-dir> [--config <config.json>] [--report-bounds]"
     );
     eprintln!("If --input is a model directory, the converter looks for `config.json` and `model.safetensors`.");
     eprintln!("If --input is a `.safetensors` file, the converter uses a sibling `config.json` unless --config is provided.");
+    eprintln!("`--report-bounds` prints the per-tensor max row mass and overflow-bound margin after conversion.");
 }
 
 fn convert_model_to_det_num_wgt_artifact(args: &CliArgs) -> Result<ConversionSummary> {
@@ -163,6 +204,7 @@ fn convert_model_to_det_num_wgt_artifact(args: &CliArgs) -> Result<ConversionSum
     let mut writer = BufWriter::new(output_file);
     write_artifact_header(&mut writer, tensor_names.len() as u64)?;
 
+    let mut tensor_bounds = Vec::with_capacity(tensor_names.len());
     for tensor_name in tensor_names {
         let tensor = safetensors
             .tensor(tensor_name)
@@ -174,11 +216,20 @@ fn convert_model_to_det_num_wgt_artifact(args: &CliArgs) -> Result<ConversionSum
             shape: tensor.shape().to_vec(),
             bytes: Vec::new(),
         };
+        let max_row_mass = compute_max_row_mass(&tensor).with_context(|| {
+            format!("tensor `{tensor_name}` failed the conversion-time overflow bound check")
+        })?;
+        tensor_bounds.push(TensorBounds {
+            name: tensor_name.to_string(),
+            max_row_mass,
+            mac_bound: row_mass_bound_applies(tensor.shape()),
+        });
         output_tensor_bytes += payload_len_for_tensor(&tensor)?;
         write_tensor_header(
             &mut writer,
             &converted_tensor,
             payload_len_for_tensor(&tensor)?,
+            max_row_mass,
         )?;
         write_tensor_payload_as_wgt(&mut writer, &tensor)
             .with_context(|| format!("failed to convert tensor `{tensor_name}` to Wgt"))?;
@@ -205,7 +256,54 @@ fn convert_model_to_det_num_wgt_artifact(args: &CliArgs) -> Result<ConversionSum
         output_tensor_bytes,
         output_weights_path,
         output_config_path,
+        tensor_bounds,
     })
+}
+
+/// Returns whether the conversion-time overflow bound applies to a tensor shape.
+///
+/// The bound is defined for weight tensors used in MAC reductions, whose
+/// last-dimension rows are dot-product reduction rows: tensors of rank >= 2.
+/// Rank-1 tensors (norm gains, scalars) are elementwise operands that never
+/// enter a MAC reduction; their mass is recorded for audit but not enforced.
+fn row_mass_bound_applies(shape: &[usize]) -> bool {
+    shape.len() >= 2
+}
+
+/// Computes the per-tensor maximum row mass (`max_r sum_i |wgt_bits[r][i]|`) over
+/// last-dimension rows. For MAC-bound tensors (rank >= 2) it enforces the
+/// normative conversion-time overflow bound: every row mass must be strictly
+/// below `DET_WGT_ROW_MASS_LIMIT` (2^31), failing closed on the first violating
+/// row. For other tensors the mass is computed but not enforced.
+fn compute_max_row_mass(tensor: &safetensors::tensor::TensorView<'_>) -> Result<u64> {
+    let bytes_per_scalar = bytes_per_scalar(tensor.dtype())?;
+    let row_len = tensor.shape().last().copied().unwrap_or(1).max(1);
+    let enforce_bound = row_mass_bound_applies(tensor.shape());
+
+    let mut max_row_mass = 0u64;
+    let mut row_mass = 0u64;
+    let mut row_idx = 0usize;
+    let mut col_idx = 0usize;
+    for encoded_value in tensor.data().chunks_exact(bytes_per_scalar) {
+        let decoded = decode_scalar(encoded_value, tensor.dtype())?;
+        if !decoded.is_finite() {
+            bail!("non-finite source values are not supported");
+        }
+        row_mass += u64::from(f32_to_wgt(decoded).to_bits().unsigned_abs());
+        col_idx += 1;
+        if col_idx == row_len {
+            if enforce_bound && row_mass >= DET_WGT_ROW_MASS_LIMIT {
+                bail!(
+                    "row {row_idx} has row mass {row_mass}, violating the overflow bound (must be < {DET_WGT_ROW_MASS_LIMIT})"
+                );
+            }
+            max_row_mass = max_row_mass.max(row_mass);
+            row_mass = 0;
+            col_idx = 0;
+            row_idx += 1;
+        }
+    }
+    Ok(max_row_mass)
 }
 
 fn tensor_names_len(safetensors: &SafeTensors<'_>) -> usize {
@@ -356,6 +454,7 @@ fn write_tensor_header(
     writer: &mut impl Write,
     tensor: &ConvertedTensor,
     payload_len: usize,
+    max_row_mass: u64,
 ) -> Result<()> {
     let name_bytes = tensor.name.as_bytes();
     let name_len = u32::try_from(name_bytes.len()).map_err(|_| anyhow!("tensor name too long"))?;
@@ -376,6 +475,7 @@ fn write_tensor_header(
     }
     writer.write_all(&element_count.to_le_bytes())?;
     writer.write_all(&payload_len.to_le_bytes())?;
+    writer.write_all(&max_row_mass.to_le_bytes())?;
     Ok(())
 }
 
@@ -441,6 +541,7 @@ mod tests {
     struct ParsedTensor {
         name: String,
         shape: Vec<u64>,
+        max_row_mass: u64,
         payload: Vec<i32>,
     }
 
@@ -471,6 +572,7 @@ mod tests {
             input: input_dir.clone(),
             output_dir: output_dir.clone(),
             config: None,
+            report_bounds: false,
         })
         .unwrap();
 
@@ -489,11 +591,13 @@ mod tests {
                 ParsedTensor {
                     name: "model.language_model.embed_tokens.weight".to_string(),
                     shape: vec![2, 2],
+                    max_row_mass: 507_904,
                     payload: vec![98_304, -131_072, 212_992, 294_912],
                 },
                 ParsedTensor {
                     name: "model.language_model.norm.weight".to_string(),
                     shape: vec![2],
+                    max_row_mass: 98_304,
                     payload: vec![32_768, 65_536],
                 }
             ]
@@ -520,6 +624,7 @@ mod tests {
             input: input_dir.join("model.safetensors"),
             output_dir: output_dir.clone(),
             config: None,
+            report_bounds: false,
         })
         .unwrap();
 
@@ -541,12 +646,14 @@ mod tests {
         fs::remove_dir_all(&output_dir_b).unwrap();
 
         fs::write(input_dir.join(CONFIG_FILENAME), "{}").unwrap();
+        // Row 0 saturates to i32::MAX, whose row mass of 2^31 - 1 sits exactly at
+        // the overflow bound minus one and must be accepted.
         write_model_file(
             &input_dir,
             &[FixtureTensor::f32(
                 "tensor",
-                &[4],
-                &[40_000.0, -40_000.0, -3.5 / 65_536.0, 3.5 / 65_536.0],
+                &[2, 2],
+                &[40_000.0, 0.0, -3.5 / 65_536.0, 3.5 / 65_536.0],
             )],
         );
 
@@ -554,12 +661,14 @@ mod tests {
             input: input_dir.clone(),
             output_dir: output_dir_a.clone(),
             config: None,
+            report_bounds: false,
         })
         .unwrap();
         convert_model_to_det_num_wgt_artifact(&CliArgs {
             input: input_dir.clone(),
             output_dir: output_dir_b.clone(),
             config: None,
+            report_bounds: false,
         })
         .unwrap();
 
@@ -568,7 +677,76 @@ mod tests {
         assert_eq!(bytes_a, bytes_b);
 
         let tensors = parse_artifact(&bytes_a);
-        assert_eq!(tensors[0].payload, vec![i32::MAX, i32::MIN, -4, 4]);
+        assert_eq!(tensors[0].payload, vec![i32::MAX, 0, -4, 4]);
+        assert_eq!(tensors[0].max_row_mass, u64::from(i32::MAX.unsigned_abs()));
+    }
+
+    #[test]
+    fn rejects_tensor_violating_row_mass_bound() {
+        let input_dir = create_temp_dir("bound-violation");
+        let output_dir = create_temp_dir("bound-violation-output");
+        fs::remove_dir_all(&output_dir).unwrap();
+
+        fs::write(input_dir.join(CONFIG_FILENAME), "{}").unwrap();
+        // -40000.0 saturates to i32::MIN, whose magnitude (2^31) alone reaches
+        // the row mass limit, so the converter must fail closed.
+        write_model_file(
+            &input_dir,
+            &[FixtureTensor::f32(
+                "tensor",
+                &[2, 2],
+                &[-40_000.0, 0.0, 0.0, 0.0],
+            )],
+        );
+
+        let error = convert_model_to_det_num_wgt_artifact(&CliArgs {
+            input: input_dir.clone(),
+            output_dir: output_dir.clone(),
+            config: None,
+            report_bounds: false,
+        })
+        .expect_err("row mass bound violation should fail conversion");
+        assert!(
+            format!("{error:#}").contains("violating the overflow bound"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn accepts_rank1_norm_tensor_exceeding_mac_bound_mass() {
+        let input_dir = create_temp_dir("rank1-norm");
+        let output_dir = create_temp_dir("rank1-norm-output");
+        fs::remove_dir_all(&output_dir).unwrap();
+
+        fs::write(input_dir.join(CONFIG_FILENAME), "{}").unwrap();
+        // Norm gain vectors are elementwise operands, never MAC reduction rows;
+        // a whole-vector mass beyond 2^31 (here 2 * 40000 * 2^16) must convert.
+        write_model_file(
+            &input_dir,
+            &[FixtureTensor::f32(
+                "model.norm.weight",
+                &[2],
+                &[20_000.0, 20_000.0],
+            )],
+        );
+
+        let summary = convert_model_to_det_num_wgt_artifact(&CliArgs {
+            input: input_dir.clone(),
+            output_dir: output_dir.clone(),
+            config: None,
+            report_bounds: false,
+        })
+        .expect("rank-1 tensor with large mass should convert");
+
+        assert_eq!(summary.tensor_bounds.len(), 1);
+        assert!(!summary.tensor_bounds[0].mac_bound);
+        assert_eq!(
+            summary.tensor_bounds[0].max_row_mass,
+            2 * 20_000 * 65_536_u64
+        );
+
+        let tensors = parse_artifact(&fs::read(output_dir.join(OUTPUT_WEIGHTS_FILENAME)).unwrap());
+        assert_eq!(tensors[0].max_row_mass, 2 * 20_000 * 65_536_u64);
     }
 
     #[test]
@@ -679,6 +857,7 @@ mod tests {
             input: input_dir.clone(),
             output_dir: output_dir.clone(),
             config: None,
+            report_bounds: false,
         })
         .unwrap();
 
@@ -703,8 +882,11 @@ mod tests {
         let mut cursor = 0usize;
         assert_eq!(&bytes[cursor..cursor + 8], b"DNWGTV0\0");
         cursor += 8;
-        assert_eq!(read_u32(bytes, &mut cursor), 0);
-        assert_eq!(read_u32(bytes, &mut cursor), 0);
+        assert_eq!(
+            read_u32(bytes, &mut cursor),
+            super::DET_WGT_ARTIFACT_FORMAT_VERSION
+        );
+        assert_eq!(read_u32(bytes, &mut cursor), super::DET_NUM_SPEC_VERSION);
         let tensor_count = read_u64(bytes, &mut cursor) as usize;
 
         let mut tensors = Vec::with_capacity(tensor_count);
@@ -720,14 +902,26 @@ mod tests {
             let element_count = read_u64(bytes, &mut cursor) as usize;
             let payload_len = read_u64(bytes, &mut cursor) as usize;
             assert_eq!(payload_len, element_count * 4);
-            let payload = bytes[cursor..cursor + payload_len]
+            let max_row_mass = read_u64(bytes, &mut cursor);
+            let payload: Vec<i32> = bytes[cursor..cursor + payload_len]
                 .chunks_exact(4)
                 .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
                 .collect();
             cursor += payload_len;
+            let row_len = shape.last().copied().unwrap_or(1).max(1) as usize;
+            let recomputed_max_row_mass = payload
+                .chunks(row_len)
+                .map(|row| row.iter().map(|bits| bits.unsigned_abs() as u64).sum())
+                .max()
+                .unwrap_or(0u64);
+            assert_eq!(
+                max_row_mass, recomputed_max_row_mass,
+                "tensor `{name}` max row mass should match independent recomputation"
+            );
             tensors.push(ParsedTensor {
                 name,
                 shape,
+                max_row_mass,
                 payload,
             });
         }

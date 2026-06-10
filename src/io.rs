@@ -26,7 +26,7 @@ use crate::shared::model::transformer::{
 };
 use crate::shared::numerics::det_num::{
     f32_to_acc, f32_to_act, scale_act, Act, Wgt, DET_NUM_SPEC_VERSION,
-    DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
+    DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC, DET_WGT_ROW_MASS_LIMIT,
 };
 // use crate::trace::{trace_event, trace_scope};
 
@@ -316,6 +316,16 @@ impl DetNumTensorReader {
             if payload_len != expected_payload_len {
                 bail!(
                     "tensor `{name}` payload length mismatch: expected {expected_payload_len}, got {payload_len}"
+                );
+            }
+
+            let max_row_mass = read_u64(&bytes, &mut cursor)?;
+            // The overflow bound applies only to MAC-reduction weight tensors
+            // (rank >= 2); rank-1 tensors are elementwise operands whose mass is
+            // recorded for audit but not bounded.
+            if shape.len() >= 2 && max_row_mass >= DET_WGT_ROW_MASS_LIMIT {
+                bail!(
+                    "tensor `{name}` max row mass {max_row_mass} violates the conversion-time overflow bound (must be < {DET_WGT_ROW_MASS_LIMIT})"
                 );
             }
 
@@ -3886,6 +3896,103 @@ mod tests {
         serialize_to_file(&metadata, &None, &dir.join("model.safetensors")).unwrap();
     }
 
+    #[test]
+    fn det_artifact_loader_rejects_v0_format_version() {
+        let dir = create_test_model_dir("det-v0-format");
+        let path = dir.join("model.detwgt");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let error = match super::DetNumTensorReader::load_artifact(&path) {
+            Ok(_) => panic!("v0 format version should fail closed"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported deterministic artifact format version"));
+    }
+
+    #[test]
+    fn det_artifact_loader_rejects_v0_spec_version() {
+        let dir = create_test_model_dir("det-v0-spec");
+        let path = dir.join("model.detwgt");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
+        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let error = match super::DetNumTensorReader::load_artifact(&path) {
+            Ok(_) => panic!("v0 spec version should fail closed"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("unsupported deterministic artifact det_num spec version"));
+    }
+
+    fn single_tensor_detwgt_bytes(name: &str, shape: &[u64], max_row_mass: u64) -> Vec<u8> {
+        let element_count: u64 = shape.iter().product();
+        let payload = vec![0u8; (element_count * 4) as usize];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
+        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+        for dim in shape {
+            bytes.extend_from_slice(&dim.to_le_bytes());
+        }
+        bytes.extend_from_slice(&element_count.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&max_row_mass.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    #[test]
+    fn det_artifact_loader_rejects_matrix_row_mass_violating_bound() {
+        let dir = create_test_model_dir("det-row-mass-violation");
+        let path = dir.join("model.detwgt");
+        fs::write(
+            &path,
+            single_tensor_detwgt_bytes("tensor", &[1, 2], super::DET_WGT_ROW_MASS_LIMIT),
+        )
+        .unwrap();
+
+        let error = match super::DetNumTensorReader::load_artifact(&path) {
+            Ok(_) => panic!("matrix row mass at the limit should fail closed"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("violates the conversion-time overflow bound"));
+    }
+
+    #[test]
+    fn det_artifact_loader_accepts_rank1_tensor_with_unbounded_mass() {
+        let dir = create_test_model_dir("det-row-mass-rank1");
+        let path = dir.join("model.detwgt");
+        // Rank-1 tensors are elementwise operands (e.g. RMSNorm gains); the
+        // MAC overflow bound does not apply to their recorded mass.
+        fs::write(
+            &path,
+            single_tensor_detwgt_bytes("norm.weight", &[2], super::DET_WGT_ROW_MASS_LIMIT * 2),
+        )
+        .unwrap();
+
+        super::DetNumTensorReader::load_artifact(&path)
+            .map(|_| ())
+            .expect("rank-1 tensor with large recorded mass should load");
+    }
+
     fn write_detwgt_file(dir: &Path, tensors: &[FixtureTensor]) {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
@@ -3904,10 +4011,24 @@ mod tests {
             }
             bytes.extend_from_slice(&element_count.to_le_bytes());
             bytes.extend_from_slice(&(tensor.bytes.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&fixture_max_row_mass(tensor).to_le_bytes());
             bytes.extend_from_slice(&tensor.bytes);
         }
 
         fs::write(dir.join("model.detwgt"), bytes).unwrap();
+    }
+
+    fn fixture_max_row_mass(tensor: &FixtureTensor) -> u64 {
+        let row_len = tensor.shape.last().copied().unwrap_or(1).max(1);
+        tensor
+            .bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()).unsigned_abs() as u64)
+            .collect::<Vec<_>>()
+            .chunks(row_len)
+            .map(|row| row.iter().sum::<u64>())
+            .max()
+            .unwrap_or(0)
     }
 
     fn layer_tensors(layer_idx: usize, base: f32, include_v_proj: bool) -> Vec<FixtureTensor> {

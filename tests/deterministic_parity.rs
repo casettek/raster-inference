@@ -1366,11 +1366,25 @@ fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) {
 
     for tensor in tensors {
         let name_bytes = tensor.name.as_bytes();
-        let payload = tensor
+        let wgt_bits = tensor
             .values
             .iter()
-            .flat_map(|value| wgt_to_le_bytes(f32_to_wgt(*value)))
+            .map(|value| f32_to_wgt(*value))
             .collect::<Vec<_>>();
+        let payload = wgt_bits
+            .iter()
+            .flat_map(|wgt| wgt_to_le_bytes(*wgt))
+            .collect::<Vec<_>>();
+        let row_len = tensor.shape.last().copied().unwrap_or(1).max(1);
+        let max_row_mass = wgt_bits
+            .chunks(row_len)
+            .map(|row| {
+                row.iter()
+                    .map(|wgt| u64::from(wgt.to_bits().unsigned_abs()))
+                    .sum::<u64>()
+            })
+            .max()
+            .unwrap_or(0);
         let element_count = tensor.shape.iter().product::<usize>() as u64;
 
         bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
@@ -1381,6 +1395,7 @@ fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) {
         }
         bytes.extend_from_slice(&element_count.to_le_bytes());
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&max_row_mass.to_le_bytes());
         bytes.extend_from_slice(&payload);
     }
 

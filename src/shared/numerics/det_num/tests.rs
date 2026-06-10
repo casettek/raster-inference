@@ -1,7 +1,7 @@
 use std::{mem::size_of, panic};
 
 use super::{
-    acc_add_sat, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first,
+    acc_add_sat, acc_combine, acc_to_le_bytes, act_to_f32, act_to_le_bytes, add_sat, argmax_first,
     attention_score, attention_softmax, attention_softmax_exp_term, attention_softmax_raw_weight,
     attention_softmax_residual, attention_weighted_sum, clip_act, div_acc_by_u32, div_act,
     f32_to_acc, f32_to_act, f32_to_wgt, gelu_pytorch_tanh_act, mac, mac_bits, mul_sat, mul_wide,
@@ -59,6 +59,18 @@ fn mul_wide_matches_golden_vectors() {
             b_bits: i32::MAX,
             expected_bits: i64::from(i32::MAX) * i64::from(i32::MAX),
         },
+        Case {
+            name: "extreme_negative_pair_exact",
+            a_bits: i32::MIN,
+            b_bits: i32::MIN,
+            expected_bits: 1_i64 << 62,
+        },
+        Case {
+            name: "extreme_mixed_pair_exact",
+            a_bits: i32::MIN,
+            b_bits: i32::MAX,
+            expected_bits: i64::from(i32::MIN) * i64::from(i32::MAX),
+        },
     ];
 
     for case in cases {
@@ -90,17 +102,45 @@ fn mac_matches_golden_vectors() {
             expected_bits: 22,
         },
         Case {
-            name: "positive_saturation",
+            name: "positive_wraparound_crosses_max",
             acc_bits: i64::MAX - 3,
             a_bits: 2,
+            b_bits: 2,
+            expected_bits: i64::MIN,
+        },
+        Case {
+            name: "negative_wraparound_crosses_min",
+            acc_bits: i64::MIN + 3,
+            a_bits: -2,
             b_bits: 2,
             expected_bits: i64::MAX,
         },
         Case {
-            name: "negative_saturation",
-            acc_bits: i64::MIN + 3,
-            a_bits: -2,
-            b_bits: 2,
+            name: "positive_wraparound_with_wide_product",
+            acc_bits: i64::MAX,
+            a_bits: 1 << 16,
+            b_bits: 1 << 16,
+            expected_bits: i64::MIN + (1_i64 << 32) - 1,
+        },
+        Case {
+            name: "sign_mixed_terms_stay_exact",
+            acc_bits: -(1_i64 << 40),
+            a_bits: 1 << 20,
+            b_bits: 1 << 21,
+            expected_bits: (1_i64 << 41) - (1_i64 << 40),
+        },
+        Case {
+            name: "extreme_product_accumulates_exactly",
+            acc_bits: 0,
+            a_bits: i32::MIN,
+            b_bits: i32::MIN,
+            expected_bits: 1_i64 << 62,
+        },
+        Case {
+            name: "extreme_products_wrap_deterministically",
+            acc_bits: 1_i64 << 62,
+            a_bits: i32::MIN,
+            b_bits: i32::MIN,
             expected_bits: i64::MIN,
         },
     ];
@@ -149,13 +189,13 @@ fn mac_bits_matches_mac_for_representative_vectors() {
             b_bits: i32::MAX,
         },
         Case {
-            name: "positive_saturation",
+            name: "positive_wraparound",
             acc_bits: i64::MAX - 3,
             a_bits: 2,
             b_bits: 2,
         },
         Case {
-            name: "negative_saturation",
+            name: "negative_wraparound",
             acc_bits: i64::MIN + 3,
             a_bits: -2,
             b_bits: 2,
@@ -174,6 +214,273 @@ fn mac_bits_matches_mac_for_representative_vectors() {
             "{}",
             case.name
         );
+    }
+}
+
+#[test]
+fn acc_combine_matches_wrapping_golden_vectors() {
+    struct Case {
+        name: &'static str,
+        a_bits: i64,
+        b_bits: i64,
+        expected_bits: i64,
+    }
+
+    let cases = [
+        Case {
+            name: "exact_sum",
+            a_bits: 5,
+            b_bits: 7,
+            expected_bits: 12,
+        },
+        Case {
+            name: "sign_mixed_exact_sum",
+            a_bits: -3,
+            b_bits: 10,
+            expected_bits: 7,
+        },
+        Case {
+            name: "positive_wraparound",
+            a_bits: i64::MAX,
+            b_bits: 1,
+            expected_bits: i64::MIN,
+        },
+        Case {
+            name: "negative_wraparound",
+            a_bits: i64::MIN,
+            b_bits: -1,
+            expected_bits: i64::MAX,
+        },
+        Case {
+            name: "double_min_wraps_to_zero",
+            a_bits: i64::MIN,
+            b_bits: i64::MIN,
+            expected_bits: 0,
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            acc_combine(Acc::from_bits(case.a_bits), Acc::from_bits(case.b_bits)).to_bits(),
+            case.expected_bits,
+            "{}",
+            case.name
+        );
+    }
+}
+
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn mac_fold_left_to_right(terms: &[(i32, i32)]) -> i64 {
+    terms
+        .iter()
+        .fold(0_i64, |acc_bits, (a_bits, b_bits)| {
+            mac_bits(acc_bits, *a_bits, *b_bits)
+        })
+}
+
+fn mac_tree_reduce(terms: &[(i32, i32)]) -> i64 {
+    if terms.is_empty() {
+        return 0;
+    }
+    let mut level = terms
+        .iter()
+        .map(|(a_bits, b_bits)| mac_bits(0, *a_bits, *b_bits))
+        .collect::<Vec<_>>();
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| match pair {
+                [lhs, rhs] => acc_combine(Acc::from_bits(*lhs), Acc::from_bits(*rhs)).to_bits(),
+                [single] => *single,
+                _ => unreachable!("chunks(2) yields one or two elements"),
+            })
+            .collect();
+    }
+    level[0]
+}
+
+fn mac_chunked_reduce(terms: &[(i32, i32)], chunk_size: usize) -> i64 {
+    terms
+        .chunks(chunk_size)
+        .map(mac_fold_left_to_right)
+        .fold(0_i64, |acc_bits, partial_bits| {
+            acc_combine(Acc::from_bits(acc_bits), Acc::from_bits(partial_bits)).to_bits()
+        })
+}
+
+fn shuffled<T: Copy>(items: &[T], rng_state: &mut u64) -> Vec<T> {
+    let mut shuffled = items.to_vec();
+    for idx in (1..shuffled.len()).rev() {
+        let swap_idx = (xorshift64(rng_state) % (idx as u64 + 1)) as usize;
+        shuffled.swap(idx, swap_idx);
+    }
+    shuffled
+}
+
+/// Executable form of the v1 contract: wrapping MAC accumulation is associative
+/// and commutative, so every reduction schedule over the same term set must
+/// produce identical accumulator bits. Permanent conformance fixture.
+#[test]
+fn mac_reduction_is_schedule_independent() {
+    let mut rng_state = 0x5DEECE66D_u64;
+
+    let mut term_sets: Vec<(String, Vec<(i32, i32)>)> = Vec::new();
+
+    // Randomized term sets covering vector-lane tail classes.
+    for len in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100] {
+        let terms = (0..len)
+            .map(|_| {
+                (
+                    xorshift64(&mut rng_state) as u32 as i32,
+                    xorshift64(&mut rng_state) as u32 as i32,
+                )
+            })
+            .collect::<Vec<_>>();
+        term_sets.push((format!("random_len_{len}"), terms));
+    }
+
+    // Adversarial sets engineered to wrap: each term contributes 2^62, so the
+    // accumulator crosses i64 boundaries repeatedly.
+    term_sets.push((
+        "all_extreme_negative_pairs".to_string(),
+        vec![(i32::MIN, i32::MIN); 9],
+    ));
+    term_sets.push((
+        "all_extreme_positive_pairs".to_string(),
+        vec![(i32::MAX, i32::MAX); 17],
+    ));
+    term_sets.push((
+        "alternating_extreme_sign_pairs".to_string(),
+        (0..33)
+            .map(|idx| {
+                if idx % 2 == 0 {
+                    (i32::MIN, i32::MIN)
+                } else {
+                    (i32::MIN, i32::MAX)
+                }
+            })
+            .collect(),
+    ));
+
+    for (name, terms) in &term_sets {
+        let reference_bits = mac_fold_left_to_right(terms);
+
+        let reversed = terms.iter().rev().copied().collect::<Vec<_>>();
+        assert_eq!(
+            mac_fold_left_to_right(&reversed),
+            reference_bits,
+            "{name}: reversed fold should match the serial reference"
+        );
+
+        for permutation_idx in 0..4 {
+            let permuted = shuffled(terms, &mut rng_state);
+            assert_eq!(
+                mac_fold_left_to_right(&permuted),
+                reference_bits,
+                "{name}: random permutation {permutation_idx} should match the serial reference"
+            );
+        }
+
+        assert_eq!(
+            mac_tree_reduce(terms),
+            reference_bits,
+            "{name}: balanced pairwise tree reduction should match the serial reference"
+        );
+
+        for chunk_size in [1usize, 2, 3, 4, 7, 8, 16, 32] {
+            assert_eq!(
+                mac_chunked_reduce(terms, chunk_size),
+                reference_bits,
+                "{name}: chunked reduction with chunk size {chunk_size} should match the serial reference"
+            );
+        }
+    }
+}
+
+/// The softmax exponent-term sum stays saturating (`acc_add_sat`), which is
+/// order-independent over non-negative terms: partial sums are monotonically
+/// non-decreasing under every ordering, so either no ordering saturates or
+/// every ordering saturates and stays saturated.
+#[test]
+fn saturating_sum_of_non_negative_terms_is_schedule_independent() {
+    let mut rng_state = 0xB5297A4D_u64;
+
+    let mut term_sets: Vec<(String, Vec<i64>)> = vec![
+        ("empty".to_string(), Vec::new()),
+        ("single_term".to_string(), vec![42]),
+        (
+            "saturating_terms".to_string(),
+            vec![i64::MAX / 2, i64::MAX / 2, i64::MAX / 2, 12_345, 0, 7],
+        ),
+        (
+            "all_max_terms".to_string(),
+            vec![i64::MAX, i64::MAX, i64::MAX],
+        ),
+        (
+            "exact_boundary_sum".to_string(),
+            vec![i64::MAX - 10, 10, 0],
+        ),
+    ];
+    for len in [3usize, 8, 33] {
+        let terms = (0..len)
+            .map(|_| (xorshift64(&mut rng_state) >> 1) as i64 >> 16)
+            .collect::<Vec<_>>();
+        term_sets.push((format!("random_non_negative_len_{len}"), terms));
+    }
+
+    fn sat_fold(terms: &[i64]) -> i64 {
+        terms
+            .iter()
+            .fold(Acc::from_bits(0), |acc, bits| {
+                acc_add_sat(acc, Acc::from_bits(*bits))
+            })
+            .to_bits()
+    }
+
+    for (name, terms) in &term_sets {
+        assert!(
+            terms.iter().all(|bits| *bits >= 0),
+            "{name}: fixture terms must be non-negative"
+        );
+        let reference_bits = sat_fold(terms);
+
+        let reversed = terms.iter().rev().copied().collect::<Vec<_>>();
+        assert_eq!(
+            sat_fold(&reversed),
+            reference_bits,
+            "{name}: reversed saturating fold should match"
+        );
+
+        for permutation_idx in 0..4 {
+            let permuted = shuffled(terms, &mut rng_state);
+            assert_eq!(
+                sat_fold(&permuted),
+                reference_bits,
+                "{name}: permuted saturating fold {permutation_idx} should match"
+            );
+        }
+
+        for chunk_size in [1usize, 2, 3, 5, 8] {
+            let chunked = terms
+                .chunks(chunk_size)
+                .map(sat_fold)
+                .fold(Acc::from_bits(0), |acc, partial_bits| {
+                    acc_add_sat(acc, Acc::from_bits(partial_bits))
+                })
+                .to_bits();
+            assert_eq!(
+                chunked, reference_bits,
+                "{name}: chunked saturating combination with chunk size {chunk_size} should match"
+            );
+        }
     }
 }
 

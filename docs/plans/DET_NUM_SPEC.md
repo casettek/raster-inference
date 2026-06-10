@@ -1,4 +1,25 @@
-# `det_num` v0 Arithmetic and Model-Compilation Spec
+# `det_num` v1 Arithmetic and Model-Compilation Spec
+
+Status: CURRENT — supersedes `det_num` v0. v0 is archived unamended as `DET_NUM_SPEC_V0.md`.
+
+---
+
+## Changelog: v0 -> v1
+
+Normative changes:
+
+1. **MAC accumulation is wrapping, not saturating.** Dot-product accumulation in `Acc` uses two's-complement wrapping addition. Reduction order over MAC terms is no longer part of the contract (§2, §3).
+2. **Reduction-order requirements removed for associative reductions.** The "left-to-right" ordering rules in attention-score and weighted-value-aggregation semantics are deleted (§8, §10). The set of terms per output element remains exactly specified; their grouping and order do not.
+3. **Conversion-time overflow bound added (normative).** The model compiler must prove, per weight row, that MAC accumulation cannot exceed `2^62` in magnitude for any representable activation input, and must fail closed otherwise (Canonical source conversion rules).
+4. **Parallelism legality section added.** Defines which execution schedules are conforming (new section).
+5. **Wraparound determinism clause added.** Defines semantics when wrapping occurs in reductions that cannot be statically bounded (§3).
+6. **Storage-width extension pre-authorized.** Exact, value-preserving width-reduced weight encodings are permitted in future artifact format versions; the v0 prohibition on alternate encodings is narrowed to value-changing encodings (v1 storage policy).
+7. **Compatibility-commitment retirement for deterministic mode.** Deterministic-mode runs emit only canonical `det_*` commitments; f32 mirror computation and f32 compatibility commitments are removed from the deterministic path (Runtime state boundary).
+8. `det_num_spec_version = 1`; mixed-version execution fails closed (Versioning).
+
+Unchanged from v0 (explicitly reaffirmed): type layouts and real-value interpretation; widening multiply; `requantize` rounding (round-to-nearest, ties-to-even) and saturating narrowing; all `Act`-domain saturating elementwise ops (`add_sat`, `sub_sat`, `mul_sat`); right-shift semantics; comparison and `argmax_first` tie-breaking; RoPE semantics; softmax semantics including residual assignment; tanh, softcap, and GELU fixed evaluation orders; FP32 -> `Wgt` conversion rule; serialization rules.
+
+---
 
 ## Purpose
 
@@ -8,39 +29,40 @@ Its purpose is to ensure that the same model, inputs, and code produce identical
 
 - different CPUs
 - different compiler settings
+- different execution schedules (serial, multicore, SIMD, GPU)
 - future RISC Zero guest execution
 
-`det_num` is the source of truth for arithmetic semantics. External libraries like `fixed` and `fixed_analytics` are implementation dependencies only.
+`det_num` is the source of truth for arithmetic semantics. External libraries like `fixed` are implementation dependencies only.
 
-In v0, `det_num` also defines the canonical numeric representation of compiled model weights used by inference kernels.
+v1's central change: the canonical dot-product reduction is made **associative and commutative** by adopting wrapping accumulation, so that conformance is a property of the *values computed*, never of the *schedule used to compute them*. A serial zkVM guest and a vectorized multicore native backend are equal by algebra, not by testing.
 
 ---
 
 ## Runtime state boundary
 
-Deterministic execution requires a model loaded from `model.detwgt`. Mixed-mode inputs such as safetensors/f32 model provenance with `InferenceExecutionMode::Deterministic` are invalid and must fail closed instead of requantizing public f32 mirrors.
+Deterministic execution requires a model loaded from a canonical weight artifact (`model.detwgt`). Mixed-mode inputs such as safetensors/f32 model provenance with `InferenceExecutionMode::Deterministic` are invalid and must fail closed.
 
 Deterministic execution stores runtime state internally in canonical fixed-point form:
 
-- layer activation rows that continue through deterministic prefill and decode use canonical `Act` rows as the source of truth
+- layer activation rows use canonical `Act` rows as the source of truth
 - deterministic KV cache keys and values retain canonical `Act` rows across decode steps
-- logits can carry canonical `Act` values through deterministic token selection
-- norm vectors loaded from `model.detwgt` are carried as canonical `Wgt` values alongside their compatibility f32 views
-- config-derived deterministic scalars such as RMS epsilon and RoPE bases are converted once at load time into canonical `Acc` values
+- logits carry canonical `Act` values through deterministic token selection
+- config-derived deterministic scalars (RMS epsilon, RoPE bases) are converted once at load time into canonical `Acc` values
 - deterministic scale/softcap scalars are converted once at load time into canonical `Act` values
 
-The current public API still exposes compatibility `f32` views. Existing fields such as `activations_sha256`, `final_logits_sha256`, and serialized `layer_caches` remain compatibility commitments over those `f32` views. Optional `det_*_sha256` fields are canonical commitments over fixed-point bytes and are emitted only when deterministic internals are present; f32-only internals must not fabricate them.
+**v1 change:** deterministic mode computes no `f32` mirror values downstream of weight load. Deterministic-mode outputs carry only canonical commitments (`det_*` fields) over canonical serialized bytes. The v0 f32 compatibility commitments (`activations_sha256`, `final_logits_sha256`, f32 `layer_caches` serializations) are not emitted by deterministic-mode runs. Fp32-mode execution and outputs are unchanged.
+
+The in-memory representation of canonical values (nested vs. flat buffers, borrowed vs. owned, storage width of weights per the artifact format) is not contract surface. Only canonical values and their canonical serialized bytes are.
 
 ---
 
 ## Design goals
 
 - deterministic and portable
-- simple enough to implement and test early
-- efficient enough for CPU inference
-- strict enough to preserve future zkVM parity
-- small surface area for v0
-- isolate arithmetic-path quality effects from storage-format compression effects
+- schedule-independent: conforming results must not depend on execution order, thread count, lane width, or hardware backend
+- efficient enough for CPU and GPU inference without semantic compromise
+- strict enough to preserve zkVM parity
+- small surface area
 
 ---
 
@@ -48,44 +70,13 @@ The current public API still exposes compatibility `f32` views. Existing fields 
 
 ### Core fixed-point types
 
-The runtime defines three canonical scalar types:
+Unchanged from v0:
 
-- `Act`: activation type
-- `Wgt`: weight type
-- `Acc`: accumulator type
-
-### Initial v0 choices
-
-These are the canonical v0 scalar layouts:
-
-- `Act`: signed 32-bit fixed-point scalar with 16 fractional bits
-- `Wgt`: signed 32-bit fixed-point scalar with 16 fractional bits
-- `Acc`: signed 64-bit fixed-point scalar with 32 fractional bits
-
-Interpretation:
-
-- activations and weights use a signed 32-bit fixed-point layout with 16 fractional bits
-- accumulators use a signed 64-bit fixed-point layout with 32 fractional bits
-- concrete host-library type names may differ as long as the bit layout and canonical arithmetic semantics are preserved
-
-This gives:
-
-- enough fractional precision to start safely
-- wide accumulation headroom
-- easy multiply/requantize behavior
-- a single canonical executable weight format for v0
+- `Act`: signed 32-bit fixed-point scalar, 16 fractional bits (Q16.16); `Act(x)` represents `x / 2^16`
+- `Wgt`: signed 32-bit fixed-point scalar, 16 fractional bits (Q16.16); `Wgt(x)` represents `x / 2^16`
+- `Acc`: signed 64-bit fixed-point scalar, 32 fractional bits (Q32.32); `Acc(x)` represents `x / 2^32`
 
 These bit layouts and semantics are part of the arithmetic contract.
-
-### Real-value interpretation
-
-Canonical interpretation is:
-
-- `Act(x)` represents `x / 2^16`
-- `Wgt(x)` represents `x / 2^16`
-- `Acc(x)` represents `x / 2^32`
-
-where `x` is the signed integer payload of the scalar.
 
 ---
 
@@ -93,127 +84,88 @@ where `x` is the signed integer payload of the scalar.
 
 ### 1. Multiplication
 
-All scalar multiplication between `Act` and `Wgt` must use widening multiply.
-
-Rule:
+Unchanged. All scalar multiplication between `Act` and `Wgt` uses widening multiply.
 
 - `mul_wide(a: Act, b: Wgt) -> Acc`
-
-Semantics:
-
-- multiplication is performed in widened precision
-- no narrow multiply is allowed in canonical kernels
-- no implicit truncation is allowed during multiply
-- the mathematical interpretation is Q16.16 × Q16.16 -> Q32.32
+- performed in widened precision; the product of two signed 32-bit payloads is always exactly representable in the signed 64-bit accumulator payload — widening multiplication is exact and cannot overflow
+- no narrow multiply, no implicit truncation
+- mathematical interpretation: Q16.16 × Q16.16 -> Q32.32
 
 ### 2. Multiply-accumulate
 
-All dot products and affine transforms must accumulate only in `Acc`.
+All dot products and affine transforms accumulate only in `Acc`.
 
 Rule:
 
 - `mac(acc: Acc, a: Act, b: Wgt) -> Acc`
+- bit-level form: `mac_bits(acc_bits: i64, act_bits: i32, wgt_bits: i32) -> i64`
 
 Semantics:
 
-- compute `mul_wide(a, b)`
-- add result to `acc`
-- addition uses saturating arithmetic
+- compute the exact widened product `i64(act_bits) * i64(wgt_bits)`
+- add the product to the accumulator using **two's-complement wrapping addition** (addition modulo `2^64` on the bit pattern, reinterpreted as signed)
 - no narrowing during accumulation
+
+Consequences (normative):
+
+- wrapping addition is associative and commutative; therefore **the grouping and ordering of MAC terms is not part of the contract**
+- any partition of a reduction's term set into sub-reductions, computed in any order, on any hardware, combined with wrapping `Acc` addition, is conforming and produces identical accumulator bits
+- a reduction is specified by its **term set**: the exact multiset of `(activation, weight)` pairs contributing to each output element. The term set per output element is part of the contract; the schedule is not.
+- partial accumulators combined across lanes, threads, warps, or devices must be combined with the same wrapping `Acc` addition. No other combination operation is conforming.
+
+The serial left-to-right loop remains the **reference implementation** and the oracle for differential testing. It is no longer the only conforming schedule.
 
 ### 3. Overflow policy
 
-Canonical runtime overflow behavior is:
+v1 splits overflow behavior by domain:
 
-- **saturating**
+**Reduction domain (`Acc` MAC accumulation): wrapping.**
 
-This applies to:
+- accumulation overflow wraps modulo `2^64`
+- wrapping in this domain is fully deterministic and identical across all conforming backends
 
-- addition
-- subtraction
-- narrowing/requantization
-- explicit clipping steps
-- model-compilation conversion into canonical scalar types
+**Materialization and elementwise domain: saturating.** Unchanged from v0:
 
-Wrapping arithmetic is forbidden in canonical inference kernels unless a future spec version explicitly introduces it.
+- `requantize` narrowing saturates
+- `Act`-domain addition, subtraction, multiplication (`add_sat`, `sub_sat`, `mul_sat`) saturate
+- explicit clipping saturates
+- model-compilation conversion into canonical scalar types saturates
+
+These saturating operations are applied either once per output element (narrowing) or with a fixed operand pairing (elementwise ops), so order-dependence cannot arise from them.
+
+**Wraparound determinism clause.** Where accumulation wraparound is reachable, the result is still exactly specified: every conforming backend computes the identical wrapped bit pattern. The protocol's security property is bit-equality of committed canonical values; wraparound therefore cannot create divergence between honest conforming executors. Wraparound reachability per reduction site:
+
+- **Linear projections (weights from the canonical artifact):** wraparound is statically impossible. The conversion-time overflow bound (below) guarantees `|Σ products| < 2^62` for every representable activation input. (Informative: this means even adversarially chosen activations cannot wrap a weight-bounded reduction.)
+- **Attention weighted-value aggregation:** wraparound is structurally impossible when weights are canonical `attention_softmax` outputs: the weights are non-negative and sum to exactly `1.0` in Q16.16 (`Σ w_bits = 2^16`), so `|Σ w_i · v_i| ≤ 2^16 · 2^31 = 2^47 < 2^62`.
+- **Attention score (q·k):** both operands are runtime activations, so no static bound exists; with extreme adversarially-constructed activations the accumulation can wrap. Honest activations under RMS normalization do not approach this regime. If wraparound occurs, the wrapped result is canonical and identical everywhere; downstream `requantize` saturation bounds the materialized score.
+
+**Softmax exponent-term summation: saturating, retained.** `acc_add_sat` over softmax exponent terms remains the canonical operation. This does not reintroduce order-dependence: all exponent terms are non-negative by construction, and saturating summation of non-negative terms is order-independent — partial sums are monotonically non-decreasing under every ordering, so either no ordering reaches the ceiling (all orderings compute the exact sum) or every ordering reaches and remains at the ceiling. The term set, not the order, determines the result. (Informative: this site may therefore also be parallelized freely.)
 
 ### 4. Requantization
 
-Rule:
+Unchanged from v0.
 
 - `requantize(x: Acc) -> Act`
-
-Semantics:
-
 - narrowing from `Acc` to `Act` is always explicit
-- rounding mode is:
-  - **round to nearest**
-  - **ties to even**
+- rounding: round to nearest, ties to even
 - narrowing uses saturating conversion
-- no implicit casts are allowed in canonical kernels
-- in v0, `clip_act(x)` is intentionally identical to `requantize(x)`
+- no implicit casts in canonical kernels
+- `clip_act(x)` remains intentionally identical to `requantize(x)`
+- `requantize` is applied exactly once per reduction output, to the final combined accumulator
 
 ### 5. Right-shift semantics
 
-All right shifts used for scaling/requantization must be routed through canonical helper functions.
-
-Semantics:
-
-- signed right shifts must preserve sign
-- any rounding before shift must be explicit
-- raw `>>` in model kernels is forbidden unless wrapped in `det_num`
-- `rshift_round_ties_even(x, shift)` panics for `shift >= 64`
-
-Rule:
-
-- use helper such as `rshift_round_ties_even(...)`
+Unchanged from v0. All scaling right shifts route through canonical helpers (`rshift_round_ties_even`); signed shifts preserve sign; raw `>>` is forbidden in model kernels outside `det_num`; `rshift_round_ties_even(x, shift)` panics for `shift >= 64`.
 
 ### 6. Comparison semantics
 
-Canonical scalar comparison is exact comparison on fixed-point encoded values.
-
-For argmax:
-
-- larger value wins
-- if values are equal, **lowest index wins**
-
-Rule:
-
-- `argmax_first(xs: &[Act]) -> usize`
-
-Behavior:
-
-- `argmax_first` panics on empty slices
-
-This tie-break rule is part of the contract.
+Unchanged from v0. Exact comparison on fixed-point encoded values. `argmax_first`: larger value wins; equal values resolve to lowest index; panics on empty slices. The tie-break rule is part of the contract.
 
 ### 7. RoPE semantics
 
-Canonical deterministic RoPE is defined on `Act` rows and must not rely on host `f32`
-transcendentals at execution time.
-
-Rule:
-
-- `rope_rotate_pairs(input: &[Act], rotary_dim: usize, freq_base_dim: usize, base: Acc, position: usize) -> Vec<Act>`
-
-Semantics:
-
-- `rotary_dim == 0` is a no-op
-- otherwise, `rotary_dim` must be even and must fit within `input.len()`
-- `freq_base_dim` must be even and at least 2
-- `base` must be strictly positive
-- pair `i` rotates `input[i]` with `input[i + rotary_dim / 2]`
-- the per-pair inverse-frequency step is the canonical Q32.32 reciprocal of the canonical Q32.32 `freq_base_dim / 2`-th root of `base`
-- pair `0` uses inverse frequency `1.0`, and each later pair multiplies by that step using canonical Q32.32 fixed-point multiply semantics
-- the angle is `position * inverse_frequency`, represented canonically in Q32.32
-- `sin` and `cos` are materialized canonically from that Q32.32 angle using only deterministic fixed-point helpers
-- rotated outputs use canonical fixed-point multiply/requantize plus saturating add/sub semantics
-- dimensions beyond `rotary_dim` are copied through unchanged
+Unchanged from v0 in full. (Informative: RoPE rotation is elementwise per pair with fixed operand pairing — no reduction — so it was never order-sensitive; per-(position, dimension, base) sin/cos values are pure canonical function outputs and may be precomputed and cached without affecting conformance.)
 
 ### 8. Attention score semantics
-
-Canonical deterministic attention scores are defined on `Act` rows and must not rely on host `f32`
-accumulation once deterministic execution is active.
 
 Rule:
 
@@ -222,38 +174,25 @@ Rule:
 Semantics:
 
 - `query` and `key` must be non-empty and have matching widths
-- reduction order is left-to-right over the row
-- each term uses canonical widening multiply semantics
-- accumulation uses saturating `Acc`
-- score materialization is explicit and uses canonical `requantize`
+- the term set is `{(query[i], key[i]) : i in 0..width}`; each term uses canonical widening multiply
+- accumulation uses **wrapping `Acc`** per §2/§3; grouping and ordering of terms are not part of the contract
+- score materialization is explicit and uses canonical `requantize` on the final combined accumulator
 - no host-float dot-product fallback is allowed on the deterministic path
 
 ### 9. Attention softmax semantics
 
-Canonical deterministic softmax is defined on `Act` logits and emits canonical `Act` weights.
+Unchanged from v0 except the summation note in §3:
 
-Rule:
-
-- `attention_softmax(logits: &[Act]) -> Vec<Act>`
-
-Semantics:
-
-- `logits` must be non-empty
-- the maximum logit is selected with canonical `argmax_first`, so equal maxima resolve to the
-  lowest index
-- every exponent term is computed from `logit - max_logit`, so the largest shifted logit is exactly
-  zero
-- shifted logits are interpreted canonically in Q32.32 before exponent materialization
-- exponent materialization uses deterministic range reduction by `ln(2)`, then a fixed polynomial on
-  the reduced remainder; no host `exp` is allowed
-- exponent terms smaller than the explicit underflow floor clamp to zero
+- maximum logit selected with canonical `argmax_first` (lowest index on ties)
+- exponent terms computed from `logit - max_logit`; largest shifted logit is exactly zero
+- shifted logits interpreted canonically in Q32.32 before exponent materialization
+- exponent materialization uses deterministic range reduction by `ln(2)` then a fixed polynomial; no host `exp`
+- exponent terms below the explicit underflow floor clamp to zero
+- exponent-term summation uses `acc_add_sat` (order-independent over non-negative terms; see §3)
 - normalization divides each exponent by the canonical sum with ties-to-even rounding
-- the final residual needed to make weights sum to exactly `1.0` in Q16.16 is assigned back to the
-  winning `argmax_first` index
+- the residual making weights sum to exactly `1.0` in Q16.16 is assigned to the winning `argmax_first` index
 
 ### 10. Attention weighted-value aggregation semantics
-
-Canonical deterministic value mixing applies canonical attention weights to canonical value rows.
 
 Rule:
 
@@ -261,92 +200,38 @@ Rule:
 
 Semantics:
 
-- `weights` and `value_rows` must be non-empty and have matching row counts
-- all value rows must share one width
-- reduction order is row-major and left-to-right within the weight/value pairing
-- each multiply uses canonical widening precision
-- accumulation uses saturating `Acc`
-- each output dimension is materialized with canonical `requantize`
+- `weights` and `value_rows` must be non-empty with matching row counts; all value rows share one width
+- for output dimension `d`, the term set is `{(weights[r], value_rows[r][d]) : r in 0..rows}`; each multiply uses canonical widening precision
+- accumulation uses **wrapping `Acc`** per §2/§3; grouping and ordering are not part of the contract
+- each output dimension is materialized with canonical `requantize` on its final combined accumulator
 
 ### 11. Deterministic tanh semantics
 
-Canonical deterministic `tanh` is defined on `Act` inputs and must not rely on host `f32`
-transcendentals at execution time.
-
-Rule:
-
-- `tanh_act(input: Act) -> Act`
-
-Semantics:
-
-- inputs are interpreted canonically in Q16.16
-- saturation is explicit: `input >= 3.0` maps to `1.0`, and `input <= -3.0` maps to `-1.0`
-- otherwise, evaluation uses the fixed rational approximation `x * (27 + x^2) / (27 + 9x^2)`
-- `x^2` is materialized with canonical `mul_sat`
-- numerator and denominator terms are formed with canonical saturating add/multiply helpers
-- division uses canonical `div_act`, so rounding is ties-to-even
-- evaluation order is fixed and part of the contract:
-  1. compute `x^2`
-  2. compute `27 + x^2`
-  3. compute `27 + 9x^2`
-  4. compute `x * (27 + x^2)`
-  5. divide by `27 + 9x^2`
+Unchanged from v0 in full, including the fixed five-step evaluation order. (Informative: fixed evaluation orders for scalar polynomial/rational pipelines are not reduction orders; they remain contract because each step's saturating intermediate is semantically load-bearing.)
 
 ### 12. Deterministic logits softcap semantics
 
-Canonical deterministic logits softcapping is defined on `Act` logits and must not rely on host
-`f32` transcendental helpers at execution time.
-
-Rule:
-
-- `softcap_act(input: Act, softcap: Act) -> Act`
-
-Semantics:
-
-- `softcap` must be strictly positive
-- the helper implements `softcap * tanh(input / softcap)`
-- division must happen first via canonical `div_act`
-- the nonlinear step must call canonical `tanh_act`
-- the final rescale must use canonical `mul_sat`
-- evaluation order is fixed and part of the contract:
-  1. compute `input / softcap`
-  2. compute `tanh_act(...)`
-  3. compute `softcap * tanh(...)`
-- `input == 0` must materialize exactly to zero
-- callers may quantize host `f32` logits into `Act`, execute this contract canonically, then
-  materialize back to `f32` only at the logits output boundary
+Unchanged from v0 in full, including the fixed three-step evaluation order and the `input == 0 -> 0` requirement.
 
 ### 13. Deterministic GELU(tanh) semantics
 
-Canonical deterministic GELU uses the repo's existing PyTorch tanh structure, but every step is
-defined on canonical fixed-point inputs.
+Unchanged from v0 in full, including the canonical constants (`0.5 -> 32768`, `sqrt(2/pi) -> 52290`, `0.044715 -> 2930`) and the fixed nine-step evaluation order.
 
-Rule:
+---
 
-- `gelu_pytorch_tanh_act(input: Act) -> Act`
+## Parallelism legality
 
-Semantics:
+This section defines which execution schedules are conforming. It is normative.
 
-- the helper implements `0.5 * x * (1 + tanh(sqrt(2 / pi) * (x + 0.044715 * x^3)))`
-- constants are encoded canonically in Q16.16 before evaluation:
-  - `0.5 -> 32768`
-  - `sqrt(2 / pi) -> 52290`
-  - `0.044715 -> 2930`
-- `x^2` and `x^3` use canonical `mul_sat`
-- the cubic term is formed before adding back to `x`
-- the inner scale multiplication happens after that addition
-- the `tanh` stage must call canonical `tanh_act`
-- the final multiply order is fixed and part of the contract:
-  1. compute `x^2`
-  2. compute `x^3`
-  3. compute `0.044715 * x^3`
-  4. compute `x + 0.044715 * x^3`
-  5. compute `sqrt(2 / pi) * (...)`
-  6. compute `tanh_act(...)`
-  7. compute `0.5 * x`
-  8. compute `1 + tanh(...)`
-  9. multiply those two terms
-- no host-float GELU or host `tanh` fallback is allowed once deterministic MLP execution is active
+1. **Across-output parallelism: always conforming.** Distinct output elements (output rows of a projection, attention outputs per (head, query), normalized rows, softmax rows, elementwise results) are independent canonical computations over read-only shared inputs. They may be computed concurrently in any order provided each result is placed at its specified output coordinate.
+
+2. **Within-reduction parallelism: conforming iff the accumulation is order-independent under this spec.** Under v1 this holds for: wrapping `Acc` MAC reductions (§2), and saturating summation of provably non-negative term sets (§3, softmax sum). It does not hold for any saturating fold over sign-mixed terms; no such fold exists in the v1 canonical kernel set, and none may be introduced without a spec revision.
+
+3. **Combination operations are contract.** Partial results of a split reduction must be combined with the reduction's own canonical accumulation operation (wrapping `Acc` add for MAC reductions; `acc_add_sat` for the softmax sum). Converting through any other type or operation during combination is non-conforming.
+
+4. **Guest profile.** The zkVM guest executes the serial reference schedule. Canonical kernel functions (the `det_num` module) must remain free of parallelism constructs, SIMD intrinsics, and platform-conditional arithmetic; parallel and vectorized drivers live in native-only modules that invoke or reimplement the canonical semantics and are validated against the reference by the conformance requirements below.
+
+5. **Schedule-dependence is the forbidden property.** Any implementation whose committed canonical values depend on thread count, lane width, chunk size, scheduling order, or hardware backend is non-conforming, regardless of how the dependence arises.
 
 ---
 
@@ -354,218 +239,135 @@ Semantics:
 
 ### Overview
 
-`det_num` v0 defines a canonical conversion from source FP32 weights into executable `Wgt` tensors.
-
-This conversion is part of the deterministic model-compilation process.
-
-The source FP32 model is an upstream artifact only. It is **not** the canonical executable inference artifact.
-
-The canonical executable model artifact for v0 stores weights directly as `Wgt` values.
+Unchanged framing from v0: `det_num` defines a canonical conversion from source FP32 weights into executable `Wgt` tensors; the FP32 model is an upstream artifact only; the canonical executable artifact stores weights as `Wgt` values.
 
 ### FP32 -> `Wgt` conversion
 
-Rule:
+Unchanged from v0:
 
 - `f32_to_wgt(x: f32) -> Wgt`
+- `q = sat_i32(round_ties_even(x * 65536.0))`; `Wgt(q)` represents `q / 65536`
 
-Semantics:
+### Conversion-time overflow bound (new in v1, normative)
 
-1. Interpret `x` as a real-valued scalar.
-2. Multiply by `2^16`.
-3. Round to nearest, ties to even.
-4. Saturate to signed 32-bit range.
-5. Store the resulting signed 32-bit integer payload as `Wgt`.
+For every weight tensor used in MAC reductions, for every output row `r` with columns `i in 0..cols`:
 
-Equivalent mathematical form:
+```
+sum_i |wgt_bits[r][i]| * A_MAX < 2^62        where A_MAX = 2^31
+```
 
-- `q = sat_i32(round_ties_even(x * 65536.0))`
+equivalently:
 
-Interpretation:
+```
+sum_i |wgt_bits[r][i]| < 2^31
+```
 
-- resulting `Wgt(q)` represents `q / 65536`
+- **Scope.** The bound applies to weight tensors whose last-dimension rows are MAC reduction rows: tensors of rank >= 2. Rank-1 tensors (RMSNorm gains, per-layer scalars) are elementwise operands under saturating `Act`-domain ops and never enter a MAC reduction; the compiler records their computed mass in artifact metadata for audit but MUST NOT enforce the bound against them. (Informative: Gemma-family norm gains legitimately carry whole-vector masses above `2^31`.)
+- `A_MAX = 2^31` bounds the magnitude of every representable `Act` payload, so satisfying this bound guarantees the reduction's exact integer sum stays below `2^62` for **any** activation input, representable or adversarial. The `2^62` ceiling (vs. the `2^63` wrap point) is a deliberate 2x margin and is itself normative.
+- The model compiler MUST evaluate this bound per row and MUST fail closed (refuse to emit the artifact) if any row violates it. Splitting, rescaling, or otherwise altering weights to pass the bound is a model-design decision outside this spec; the compiler must not silently modify values.
+- The compiler MUST record per-tensor maximum row mass (`max_r sum_i |wgt_bits[r][i]|`) in artifact metadata for audit.
+- Worked example (informative): Q16.16 weights with `|w| < 1` have `|wgt_bits| < 2^16`; a 4096-wide row gives row mass `< 2^28`, passing with 8x margin; a 16384-wide MLP row with all `|w| = 1` gives `2^30`, passing with 2x margin. Real trained-LLM rows sit far below these worst cases.
 
-### v0 storage policy
+### v1 storage policy
 
-v0 uses **direct canonical Q16.16 weight storage**.
+v1 retains direct canonical Q16.16 weight storage as the baseline and continues to exclude per-tensor/per-channel external scales, block quantization metadata, and value-changing compressed encodings.
 
-v0 does **not** introduce:
-
-- per-tensor external scales
-- per-channel external scales
-- block quantization metadata
-- compressed weight encodings optimized for size
-
-This is intentional, to isolate arithmetic-path effects from separate storage-format approximation schemes.
+**v1 narrows the v0 encoding prohibition:** artifact format versions MAY define width-reduced storage of `Wgt` payloads (e.g., 16-bit two's-complement storage for tensors whose every value is representable in 16 bits), PROVIDED the stored encoding is exact and value-preserving: the canonical value of each weight is its sign-extended integer payload, all arithmetic occurs after widening to the canonical type, and the resulting products and reductions are bit-identical to direct Q16.16 storage. Storage width is representation, not semantics, and does not by itself require a `det_num` spec revision. The concrete layout, width tags, and alignment rules belong to the weight-artifact format spec (detwgt), not this document.
 
 ### Canonical model artifact
 
-The v0 executable model artifact must store weights in canonical `Wgt` form.
-
-The artifact may contain:
-
-- format magic/version
-- `det_num_spec_version`
-- tensor metadata
-- tensor shapes
-- tensor role/type
-- canonical `Wgt` payload bytes
-
-The artifact must not require host-native floating-point interpretation during inference.
+As v0, with one addition: the artifact MUST carry `det_num_spec_version`, and a runtime pinned to one spec version MUST fail closed when loading an artifact declaring another. The artifact must not require host floating-point interpretation during inference.
 
 ---
 
 ## Serialization rules
 
-All serialized arithmetic values must use:
-
-- **little-endian**
-- canonical fixed-width byte encoding
-- no host-dependent layout assumptions
-
-Rules:
-
-- all scalar numeric values serialized with explicit byte conversion
-- no raw memory reinterpretation as canonical serialization format
-- all checkpoint/state hashes must derive from canonical serialized bytes
-
-For v0 compiled weights:
-
-- each `Wgt` scalar is serialized as a 4-byte signed little-endian integer
-- each `Act` scalar is serialized as a 4-byte signed little-endian integer
-- each `Acc` scalar is serialized as an 8-byte signed little-endian integer
+Unchanged from v0 in full: little-endian, canonical fixed-width byte encoding, explicit byte conversion, no raw memory reinterpretation as the canonical serialization format, all checkpoint/state hashes derive from canonical serialized bytes. `Wgt`/`Act` serialize as 4-byte signed little-endian; `Acc` as 8-byte signed little-endian. (Informative: in-memory layout may be flat, strided, mmap-backed, or width-reduced per the artifact format; serialization for hashing always produces these canonical bytes in the specified element order.)
 
 ---
 
 ## Forbidden behavior
 
-The following are forbidden in canonical arithmetic code:
+Forbidden in canonical arithmetic code:
 
 - native floating-point as trusted semantics
 - implicit narrowing conversions
-- implicit overflow behavior
+- implicit or unspecified overflow behavior (v1: `Acc` MAC wrapping and the listed saturating sites are the only specified overflow behaviors; anything else is unspecified and forbidden)
 - direct use of transcendental host math (`exp`, `sin`, `cos`, `tanh`, etc.)
-- non-deterministic reduction order
+- schedule-dependent results (any dependence of canonical values on execution order, thread count, lane width, or backend)
+- combining split-reduction partials with any operation other than the reduction's canonical accumulation
 - platform-dependent serialization
 - unordered or unstable argmax behavior
 
-The following are additionally forbidden in the v0 executable inference path:
+Additionally forbidden in the executable inference path:
 
 - reading FP32 weights as runtime arithmetic truth
 - load-time weight interpretation that changes canonical numeric meaning
-- alternate weight encodings that are not direct `Wgt` payloads
+- weight encodings that are not exact value-preserving representations of canonical `Wgt` payloads
+
+Removed from the v0 list: the blanket prohibition on wrapping arithmetic (now the canonical MAC accumulation behavior) and the blanket prohibition on non-left-to-right reduction order (now free for the order-independent reductions defined above).
 
 ---
 
 ## Required wrapper API
 
-`det_num` v0 must expose at least:
+As v0, with semantics updated per this spec:
 
-- `type Act`
-- `type Wgt`
-- `type Acc`
-
+- `type Act`, `type Wgt`, `type Acc`
 - `fn mul_wide(a: Act, b: Wgt) -> Acc`
-- `fn mac(acc: Acc, a: Act, b: Wgt) -> Acc`
-
+- `fn mac(acc: Acc, a: Act, b: Wgt) -> Acc` — wrapping accumulation per §2
+- `fn mac_bits(acc_bits: i64, act_bits: i32, wgt_bits: i32) -> i64` — promoted from helper to required API: it is the shared bit-level MAC used by both native and raster kernels and is the precise locus of the v0->v1 semantic change
 - `fn requantize(x: Acc) -> Act`
 - `fn clip_act(x: Acc) -> Act`
-
 - `fn argmax_first(xs: &[Act]) -> usize`
-- `fn rope_rotate_pairs(input: &[Act], rotary_dim: usize, freq_base_dim: usize, base: Acc, position: usize) -> Vec<Act>`
-- `fn attention_score(query: &[Act], key: &[Act]) -> Act`
-- `fn attention_softmax(logits: &[Act]) -> Vec<Act>`
-- `fn attention_weighted_sum(weights: &[Act], value_rows: &[Vec<Act>]) -> Vec<Act>`
-- `fn tanh_act(input: Act) -> Act`
-- `fn gelu_pytorch_tanh_act(input: Act) -> Act`
-
+- `fn rope_rotate_pairs(...)`, `fn attention_score(...)`, `fn attention_softmax(...)`, `fn attention_weighted_sum(...)`, `fn tanh_act(...)`, `fn gelu_pytorch_tanh_act(...)`
 - `fn f32_to_wgt(x: f32) -> Wgt`
 
-Recommended additional helpers:
+Recommended helpers unchanged (`add_sat`, `sub_sat`, `acc_add_sat`, `rshift_round_ties_even`, `*_to_le_bytes`), plus recommended for v1:
 
-- `fn add_sat(a: Act, b: Act) -> Act`
-- `fn sub_sat(a: Act, b: Act) -> Act`
-- `fn acc_add_sat(a: Acc, b: Acc) -> Acc`
-- `fn rshift_round_ties_even(x: Acc, shift: u32) -> Acc`
-- `fn act_to_le_bytes(x: Act) -> [u8; 4]`
-- `fn wgt_to_le_bytes(x: Wgt) -> [u8; 4]`
-- `fn acc_to_le_bytes(x: Acc) -> [u8; 8]`
-
----
-
-## v0 scope limits
-
-`det_num` v0 does **not** yet define canonical semantics for:
-
-- `exp`
-- `log`
-- `sqrt`
-- `rsqrt`
-- `sin`
-- `cos`
-- `rmsnorm`
-
-Those belong in later layers built on top of `det_num`.
-
-v0 defines:
-
-- the arithmetic substrate
-- the canonical executable weight representation
-- the canonical FP32 -> `Wgt` model-compilation rule
-
-v0 does **not** yet define full end-to-end inference semantics.
+- `fn acc_combine(a: Acc, b: Acc) -> Acc` — wrapping combination of partial MAC accumulators, for split-reduction drivers; semantically identical to adding a partial's bits with wrapping `i64` addition
 
 ---
 
 ## Testing requirements
 
-Before using `det_num` in model kernels, it must pass:
+All v0 golden scalar, weight-conversion, serialization, and cross-build tests carry forward, with saturating-MAC edge tests replaced by the following.
 
-### Golden scalar tests
+### Wrapping MAC tests
 
-- multiply widening behavior
-- saturating add/sub behavior
-- requantization edge cases
-- ties-to-even narrowing cases
-- signed shift behavior
-- argmax tie-breaking
-- attention score accumulation
-- attention softmax normalization and tie handling
-- attention weighted-value aggregation
-- tanh saturation, sign, and ties-to-even division behavior
-- GELU representative positive, negative, near-zero, and tie-sensitive cases
+- golden vectors pinning exact wrapped bit patterns for accumulations engineered to cross `i64::MAX` and `i64::MIN`, including sign-mixed term sets
+- confirmation that `mul_wide` is exact for extreme `i32` payload pairs
 
-### Weight-conversion tests
+### Associativity property tests (new, permanent conformance fixtures)
 
-- `f32_to_wgt` exactness for representative values
-- ties-to-even conversion cases near half-step boundaries
-- saturation behavior at extreme source values
-- byte-stable serialized `Wgt` output
+For randomized and adversarial term sets — including sets engineered to wrap, sets with all extreme-magnitude payloads, and every reduction length tail class relevant to vector lane widths — assert identical final accumulator bits across at least:
 
-### Serialization tests
+- left-to-right serial fold (reference)
+- reversed-order fold
+- random-permutation fold
+- balanced pairwise tree reduction
+- chunked partial accumulators combined with `acc_combine`, for multiple chunk sizes
 
-- byte encoding is stable
-- little-endian output is exact
-- cross-machine byte equality
+These tests are the executable form of §2's contract and must run in CI permanently.
 
-### Cross-build tests
+### Softmax-sum order-independence tests
 
-- debug vs release parity
-- x86 vs ARM parity for the same inputs
+- property test asserting `acc_add_sat` folds over non-negative term sets yield identical results under permutation and chunked combination, including saturating cases
 
-### Transitional validation tests
+### Conversion bound tests
 
-During migration from the current FP32 inference path:
+- converter rejects a synthetic tensor violating the row-mass bound; accepts one at the boundary minus one
+- per-tensor max row mass appears in artifact metadata and matches an independent recomputation
+- reference-model conversion succeeds with the margin report committed
 
-- compare converted-weight path against existing FP32 baseline
-- measure token agreement
-- measure logits drift
-- record any quality changes before replacing higher-level arithmetic operators
+### Cross-schedule end-to-end tests
 
-Implementation note for this repo:
+- full reference-model deterministic prefill + decode under: serial reference, multicore output-parallel, and (when present) vectorized backends — identical canonical checkpoint commitments at every checkpoint
+- debug vs release parity; x86 vs ARM parity
 
-- the current Phase 1 deterministic comparison path may load canonical `Wgt` bytes from `model.detwgt` and reconstruct host runtime matrices to isolate converted-weight quality effects
-- that comparison path is a migration aid only; it is **not** the final canonical end-to-end `det_num` runtime described by the rules above
-- replacing host-runtime arithmetic with full `Act` / `Wgt` / `Acc` execution remains follow-up work after converted-weight parity is validated
+### Migration validation
+
+- one-time check: regenerate end-to-end golden checkpoint commitments under v1 and compare to v0 goldens for honest reference traffic. Expected result: identical (honest traffic should never have engaged MAC saturation). If any commitment differs, the divergence indicates honest-path saturation under v0 and MUST be investigated and documented before v1 ships.
 
 ---
 
@@ -573,37 +375,26 @@ Implementation note for this repo:
 
 This spec is versioned as:
 
-- `det_num_spec_version = 0`
+- `det_num_spec_version = 1`
 
-Any future change to:
+Runtime, weight artifacts, and any serialized checkpoint metadata embedding a spec version must agree; mismatches fail closed. There is no dual-version runtime support.
 
-- type aliases
-- numeric interpretation
-- source conversion rule
-- rounding mode
-- overflow policy
-- shift policy
-- tie-breaking
-- serialization
-- executable weight artifact format
-
-must increment the spec version.
+Any future change to type aliases, numeric interpretation, source conversion rule, rounding mode, overflow policy (either domain), shift policy, tie-breaking, serialization, the conversion-time bound, parallelism legality, or the executable weight artifact contract must increment the spec version.
 
 ---
 
 ## Summary
 
-`det_num` v0 uses:
+`det_num` v1 uses:
 
-- `Act`: signed 32-bit fixed-point scalar with 16 fractional bits
-- `Wgt`: signed 32-bit fixed-point scalar with 16 fractional bits
-- `Acc`: signed 64-bit fixed-point scalar with 32 fractional bits
-- widening multiply always
-- saturating arithmetic
-- explicit requantization only
-- round-to-nearest, ties-to-even
-- little-endian serialization
-- argmax ties resolved by lowest index
-- direct canonical Q16.16 compiled weight storage
-- explicit FP32 -> `Wgt` deterministic model compilation
-- deterministic attention score, softmax, and value-mixing semantics
+- `Act`/`Wgt`: signed 32-bit Q16.16; `Acc`: signed 64-bit Q32.32
+- widening multiply always; exact products
+- **wrapping `Acc` accumulation for all MAC reductions; reduction schedule is not contract**
+- saturating arithmetic at materialization and in `Act`-domain elementwise ops, unchanged
+- explicit requantization only; round-to-nearest, ties-to-even
+- a normative conversion-time row-mass bound making linear-layer wraparound statically impossible
+- wraparound, where reachable, fully deterministic and identical across backends
+- explicit parallelism legality: free across outputs; free within order-independent reductions; serial reference preserved as oracle and guest profile
+- little-endian canonical serialization; argmax ties to lowest index
+- direct canonical Q16.16 weight storage, with exact width-reduced storage pre-authorized for future artifact format versions
+- deterministic-mode outputs commit canonical bytes only
