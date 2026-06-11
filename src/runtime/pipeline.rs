@@ -1,7 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokenizers::Tokenizer;
 
-use crate::runtime::checkpoints::{RasterDetourController, RoutineId};
 use crate::shared::api::input::{InferenceExecutionMode, PromptPreparationState, SamplingConfig};
 use crate::shared::api::output::OutputDecodeState;
 use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
@@ -261,7 +260,7 @@ pub fn run_output_decode_with_mode(
     transformer_model: &Gemma4TransformerModel,
     execution_mode: InferenceExecutionMode,
 ) -> Result<OutputDecodeState> {
-    run_output_decode_with_mode_internal(
+    crate::runtime::executors::native::run_output_decode(
         prompt_token_ids,
         initial_transformer_state,
         sampling,
@@ -271,30 +270,6 @@ pub fn run_output_decode_with_mode(
         execution_mode,
         None,
         None,
-    )
-}
-
-pub(crate) fn run_output_decode_with_mode_and_detour(
-    prompt_token_ids: &[u32],
-    initial_transformer_state: &TransformerPrefillResult,
-    sampling: &SamplingConfig,
-    tokenizer: &Tokenizer,
-    raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
-    transformer_model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
-    detour_controller: Option<&mut RasterDetourController>,
-    raster_sizing: Option<RasterSizingControls>,
-) -> Result<OutputDecodeState> {
-    run_output_decode_with_mode_internal(
-        prompt_token_ids,
-        initial_transformer_state,
-        sampling,
-        tokenizer,
-        raster_tokenizer,
-        transformer_model,
-        execution_mode,
-        detour_controller,
-        raster_sizing,
     )
 }
 
@@ -398,193 +373,6 @@ pub(crate) fn run_output_decode_with_raster_state(
     }
 }
 
-fn run_output_decode_with_mode_internal(
-    prompt_token_ids: &[u32],
-    initial_transformer_state: &TransformerPrefillResult,
-    sampling: &SamplingConfig,
-    tokenizer: &Tokenizer,
-    raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
-    transformer_model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
-    mut detour_controller: Option<&mut RasterDetourController>,
-    raster_sizing: Option<RasterSizingControls>,
-) -> Result<OutputDecodeState> {
-    let _trace = trace_scope("decode.run");
-    let max_new_tokens = validate_sampling_config(sampling)?;
-    let mut decode_transition_states = Vec::new();
-    let mut decode_state = crate::shared::api::output::DecodeState::new(
-        prompt_token_ids.to_vec(),
-        initial_transformer_state
-            .transformer_state
-            .prefill_logits
-            .logits
-            .clone(),
-        initial_transformer_state.transformer_decode_state.clone(),
-    );
-    decode_state.set_internal_logits(
-        initial_transformer_state
-            .transformer_state
-            .prefill_logits
-            .clone_internal(),
-    );
-
-    loop {
-        if crate::decode_select_token::native::check_stop_condition(
-            decode_state.generated_token_ids.len(),
-            max_new_tokens,
-        )
-        .is_some()
-        {
-            let detour_finalize_output = detour_controller
-                .as_deref_mut()
-                .is_some_and(|controller| controller.should_detour(RoutineId::FinalizeOutput));
-            trace_event("output.detokenize");
-            let mut output_decode_state = if detour_finalize_output {
-                let raster_sizing = raster_sizing.context(
-                    "selective raster output.finalize detour requires raster sizing controls",
-                )?;
-                let raster_tokenizer = raster_tokenizer.context(
-                    "selective raster output.finalize detour requires an authenticated Gemma tokenizer",
-                )?;
-                crate::output_finalize::run_selected_raster_detour_from_native_boundary(
-                    decode_state,
-                    raster_tokenizer,
-                    raster_sizing,
-                )?
-            } else {
-                crate::output_finalize::run(decode_state, tokenizer)?
-            };
-            output_decode_state.decode_transition_states = decode_transition_states;
-            return Ok(output_decode_state);
-        }
-
-        let detour_select_token = detour_controller
-            .as_deref_mut()
-            .is_some_and(|controller| controller.should_detour(RoutineId::SelectOutputToken));
-        trace_event("decode.select_token");
-        let next_token = if detour_select_token {
-            let raster_sizing = raster_sizing.context(
-                "selective raster decode.select_token detour requires raster sizing controls",
-            )?;
-            crate::decode_select_token::run_selected_raster_detour_from_native_boundary(
-                &mut decode_state,
-                max_new_tokens,
-                raster_sizing,
-            )?
-        } else {
-            crate::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
-                .expect("stop condition should have returned earlier")
-        };
-
-        trace_event("decode.step");
-        let decode_layer_range_width = raster_sizing
-            .map(|sizing| sizing.decode_layer_range_width)
-            .unwrap_or(crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH);
-        let decode_state_before_transition = decode_state.clone();
-        let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
-        let mut range_state = match execution_mode {
-            InferenceExecutionMode::Fp32 => {
-                crate::decode_layer_range::native::init_state_with_mode(
-                    transformer_decode_state,
-                    next_token,
-                    transformer_model,
-                    execution_mode,
-                )?
-            }
-            InferenceExecutionMode::Deterministic => {
-                crate::decode_layer_range::native::deterministic_tiles::init_state(
-                    transformer_decode_state,
-                    next_token,
-                    transformer_model,
-                )?
-            }
-        };
-        while !range_state.is_complete() {
-            let detour_decode_layer_range = detour_controller
-                .as_deref_mut()
-                .is_some_and(|controller| controller.should_detour(RoutineId::DecodeLayerRange));
-            if detour_decode_layer_range {
-                let raster_sizing = raster_sizing.context(
-                    "selective raster decode.layer_range detour requires raster sizing controls",
-                )?;
-                let source =
-                    crate::decode_layer_range::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource::from_model(
-                        format!(
-                            "decode.layer_range.detour.position_{}.layer_{}",
-                            range_state.position, range_state.next_layer_idx
-                        ),
-                        transformer_model,
-                    )?;
-                range_state =
-                    crate::decode_layer_range::run_selected_raster_detour_from_native_boundary(
-                        range_state,
-                        &source,
-                        raster_sizing,
-                    )?;
-            } else {
-                let (next_range_state, _reached_terminal) = match execution_mode {
-                    InferenceExecutionMode::Fp32 => {
-                        crate::decode_layer_range::native::run_range_with_mode(
-                            range_state,
-                            transformer_model,
-                            decode_layer_range_width,
-                            execution_mode,
-                            None,
-                        )?
-                    }
-                    InferenceExecutionMode::Deterministic => {
-                        crate::decode_layer_range::native::deterministic_tiles::run_range(
-                            range_state,
-                            transformer_model,
-                            decode_layer_range_width,
-                        )?
-                    }
-                };
-                range_state = next_range_state;
-            }
-        }
-        let detour_decode_transition_finalize =
-            detour_controller.as_deref_mut().is_some_and(|controller| {
-                controller.should_detour(RoutineId::DecodeTransitionFinalize)
-            });
-        let decode_transition = if detour_decode_transition_finalize {
-            let raster_sizing = raster_sizing.context(
-                "selective raster decode.transition_finalize detour requires raster sizing controls",
-            )?;
-            let source =
-                crate::decode_transition_finalize::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource::from_model(
-                    format!(
-                        "decode.transition_finalize.detour.position_{}",
-                        range_state.position
-                    ),
-                    transformer_model,
-                )?;
-            crate::decode_transition_finalize::run_selected_raster_detour_from_native_boundary(
-                &decode_state_before_transition,
-                range_state,
-                &source,
-                raster_sizing,
-            )?
-        } else {
-            crate::decode_transition_finalize::native::run_with_mode(
-                range_state,
-                transformer_model,
-                execution_mode,
-            )?
-        };
-        decode_transition_states.push(decode_transition.activation_state.clone());
-        decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
-        decode_state.transformer_decode_state = decode_transition.transformer_decode_state;
-        crate::decode_transition_finalize::trace_checkpoint(&decode_state)?;
-        if crate::trace::reached_terminal_checkpoint_id().is_some() {
-            let mut output_decode_state =
-                build_current_output_decode_state(&decode_state, tokenizer)?;
-            output_decode_state.decode_transition_states = decode_transition_states;
-            return Ok(output_decode_state);
-        }
-    }
-}
-
 fn materialize_activation_sequence_from_ref(
     roots: &crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots,
     activation_ref: &RasterActivationSequenceRef,
@@ -610,26 +398,6 @@ fn materialize_activation_sequence_from_ref(
             ),
         ),
     ))
-}
-
-fn build_current_output_decode_state(
-    decode_state: &crate::shared::api::output::DecodeState,
-    tokenizer: &Tokenizer,
-) -> Result<OutputDecodeState> {
-    let generated_token_ids = decode_state.generated_token_ids.clone();
-    let generated_text =
-        crate::output_finalize::native::detokenize_output_tokens(tokenizer, &generated_token_ids)?;
-    let generated_token_ids_sha256 =
-        crate::output_finalize::native::build_output_decode_commitment(&generated_token_ids)?;
-
-    Ok(OutputDecodeState {
-        generated_token_count: generated_token_ids.len(),
-        generated_token_ids,
-        generated_token_ids_sha256,
-        generated_text,
-        stop_reason: crate::shared::api::output::OutputDecodeStopReason::MaxNewTokens,
-        decode_transition_states: Vec::new(),
-    })
 }
 
 fn build_current_output_decode_state_from_raster_state(
