@@ -8,6 +8,9 @@
 //! Regenerate goldens (only when an intentional contract change lands) with:
 //! `RASTER_BLESS_DET_GOLDENS=1 cargo test det_goldens`
 
+// Exercises the deprecated legacy entry point on purpose (shim equivalence).
+#![allow(deprecated)]
+
 use std::{
     fs,
     path::{Path, PathBuf},

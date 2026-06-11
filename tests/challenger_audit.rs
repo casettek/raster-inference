@@ -16,6 +16,10 @@
 //! The trace collector and artifact stores are process-global, so every test
 //! serializes through `suite_lock`.
 
+// The parity/golden suites intentionally exercise the deprecated legacy
+// entry points: they are what proves the shims stay equivalent.
+#![allow(deprecated)]
+
 use std::{
     env, fs,
     path::PathBuf,

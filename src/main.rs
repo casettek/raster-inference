@@ -4,7 +4,7 @@ use raster_inference::shared::artifacts::integrity_mode::with_raster_integrity_m
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
     load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, run_inference_with_controls, trace,
+    load_transformer_state_model_from_gemma_model_path, sequence, trace,
     AuthenticatedGemmaTokenizer, InferenceControls, InferenceExecutionMode, InferenceRequest,
     InferenceRunOutcome, ModelSpec, RasterDetourSpec, RasterIntegrityMode, SamplingConfig,
     TextDecodingPolicy,
@@ -96,7 +96,7 @@ fn run() -> anyhow::Result<()> {
     };
     let run_inference = || {
         with_raster_integrity_mode(raster_integrity_mode, || {
-            run_inference_with_controls(&request, &model, &tokenizer, &transformer_model, &controls)
+            sequence::run(&request, &model, &tokenizer, &transformer_model, &controls)
         })
     };
     let inference_outcome = if cli_args.raster_trace_tiles {

@@ -1,3 +1,7 @@
+// The parity/golden suites intentionally exercise the deprecated legacy
+// entry points: they are what proves the shims stay equivalent.
+#![allow(deprecated)]
+
 use std::{
     collections::BTreeMap,
     fs,

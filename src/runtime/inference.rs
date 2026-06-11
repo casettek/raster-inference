@@ -219,12 +219,17 @@ pub enum InferenceRunOutcome {
     RasterPromptPrepared(RasterPromptPreparedState),
 }
 
+#[deprecated(
+    note = "use runtime::sequence::run with default InferenceControls, or the role APIs \
+            (runtime::roles::claimer / runtime::roles::challenger)"
+)]
 pub fn run_inference(
     request: &InferenceRequest,
     model: &ModelSpec,
     tokenizer: &Tokenizer,
     transformer_model: &Gemma4TransformerModel,
 ) -> Result<InferenceState> {
+    #[allow(deprecated)]
     match run_inference_with_controls(
         request,
         model,
@@ -244,6 +249,10 @@ pub fn run_inference(
     }
 }
 
+#[deprecated(
+    note = "use runtime::sequence::run (identical signature and behavior), or the role APIs \
+            (runtime::roles::claimer / runtime::roles::challenger)"
+)]
 pub fn run_inference_with_controls(
     request: &InferenceRequest,
     model: &ModelSpec,
@@ -255,24 +264,31 @@ pub fn run_inference_with_controls(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use serde_json::json;
     use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
+    use crate::decode_select_token::run as run_decode_select_token;
+    use crate::decode_transition_finalize::trace_checkpoint as finalize_decode_transition;
+    use crate::output_finalize::run as run_output_finalize;
     use crate::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource;
+    use crate::prefill_finalize::run as run_prefill_finalize;
+    use crate::prefill_prepare_aux::run as run_prefill_prepare_aux;
+    use crate::prefill_range::run as run_prefill_range;
+    use crate::prompt_prepare::run as run_prompt_prepare;
     use crate::shared::model::gemma_tokenizer::GemmaAddedToken;
     use crate::shared::model::transformer::{
         DetNumMatrix, DetNumTensorSliceSource, Gemma4LayerMatrixSource, GemmaEmbeddingTensorSource,
         InternalActivationSequence, InternalLogits,
     };
     use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
+    use crate::shared::numerics::transformer_kernels::embed_input_tokens;
     use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
     use crate::shared::raster_kernels::transformer::RasterActivationSequence;
     use crate::shared::tensors::raster_tensor_artifacts::insert_activation_sequence_artifact_ref;
     use crate::{
-        decode_step_with_mode, embed_input_tokens, finalize_decode_transition,
-        run_decode_select_token, run_inference, run_inference_with_controls, run_output_finalize,
-        run_prefill_finalize, run_prefill_prepare_aux, run_prefill_range, run_prompt_prepare,
+        decode_step_with_mode, run_inference, run_inference_with_controls,
         AuthenticatedGemmaTokenizer, DecodeState, EmbeddingTable, Gemma4AttentionKind,
         Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
         Gemma4PleLayerWeights, Gemma4TransformerModel, GemmaBpeMerge, GemmaTokenizerSpec,

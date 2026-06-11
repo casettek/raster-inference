@@ -37,6 +37,10 @@
 //! reproducible on the platform that captured it. The deterministic and
 //! raster goldens use the det_num integer numerics and are platform-exact.
 
+// The parity/golden suites intentionally exercise the deprecated legacy
+// entry points: they are what proves the shims stay equivalent.
+#![allow(deprecated)]
+
 use std::{
     env, fs,
     path::PathBuf,
