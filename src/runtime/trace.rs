@@ -235,7 +235,6 @@ pub fn reached_terminal_checkpoint_id() -> Option<String> {
 #[derive(Default)]
 struct TraceCollector {
     checkpoints: Vec<Value>,
-    #[cfg(test)]
     completed_checkpoints: Option<Value>,
     completed_trace_path: Option<PathBuf>,
 }
@@ -342,6 +341,29 @@ pub fn abort_inference_trace(error: &anyhow::Error) {
     emit_checkpoint_bundle(&payload, collector.completed_trace_path.as_deref());
 }
 
+/// Path of the checkpoint trace artifact written by the most recently
+/// finished (or aborted) committed run, if any. The artifact bytes at this
+/// path are the protocol object a claimer commits.
+pub fn completed_trace_path() -> Option<PathBuf> {
+    trace_collector()
+        .lock()
+        .expect("trace collector mutex should not be poisoned")
+        .completed_trace_path
+        .clone()
+}
+
+/// Checkpoint payload (the JSON array of `{checkpoint_id: sha256}` entries)
+/// collected by the most recently finished (or aborted) committed run, if
+/// any. Identical in content to the serialized artifact at
+/// [`completed_trace_path`].
+pub fn completed_checkpoint_payload() -> Option<Value> {
+    trace_collector()
+        .lock()
+        .expect("trace collector mutex should not be poisoned")
+        .completed_checkpoints
+        .clone()
+}
+
 #[cfg(test)]
 pub(crate) fn checkpoint_payload_for_tests() -> Value {
     let checkpoints = trace_collector()
@@ -369,21 +391,13 @@ pub(crate) fn take_completed_checkpoint_payload_for_tests() -> Value {
         .unwrap_or_else(|| Value::Array(Vec::new()))
 }
 
-#[cfg(test)]
 fn clear_completed_checkpoints_for_tests(collector: &mut TraceCollector) {
     collector.completed_checkpoints = None;
 }
 
-#[cfg(not(test))]
-fn clear_completed_checkpoints_for_tests(_collector: &mut TraceCollector) {}
-
-#[cfg(test)]
 fn store_completed_checkpoints_for_tests(collector: &mut TraceCollector, payload: &Value) {
     collector.completed_checkpoints = Some(payload.clone());
 }
-
-#[cfg(not(test))]
-fn store_completed_checkpoints_for_tests(_collector: &mut TraceCollector, _payload: &Value) {}
 
 pub fn serialize_layer_caches(
     layer_caches: &[crate::shared::model::transformer::LayerKvCache],
