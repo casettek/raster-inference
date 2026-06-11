@@ -14,11 +14,12 @@
 //!   → output.finalize
 //! ```
 //!
-//! It owns terminal-checkpoint stop logic, checkpoint emission points that
-//! are not inside routines, outcome assembly, and the trace lifecycle
-//! (`start`/`finish`/`abort`). Trace scopes are established in exactly the
-//! same nesting order as the pre-split monolith so committed trace artifacts
-//! are byte-identical (enforced by `tests/golden_traces.rs`).
+//! It owns terminal-checkpoint stop logic, outcome assembly, and the trace
+//! lifecycle (`start`/`finish`/`abort`), and dispatches each phase to the
+//! native or raster executor through [`ExecutionPolicy`] — it is itself
+//! mode-agnostic. Trace scopes are established in exactly the same nesting
+//! order as the pre-split monolith so committed trace artifacts are
+//! byte-identical (enforced by `tests/golden_traces.rs`).
 
 use std::ops::ControlFlow;
 
@@ -26,27 +27,17 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use tokenizers::Tokenizer;
 
-use crate::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
-use crate::runtime::checkpoints::{PhaseId, RasterDetourController, RoutineId};
-use crate::runtime::executors::native;
+use crate::input_embedding;
+use crate::runtime::checkpoints::{PhaseId, RoutineId};
+use crate::runtime::executors::{native, raster, ExecutionPolicy, StepMode};
 use crate::runtime::inference::{
     InferenceControls, InferenceRunOutcome, InferenceState, InputEmbeddingState,
-    PausedInferenceState, RasterPromptPreparedState,
+    PausedInferenceState,
 };
-use crate::runtime::{pipeline, trace};
-use crate::shared::api::input::{
-    InferenceExecutionMode, InferenceRequest, ModelSpec, PromptPreparationState,
-    RasterPromptPreparationState,
-};
-use crate::shared::artifacts::artifact_io::ArtifactIo;
+use crate::runtime::trace;
+use crate::shared::api::input::{InferenceExecutionMode, InferenceRequest, ModelSpec};
 use crate::shared::artifacts::integrity_mode::current_raster_integrity_mode;
-use crate::shared::artifacts::raster_artifact_store::RasterTokenIdSequenceRef;
 use crate::shared::model::transformer::Gemma4TransformerModel;
-use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
-use crate::shared::raster_contracts::prefill_ple::AuthenticatedGemmaPleSource;
-use crate::{
-    input_embedding, prefill_finalize, prefill_prepare_aux, prefill_range, prompt_prepare,
-};
 
 /// Runs one inference request through the canonical phase sequence under the
 /// given controls. This is the engine behind both the legacy
@@ -72,12 +63,10 @@ pub fn run(
             {
                 anyhow::bail!("selective raster detour requires deterministic execution");
             }
-            let mut raster_detour_controller = RasterDetourController::new(controls.raster_detour);
-            let use_raster_prefill = controls.raster;
-            let use_raster_decode = controls.raster;
-            let count_raster_tiles = use_raster_decode || raster_detour_controller.is_active();
-            let raster_sizing_controls = if controls.raster
-                || raster_detour_controller.is_active()
+            let mut policy = ExecutionPolicy::from_controls(controls);
+            let count_raster_tiles = policy.is_full_raster() || policy.is_detour_active();
+            let raster_sizing_controls = if policy.is_full_raster()
+                || policy.is_detour_active()
                 || controls.prefill_token_range_width.is_some()
                 || controls.decode_layer_range_width.is_some()
             {
@@ -97,73 +86,38 @@ pub fn run(
                 "terminal_checkpoint": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.checkpoint_id()),
                 "terminal_checkpoint_occurrence": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.occurrence()),
                 "commit_checkpoints": controls.commit_checkpoints,
-                "tile_dsl_mode": if use_raster_prefill { "raster" } else { "native" },
-                "raster_detour": raster_detour_controller.selected_spec().map(|spec| spec.to_string()),
+                "tile_dsl_mode": if policy.is_full_raster() { "raster" } else { "native" },
+                "raster_detour": policy.selected_detour_spec().map(|spec| spec.to_string()),
                 "raster_integrity_mode": current_raster_integrity_mode().label(),
                 "raster_sizing_controls": raster_sizing_controls,
             }));
             if count_raster_tiles {
                 crate::dsl::start_tile_invocation_counting();
             }
-            let selected_raster_detour_routine = raster_detour_controller
-                .selected_spec()
-                .map(|spec| spec.routine_id());
+            let selected_raster_detour_routine =
+                policy.selected_detour_spec().map(|spec| spec.routine_id());
 
             let result = (|| {
-                raster_detour_controller
-                    .reject_if_selected_unsupported(RoutineId::PromptPrepare)?;
+                // --- prompt.prepare ---
+                policy.reject_if_selected_unsupported(RoutineId::PromptPrepare)?;
                 let (
                     prompt_preparation,
                     raster_prompt_preparation_for_embedding,
                     raster_prompt_preparation_roots_for_embedding,
-                ) = if use_raster_prefill {
-                    let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
-                        "raster tile inference requires an authenticated Gemma tokenizer",
-                    )?;
-                    let raster_sizing_controls = raster_sizing_controls
-                        .as_ref()
-                        .expect("raster sizing controls should be validated");
-                    let raster_prompt_preparation = prompt_prepare::run_raster(
+                ) = if policy.is_full_raster() {
+                    match raster::run_prompt_prepare(
                         request,
                         model,
-                        tokenizer_source,
-                        *raster_sizing_controls,
-                    )?;
-                    trace::trace_checkpoint(
-                        "prompt.prepare",
-                        &json!({
-                            "prompt_bytes_root": raster_prompt_preparation.state.prompt_bytes_root.clone(),
-                            "prompt_text_root": raster_prompt_preparation.state.prompt_text_root.clone(),
-                            "rendered_prompt_root": raster_prompt_preparation.state.rendered_prompt_root.clone(),
-                            "normalized_prompt_root": raster_prompt_preparation.state.normalized_prompt_root.clone(),
-                            "prompt_token_count": raster_prompt_preparation.state.prompt_token_count,
-                            "prompt_token_ids_root": raster_prompt_preparation.state.prompt_token_ids_root.clone(),
-                            "sampling": request.sampling.clone(),
-                        }),
-                    );
-                    if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
-                        return Ok(InferenceRunOutcome::RasterPromptPrepared(
-                            RasterPromptPreparedState {
-                                terminal_checkpoint_id,
-                                prompt_preparation: raster_prompt_preparation.state,
-                                sampling: request.sampling.clone(),
-                                raster_tile_invocations: None,
-                            },
-                        ));
+                        controls,
+                        raster_sizing_controls.as_ref(),
+                    )? {
+                        ControlFlow::Break(outcome) => return Ok(outcome),
+                        ControlFlow::Continue(prepared) => (
+                            prepared.prompt_preparation,
+                            Some(prepared.raster_state),
+                            Some(prepared.raster_roots),
+                        ),
                     }
-                    let raster_prompt_preparation_roots =
-                        Some(raster_prompt_preparation.artifact_store_roots.clone());
-                    let raster_prompt_preparation_state =
-                        Some(raster_prompt_preparation.state.clone());
-                    let prompt_preparation = prompt_preparation_from_raster_prompt(
-                        request,
-                        &raster_prompt_preparation.state,
-                    )?;
-                    (
-                        prompt_preparation,
-                        raster_prompt_preparation_state,
-                        raster_prompt_preparation_roots,
-                    )
                 } else {
                     match native::run_prompt_prepare(request, model, tokenizer, controls)? {
                         ControlFlow::Break(outcome) => return Ok(outcome),
@@ -174,56 +128,24 @@ pub fn run(
                         ),
                     }
                 };
-                let detour_input_embedding =
-                    raster_detour_controller.should_detour(RoutineId::InputEmbedding);
-                let (token_embeddings, raster_input_embedding_refs) = if use_raster_prefill {
-                    let raster_prompt_preparation = raster_prompt_preparation_for_embedding
-                        .as_ref()
-                        .expect("raster prompt preparation should exist for raster prefill");
-                    let raster_prompt_preparation_roots =
-                        raster_prompt_preparation_roots_for_embedding
-                            .clone()
-                            .expect(
-                                "raster prompt preparation roots should exist for raster prefill",
-                            );
-                    let embedding_source = AuthenticatedGemmaInputEmbeddingSource::from_model(
-                        model.model_id.clone(),
+
+                // --- input.embedding ---
+                let (token_embeddings, raster_input_embedding_refs) = if policy.is_full_raster() {
+                    let (token_embeddings, output) = raster::run_input_embedding_full(
+                        model,
                         transformer_model,
+                        raster_prompt_preparation_for_embedding.as_ref(),
+                        raster_prompt_preparation_roots_for_embedding.as_ref(),
                     )?;
-                    let input_embedding_output = input_embedding::run_raster(
-                        raster_prompt_preparation_roots,
-                        raster_prompt_preparation,
-                        &embedding_source,
-                    )?;
-                    let token_embeddings =
-                        input_embedding::materialize_input_embedding_refs_for_trace(
-                            &input_embedding_output.refs,
-                        )?;
-                    (token_embeddings, Some(input_embedding_output))
-                } else if detour_input_embedding {
-                    let raster_prompt_preparation = raster_prompt_preparation_for_embedding
-                        .as_ref()
-                        .context(
-                            "selective raster input.embedding detour requires an authenticated Gemma tokenizer",
-                        )?;
-                    let raster_prompt_preparation_roots =
-                        raster_prompt_preparation_roots_for_embedding.clone().context(
-                            "selective raster input.embedding detour requires prompt artifact roots",
-                        )?;
-                    let embedding_source = AuthenticatedGemmaInputEmbeddingSource::from_model(
-                        model.model_id.clone(),
+                    (token_embeddings, Some(output))
+                } else if policy.mode_for(RoutineId::InputEmbedding) == StepMode::Raster {
+                    let (token_embeddings, output) = raster::run_input_embedding_detour(
+                        model,
                         transformer_model,
+                        raster_prompt_preparation_for_embedding.as_ref(),
+                        raster_prompt_preparation_roots_for_embedding.as_ref(),
                     )?;
-                    let input_embedding_output = input_embedding::run_raster(
-                        raster_prompt_preparation_roots,
-                        raster_prompt_preparation,
-                        &embedding_source,
-                    )?;
-                    let token_embeddings =
-                        input_embedding::materialize_input_embedding_refs_for_trace(
-                            &input_embedding_output.refs,
-                        )?;
-                    (token_embeddings, Some(input_embedding_output))
+                    (token_embeddings, Some(output))
                 } else {
                     native::run_input_embedding(
                         &prompt_preparation.prompt_token_ids,
@@ -254,7 +176,7 @@ pub fn run(
                         }),
                     );
                 }
-                let input_embedding_raster_refs_for_checkpoint = if use_raster_prefill
+                let input_embedding_raster_refs_for_checkpoint = if policy.is_full_raster()
                     || selected_raster_detour_routine == Some(RoutineId::InputEmbedding)
                 {
                     raster_input_embedding_refs
@@ -277,102 +199,34 @@ pub fn run(
                         raster_tile_invocations: None,
                     }));
                 }
+
+                // --- prefill: prepare_aux → range(s) → finalize ---
                 let mut raster_decode_state_for_output = None;
-                let prefill = if use_raster_prefill {
-                    let raster_sizing =
-                        raster_sizing_controls.expect("raster sizing controls should be validated");
-                    raster_detour_controller
-                        .reject_if_selected_unsupported(RoutineId::PrefillPrepareAux)?;
-                    let ple_source = AuthenticatedGemmaPleSource::from_model(
-                        model.model_id.clone(),
+                let prefill = if policy.is_full_raster() {
+                    match raster::run_prefill(
+                        model,
                         transformer_model,
-                    )?;
-                    let input_embedding_output = raster_input_embedding_refs
-                        .as_ref()
-                        .expect("raster prefill requires raster input embedding refs");
-                    let ple_output = prefill_prepare_aux::run_raster(
-                        input_embedding_output.artifact_store_roots.clone(),
-                        &input_embedding_output.refs,
-                        &ple_source,
-                        raster_sizing,
-                    )?;
-                    let (layer_roots, ple_input_manifest_root) = ple_output.into_parts();
-                    if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
-                        trace::phase_paused(PhaseId::TransformerStateTransition);
-                        return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                            terminal_checkpoint_id,
-                            input_embedding,
-                            transformer_state_transition: None,
-                            output_decode: None,
-                            raster_tile_invocations: None,
-                        }));
+                        controls,
+                        raster_sizing_controls,
+                        policy.detour_controller_mut(),
+                        prompt_preparation.prompt_token_ids.len(),
+                        raster_prompt_preparation_for_embedding.as_ref(),
+                        raster_input_embedding_refs.as_ref(),
+                    )? {
+                        ControlFlow::Break(terminal_checkpoint_id) => {
+                            return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
+                                terminal_checkpoint_id,
+                                input_embedding,
+                                transformer_state_transition: None,
+                                output_decode: None,
+                                raster_tile_invocations: None,
+                            }));
+                        }
+                        ControlFlow::Continue(raster_prefill) => {
+                            raster_decode_state_for_output = Some(raster_prefill.decode_loop_state);
+                            raster_prefill.prefill
+                        }
                     }
-                    let layer_source =
-                    crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
-                        model.model_id.clone(),
-                        transformer_model,
-                    )?;
-                    raster_detour_controller
-                        .reject_if_selected_unsupported(RoutineId::PrefillRangeFinalize)?;
-                    let (layer_roots, layer_refs) = prefill_range::run_raster(
-                        layer_roots,
-                        &input_embedding_output.refs,
-                        &layer_source,
-                        ple_input_manifest_root.as_deref(),
-                        raster_sizing,
-                    )?;
-                    if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
-                        trace::phase_paused(PhaseId::TransformerStateTransition);
-                        return Ok(InferenceRunOutcome::Paused(PausedInferenceState {
-                            terminal_checkpoint_id,
-                            input_embedding,
-                            transformer_state_transition: None,
-                            output_decode: None,
-                            raster_tile_invocations: None,
-                        }));
-                    }
-                    let finalize_source =
-                    crate::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource::from_model(
-                        model.model_id.clone(),
-                        transformer_model,
-                    )?;
-                    raster_detour_controller
-                        .reject_if_selected_unsupported(RoutineId::PrefillFinalize)?;
-                    let prefill_output = prefill_finalize::run_raster(
-                        layer_roots,
-                        prompt_preparation.prompt_token_ids.len(),
-                        &finalize_source,
-                        layer_refs.final_hidden_states_ref,
-                        layer_refs.layer_caches,
-                        raster_sizing.projection_rows_per_tile,
-                    )?;
-                    let full_token_ids_ref =
-                        RasterTokenIdSequenceRef::new(ArtifactIo::artifact_ref_for_root(
-                            &raster_prompt_preparation_for_embedding
-                                .as_ref()
-                                .expect("raster prompt preparation should exist for raster prefill")
-                                .prompt_token_ids_root,
-                        )?)?;
-                    raster_decode_state_for_output = Some(RasterDecodeLoopState::new(
-                        prefill_output.artifact_store_roots.clone(),
-                        Some(full_token_ids_ref),
-                        prompt_preparation.prompt_token_ids.len(),
-                        None,
-                        0,
-                        prefill_output.refs.logits_ref.clone(),
-                        prefill_output.refs.logit_count,
-                        prefill_output
-                            .refs
-                            .layer_caches
-                            .iter()
-                            .cloned()
-                            .map(Into::into)
-                            .collect(),
-                        prompt_preparation.prompt_token_ids.len(),
-                        prompt_preparation.prompt_token_ids.len(),
-                        Some(prefill_output.refs.final_hidden_states_ref.clone()),
-                    )?);
-                    prefill_finalize::materialize_raster_output_refs_for_api(&prefill_output)?
                 } else {
                     match native::run_prefill(
                         request,
@@ -380,7 +234,7 @@ pub fn run(
                         transformer_model,
                         controls,
                         raster_sizing_controls,
-                        &mut raster_detour_controller,
+                        policy.detour_controller_mut(),
                         &prompt_preparation.prompt_token_ids,
                         &token_embeddings,
                         raster_input_embedding_refs.as_ref(),
@@ -408,13 +262,15 @@ pub fn run(
                         raster_tile_invocations: None,
                     }));
                 }
+
+                // --- output decode loop → output.finalize ---
                 let output_decode = if let Some(raster_decode_state) =
                     raster_decode_state_for_output
                 {
                     let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
                         "raster tile inference requires an authenticated Gemma tokenizer",
                     )?;
-                    pipeline::run_output_decode_with_raster_state(
+                    raster::run_output_decode(
                         raster_decode_state,
                         &request.sampling,
                         tokenizer_source,
@@ -430,7 +286,7 @@ pub fn run(
                         controls.raster_tokenizer_source.as_ref(),
                         transformer_model,
                         request.execution_mode,
-                        Some(&mut raster_detour_controller),
+                        Some(policy.detour_controller_mut()),
                         raster_sizing_controls,
                     )?
                 };
@@ -447,7 +303,7 @@ pub fn run(
                         raster_tile_invocations: None,
                     }));
                 }
-                raster_detour_controller.ensure_matched_if_active()?;
+                policy.ensure_matched_if_active()?;
                 Ok(InferenceRunOutcome::Completed(InferenceState {
                     input_embedding,
                     transformer_state_transition,
@@ -513,48 +369,4 @@ pub fn run(
 pub(crate) fn reached_terminal_checkpoint_id(controls: &InferenceControls) -> Option<String> {
     controls.terminal_checkpoint.as_ref()?;
     trace::reached_terminal_checkpoint_id()
-}
-
-fn prompt_preparation_from_raster_prompt(
-    request: &InferenceRequest,
-    raster_prompt: &RasterPromptPreparationState,
-) -> Result<PromptPreparationState> {
-    let prompt_text = prompt_prepare::native::decode_prompt_bytes(
-        &request.prompt_bytes,
-        request.text_decoding_policy,
-    )?;
-    let prompt_token_ids = materialize_raster_prompt_token_ids(
-        &raster_prompt.prompt_token_ids_root,
-        raster_prompt.prompt_token_count,
-    )?;
-    let prompt_token_ids_sha256 =
-        prompt_prepare::native::build_prompt_commitment(&prompt_token_ids)?;
-
-    Ok(PromptPreparationState {
-        prompt_text,
-        prompt_token_ids,
-        prompt_token_ids_sha256,
-    })
-}
-
-fn materialize_raster_prompt_token_ids(
-    token_ids_root: &str,
-    token_count: usize,
-) -> Result<Vec<u32>> {
-    let token_ids_ref =
-        RasterTokenIdSequenceRef::new(ArtifactIo::artifact_ref_for_root(token_ids_root)?)?;
-    if token_ids_ref.token_count() != token_count {
-        anyhow::bail!(
-            "raster prompt token count mismatch: root has {}, checkpoint expected {}",
-            token_ids_ref.token_count(),
-            token_count
-        );
-    }
-
-    (0..token_count)
-        .map(|token_idx| {
-            ArtifactIo::read_authenticated_leaf(token_ids_ref.artifact_ref(), token_idx)?
-                .deserialize()
-        })
-        .collect()
 }
