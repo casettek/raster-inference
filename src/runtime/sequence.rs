@@ -312,58 +312,66 @@ pub fn run(
                 }))
             })();
 
-            let raster_tile_invocations = count_raster_tiles
-                .then(crate::dsl::stop_tile_invocation_counting)
-                .flatten();
-            if let Some(total) = raster_tile_invocations {
-                trace::raster_tile_invocations_finished(total);
-            }
-
-            let mut result = result;
-            if let Some(total) = raster_tile_invocations {
-                match &mut result {
-                    Ok(InferenceRunOutcome::Completed(state)) => {
-                        state.raster_tile_invocations = Some(total);
-                    }
-                    Ok(InferenceRunOutcome::Paused(state)) => {
-                        state.raster_tile_invocations = Some(total);
-                    }
-                    Ok(InferenceRunOutcome::RasterPromptPrepared(state)) => {
-                        state.raster_tile_invocations = Some(total);
-                    }
-                    Err(_) => {}
-                }
-            }
-
-            match &result {
-                Ok(InferenceRunOutcome::Completed(state)) => {
-                    trace::finish_inference_trace(&json!({
-                        "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
-                        "output_decode_generated_token_ids_sha256": state.output_decode.generated_token_ids_sha256,
-                        "output_decode_generated_text_sha256": trace::sha256_hex(&state.output_decode.generated_text),
-                        "generated_token_count": state.output_decode.generated_token_count,
-                        "raster_tile_invocations": state.raster_tile_invocations,
-                    }))
-                }
-                Ok(InferenceRunOutcome::Paused(state)) => trace::finish_inference_trace(&json!({
-                    "terminal_checkpoint_id": state.terminal_checkpoint_id,
-                    "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
-                    "raster_tile_invocations": state.raster_tile_invocations,
-                })),
-                Ok(InferenceRunOutcome::RasterPromptPrepared(state)) => {
-                    trace::finish_inference_trace(&json!({
-                        "terminal_checkpoint_id": state.terminal_checkpoint_id,
-                        "prompt_token_ids_root": state.prompt_preparation.prompt_token_ids_root,
-                        "prompt_token_count": state.prompt_preparation.prompt_token_count,
-                        "raster_tile_invocations": state.raster_tile_invocations,
-                    }))
-                }
-                Err(error) => trace::abort_inference_trace(error),
-            }
-
-            result
+            finish_run(result, count_raster_tiles)
         })
     })
+}
+
+/// Post-run bookkeeping shared by every outcome: attaches the raster tile
+/// invocation total to the outcome and finishes (or aborts) the inference
+/// trace, writing the serialized checkpoint artifact.
+fn finish_run(
+    result: Result<InferenceRunOutcome>,
+    count_raster_tiles: bool,
+) -> Result<InferenceRunOutcome> {
+    let raster_tile_invocations = count_raster_tiles
+        .then(crate::dsl::stop_tile_invocation_counting)
+        .flatten();
+    if let Some(total) = raster_tile_invocations {
+        trace::raster_tile_invocations_finished(total);
+    }
+
+    let mut result = result;
+    if let Some(total) = raster_tile_invocations {
+        match &mut result {
+            Ok(InferenceRunOutcome::Completed(state)) => {
+                state.raster_tile_invocations = Some(total);
+            }
+            Ok(InferenceRunOutcome::Paused(state)) => {
+                state.raster_tile_invocations = Some(total);
+            }
+            Ok(InferenceRunOutcome::RasterPromptPrepared(state)) => {
+                state.raster_tile_invocations = Some(total);
+            }
+            Err(_) => {}
+        }
+    }
+
+    match &result {
+        Ok(InferenceRunOutcome::Completed(state)) => trace::finish_inference_trace(&json!({
+            "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
+            "output_decode_generated_token_ids_sha256": state.output_decode.generated_token_ids_sha256,
+            "output_decode_generated_text_sha256": trace::sha256_hex(&state.output_decode.generated_text),
+            "generated_token_count": state.output_decode.generated_token_count,
+            "raster_tile_invocations": state.raster_tile_invocations,
+        })),
+        Ok(InferenceRunOutcome::Paused(state)) => trace::finish_inference_trace(&json!({
+            "terminal_checkpoint_id": state.terminal_checkpoint_id,
+            "input_embedding_prompt_token_ids_sha256": state.input_embedding.prompt_preparation.prompt_token_ids_sha256,
+            "raster_tile_invocations": state.raster_tile_invocations,
+        })),
+        Ok(InferenceRunOutcome::RasterPromptPrepared(state)) => {
+            trace::finish_inference_trace(&json!({
+                "terminal_checkpoint_id": state.terminal_checkpoint_id,
+                "prompt_token_ids_root": state.prompt_preparation.prompt_token_ids_root,
+                "prompt_token_count": state.prompt_preparation.prompt_token_count,
+                "raster_tile_invocations": state.raster_tile_invocations,
+            }))
+        }
+        Err(error) => trace::abort_inference_trace(error),
+    }
+
+    result
 }
 
 pub(crate) fn reached_terminal_checkpoint_id(controls: &InferenceControls) -> Option<String> {
