@@ -1,0 +1,59 @@
+[
+  {
+    "prompt.prepare": "c11e3b426e86934fce15a8c15c06527c8fe980d5ee9b358c7f88afc211308cc0"
+  },
+  {
+    "input.embedding": "9aeaf46aef647548b8f75d188d45a4da7cb2b4ed4ab4af5635e9b191e8c1cb06"
+  },
+  {
+    "prefill.prepare_aux": "bb131f8f976b898a22b32fb4239f952f0909e8577d91f105cbd095249bd0cbd6"
+  },
+  {
+    "prefill.range": "378a8f2ca76d70208c3026c76701a8c08bb8d09a7861d1ae8f936f3f5a69bda7"
+  },
+  {
+    "prefill.range_finalize": "b3b47ad5ba97237d8d9c1d4b36e171124cf6e3fdcc2e533316bb3f1d55f0173f"
+  },
+  {
+    "prefill.range": "5087defe8910cba3b2000f4a4bcaafc83e9834f93107a8169f6fab591c23df28"
+  },
+  {
+    "prefill.range_finalize": "8db6d6a27bf2069a9c692358d69ffb2febd5942ba958809ff5a08c48d61f7974"
+  },
+  {
+    "prefill.range": "f68b4f1c28f2ec98d1260c2579edb997ed123abeab93fd0395e84ef0b1ddb24d"
+  },
+  {
+    "prefill.range_finalize": "1b4cde62da867c4607a2a2fcfbb6d7bd00b8fa2b0058b26b3683c13816160263"
+  },
+  {
+    "prefill.range": "45645bdbee825a021d2c3715f413132d850c52ed8e7858709b6bd5e960b9e009"
+  },
+  {
+    "prefill.range_finalize": "8087537a9ef7db0fcf9210012b1b4577116e7f3965b99d03d6b9340c5a9ffd85"
+  },
+  {
+    "prefill.finalize": "7a87c3d364f97e1c339ad69f0504c17fcb3a041aeee3a4835a497c14c7efbce1"
+  },
+  {
+    "decode.select_token": "a7a1e4df42f5ff1ecf75a23e38b523b9bb41fb7847bb41ac843cac0f968d3e5f"
+  },
+  {
+    "decode.layer_range": "2398dddec2408fd50b1ce6cb806c671ebd7ced161f279479b9c6530972054377"
+  },
+  {
+    "decode.transition_finalize": "4b82c3712595d7e603521ac6dfcad178b3b206272267ff0504681f363ce50123"
+  },
+  {
+    "decode.select_token": "78c80f7944483b89a90a7b0929a42b98c8da75142575b55c63212fc65a6443fb"
+  },
+  {
+    "decode.layer_range": "5f3c18a290a4812710405bdb0deddd0b31f3e48115da076c89a193b2c3e73792"
+  },
+  {
+    "decode.transition_finalize": "5cf74fde6dac34a54430f31bbfaea701f559dd3b9efad3ea15c2d0f1cb8e6b4c"
+  },
+  {
+    "output.finalize": "25649226ce89d0a2b78a389b5d58655b907c10702ca3bd7f6179cb5f3eced95c"
+  }
+]
