@@ -3,9 +3,8 @@ use minijinja::{context, Environment};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-use crate::shared::api::input::{
-    Gemma4Prompt, MessageRole, ModelSpec, TextDecodingPolicy, TextMessage,
-};
+use crate::shared::api::input::{MessageRole, ModelSpec, TextDecodingPolicy, TextMessage};
+use crate::shared::model::gemma::Gemma4Prompt;
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct TemplateMessage {

@@ -42,12 +42,12 @@ pub use runtime::pipeline::{
 };
 pub use runtime::trace;
 pub use shared::api::input::{
-    Gemma4Prompt, InferenceExecutionMode, InferenceRequest, MessageRole, ModelSpec,
-    PromptPreparationState, RasterPromptPreparationState, SamplingConfig, TextDecodingPolicy,
-    TextMessage,
+    InferenceExecutionMode, InferenceRequest, MessageRole, ModelSpec, PromptPreparationState,
+    RasterPromptPreparationState, SamplingConfig, TextDecodingPolicy, TextMessage,
 };
 pub use shared::api::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
 pub use shared::artifacts::integrity_mode::RasterIntegrityMode;
+pub use shared::model::gemma::Gemma4Prompt;
 pub use shared::model::gemma_tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeState, GemmaTokenizerSpec,
     GemmaVocabEntry,

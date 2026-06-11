@@ -81,12 +81,6 @@ pub struct InferenceRequest {
     pub sampling: SamplingConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Gemma4Prompt {
-    pub messages: Vec<TextMessage>,
-    pub add_generation_prompt: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PromptPreparationState {
     pub prompt_text: String,
