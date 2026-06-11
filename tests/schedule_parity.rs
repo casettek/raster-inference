@@ -19,8 +19,7 @@ use std::{
 };
 
 use raster_inference::shared::numerics::det_num::{
-    f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-    DET_WGT_ARTIFACT_MAGIC,
+    encode_det_wgt_artifact_with_widths, f32_to_wgt, DetWgtTensorSpec, DetWgtWidthPolicy,
 };
 use raster_inference::{
     decode_step_with_mode, input_embedding, load_transformer_state_model_from_det_num_wgt_path,
@@ -44,7 +43,7 @@ const PLE_DIM: usize = 4;
 const SLIDING_WINDOW: usize = 8;
 
 /// Per-checkpoint det commitments captured from one full prefill + decode run.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ScheduleCapture {
     embedding: Option<String>,
     prefill_final_hidden: Option<String>,
@@ -81,6 +80,92 @@ fn det_checkpoint_commitments_are_identical_across_schedules() {
              schedule and the {threads}-thread schedule"
         );
     }
+}
+
+/// Environment variable that flips this test binary into "child capture"
+/// mode for the backend-axis test: the child loads the model from the given
+/// directory, captures commitments under whatever kernel backend
+/// `RASTER_DET_KERNEL_BACKEND` selects for its process, and prints them as
+/// framed JSON. Backend selection is cached once per process, so the scalar
+/// leg must run in a separate process.
+const CHILD_MODEL_DIR_ENV: &str = "SCHEDULE_PARITY_CHILD_MODEL_DIR";
+const CAPTURE_BEGIN: &str = "SCHEDULE_PARITY_CAPTURE_BEGIN";
+const CAPTURE_END: &str = "SCHEDULE_PARITY_CAPTURE_END";
+
+/// Backend axis (force-scalar oracle vs auto-detected SIMD) and storage
+/// width axis (detwgt v2 auto i16/i32 vs forced all-i32): every combination
+/// must produce identical det checkpoint commitments.
+#[test]
+fn det_checkpoint_commitments_are_identical_across_backends_and_widths() {
+    if let Ok(model_dir) = std::env::var(CHILD_MODEL_DIR_ENV) {
+        let model = load_transformer_state_model_from_det_num_wgt_path(Path::new(&model_dir))
+            .expect("child fixture should load");
+        let capture = capture_with_threads(&model, 4);
+        println!(
+            "{CAPTURE_BEGIN}{}{CAPTURE_END}",
+            serde_json::to_string(&capture).expect("capture should serialize")
+        );
+        return;
+    }
+
+    let (auto_dir, auto_model) = fixture_model_with_policy(DetWgtWidthPolicy::Auto);
+    let (i32_dir, i32_model) = fixture_model_with_policy(DetWgtWidthPolicy::ForceI32);
+
+    // The fixture must actually exercise the i16 path: auto-width storage
+    // narrows the (sub-0.5 magnitude) matrix tensors, so its artifact is
+    // strictly smaller than the forced all-i32 one.
+    let auto_len = fs::metadata(auto_dir.join("model.detwgt")).unwrap().len();
+    let i32_len = fs::metadata(i32_dir.join("model.detwgt")).unwrap().len();
+    assert!(
+        auto_len < i32_len,
+        "auto-width fixture ({auto_len} bytes) should be smaller than forced-i32 ({i32_len} bytes)"
+    );
+
+    // Width axis, in-process (auto-detected backend).
+    let auto_capture = capture_with_threads(&auto_model, 4);
+    let i32_capture = capture_with_threads(&i32_model, 4);
+    assert_eq!(
+        auto_capture, i32_capture,
+        "det checkpoint commitments diverged between i16/i32 auto-width and all-i32 storage"
+    );
+
+    // Backend axis, via subprocesses with the backend pinned per process.
+    let scalar_capture = capture_in_subprocess(&auto_dir, "scalar");
+    assert_eq!(
+        scalar_capture, auto_capture,
+        "det checkpoint commitments diverged between the force-scalar oracle and the \
+         auto-detected kernel backend"
+    );
+}
+
+fn capture_in_subprocess(model_dir: &Path, backend: &str) -> ScheduleCapture {
+    let exe = std::env::current_exe().expect("test executable path should resolve");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "det_checkpoint_commitments_are_identical_across_backends_and_widths",
+            "--nocapture",
+        ])
+        .env(CHILD_MODEL_DIR_ENV, model_dir)
+        .env("RASTER_DET_KERNEL_BACKEND", backend)
+        .output()
+        .expect("child capture process should spawn");
+    assert!(
+        output.status.success(),
+        "child capture process failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("child stdout should be UTF-8");
+    let begin = stdout
+        .find(CAPTURE_BEGIN)
+        .expect("child output should contain the capture marker")
+        + CAPTURE_BEGIN.len();
+    let end = stdout[begin..]
+        .find(CAPTURE_END)
+        .expect("child output should terminate the capture marker")
+        + begin;
+    serde_json::from_str(&stdout[begin..end]).expect("child capture should deserialize")
 }
 
 fn capture_with_threads(model: &Gemma4TransformerModel, threads: usize) -> ScheduleCapture {
@@ -189,11 +274,19 @@ struct FixtureTensor {
 }
 
 fn fixture_model() -> Gemma4TransformerModel {
+    fixture_model_with_policy(DetWgtWidthPolicy::Auto).1
+}
+
+fn fixture_model_with_policy(
+    policy: DetWgtWidthPolicy,
+) -> (std::path::PathBuf, Gemma4TransformerModel) {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time should advance")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("raster-inference-schedule-parity-{unique}"));
+    let dir = std::env::temp_dir().join(format!(
+        "raster-inference-schedule-parity-{unique}-{policy:?}"
+    ));
     fs::create_dir_all(&dir).expect("fixture dir should create");
 
     let config = format!(
@@ -220,8 +313,10 @@ fn fixture_model() -> Gemma4TransformerModel {
     fs::write(dir.join("config.json"), config).expect("config should write");
 
     let tensors = fixture_tensors();
-    write_detwgt_file(&dir.join("model.detwgt"), &tensors);
-    load_transformer_state_model_from_det_num_wgt_path(&dir).expect("fixture should load")
+    write_detwgt_file_with_policy(&dir.join("model.detwgt"), &tensors, policy);
+    let model =
+        load_transformer_state_model_from_det_num_wgt_path(&dir).expect("fixture should load");
+    (dir, model)
 }
 
 fn fixture_tensors() -> Vec<FixtureTensor> {
@@ -363,47 +458,24 @@ fn fixture_tensors() -> Vec<FixtureTensor> {
     tensors
 }
 
-fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
-    bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-
-    for tensor in tensors {
-        let name_bytes = tensor.name.as_bytes();
-        let wgt_bits = tensor
-            .values
-            .iter()
-            .map(|value| f32_to_wgt(*value))
-            .collect::<Vec<_>>();
-        let payload = wgt_bits
-            .iter()
-            .flat_map(|wgt| wgt_to_le_bytes(*wgt))
-            .collect::<Vec<_>>();
-        let row_len = tensor.shape.last().copied().unwrap_or(1).max(1);
-        let max_row_mass = wgt_bits
-            .chunks(row_len)
-            .map(|row| {
-                row.iter()
-                    .map(|wgt| u64::from(wgt.to_bits().unsigned_abs()))
-                    .sum::<u64>()
-            })
-            .max()
-            .unwrap_or(0);
-        let element_count = tensor.shape.iter().product::<usize>() as u64;
-
-        bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(name_bytes);
-        bytes.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
-        for dim in &tensor.shape {
-            bytes.extend_from_slice(&(*dim as u64).to_le_bytes());
-        }
-        bytes.extend_from_slice(&element_count.to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&max_row_mass.to_le_bytes());
-        bytes.extend_from_slice(&payload);
-    }
-
+fn write_detwgt_file_with_policy(
+    path: &Path,
+    tensors: &[FixtureTensor],
+    policy: DetWgtWidthPolicy,
+) {
+    let specs = tensors
+        .iter()
+        .map(|tensor| DetWgtTensorSpec {
+            name: tensor.name.clone(),
+            shape: tensor.shape.clone(),
+            wgt_bits: tensor
+                .values
+                .iter()
+                .map(|value| f32_to_wgt(*value).to_bits())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let bytes =
+        encode_det_wgt_artifact_with_widths(&specs, policy).expect("detwgt v2 should encode");
     fs::write(path, bytes).expect("detwgt should write");
 }

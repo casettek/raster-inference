@@ -25,8 +25,9 @@ use crate::shared::model::transformer::{
     ResolvedGemma4PleLayerWeights,
 };
 use crate::shared::numerics::det_num::{
-    f32_to_acc, f32_to_act, scale_act, Act, Wgt, DET_NUM_SPEC_VERSION,
-    DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC, DET_WGT_ROW_MASS_LIMIT,
+    decode_wgt_bits_le, f32_to_acc, f32_to_act, scale_act, Act, DetWgtElementWidth, Wgt,
+    DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
+    DET_WGT_ROW_MASS_LIMIT,
 };
 // use crate::trace::{trace_event, trace_scope};
 
@@ -207,6 +208,7 @@ struct DetNumTensorMetadata {
     shape: Vec<usize>,
     data_offset: usize,
     data_len: usize,
+    element_width: DetWgtElementWidth,
 }
 
 struct DetNumTensorReader {
@@ -264,7 +266,8 @@ impl DetNumTensorReader {
         let format_version = read_u32(&bytes, &mut cursor)?;
         if format_version != DET_WGT_ARTIFACT_FORMAT_VERSION {
             bail!(
-                "unsupported deterministic artifact format version {format_version}; expected {}",
+                "unsupported deterministic artifact format version {format_version}; expected {} \
+                 — re-convert the model with gemma-det-num-wgt-converter (detwgt v2)",
                 DET_WGT_ARTIFACT_FORMAT_VERSION
             );
         }
@@ -308,10 +311,14 @@ impl DetNumTensorReader {
                 );
             }
 
+            let element_width =
+                DetWgtElementWidth::from_tag(read_u32(&bytes, &mut cursor)?)
+                    .with_context(|| format!("tensor `{name}` has an invalid element width"))?;
+
             let payload_len = usize::try_from(read_u64(&bytes, &mut cursor)?)
                 .map_err(|_| anyhow!("tensor payload length does not fit into usize"))?;
             let expected_payload_len = element_count
-                .checked_mul(4)
+                .checked_mul(element_width.byte_width())
                 .ok_or_else(|| anyhow!("tensor payload byte count overflowed"))?;
             if payload_len != expected_payload_len {
                 bail!(
@@ -329,6 +336,15 @@ impl DetNumTensorReader {
                 );
             }
 
+            // Payloads are 64-byte aligned in the file; the padding bytes are
+            // part of the canonical encoding and must be zero.
+            let padding_len =
+                crate::shared::numerics::det_num::artifact::padding_for_offset(cursor as u64);
+            let padding = take_bytes(bytes, &mut cursor, padding_len)?;
+            if padding.iter().any(|byte| *byte != 0) {
+                bail!("tensor `{name}` has non-zero payload alignment padding");
+            }
+
             let payload_start = cursor;
             let _payload_bytes = take_bytes(bytes, &mut cursor, payload_len)?;
             if tensors
@@ -338,6 +354,7 @@ impl DetNumTensorReader {
                         shape,
                         data_offset: payload_start,
                         data_len: payload_len,
+                        element_width,
                     },
                 )
                 .is_some()
@@ -420,13 +437,9 @@ impl DetNumTensorReader {
             );
         }
         let payload = self.payload_slice(tensor_name, tensor)?;
-        Ok(payload
-            .chunks_exact(4)
-            .map(|chunk| {
-                Wgt::from_bits(i32::from_le_bytes(
-                    chunk.try_into().expect("i32 byte width should match"),
-                ))
-            })
+        Ok(decode_wgt_bits_le(payload, tensor.element_width)?
+            .into_iter()
+            .map(Wgt::from_bits)
             .collect())
     }
 
@@ -448,11 +461,13 @@ impl DetNumTensorReader {
         }
         let payload = self.payload_slice(tensor_name, tensor)?;
         let bytes = payload
-            .get(..4)
+            .get(..tensor.element_width.byte_width())
             .ok_or_else(|| anyhow!("tensor `{tensor_name}` is missing its scalar payload"))?;
-        Ok(Some(Wgt::from_bits(i32::from_le_bytes(
-            bytes.try_into().expect("i32 byte width should match"),
-        ))))
+        let bits = decode_wgt_bits_le(bytes, tensor.element_width)?
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("tensor `{tensor_name}` is missing its scalar payload"))?;
+        Ok(Some(Wgt::from_bits(bits)))
     }
 
     fn tensor_to_matrix(
@@ -508,6 +523,7 @@ impl DetNumTensorReader {
             total_rows,
             total_cols,
             data_offset: tensor.data_offset,
+            element_width: tensor.element_width,
             row_offset,
             row_count,
             col_offset,
@@ -1799,6 +1815,32 @@ fn decode_matrix_slice_from_source(
     })
 }
 
+/// Resolves the byte range of one row of a deterministic tensor slice at the
+/// slice's storage width.
+fn det_num_source_row_range(
+    source: &DetNumTensorSliceSource,
+    global_row_idx: usize,
+) -> Result<std::ops::Range<usize>> {
+    let elem_bytes = source.element_width.byte_width();
+    let row_bytes = source
+        .total_cols
+        .checked_mul(elem_bytes)
+        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
+    let start = source
+        .data_offset
+        .checked_add(
+            global_row_idx
+                .checked_mul(row_bytes)
+                .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?,
+        )
+        .and_then(|offset| offset.checked_add(source.col_offset * elem_bytes))
+        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+    let end = start
+        .checked_add(source.col_count * elem_bytes)
+        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+    Ok(start..end)
+}
+
 fn decode_matrix_row_acts_from_det_num_source(
     source: &DetNumTensorSliceSource,
     row_idx: usize,
@@ -1810,62 +1852,31 @@ fn decode_matrix_row_acts_from_det_num_source(
             source.row_count
         );
     }
-    let row_bytes = source
-        .total_cols
-        .checked_mul(4)
-        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
-    let global_row_idx = source.row_offset + row_idx;
-    let start = source
-        .data_offset
-        .checked_add(global_row_idx * row_bytes)
-        .and_then(|offset| offset.checked_add(source.col_offset * 4))
-        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
-    let end = start
-        .checked_add(source.col_count * 4)
-        .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+    let range = det_num_source_row_range(source, source.row_offset + row_idx)?;
     let encoded_row = mmap
-        .get(start..end)
+        .get(range)
         .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
-    let mut row = Vec::with_capacity(source.col_count);
-    for encoded_value in encoded_row.chunks_exact(4) {
-        row.push(Act::from_bits(i32::from_le_bytes(
-            encoded_value
-                .try_into()
-                .expect("i32 byte width should match"),
-        )));
-    }
-    Ok(row)
+    Ok(decode_wgt_bits_le(encoded_row, source.element_width)?
+        .into_iter()
+        .map(Act::from_bits)
+        .collect())
 }
 
 fn decode_matrix_slice_from_det_num_source(
     source: &DetNumTensorSliceSource,
     mmap: &Mmap,
 ) -> Result<MatrixF32> {
-    let row_bytes = source
-        .total_cols
-        .checked_mul(4)
-        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
     let mut values = Vec::with_capacity(source.row_count * source.col_count);
     for row_idx in 0..source.row_count {
-        let global_row_idx = source.row_offset + row_idx;
-        let start = source
-            .data_offset
-            .checked_add(global_row_idx * row_bytes)
-            .and_then(|offset| offset.checked_add(source.col_offset * 4))
-            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
-        let end = start
-            .checked_add(source.col_count * 4)
-            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+        let range = det_num_source_row_range(source, source.row_offset + row_idx)?;
         let encoded_row = mmap
-            .get(start..end)
+            .get(range)
             .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
-        for encoded_value in encoded_row.chunks_exact(4) {
-            values.push(det_wgt_to_f32(i32::from_le_bytes(
-                encoded_value
-                    .try_into()
-                    .expect("i32 byte width should match"),
-            )));
-        }
+        values.extend(
+            decode_wgt_bits_le(encoded_row, source.element_width)?
+                .into_iter()
+                .map(det_wgt_to_f32),
+        );
     }
     Ok(MatrixF32 {
         rows: source.row_count,
@@ -1878,31 +1889,13 @@ fn decode_det_num_matrix_from_source(
     source: &DetNumTensorSliceSource,
     mmap: &Mmap,
 ) -> Result<DetNumMatrix> {
-    let row_bytes = source
-        .total_cols
-        .checked_mul(4)
-        .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
     let mut values = Vec::with_capacity(source.row_count * source.col_count);
     for row_idx in 0..source.row_count {
-        let global_row_idx = source.row_offset + row_idx;
-        let start = source
-            .data_offset
-            .checked_add(global_row_idx * row_bytes)
-            .and_then(|offset| offset.checked_add(source.col_offset * 4))
-            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
-        let end = start
-            .checked_add(source.col_count * 4)
-            .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
+        let range = det_num_source_row_range(source, source.row_offset + row_idx)?;
         let encoded_row = mmap
-            .get(start..end)
+            .get(range)
             .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
-        for encoded_value in encoded_row.chunks_exact(4) {
-            values.push(i32::from_le_bytes(
-                encoded_value
-                    .try_into()
-                    .expect("i32 byte width should match"),
-            ));
-        }
+        values.extend(decode_wgt_bits_le(encoded_row, source.element_width)?);
     }
     Ok(DetNumMatrix {
         rows: source.row_count,
@@ -1912,20 +1905,21 @@ fn decode_det_num_matrix_from_source(
 }
 
 /// Zero-copy variant of [`decode_det_num_matrix_from_source`]: borrows the
-/// weight payload directly from the mmapped artifact when the slice is
-/// contiguous in the file and 4-byte aligned, falling back to an owned copy
-/// otherwise. detwgt v1 packs payloads after variable-length names, so
-/// alignment is not guaranteed; aligned payloads (and the detwgt v2 format)
-/// take the borrowed path.
+/// weight payload directly from the mmapped artifact (at its storage width)
+/// when the slice is contiguous in the file and element-aligned, falling
+/// back to an owned widened copy otherwise. detwgt v2 aligns payloads to 64
+/// bytes, so full-matrix slices always take the borrowed path on
+/// little-endian hosts.
 fn decode_det_num_matrix_from_source_shared(
     source: &DetNumTensorSliceSource,
     mmap: &std::sync::Arc<Mmap>,
 ) -> Result<DetNumMatrix> {
     let contiguous = source.col_offset == 0 && source.col_count == source.total_cols;
     if contiguous && cfg!(target_endian = "little") {
+        let elem_bytes = source.element_width.byte_width();
         let row_bytes = source
             .total_cols
-            .checked_mul(4)
+            .checked_mul(elem_bytes)
             .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
         let byte_offset = source
             .data_offset
@@ -1936,20 +1930,31 @@ fn decode_det_num_matrix_from_source_shared(
             .checked_mul(source.col_count)
             .ok_or_else(|| anyhow!("matrix element count overflowed"))?;
         let byte_end = byte_offset
-            .checked_add(len * 4)
+            .checked_add(len * elem_bytes)
             .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
         let in_bounds = mmap.get(byte_offset..byte_end).is_some();
-        let aligned =
-            (mmap.as_ptr() as usize + byte_offset) % std::mem::align_of::<i32>() == 0;
+        let aligned = (mmap.as_ptr() as usize + byte_offset) % elem_bytes == 0;
         if in_bounds && aligned {
+            let values = match source.element_width {
+                DetWgtElementWidth::I32 => {
+                    crate::shared::model::transformer::DetNumValues::Mmap {
+                        map: mmap.clone(),
+                        byte_offset,
+                        len,
+                    }
+                }
+                DetWgtElementWidth::I16 => {
+                    crate::shared::model::transformer::DetNumValues::MmapI16 {
+                        map: mmap.clone(),
+                        byte_offset,
+                        len,
+                    }
+                }
+            };
             return Ok(DetNumMatrix {
                 rows: source.row_count,
                 cols: source.col_count,
-                values: crate::shared::model::transformer::DetNumValues::Mmap {
-                    map: mmap.clone(),
-                    byte_offset,
-                    len,
-                },
+                values,
             });
         }
     }
@@ -2647,7 +2652,7 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
     }
 
     let row_bytes = hidden_size
-        .checked_mul(4)
+        .checked_mul(source.element_width.byte_width())
         .ok_or_else(|| anyhow!("embedding row byte size overflowed"))?;
     let mut activations = Vec::with_capacity(token_ids.len());
     let mut acts = Vec::with_capacity(token_ids.len());
@@ -2666,27 +2671,18 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
         let encoded_row = mmap
             .get(start..end)
             .ok_or_else(|| anyhow!("embedding row byte range is out of bounds"))?;
+        let row_bits = decode_wgt_bits_le(encoded_row, source.element_width)?;
         match execution_mode {
             InferenceExecutionMode::Fp32 => {
-                let mut row = Vec::with_capacity(hidden_size);
-                for encoded_value in encoded_row.chunks_exact(4) {
-                    row.push(det_wgt_to_f32(i32::from_le_bytes(
-                        encoded_value
-                            .try_into()
-                            .expect("i32 byte width should match"),
-                    )));
-                }
-                activations.push(row.into_iter().map(|value| value * scale).collect());
+                activations.push(
+                    row_bits
+                        .into_iter()
+                        .map(|bits| det_wgt_to_f32(bits) * scale)
+                        .collect(),
+                );
             }
             InferenceExecutionMode::Deterministic => {
-                let mut row = Vec::with_capacity(hidden_size);
-                for encoded_value in encoded_row.chunks_exact(4) {
-                    row.push(Act::from_bits(i32::from_le_bytes(
-                        encoded_value
-                            .try_into()
-                            .expect("i32 byte width should match"),
-                    )));
-                }
+                let row = row_bits.into_iter().map(Act::from_bits).collect();
                 acts.push(scale_act_row(row, scale));
             }
         }
@@ -2892,8 +2888,8 @@ mod tests {
     use crate::shared::api::input::InferenceExecutionMode;
     use crate::shared::model::transformer::DetNumTensorSliceSource;
     use crate::shared::numerics::det_num::{
-        f32_to_act, f32_to_wgt, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
-        DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
+        f32_to_wgt, wgt_to_le_bytes, Act, DetWgtElementWidth, DetWgtTensorSpec,
+        DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
     };
     use crate::{Gemma4AttentionKind, Gemma4LogitsProjection};
     use memmap2::Mmap;
@@ -3026,6 +3022,7 @@ mod tests {
             total_rows: 2,
             total_cols: 3,
             data_offset: 8,
+            element_width: DetWgtElementWidth::I32,
             row_offset: 0,
             row_count: 2,
             col_offset: 0,
@@ -3034,7 +3031,7 @@ mod tests {
         let aligned = super::decode_det_num_matrix_from_source_shared(&aligned_source, &mmap)
             .expect("aligned matrix should load");
         assert!(aligned.values.is_mmap_backed());
-        assert_eq!(aligned.values.as_slice(), payload_values.as_slice());
+        assert_eq!(aligned.values.to_widened_vec(), payload_values);
 
         // Misaligned payload start (detwgt v1 packs payloads after
         // variable-length names): falls back to an owned copy.
@@ -3052,6 +3049,7 @@ mod tests {
             total_rows: 2,
             total_cols: 3,
             data_offset: 6,
+            element_width: DetWgtElementWidth::I32,
             row_offset: 0,
             row_count: 2,
             col_offset: 0,
@@ -3063,7 +3061,7 @@ mod tests {
         )
         .expect("misaligned matrix should load via copy");
         assert!(!copied.values.is_mmap_backed());
-        assert_eq!(copied.values.as_slice(), payload_values.as_slice());
+        assert_eq!(copied.values.to_widened_vec(), payload_values);
 
         // Column slices are not contiguous in the file: copy fallback.
         let sliced_source = DetNumTensorSliceSource {
@@ -3071,6 +3069,7 @@ mod tests {
             total_rows: 2,
             total_cols: 3,
             data_offset: 8,
+            element_width: DetWgtElementWidth::I32,
             row_offset: 0,
             row_count: 2,
             col_offset: 1,
@@ -3079,7 +3078,7 @@ mod tests {
         let sliced = super::decode_det_num_matrix_from_source_shared(&sliced_source, &mmap)
             .expect("column slice should load via copy");
         assert!(!sliced.values.is_mmap_backed());
-        assert_eq!(sliced.values.as_slice(), &[-2, 3, -5, 6]);
+        assert_eq!(sliced.values.to_widened_vec(), vec![-2, 3, -5, 6]);
     }
 
     #[test]
@@ -3095,6 +3094,7 @@ mod tests {
             total_rows: 1,
             total_cols: 1,
             data_offset: 0,
+            element_width: DetWgtElementWidth::I32,
             row_offset: 0,
             row_count: 1,
             col_offset: 0,
@@ -3501,59 +3501,59 @@ mod tests {
             .expect("deterministic model should retain raw down_proj weights");
         assert_eq!(det_q_proj.rows, 4);
         assert_eq!(det_q_proj.cols, 4);
-        assert_eq!(det_q_proj.values[0], f32_to_wgt(q_proj_values[0]).to_bits());
-        assert_eq!(det_q_proj.values[1], f32_to_wgt(q_proj_values[1]).to_bits());
+        assert_eq!(det_q_proj.values.wgt_bits(0), f32_to_wgt(q_proj_values[0]).to_bits());
+        assert_eq!(det_q_proj.values.wgt_bits(1), f32_to_wgt(q_proj_values[1]).to_bits());
         assert_eq!(det_k_proj.rows, 2);
         assert_eq!(det_k_proj.cols, 4);
-        assert_eq!(det_k_proj.values[0], f32_to_wgt(k_proj_values[0]).to_bits());
-        assert_eq!(det_k_proj.values[1], f32_to_wgt(k_proj_values[1]).to_bits());
+        assert_eq!(det_k_proj.values.wgt_bits(0), f32_to_wgt(k_proj_values[0]).to_bits());
+        assert_eq!(det_k_proj.values.wgt_bits(1), f32_to_wgt(k_proj_values[1]).to_bits());
         assert_eq!(det_v_proj.rows, 2);
         assert_eq!(det_v_proj.cols, 4);
-        assert_eq!(det_v_proj.values[0], f32_to_wgt(v_proj_values[0]).to_bits());
-        assert_eq!(det_v_proj.values[1], f32_to_wgt(v_proj_values[1]).to_bits());
+        assert_eq!(det_v_proj.values.wgt_bits(0), f32_to_wgt(v_proj_values[0]).to_bits());
+        assert_eq!(det_v_proj.values.wgt_bits(1), f32_to_wgt(v_proj_values[1]).to_bits());
         assert_eq!(det_o_proj.rows, 4);
         assert_eq!(det_o_proj.cols, 4);
-        assert_eq!(det_o_proj.values[0], f32_to_wgt(o_proj_values[0]).to_bits());
-        assert_eq!(det_o_proj.values[1], f32_to_wgt(o_proj_values[1]).to_bits());
+        assert_eq!(det_o_proj.values.wgt_bits(0), f32_to_wgt(o_proj_values[0]).to_bits());
+        assert_eq!(det_o_proj.values.wgt_bits(1), f32_to_wgt(o_proj_values[1]).to_bits());
         assert_eq!(fp32_lm_head.values[0], lm_head_values[0]);
         assert_eq!(det_lm_head.rows, 3);
         assert_eq!(det_lm_head.cols, 4);
         assert_eq!(
-            det_lm_head.values[0],
+            det_lm_head.values.wgt_bits(0),
             f32_to_wgt(lm_head_values[0]).to_bits()
         );
         assert_eq!(
-            det_lm_head.values[1],
+            det_lm_head.values.wgt_bits(1),
             f32_to_wgt(lm_head_values[1]).to_bits()
         );
         assert_eq!(det_gate_proj.rows, 8);
         assert_eq!(det_gate_proj.cols, 4);
         assert_eq!(
-            det_gate_proj.values[0],
+            det_gate_proj.values.wgt_bits(0),
             f32_to_wgt(gate_proj_values[0]).to_bits()
         );
         assert_eq!(
-            det_gate_proj.values[1],
+            det_gate_proj.values.wgt_bits(1),
             f32_to_wgt(gate_proj_values[1]).to_bits()
         );
         assert_eq!(det_up_proj.rows, 8);
         assert_eq!(det_up_proj.cols, 4);
         assert_eq!(
-            det_up_proj.values[0],
+            det_up_proj.values.wgt_bits(0),
             f32_to_wgt(up_proj_values[0]).to_bits()
         );
         assert_eq!(
-            det_up_proj.values[1],
+            det_up_proj.values.wgt_bits(1),
             f32_to_wgt(up_proj_values[1]).to_bits()
         );
         assert_eq!(det_down_proj.rows, 4);
         assert_eq!(det_down_proj.cols, 8);
         assert_eq!(
-            det_down_proj.values[0],
+            det_down_proj.values.wgt_bits(0),
             f32_to_wgt(down_proj_values[0]).to_bits()
         );
         assert_eq!(
-            det_down_proj.values[1],
+            det_down_proj.values.wgt_bits(1),
             f32_to_wgt(down_proj_values[1]).to_bits()
         );
     }
@@ -3762,19 +3762,19 @@ mod tests {
         assert_eq!(det_ple.input_gate_det.as_ref().unwrap().rows, 2);
         assert_eq!(det_ple.input_gate_det.as_ref().unwrap().cols, 4);
         assert_eq!(
-            det_ple.input_gate_det.as_ref().unwrap().values[0],
+            det_ple.input_gate_det.as_ref().unwrap().values.wgt_bits(0),
             f32_to_wgt(input_gate_values[0]).to_bits()
         );
         assert_eq!(det_ple.layer_projection_det.as_ref().unwrap().rows, 4);
         assert_eq!(det_ple.layer_projection_det.as_ref().unwrap().cols, 2);
         assert_eq!(
-            det_ple.layer_projection_det.as_ref().unwrap().values[0],
+            det_ple.layer_projection_det.as_ref().unwrap().values.wgt_bits(0),
             f32_to_wgt(layer_projection_values[0]).to_bits()
         );
         assert_eq!(det_global_projection.rows, 2);
         assert_eq!(det_global_projection.cols, 4);
         assert_eq!(
-            det_global_projection.values[0],
+            det_global_projection.values.wgt_bits(0),
             f32_to_wgt(global_projection_values[0]).to_bits()
         );
     }
@@ -4066,23 +4066,18 @@ mod tests {
     }
 
     fn single_tensor_detwgt_bytes(name: &str, shape: &[u64], max_row_mass: u64) -> Vec<u8> {
+        use crate::shared::numerics::det_num::artifact::{
+            file_header_bytes, padding_for_offset, tensor_header_bytes,
+        };
+        let shape_usize = shape.iter().map(|dim| *dim as usize).collect::<Vec<_>>();
         let element_count: u64 = shape.iter().product();
-        let payload = vec![0u8; (element_count * 4) as usize];
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
-        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(name.as_bytes());
-        bytes.extend_from_slice(&(shape.len() as u32).to_le_bytes());
-        for dim in shape {
-            bytes.extend_from_slice(&dim.to_le_bytes());
-        }
-        bytes.extend_from_slice(&element_count.to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&max_row_mass.to_le_bytes());
-        bytes.extend_from_slice(&payload);
+        let mut bytes = file_header_bytes(1);
+        bytes.extend_from_slice(
+            &tensor_header_bytes(name, &shape_usize, DetWgtElementWidth::I32, max_row_mass)
+                .unwrap(),
+        );
+        bytes.resize(bytes.len() + padding_for_offset(bytes.len() as u64), 0);
+        bytes.extend(std::iter::repeat(0u8).take((element_count * 4) as usize));
         bytes
     }
 
@@ -4123,41 +4118,20 @@ mod tests {
     }
 
     fn write_detwgt_file(dir: &Path, tensors: &[FixtureTensor]) {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
-        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-
-        for tensor in tensors {
-            let name_bytes = tensor.name.as_bytes();
-            let element_count = tensor.shape.iter().product::<usize>() as u64;
-            bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(name_bytes);
-            bytes.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
-            for dim in &tensor.shape {
-                bytes.extend_from_slice(&(*dim as u64).to_le_bytes());
-            }
-            bytes.extend_from_slice(&element_count.to_le_bytes());
-            bytes.extend_from_slice(&(tensor.bytes.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(&fixture_max_row_mass(tensor).to_le_bytes());
-            bytes.extend_from_slice(&tensor.bytes);
-        }
-
+        let specs = tensors
+            .iter()
+            .map(|tensor| DetWgtTensorSpec {
+                name: tensor.name.clone(),
+                shape: tensor.shape.clone(),
+                wgt_bits: tensor
+                    .bytes
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let bytes = crate::shared::numerics::det_num::encode_det_wgt_artifact(&specs).unwrap();
         fs::write(dir.join("model.detwgt"), bytes).unwrap();
-    }
-
-    fn fixture_max_row_mass(tensor: &FixtureTensor) -> u64 {
-        let row_len = tensor.shape.last().copied().unwrap_or(1).max(1);
-        tensor
-            .bytes
-            .chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()).unsigned_abs() as u64)
-            .collect::<Vec<_>>()
-            .chunks(row_len)
-            .map(|row| row.iter().sum::<u64>())
-            .max()
-            .unwrap_or(0)
     }
 
     fn layer_tensors(layer_idx: usize, base: f32, include_v_proj: bool) -> Vec<FixtureTensor> {

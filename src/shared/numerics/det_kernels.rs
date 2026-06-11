@@ -16,15 +16,25 @@ use rayon::prelude::*;
 
 use crate::shared::model::transformer::{
     DetNumMatrix, Gemma4LogitsProjection, GemmaEmbeddingTensorSource, InternalActivationRow,
-    InternalActivationSequence, LayerKvCache, ResolvedGemma4LayerWeights,
+    InternalActivationSequence, LayerKvCache, ResolvedGemma4LayerWeights, WgtPayload,
 };
 use crate::shared::numerics::det_num::{
-    add_sat, attention_score as det_attention_score, attention_softmax_into,
-    attention_weighted_sum_flat_into, gelu_pytorch_tanh_act, mac_bits, mul_sat, requantize,
+    add_sat, attention_softmax_into, gelu_pytorch_tanh_act, mul_sat, requantize,
     rms_norm_in_place, rope_rotate_pairs_in_place, scale_act, softcap_act,
     value_rms_norm_in_place, Acc, Act, Wgt,
 };
+use crate::shared::numerics::det_simd;
 use crate::shared::numerics::det_tensor::{ActSlab, DetKvCacheData, HeadSlab};
+
+/// Views canonical `Act` values as their raw `i32` bit patterns.
+///
+/// `Act` is `fixed::FixedI32<16>`, a `#[repr(transparent)]` wrapper over
+/// `i32`, so the reinterpretation is layout-exact; `to_bits` on each element
+/// would produce the same values.
+fn act_bits(values: &[Act]) -> &[i32] {
+    // SAFETY: `Act` is repr(transparent) over i32 with identical size/align.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<i32>(), values.len()) }
+}
 
 // ---------------------------------------------------------------------------
 // Parallelism controls
@@ -89,24 +99,36 @@ pub(crate) fn row_from_internal(internal: &InternalActivationRow) -> Result<Vec<
 // Elementwise / projection primitives
 // ---------------------------------------------------------------------------
 
-/// Serial canonical GEMV core shared by every linear driver: computes output
-/// rows `row_offset..row_offset + output.len()` of `weight · input`. Each
-/// output element is one canonical wrapping-MAC reduction followed by a
-/// requantize, independent of how rows are partitioned across callers.
+/// Canonical GEMV core shared by every linear driver: computes output rows
+/// `row_offset..row_offset + output.len()` of `weight · input`. Each output
+/// element is one wrapping-MAC reduction (backend-dispatched schedule,
+/// bit-identical by spec v1 associativity) followed by a scalar requantize,
+/// independent of how rows are partitioned across callers.
 fn det_linear_rows_into(
     input: &[Act],
     weight: &DetNumMatrix,
     row_offset: usize,
     output: &mut [Act],
 ) {
-    let weight_values = weight.values.as_slice();
-    for (chunk_row_idx, out) in output.iter_mut().enumerate() {
-        let row_start = (row_offset + chunk_row_idx) * weight.cols;
-        let mut acc_bits = 0_i64;
-        for (col_idx, act) in input.iter().enumerate() {
-            acc_bits = mac_bits(acc_bits, act.to_bits(), weight_values[row_start + col_idx]);
+    let input_bits = act_bits(input);
+    match weight.values.payload() {
+        WgtPayload::I32(weight_values) => {
+            for (chunk_row_idx, out) in output.iter_mut().enumerate() {
+                let row_start = (row_offset + chunk_row_idx) * weight.cols;
+                let row = &weight_values[row_start..row_start + weight.cols];
+                *out = requantize(Acc::from_bits(det_simd::dot_act_i32(input_bits, row)));
+            }
         }
-        *out = requantize(Acc::from_bits(acc_bits));
+        // i16 storage (detwgt v2): weights are sign-extended before the
+        // exact widening multiply, so products and outputs are identical to
+        // i32 storage.
+        WgtPayload::I16(weight_values) => {
+            for (chunk_row_idx, out) in output.iter_mut().enumerate() {
+                let row_start = (row_offset + chunk_row_idx) * weight.cols;
+                let row = &weight_values[row_start..row_start + weight.cols];
+                *out = requantize(Acc::from_bits(det_simd::dot_act_i16(input_bits, row)));
+            }
+        }
     }
 }
 
@@ -287,6 +309,33 @@ fn cache_windows<'a>(
     }
 }
 
+/// Backend-dispatched twin of `det_num::attention_weighted_sum_flat_into`:
+/// accumulates row-major into a wrapping i64 buffer (one exact product per
+/// (row, dim) term — the same multiset as the canonical column-major loop,
+/// so wrapping adds make the order swap bit-identical), then requantizes
+/// each output element exactly like the scalar reference.
+fn det_weighted_sum_flat_into(
+    weights: &[Act],
+    value_rows: &[Act],
+    width: usize,
+    acc_scratch: &mut Vec<i64>,
+    output: &mut [Act],
+) {
+    debug_assert!(!weights.is_empty());
+    debug_assert_eq!(weights.len() * width, value_rows.len());
+    debug_assert_eq!(output.len(), width);
+    acc_scratch.clear();
+    acc_scratch.resize(width, 0_i64);
+    let value_bits = act_bits(value_rows);
+    for (row_idx, weight) in weights.iter().enumerate() {
+        let row = &value_bits[row_idx * width..(row_idx + 1) * width];
+        det_simd::axpy_acc_i64(acc_scratch, row, weight.to_bits());
+    }
+    for (out, acc_bits) in output.iter_mut().zip(acc_scratch.iter()) {
+        *out = requantize(Acc::from_bits(*acc_bits));
+    }
+}
+
 fn attention_output_into(
     query: &[Act],
     windows: &AttentionWindows<'_>,
@@ -294,15 +343,20 @@ fn attention_output_into(
     logits_scratch: &mut Vec<Act>,
     exp_scratch: &mut Vec<Acc>,
     weights_scratch: &mut Vec<Act>,
+    acc_scratch: &mut Vec<i64>,
     output: &mut [Act],
 ) {
     logits_scratch.clear();
+    let query_bits = act_bits(query);
     for row_idx in 0..windows.rows {
         let key_row = &windows.keys[row_idx * head_dim..(row_idx + 1) * head_dim];
-        logits_scratch.push(det_attention_score(query, key_row));
+        // Canonical attention score: wrapping MAC reduction + requantize,
+        // identical to `det_num::attention_score` for every backend.
+        let score_bits = det_simd::dot_act_i32(query_bits, act_bits(key_row));
+        logits_scratch.push(requantize(Acc::from_bits(score_bits)));
     }
     attention_softmax_into(logits_scratch, exp_scratch, weights_scratch);
-    attention_weighted_sum_flat_into(weights_scratch, windows.values, head_dim, output);
+    det_weighted_sum_flat_into(weights_scratch, windows.values, head_dim, acc_scratch, output);
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +568,8 @@ fn det_attention_prefill(
                              output_row: &mut [Act],
                              logits_scratch: &mut Vec<Act>,
                              exp_scratch: &mut Vec<Acc>,
-                             weights_scratch: &mut Vec<Act>| {
+                             weights_scratch: &mut Vec<Act>,
+                             acc_scratch: &mut Vec<i64>| {
         let head_idx = item_idx / seq_len;
         let query_idx = item_idx % seq_len;
         let kv_head_idx = head_idx / kv_groups;
@@ -538,6 +593,7 @@ fn det_attention_prefill(
             logits_scratch,
             exp_scratch,
             weights_scratch,
+            acc_scratch,
             output_row,
         );
     };
@@ -547,14 +603,16 @@ fn det_attention_prefill(
             .par_chunks_mut(head_dim)
             .enumerate()
             .for_each_init(
-                || (Vec::new(), Vec::new(), Vec::new()),
-                |(logits_scratch, exp_scratch, weights_scratch), (item_idx, output_row)| {
+                || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                |(logits_scratch, exp_scratch, weights_scratch, acc_scratch),
+                 (item_idx, output_row)| {
                     compute_item(
                         item_idx,
                         output_row,
                         logits_scratch,
                         exp_scratch,
                         weights_scratch,
+                        acc_scratch,
                     );
                 },
             );
@@ -562,6 +620,7 @@ fn det_attention_prefill(
         let mut logits_scratch = Vec::with_capacity(seq_len);
         let mut exp_scratch = Vec::with_capacity(seq_len);
         let mut weights_scratch = Vec::with_capacity(seq_len);
+        let mut acc_scratch = Vec::with_capacity(layer.head_dim);
         for (item_idx, output_row) in head_outputs.as_flat_mut().chunks_mut(head_dim).enumerate()
         {
             compute_item(
@@ -570,6 +629,7 @@ fn det_attention_prefill(
                 &mut logits_scratch,
                 &mut exp_scratch,
                 &mut weights_scratch,
+                &mut acc_scratch,
             );
         }
     }
@@ -769,6 +829,7 @@ pub(crate) struct DetDecodeScratch {
     logits: Vec<Act>,
     exp_terms: Vec<Acc>,
     weights: Vec<Act>,
+    weighted_acc: Vec<i64>,
 }
 
 impl DetDecodeScratch {
@@ -939,8 +1000,9 @@ pub(crate) fn det_layer_decode(
             .par_chunks_mut(head_dim)
             .enumerate()
             .for_each_init(
-                || (Vec::new(), Vec::new(), Vec::new()),
-                |(logits_scratch, exp_scratch, weights_scratch), (head_idx, output)| {
+                || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                |(logits_scratch, exp_scratch, weights_scratch, acc_scratch),
+                 (head_idx, output)| {
                     let kv_head_idx = head_idx / kv_groups;
                     let windows = cache_windows(attention_det, kv_head_idx, key_start, window_len);
                     let query = &q[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
@@ -951,6 +1013,7 @@ pub(crate) fn det_layer_decode(
                         logits_scratch,
                         exp_scratch,
                         weights_scratch,
+                        acc_scratch,
                         output,
                     );
                 },
@@ -967,6 +1030,7 @@ pub(crate) fn det_layer_decode(
                 &mut scratch.logits,
                 &mut scratch.exp_terms,
                 &mut scratch.weights,
+                &mut scratch.weighted_acc,
                 &mut attn_combined[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim],
             );
         }
@@ -1251,5 +1315,125 @@ mod tests {
         let mut output = vec![Act::from_bits(0); rows];
         det_linear_into_par(&input, &weight, &mut output).expect("driver should succeed");
         assert_eq!(bits(&output), bits(&reference));
+    }
+
+    /// GEMV against the canonical scalar oracle (`mac_bits` fold +
+    /// `requantize`), covering every tail length around the SIMD stride.
+    /// Runs under whatever backend the process selected, so on aarch64 this
+    /// is the NEON-vs-scalar differential at the full kernel level.
+    #[test]
+    fn gemv_matches_canonical_mac_bits_oracle_for_every_tail_length() {
+        use crate::shared::numerics::det_num::mac_bits;
+        for cols in (1..=40).chain([63, 64, 65, 129]) {
+            let rows = 4;
+            let weight = fixture_matrix(rows, cols);
+            let input = fixture_input(cols);
+            let mut output = vec![Act::from_bits(0); rows];
+            det_linear_into(&input, &weight, &mut output).expect("GEMV should succeed");
+
+            let weight_values = weight.values.to_widened_vec();
+            for row_idx in 0..rows {
+                let mut acc_bits = 0_i64;
+                for (col_idx, act) in input.iter().enumerate() {
+                    acc_bits = mac_bits(
+                        acc_bits,
+                        act.to_bits(),
+                        weight_values[row_idx * cols + col_idx],
+                    );
+                }
+                assert_eq!(
+                    output[row_idx].to_bits(),
+                    requantize(Acc::from_bits(acc_bits)).to_bits(),
+                    "GEMV diverged from canonical oracle at cols {cols} row {row_idx}"
+                );
+            }
+        }
+    }
+
+    /// Storage width is representation only: the same tensor stored i16 and
+    /// i32 must produce identical GEMV outputs (detwgt v2 invariant).
+    #[test]
+    fn gemv_i16_storage_matches_i32_storage() {
+        for cols in (1..=24).chain([64, 65, 200]) {
+            let rows = 6;
+            // Values constrained to fit i16 so both storage widths are valid.
+            let narrow_values = (0..rows * cols)
+                .map(|idx| ((idx as i64).wrapping_mul(2_654_435_761) % 65_536) as i32 - 32_768)
+                .collect::<Vec<_>>();
+            let wide = DetNumMatrix {
+                rows,
+                cols,
+                values: DetNumValues::Owned(narrow_values.clone()),
+            };
+            let narrow = DetNumMatrix {
+                rows,
+                cols,
+                values: DetNumValues::OwnedI16(
+                    narrow_values
+                        .iter()
+                        .map(|bits| i16::try_from(*bits).expect("fixture fits i16"))
+                        .collect(),
+                ),
+            };
+            let input = fixture_input(cols);
+            let mut wide_output = vec![Act::from_bits(0); rows];
+            let mut narrow_output = vec![Act::from_bits(0); rows];
+            det_linear_into(&input, &wide, &mut wide_output).expect("i32 GEMV should succeed");
+            det_linear_into(&input, &narrow, &mut narrow_output)
+                .expect("i16 GEMV should succeed");
+            assert_eq!(
+                bits(&narrow_output),
+                bits(&wide_output),
+                "i16 storage diverged from i32 storage at cols {cols}"
+            );
+        }
+    }
+
+    /// The backend-dispatched row-major weighted sum must be bit-identical
+    /// to the canonical column-major loop in `det_num`.
+    #[test]
+    fn weighted_sum_matches_canonical_reference() {
+        use crate::shared::numerics::det_num::attention_weighted_sum_flat_into;
+        for width in (1..=20).chain([64, 65, 256]) {
+            for rows in [1_usize, 2, 7, 33] {
+                let weights = fixture_input(rows);
+                let value_rows = fixture_input(rows * width);
+                let mut reference = vec![Act::from_bits(0); width];
+                attention_weighted_sum_flat_into(&weights, &value_rows, width, &mut reference);
+                let mut output = vec![Act::from_bits(0); width];
+                let mut acc_scratch = Vec::new();
+                det_weighted_sum_flat_into(
+                    &weights,
+                    &value_rows,
+                    width,
+                    &mut acc_scratch,
+                    &mut output,
+                );
+                assert_eq!(
+                    bits(&output),
+                    bits(&reference),
+                    "weighted sum diverged at width {width} rows {rows}"
+                );
+            }
+        }
+    }
+
+    /// The backend-dispatched attention score core must be bit-identical to
+    /// `det_num::attention_score`.
+    #[test]
+    fn attention_score_dot_matches_canonical_reference() {
+        use crate::shared::numerics::det_num::attention_score;
+        for len in (1..=20).chain([64, 65, 256]) {
+            let query = fixture_input(len);
+            let key = fixture_input(len + 1)[1..].to_vec();
+            let reference = attention_score(&query, &key);
+            let score_bits = det_simd::dot_act_i32(act_bits(&query), act_bits(&key));
+            let score = requantize(Acc::from_bits(score_bits));
+            assert_eq!(
+                score.to_bits(),
+                reference.to_bits(),
+                "attention score diverged at len {len}"
+            );
+        }
     }
 }

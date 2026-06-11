@@ -10,7 +10,9 @@ use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 
 use crate::shared::api::input::InferenceExecutionMode;
-use crate::shared::numerics::det_num::{act_to_f32, f32_to_act, f32_to_wgt, Acc, Act, Wgt};
+use crate::shared::numerics::det_num::{
+    act_to_f32, f32_to_act, f32_to_wgt, Acc, Act, DetWgtElementWidth, Wgt,
+};
 use crate::shared::numerics::det_tensor::DetKvCacheData;
 
 fn default_embedding_scale() -> f32 {
@@ -24,28 +26,87 @@ pub struct MatrixF32 {
     pub values: Vec<f32>,
 }
 
-/// Storage for canonical weight payloads: either an owned copy or a borrowed
-/// view into the mmapped `.detwgt` artifact (zero-copy weight loading).
+/// Borrowed view of a canonical weight payload at its storage width.
 ///
-/// The in-memory representation is not contract surface; both variants expose
-/// the same `&[i32]` payload via `Deref`.
+/// Storage width is representation only (detwgt v2): the canonical value of
+/// every weight is its sign-extended integer, so an `I16` payload widened to
+/// i32 is bit-identical to the same tensor stored `I32`.
+#[derive(Debug, Clone, Copy)]
+pub enum WgtPayload<'a> {
+    I32(&'a [i32]),
+    I16(&'a [i16]),
+}
+
+impl WgtPayload<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::I32(values) => values.len(),
+            Self::I16(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Canonical (sign-extended) i32 bit pattern at `idx`.
+    pub fn wgt_bits(&self, idx: usize) -> i32 {
+        match self {
+            Self::I32(values) => values[idx],
+            Self::I16(values) => i32::from(values[idx]),
+        }
+    }
+
+    /// Canonical widened values for `start..end`, or `None` when out of
+    /// bounds.
+    pub fn get_widened(&self, start: usize, end: usize) -> Option<Vec<i32>> {
+        match self {
+            Self::I32(values) => values.get(start..end).map(<[i32]>::to_vec),
+            Self::I16(values) => values
+                .get(start..end)
+                .map(|narrow| narrow.iter().map(|value| i32::from(*value)).collect()),
+        }
+    }
+
+    pub fn to_widened_vec(&self) -> Vec<i32> {
+        self.get_widened(0, self.len())
+            .expect("full-range widening should be in bounds")
+    }
+}
+
+/// Storage for canonical weight payloads: either an owned copy or a borrowed
+/// view into the mmapped `.detwgt` artifact (zero-copy weight loading), at
+/// either storage width (detwgt v2).
+///
+/// The in-memory representation is not contract surface; every variant
+/// exposes the same canonical i32 values via [`WgtPayload`].
 #[derive(Clone)]
 pub enum DetNumValues {
     Owned(Vec<i32>),
+    OwnedI16(Vec<i16>),
     Mmap {
         map: Arc<Mmap>,
-        /// Byte offset of the payload within the map; 4-byte aligned by
-        /// construction (loaders fall back to `Owned` on misalignment).
+        /// Byte offset of the payload within the map; element-aligned by
+        /// construction (loaders fall back to owned copies on misalignment).
         byte_offset: usize,
         /// Payload length in i32 elements.
+        len: usize,
+    },
+    MmapI16 {
+        map: Arc<Mmap>,
+        /// Byte offset of the payload within the map; element-aligned by
+        /// construction (loaders fall back to owned copies on misalignment).
+        byte_offset: usize,
+        /// Payload length in i16 elements.
         len: usize,
     },
 }
 
 impl DetNumValues {
-    pub fn as_slice(&self) -> &[i32] {
+    pub fn payload(&self) -> WgtPayload<'_> {
         match self {
-            Self::Owned(values) => values,
+            Self::Owned(values) => WgtPayload::I32(values),
+            Self::OwnedI16(values) => WgtPayload::I16(values),
             Self::Mmap {
                 map,
                 byte_offset,
@@ -56,21 +117,56 @@ impl DetNumValues {
                 // SAFETY: alignment and bounds are validated at load time; the
                 // payload is encoded as little-endian i32 and this view is
                 // only constructed on little-endian hosts.
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i32, *len) }
+                WgtPayload::I32(unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const i32, *len)
+                })
+            }
+            Self::MmapI16 {
+                map,
+                byte_offset,
+                len,
+            } => {
+                let bytes = &map[*byte_offset..*byte_offset + *len * 2];
+                debug_assert_eq!(bytes.as_ptr() as usize % std::mem::align_of::<i16>(), 0);
+                // SAFETY: alignment and bounds are validated at load time; the
+                // payload is encoded as little-endian i16 and this view is
+                // only constructed on little-endian hosts.
+                WgtPayload::I16(unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const i16, *len)
+                })
             }
         }
     }
 
-    pub fn is_mmap_backed(&self) -> bool {
-        matches!(self, Self::Mmap { .. })
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(values) => values.len(),
+            Self::OwnedI16(values) => values.len(),
+            Self::Mmap { len, .. } | Self::MmapI16 { len, .. } => *len,
+        }
     }
-}
 
-impl std::ops::Deref for DetNumValues {
-    type Target = [i32];
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
-    fn deref(&self) -> &[i32] {
-        self.as_slice()
+    /// Canonical (sign-extended) i32 bit pattern at `idx`.
+    pub fn wgt_bits(&self, idx: usize) -> i32 {
+        self.payload().wgt_bits(idx)
+    }
+
+    /// Canonical widened values for `start..end`, or `None` when out of
+    /// bounds.
+    pub fn get_widened(&self, start: usize, end: usize) -> Option<Vec<i32>> {
+        self.payload().get_widened(start, end)
+    }
+
+    pub fn to_widened_vec(&self) -> Vec<i32> {
+        self.payload().to_widened_vec()
+    }
+
+    pub fn is_mmap_backed(&self) -> bool {
+        matches!(self, Self::Mmap { .. } | Self::MmapI16 { .. })
     }
 }
 
@@ -85,14 +181,15 @@ impl std::fmt::Debug for DetNumValues {
         formatter
             .debug_struct("DetNumValues")
             .field("mmap_backed", &self.is_mmap_backed())
-            .field("values", &self.as_slice())
+            .field("values", &self.to_widened_vec())
             .finish()
     }
 }
 
 impl PartialEq for DetNumValues {
     fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
+        // Canonical value equality: storage width is representation only.
+        self.to_widened_vec() == other.to_widened_vec()
     }
 }
 
@@ -387,6 +484,9 @@ pub struct DetNumTensorSliceSource {
     pub total_rows: usize,
     pub total_cols: usize,
     pub data_offset: usize,
+    /// Storage width of the tensor payload (detwgt v2); values are widened
+    /// to canonical i32 on read.
+    pub element_width: DetWgtElementWidth,
     pub row_offset: usize,
     pub row_count: usize,
     pub col_offset: usize,

@@ -2573,15 +2573,35 @@ fn det_linear_row_acts_from_acts(
         );
     }
 
-    let weight_values = weight.values.as_slice();
+    // Canonical scalar reference: weights are widened (sign-extended) on
+    // read, so i16 storage (detwgt v2) produces bit-identical products.
     let mut output = Vec::with_capacity(weight.rows);
-    for row_idx in 0..weight.rows {
-        let row_offset = row_idx * weight.cols;
-        let mut acc_bits = 0_i64;
-        for (col_idx, act) in quantized_input.iter().enumerate() {
-            acc_bits = mac_bits(acc_bits, act.to_bits(), weight_values[row_offset + col_idx]);
+    match weight.values.payload() {
+        crate::shared::model::transformer::WgtPayload::I32(weight_values) => {
+            for row_idx in 0..weight.rows {
+                let row_offset = row_idx * weight.cols;
+                let mut acc_bits = 0_i64;
+                for (col_idx, act) in quantized_input.iter().enumerate() {
+                    acc_bits =
+                        mac_bits(acc_bits, act.to_bits(), weight_values[row_offset + col_idx]);
+                }
+                output.push(requantize(Acc::from_bits(acc_bits)));
+            }
         }
-        output.push(requantize(Acc::from_bits(acc_bits)));
+        crate::shared::model::transformer::WgtPayload::I16(weight_values) => {
+            for row_idx in 0..weight.rows {
+                let row_offset = row_idx * weight.cols;
+                let mut acc_bits = 0_i64;
+                for (col_idx, act) in quantized_input.iter().enumerate() {
+                    acc_bits = mac_bits(
+                        acc_bits,
+                        act.to_bits(),
+                        i32::from(weight_values[row_offset + col_idx]),
+                    );
+                }
+                output.push(requantize(Acc::from_bits(acc_bits)));
+            }
+        }
     }
     Ok(output)
 }
@@ -3419,9 +3439,9 @@ mod tests {
         ResolvedGemma4LayerWeights, ResolvedGemma4PleLayerWeights,
     };
     use crate::shared::numerics::det_num::{
-        act_to_f32, attention_score, attention_softmax, attention_weighted_sum, f32_to_act,
-        f32_to_wgt, gelu_pytorch_tanh_act, softcap_act, wgt_to_le_bytes, Act, DET_NUM_SPEC_VERSION,
-        DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
+        act_to_f32, attention_score, attention_softmax, attention_weighted_sum,
+        encode_det_wgt_artifact, f32_to_act, f32_to_wgt, gelu_pytorch_tanh_act,
+        select_element_width, softcap_act, Act, DetWgtElementWidth, DetWgtTensorSpec,
     };
 
     #[test]
@@ -6107,41 +6127,15 @@ mod tests {
         cols: usize,
         values: &[f32],
     ) -> GemmaEmbeddingTensorSource {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let weights_path =
-            std::env::temp_dir().join(format!("raster-inference-{label}-{unique}.detwgt"));
-        let name_bytes = tensor_name.as_bytes();
-        let payload = values
-            .iter()
-            .flat_map(|value| wgt_to_le_bytes(f32_to_wgt(*value)))
-            .collect::<Vec<_>>();
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
-        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&1_u64.to_le_bytes());
-        bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(name_bytes);
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&(rows as u64).to_le_bytes());
-        bytes.extend_from_slice(&(cols as u64).to_le_bytes());
-        bytes.extend_from_slice(&((rows * cols) as u64).to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&fixture_max_row_mass(&payload, cols).to_le_bytes());
-        let data_offset = bytes.len();
-        bytes.extend_from_slice(&payload);
-        fs::write(&weights_path, bytes).expect("write det embedding artifact");
-
+        let (weights_path, data_offset, element_width) =
+            write_single_tensor_detwgt(label, tensor_name, rows, cols, values);
         GemmaEmbeddingTensorSource::Deterministic {
             source: DetNumTensorSliceSource {
                 weights_path,
                 total_rows: rows,
                 total_cols: cols,
                 data_offset,
+                element_width,
                 row_offset: 0,
                 row_count: rows,
                 col_offset: 0,
@@ -6152,18 +6146,49 @@ mod tests {
         }
     }
 
-    fn fixture_max_row_mass(payload: &[u8], cols: usize) -> u64 {
-        payload
-            .chunks_exact(4)
-            .map(|chunk| {
-                i32::from_le_bytes(chunk.try_into().expect("i32 byte width should match"))
-                    .unsigned_abs() as u64
-            })
-            .collect::<Vec<_>>()
-            .chunks(cols.max(1))
-            .map(|row| row.iter().sum::<u64>())
-            .max()
-            .unwrap_or(0)
+    /// Writes a single-tensor detwgt v2 fixture and returns its path, the
+    /// payload's file offset, and the storage width the encoder selected.
+    fn write_single_tensor_detwgt(
+        label: &str,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        values: &[f32],
+    ) -> (std::path::PathBuf, usize, DetWgtElementWidth) {
+        use crate::shared::numerics::det_num::artifact::{
+            file_header_bytes, max_row_mass, padding_for_offset, tensor_header_bytes,
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let weights_path =
+            std::env::temp_dir().join(format!("raster-inference-{label}-{unique}.detwgt"));
+        let shape = vec![rows, cols];
+        let wgt_bits = values
+            .iter()
+            .map(|value| f32_to_wgt(*value).to_bits())
+            .collect::<Vec<_>>();
+        let spec = DetWgtTensorSpec {
+            name: tensor_name.to_string(),
+            shape: shape.clone(),
+            wgt_bits: wgt_bits.clone(),
+        };
+        let bytes = encode_det_wgt_artifact(std::slice::from_ref(&spec))
+            .expect("det fixture artifact should encode");
+        let element_width = select_element_width(&wgt_bits);
+        let header_len = file_header_bytes(1).len()
+            + tensor_header_bytes(
+                tensor_name,
+                &shape,
+                element_width,
+                max_row_mass(&shape, &wgt_bits),
+            )
+            .expect("tensor header should encode")
+            .len();
+        let data_offset = header_len + padding_for_offset(header_len as u64);
+        fs::write(&weights_path, bytes).expect("write det tensor artifact");
+        (weights_path, data_offset, element_width)
     }
 
     fn deterministic_tensor_source(
@@ -6173,40 +6198,14 @@ mod tests {
         cols: usize,
         values: &[f32],
     ) -> DetNumTensorSliceSource {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let weights_path =
-            std::env::temp_dir().join(format!("raster-inference-{label}-{unique}.detwgt"));
-        let name_bytes = tensor_name.as_bytes();
-        let payload = values
-            .iter()
-            .flat_map(|value| wgt_to_le_bytes(f32_to_wgt(*value)))
-            .collect::<Vec<_>>();
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
-        bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&1_u64.to_le_bytes());
-        bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(name_bytes);
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&(rows as u64).to_le_bytes());
-        bytes.extend_from_slice(&(cols as u64).to_le_bytes());
-        bytes.extend_from_slice(&((rows * cols) as u64).to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&fixture_max_row_mass(&payload, cols).to_le_bytes());
-        let data_offset = bytes.len();
-        bytes.extend_from_slice(&payload);
-        fs::write(&weights_path, bytes).expect("write det tensor artifact");
-
+        let (weights_path, data_offset, element_width) =
+            write_single_tensor_detwgt(label, tensor_name, rows, cols, values);
         DetNumTensorSliceSource {
             weights_path,
             total_rows: rows,
             total_cols: cols,
             data_offset,
+            element_width,
             row_offset: 0,
             row_count: rows,
             col_offset: 0,

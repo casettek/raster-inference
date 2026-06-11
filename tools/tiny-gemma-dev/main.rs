@@ -1,16 +1,13 @@
 use std::{
     collections::BTreeMap,
     env, fs,
-    fs::File,
-    io::{BufWriter, Write},
     path::{Path, PathBuf},
     process,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use raster_inference::shared::numerics::det_num::{
-    f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-    DET_WGT_ARTIFACT_MAGIC,
+    encode_det_wgt_artifact, f32_to_wgt, DetWgtTensorSpec,
 };
 use safetensors::tensor::{serialize_to_file, TensorView};
 use serde_json::json;
@@ -538,52 +535,22 @@ fn write_fp32_model_file(path: &Path, tensors: &[FixtureTensor]) -> Result<()> {
 }
 
 fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) -> Result<()> {
-    let output_file = File::create(path)
-        .with_context(|| format!("failed to create deterministic artifact {}", path.display()))?;
-    let mut writer = BufWriter::new(output_file);
-    writer.write_all(DET_WGT_ARTIFACT_MAGIC)?;
-    writer.write_all(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes())?;
-    writer.write_all(&DET_NUM_SPEC_VERSION.to_le_bytes())?;
-    writer.write_all(&(tensors.len() as u64).to_le_bytes())?;
-
-    for tensor in tensors {
-        let wgt_bits = tensor
-            .values
-            .iter()
-            .map(|value| f32_to_wgt(*value))
-            .collect::<Vec<_>>();
-        let payload = wgt_bits
-            .iter()
-            .flat_map(|wgt| wgt_to_le_bytes(*wgt))
-            .collect::<Vec<_>>();
-        let row_len = tensor.shape.last().copied().unwrap_or(1).max(1);
-        let max_row_mass = wgt_bits
-            .chunks(row_len)
-            .map(|row| {
-                row.iter()
-                    .map(|wgt| u64::from(wgt.to_bits().unsigned_abs()))
-                    .sum::<u64>()
-            })
-            .max()
-            .unwrap_or(0);
-        let name_bytes = tensor.name.as_bytes();
-        let element_count = tensor.shape.iter().product::<usize>() as u64;
-
-        writer.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
-        writer.write_all(name_bytes)?;
-        writer.write_all(&(tensor.shape.len() as u32).to_le_bytes())?;
-        for dim in &tensor.shape {
-            writer.write_all(&(*dim as u64).to_le_bytes())?;
-        }
-        writer.write_all(&element_count.to_le_bytes())?;
-        writer.write_all(&(payload.len() as u64).to_le_bytes())?;
-        writer.write_all(&max_row_mass.to_le_bytes())?;
-        writer.write_all(&payload)?;
-    }
-
-    writer
-        .flush()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
+    let specs = tensors
+        .iter()
+        .map(|tensor| DetWgtTensorSpec {
+            name: tensor.name.clone(),
+            shape: tensor.shape.clone(),
+            wgt_bits: tensor
+                .values
+                .iter()
+                .map(|value| f32_to_wgt(*value).to_bits())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let bytes = encode_det_wgt_artifact(&specs)
+        .with_context(|| format!("failed to encode deterministic artifact {}", path.display()))?;
+    fs::write(path, bytes)
+        .with_context(|| format!("failed to write deterministic artifact {}", path.display()))?;
     Ok(())
 }
 

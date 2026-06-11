@@ -10,9 +10,9 @@ use crate::shared::numerics::det_num::{
     acc_add_sat, act_to_f32, add_sat, attention_score as det_attention_score,
     attention_softmax as det_attention_softmax, attention_softmax_exp_term,
     attention_softmax_raw_weight, attention_softmax_residual,
-    attention_weighted_sum as det_attention_weighted_sum, gelu_pytorch_tanh_act, mac_bits, mul_sat,
-    requantize, rms_norm as det_rms_norm, rope_rotate_pairs, scale_act,
-    value_rms_norm as det_value_rms_norm, Acc, Act, Wgt,
+    attention_weighted_sum as det_attention_weighted_sum, decode_wgt_bits_le,
+    gelu_pytorch_tanh_act, mac_bits, mul_sat, requantize, rms_norm as det_rms_norm,
+    rope_rotate_pairs, scale_act, value_rms_norm as det_value_rms_norm, Acc, Act, Wgt,
 };
 use crate::shared::raster_contracts::prefill_layer::{
     GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMatrixRowRequest,
@@ -1018,31 +1018,29 @@ pub(crate) fn det_num_tensor_slice_row_wgts(
             source.weights_path.display()
         )
     })?;
+    // Weight rows are read at the artifact's storage width (detwgt v2) and
+    // widened to canonical i32 `Wgt`; storage width never changes a value.
+    let elem_bytes = source.element_width.byte_width();
     let row_bytes = source
         .total_cols
-        .checked_mul(4)
+        .checked_mul(elem_bytes)
         .ok_or_else(|| anyhow!("matrix row byte size overflowed"))?;
     let global_row_idx = source.row_offset + row_idx;
     let start = source
         .data_offset
         .checked_add(global_row_idx * row_bytes)
-        .and_then(|offset| offset.checked_add(source.col_offset * 4))
+        .and_then(|offset| offset.checked_add(source.col_offset * elem_bytes))
         .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
     let end = start
-        .checked_add(source.col_count * 4)
+        .checked_add(source.col_count * elem_bytes)
         .ok_or_else(|| anyhow!("matrix slice byte range overflowed"))?;
     let encoded_row = mmap
         .get(start..end)
         .ok_or_else(|| anyhow!("matrix slice byte range is out of bounds"))?;
-    let mut row = Vec::with_capacity(source.col_count);
-    for encoded_value in encoded_row.chunks_exact(4) {
-        row.push(Wgt::from_bits(i32::from_le_bytes(
-            encoded_value
-                .try_into()
-                .expect("i32 byte width should match"),
-        )));
-    }
-    Ok(row)
+    Ok(decode_wgt_bits_le(encoded_row, source.element_width)?
+        .into_iter()
+        .map(Wgt::from_bits)
+        .collect())
 }
 
 pub(crate) fn det_num_matrix_row_wgts(
@@ -1064,9 +1062,9 @@ pub(crate) fn det_num_matrix_row_wgts(
         .ok_or_else(|| anyhow!("matrix row range overflowed"))?;
     let encoded_row = matrix
         .values
-        .get(start..end)
+        .get_widened(start, end)
         .ok_or_else(|| anyhow!("matrix row range is out of bounds"))?;
-    Ok(encoded_row.iter().copied().map(Wgt::from_bits).collect())
+    Ok(encoded_row.into_iter().map(Wgt::from_bits).collect())
 }
 
 pub fn project_sequence_with_prefill_source<S>(

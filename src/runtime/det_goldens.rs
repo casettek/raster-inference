@@ -23,10 +23,7 @@ use crate::shared::api::input::{
     TextDecodingPolicy,
 };
 use crate::shared::model::transformer::Gemma4TransformerModel;
-use crate::shared::numerics::det_num::{
-    f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-    DET_WGT_ARTIFACT_MAGIC,
-};
+use crate::shared::numerics::det_num::{encode_det_wgt_artifact, f32_to_wgt, DetWgtTensorSpec};
 use crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment;
 use crate::{
     load_transformer_state_model_from_det_num_wgt_path,
@@ -550,46 +547,18 @@ fn write_fp32_model_file(path: &Path, tensors: &[FixtureTensor]) {
 }
 
 fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
-    bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-
-    for tensor in tensors {
-        let name_bytes = tensor.name.as_bytes();
-        let wgt_bits = tensor
-            .values
-            .iter()
-            .map(|value| f32_to_wgt(*value))
-            .collect::<Vec<_>>();
-        let payload = wgt_bits
-            .iter()
-            .flat_map(|wgt| wgt_to_le_bytes(*wgt))
-            .collect::<Vec<_>>();
-        let row_len = tensor.shape.last().copied().unwrap_or(1).max(1);
-        let max_row_mass = wgt_bits
-            .chunks(row_len)
-            .map(|row| {
-                row.iter()
-                    .map(|wgt| u64::from(wgt.to_bits().unsigned_abs()))
-                    .sum::<u64>()
-            })
-            .max()
-            .unwrap_or(0);
-        let element_count = tensor.shape.iter().product::<usize>() as u64;
-
-        bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(name_bytes);
-        bytes.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
-        for dim in &tensor.shape {
-            bytes.extend_from_slice(&(*dim as u64).to_le_bytes());
-        }
-        bytes.extend_from_slice(&element_count.to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&max_row_mass.to_le_bytes());
-        bytes.extend_from_slice(&payload);
-    }
-
+    let specs = tensors
+        .iter()
+        .map(|tensor| DetWgtTensorSpec {
+            name: tensor.name.clone(),
+            shape: tensor.shape.clone(),
+            wgt_bits: tensor
+                .values
+                .iter()
+                .map(|value| f32_to_wgt(*value).to_bits())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let bytes = encode_det_wgt_artifact(&specs).expect("detwgt v2 should encode");
     fs::write(path, bytes).expect("detwgt should write");
 }

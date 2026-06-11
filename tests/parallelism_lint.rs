@@ -8,13 +8,17 @@
 //!
 //! This test denies `rayon` and `std::thread` usage in the guest-profile
 //! source trees so the "reduction-axis parallelism" class of bugs is
-//! structurally prevented rather than reviewed away.
+//! structurally prevented rather than reviewed away. The same trees must
+//! also stay free of SIMD constructs (`std::arch`, `target_feature`): SIMD
+//! schedules live in the native-only `det_simd` module, and the guest
+//! profile always executes the canonical scalar reference.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Substrings that indicate a parallelism construct. Matches anywhere in the
-/// source (including comments) to keep the rule simple and conservative.
+/// Substrings that indicate a parallelism or SIMD construct. Matches anywhere
+/// in the source (including comments) to keep the rule simple and
+/// conservative.
 const FORBIDDEN_TOKENS: &[&str] = &[
     "rayon",
     "par_iter",
@@ -22,6 +26,10 @@ const FORBIDDEN_TOKENS: &[&str] = &[
     "par_bridge",
     "std::thread",
     "thread::spawn",
+    "std::arch",
+    "core::arch",
+    "target_feature",
+    "portable_simd",
 ];
 
 fn manifest_dir() -> PathBuf {
@@ -59,7 +67,7 @@ fn serial_only_directories() -> Vec<PathBuf> {
 }
 
 #[test]
-fn guest_profile_sources_contain_no_parallelism_constructs() {
+fn guest_profile_sources_contain_no_parallelism_or_simd_constructs() {
     let mut violations = Vec::new();
     for directory in serial_only_directories() {
         assert!(
@@ -81,7 +89,7 @@ fn guest_profile_sources_contain_no_parallelism_constructs() {
                 for token in FORBIDDEN_TOKENS {
                     if line.contains(token) {
                         violations.push(format!(
-                            "{}:{}: forbidden parallelism token `{token}`: {}",
+                            "{}:{}: forbidden parallelism/SIMD token `{token}`: {}",
                             source.display(),
                             line_idx + 1,
                             line.trim()
@@ -93,9 +101,9 @@ fn guest_profile_sources_contain_no_parallelism_constructs() {
     }
     assert!(
         violations.is_empty(),
-        "parallelism constructs found in serial-only (guest-profile) sources;\n\
-         parallel drivers must live in native-only modules (see DET_NUM_SPEC \
-         \"Parallelism legality\"):\n{}",
+        "parallelism/SIMD constructs found in serial-only (guest-profile) sources;\n\
+         parallel and SIMD drivers must live in native-only modules (see \
+         DET_NUM_SPEC \"Parallelism legality\"):\n{}",
         violations.join("\n")
     );
 }

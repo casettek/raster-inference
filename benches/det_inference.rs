@@ -7,6 +7,13 @@
 //! Set `RASTER_BENCH_MODEL_DIR` to point at a real detwgt model directory to
 //! benchmark against it instead of the synthetic fixture.
 //!
+//! Backend / width axes:
+//! - `RASTER_DET_KERNEL_BACKEND=scalar` forces the scalar reference kernels
+//!   (default: auto-detected SIMD).
+//! - `RASTER_BENCH_WGT_WIDTH=i32` forces the synthetic fixture to all-i32
+//!   weight storage (default: detwgt v2 auto width, which stores the
+//!   matrix tensors as i16).
+//!
 //! Run: `cargo bench --bench det_inference`
 //! Record results in `benches/RESULTS.md`.
 
@@ -19,8 +26,7 @@ use std::{
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 use raster_inference::shared::numerics::det_num::{
-    f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-    DET_WGT_ARTIFACT_MAGIC,
+    encode_det_wgt_artifact_with_widths, f32_to_wgt, DetWgtTensorSpec, DetWgtWidthPolicy,
 };
 use raster_inference::{
     decode_step_with_mode, input_embedding, load_transformer_state_model_from_det_num_wgt_path,
@@ -317,46 +323,23 @@ fn build_fixture_model_dir() -> PathBuf {
 }
 
 fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(DET_WGT_ARTIFACT_MAGIC);
-    bytes.extend_from_slice(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&DET_NUM_SPEC_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-
-    for tensor in tensors {
-        let name_bytes = tensor.name.as_bytes();
-        let wgt_bits = tensor
-            .values
-            .iter()
-            .map(|value| f32_to_wgt(*value))
-            .collect::<Vec<_>>();
-        let payload = wgt_bits
-            .iter()
-            .flat_map(|wgt| wgt_to_le_bytes(*wgt))
-            .collect::<Vec<_>>();
-        let row_len = tensor.shape.last().copied().unwrap_or(1).max(1);
-        let max_row_mass = wgt_bits
-            .chunks(row_len)
-            .map(|row| {
-                row.iter()
-                    .map(|wgt| u64::from(wgt.to_bits().unsigned_abs()))
-                    .sum::<u64>()
-            })
-            .max()
-            .unwrap_or(0);
-        let element_count = tensor.shape.iter().product::<usize>() as u64;
-
-        bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(name_bytes);
-        bytes.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
-        for dim in &tensor.shape {
-            bytes.extend_from_slice(&(*dim as u64).to_le_bytes());
-        }
-        bytes.extend_from_slice(&element_count.to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&max_row_mass.to_le_bytes());
-        bytes.extend_from_slice(&payload);
-    }
-
+    let policy = match std::env::var("RASTER_BENCH_WGT_WIDTH").as_deref() {
+        Ok("i32") => DetWgtWidthPolicy::ForceI32,
+        _ => DetWgtWidthPolicy::Auto,
+    };
+    let specs = tensors
+        .iter()
+        .map(|tensor| DetWgtTensorSpec {
+            name: tensor.name.clone(),
+            shape: tensor.shape.clone(),
+            wgt_bits: tensor
+                .values
+                .iter()
+                .map(|value| f32_to_wgt(*value).to_bits())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let bytes =
+        encode_det_wgt_artifact_with_widths(&specs, policy).expect("detwgt v2 should encode");
     fs::write(path, bytes).expect("detwgt should write");
 }

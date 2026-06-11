@@ -1,10 +1,14 @@
+pub mod artifact;
 mod convert;
 mod ops;
 mod serialize;
 mod types;
 
 pub const DET_WGT_ARTIFACT_MAGIC: &[u8; 8] = b"DNWGTV0\0";
-pub const DET_WGT_ARTIFACT_FORMAT_VERSION: u32 = 1;
+/// detwgt artifact format version (v2: per-tensor element width + 64-byte
+/// aligned payloads). v1 artifacts are rejected fail-closed; re-convert with
+/// `gemma-det-num-wgt-converter`.
+pub const DET_WGT_ARTIFACT_FORMAT_VERSION: u32 = 2;
 pub const DET_NUM_SPEC_VERSION: u32 = 1;
 
 /// Normative conversion-time overflow bound on weight rows (spec v1):
@@ -12,6 +16,11 @@ pub const DET_NUM_SPEC_VERSION: u32 = 1;
 /// `sum_i |wgt_bits[r][i]| * A_MAX < 2^62` for any representable activation.
 pub const DET_WGT_ROW_MASS_LIMIT: u64 = 1 << 31;
 
+pub use self::artifact::{
+    decode_wgt_bits_le, encode_det_wgt_artifact, encode_det_wgt_artifact_with_widths,
+    select_element_width, DetWgtElementWidth, DetWgtTensorSpec, DetWgtWidthPolicy,
+    DET_WGT_PAYLOAD_ALIGNMENT,
+};
 pub use self::convert::{
     act_to_f32, enter_det_single_track_region, f32_to_acc, f32_to_act, f32_to_wgt,
     DetSingleTrackRegionGuard,

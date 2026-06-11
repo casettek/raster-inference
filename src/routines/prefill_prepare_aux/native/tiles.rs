@@ -584,15 +584,35 @@ fn det_linear_row_acts_from_acts(
         );
     }
 
-    let weight_values = weight.values.as_slice();
+    // Canonical scalar reference: weights are widened (sign-extended) on
+    // read, so i16 storage (detwgt v2) produces bit-identical products.
     let mut output = Vec::with_capacity(weight.rows);
-    for row_idx in 0..weight.rows {
-        let row_offset = row_idx * weight.cols;
-        let mut acc_bits = 0_i64;
-        for (col_idx, act) in quantized_input.iter().enumerate() {
-            acc_bits = mac_bits(acc_bits, act.to_bits(), weight_values[row_offset + col_idx]);
+    match weight.values.payload() {
+        crate::shared::model::transformer::WgtPayload::I32(weight_values) => {
+            for row_idx in 0..weight.rows {
+                let row_offset = row_idx * weight.cols;
+                let mut acc_bits = 0_i64;
+                for (col_idx, act) in quantized_input.iter().enumerate() {
+                    acc_bits =
+                        mac_bits(acc_bits, act.to_bits(), weight_values[row_offset + col_idx]);
+                }
+                output.push(requantize(Acc::from_bits(acc_bits)));
+            }
         }
-        output.push(requantize(Acc::from_bits(acc_bits)));
+        crate::shared::model::transformer::WgtPayload::I16(weight_values) => {
+            for row_idx in 0..weight.rows {
+                let row_offset = row_idx * weight.cols;
+                let mut acc_bits = 0_i64;
+                for (col_idx, act) in quantized_input.iter().enumerate() {
+                    acc_bits = mac_bits(
+                        acc_bits,
+                        act.to_bits(),
+                        i32::from(weight_values[row_offset + col_idx]),
+                    );
+                }
+                output.push(requantize(Acc::from_bits(acc_bits)));
+            }
+        }
     }
     Ok(output)
 }

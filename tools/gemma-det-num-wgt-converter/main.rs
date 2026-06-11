@@ -9,10 +9,11 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
-use raster_inference::shared::numerics::det_num::{
-    f32_to_wgt, wgt_to_le_bytes, DET_NUM_SPEC_VERSION, DET_WGT_ARTIFACT_FORMAT_VERSION,
-    DET_WGT_ARTIFACT_MAGIC, DET_WGT_ROW_MASS_LIMIT,
+use raster_inference::shared::numerics::det_num::artifact::{
+    encode_wgt_bits, file_header_bytes, padding_for_offset, tensor_header_bytes,
+    DetWgtElementWidth,
 };
+use raster_inference::shared::numerics::det_num::{f32_to_wgt, DET_WGT_ROW_MASS_LIMIT};
 use safetensors::{Dtype, SafeTensors};
 
 const CONFIG_FILENAME: &str = "config.json";
@@ -29,7 +30,7 @@ fn run() -> Result<()> {
     let args = CliArgs::parse(env::args().skip(1))?;
     let summary = convert_model_to_det_num_wgt_artifact(&args)?;
     println!(
-        "Wrote {} canonical Wgt tensors to {}",
+        "Wrote {} canonical Wgt tensors to {} (detwgt v2)",
         summary.tensor_count,
         summary.output_weights_path.display()
     );
@@ -39,10 +40,56 @@ fn run() -> Result<()> {
         human_bytes(summary.input_tensor_bytes),
         human_bytes(summary.output_tensor_bytes)
     );
+    print_width_summary(&summary.tensor_bounds);
     if args.report_bounds {
         print_bounds_report(&summary.tensor_bounds);
     }
+    if args.report_widths {
+        print_width_report(&summary.tensor_bounds);
+    }
     Ok(())
+}
+
+fn print_width_summary(tensor_bounds: &[TensorBounds]) {
+    let total = tensor_bounds.len();
+    let i16_count = tensor_bounds
+        .iter()
+        .filter(|bounds| bounds.element_width == DetWgtElementWidth::I16)
+        .count();
+    let total_bytes: u64 = tensor_bounds.iter().map(|bounds| bounds.payload_bytes).sum();
+    let i16_eligible_bytes: u64 = tensor_bounds
+        .iter()
+        .filter(|bounds| bounds.element_width == DetWgtElementWidth::I16)
+        .map(|bounds| bounds.payload_bytes)
+        .sum();
+    let tensor_pct = if total == 0 {
+        0.0
+    } else {
+        100.0 * i16_count as f64 / total as f64
+    };
+    let byte_pct = if total_bytes == 0 {
+        0.0
+    } else {
+        100.0 * i16_eligible_bytes as f64 / total_bytes as f64
+    };
+    println!(
+        "i16 width report: {i16_count}/{total} tensors stored i16 ({tensor_pct:.1}% of tensors, {byte_pct:.1}% of payload bytes)"
+    );
+}
+
+fn print_width_report(tensor_bounds: &[TensorBounds]) {
+    println!("Per-tensor storage widths:");
+    for bounds in tensor_bounds {
+        let width = match bounds.element_width {
+            DetWgtElementWidth::I16 => "i16",
+            DetWgtElementWidth::I32 => "i32",
+        };
+        println!(
+            "  {} width={width} payload={}",
+            bounds.name,
+            human_bytes(bounds.payload_bytes as usize)
+        );
+    }
 }
 
 fn print_bounds_report(tensor_bounds: &[TensorBounds]) {
@@ -74,6 +121,7 @@ struct CliArgs {
     output_dir: PathBuf,
     config: Option<PathBuf>,
     report_bounds: bool,
+    report_widths: bool,
 }
 
 impl CliArgs {
@@ -82,6 +130,7 @@ impl CliArgs {
         let mut output_dir = None;
         let mut config = None;
         let mut report_bounds = false;
+        let mut report_widths = false;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -107,6 +156,9 @@ impl CliArgs {
                 "--report-bounds" => {
                     report_bounds = true;
                 }
+                "--report-widths" => {
+                    report_widths = true;
+                }
                 "--help" | "-h" => {
                     print_usage();
                     process::exit(0);
@@ -121,6 +173,7 @@ impl CliArgs {
                 .ok_or_else(|| anyhow!("missing required --output-dir argument"))?,
             config,
             report_bounds,
+            report_widths,
         })
     }
 }
@@ -146,22 +199,18 @@ struct TensorBounds {
     name: String,
     max_row_mass: u64,
     mac_bound: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConvertedTensor {
-    name: String,
-    shape: Vec<usize>,
-    bytes: Vec<u8>,
+    element_width: DetWgtElementWidth,
+    payload_bytes: u64,
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: gemma-det-num-wgt-converter --input <model-dir-or-safetensors> --output-dir <artifact-dir> [--config <config.json>] [--report-bounds]"
+        "Usage: gemma-det-num-wgt-converter --input <model-dir-or-safetensors> --output-dir <artifact-dir> [--config <config.json>] [--report-bounds] [--report-widths]"
     );
     eprintln!("If --input is a model directory, the converter looks for `config.json` and `model.safetensors`.");
     eprintln!("If --input is a `.safetensors` file, the converter uses a sibling `config.json` unless --config is provided.");
     eprintln!("`--report-bounds` prints the per-tensor max row mass and overflow-bound margin after conversion.");
+    eprintln!("`--report-widths` prints the per-tensor storage width (i16/i32) selected for the detwgt v2 artifact.");
 }
 
 fn convert_model_to_det_num_wgt_artifact(args: &CliArgs) -> Result<ConversionSummary> {
@@ -202,7 +251,9 @@ fn convert_model_to_det_num_wgt_artifact(args: &CliArgs) -> Result<ConversionSum
         )
     })?;
     let mut writer = BufWriter::new(output_file);
-    write_artifact_header(&mut writer, tensor_names.len() as u64)?;
+    let file_header = file_header_bytes(tensor_names.len() as u64);
+    writer.write_all(&file_header)?;
+    let mut bytes_written = file_header.len() as u64;
 
     let mut tensor_bounds = Vec::with_capacity(tensor_names.len());
     for tensor_name in tensor_names {
@@ -211,28 +262,40 @@ fn convert_model_to_det_num_wgt_artifact(args: &CliArgs) -> Result<ConversionSum
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("failed to load tensor `{tensor_name}`"))?;
         input_tensor_bytes += tensor.data().len();
-        let converted_tensor = ConvertedTensor {
-            name: tensor_name.to_string(),
-            shape: tensor.shape().to_vec(),
-            bytes: Vec::new(),
-        };
-        let max_row_mass = compute_max_row_mass(&tensor).with_context(|| {
+        let analysis = analyze_tensor(&tensor).with_context(|| {
             format!("tensor `{tensor_name}` failed the conversion-time overflow bound check")
         })?;
+        // Width-reduced storage (detwgt v2): a tensor whose every canonical
+        // value fits i16 is stored at half width; values are sign-extended on
+        // read, so arithmetic is identical regardless of storage width.
+        let element_width = if analysis.fits_i16 {
+            DetWgtElementWidth::I16
+        } else {
+            DetWgtElementWidth::I32
+        };
+        let payload_len = payload_len_for_tensor(&tensor, element_width)?;
         tensor_bounds.push(TensorBounds {
             name: tensor_name.to_string(),
-            max_row_mass,
+            max_row_mass: analysis.max_row_mass,
             mac_bound: row_mass_bound_applies(tensor.shape()),
+            element_width,
+            payload_bytes: payload_len as u64,
         });
-        output_tensor_bytes += payload_len_for_tensor(&tensor)?;
-        write_tensor_header(
-            &mut writer,
-            &converted_tensor,
-            payload_len_for_tensor(&tensor)?,
-            max_row_mass,
+        output_tensor_bytes += payload_len;
+        let tensor_header = tensor_header_bytes(
+            tensor_name,
+            tensor.shape(),
+            element_width,
+            analysis.max_row_mass,
         )?;
-        write_tensor_payload_as_wgt(&mut writer, &tensor)
+        writer.write_all(&tensor_header)?;
+        bytes_written += tensor_header.len() as u64;
+        let padding_len = padding_for_offset(bytes_written);
+        writer.write_all(&vec![0u8; padding_len])?;
+        bytes_written += padding_len as u64;
+        write_tensor_payload_as_wgt(&mut writer, &tensor, element_width)
             .with_context(|| format!("failed to convert tensor `{tensor_name}` to Wgt"))?;
+        bytes_written += payload_len as u64;
     }
     writer.flush().with_context(|| {
         format!(
@@ -270,17 +333,28 @@ fn row_mass_bound_applies(shape: &[usize]) -> bool {
     shape.len() >= 2
 }
 
-/// Computes the per-tensor maximum row mass (`max_r sum_i |wgt_bits[r][i]|`) over
-/// last-dimension rows. For MAC-bound tensors (rank >= 2) it enforces the
-/// normative conversion-time overflow bound: every row mass must be strictly
-/// below `DET_WGT_ROW_MASS_LIMIT` (2^31), failing closed on the first violating
-/// row. For other tensors the mass is computed but not enforced.
-fn compute_max_row_mass(tensor: &safetensors::tensor::TensorView<'_>) -> Result<u64> {
+#[derive(Debug, Clone, Copy)]
+struct TensorAnalysis {
+    max_row_mass: u64,
+    /// True when every canonical Wgt bit pattern of the tensor fits i16,
+    /// qualifying the tensor for i16 storage (detwgt v2).
+    fits_i16: bool,
+}
+
+/// Analyzes a tensor in one pass: computes the per-tensor maximum row mass
+/// (`max_r sum_i |wgt_bits[r][i]|`) over last-dimension rows and whether
+/// every value fits i16 storage. For MAC-bound tensors (rank >= 2) it
+/// enforces the normative conversion-time overflow bound: every row mass
+/// must be strictly below `DET_WGT_ROW_MASS_LIMIT` (2^31), failing closed on
+/// the first violating row. For other tensors the mass is computed but not
+/// enforced. The row-mass check runs regardless of storage width.
+fn analyze_tensor(tensor: &safetensors::tensor::TensorView<'_>) -> Result<TensorAnalysis> {
     let bytes_per_scalar = bytes_per_scalar(tensor.dtype())?;
     let row_len = tensor.shape().last().copied().unwrap_or(1).max(1);
     let enforce_bound = row_mass_bound_applies(tensor.shape());
 
     let mut max_row_mass = 0u64;
+    let mut fits_i16 = true;
     let mut row_mass = 0u64;
     let mut row_idx = 0usize;
     let mut col_idx = 0usize;
@@ -289,7 +363,9 @@ fn compute_max_row_mass(tensor: &safetensors::tensor::TensorView<'_>) -> Result<
         if !decoded.is_finite() {
             bail!("non-finite source values are not supported");
         }
-        row_mass += u64::from(f32_to_wgt(decoded).to_bits().unsigned_abs());
+        let wgt_bits = f32_to_wgt(decoded).to_bits();
+        fits_i16 &= i16::try_from(wgt_bits).is_ok();
+        row_mass += u64::from(wgt_bits.unsigned_abs());
         col_idx += 1;
         if col_idx == row_len {
             if enforce_bound && row_mass >= DET_WGT_ROW_MASS_LIMIT {
@@ -303,7 +379,10 @@ fn compute_max_row_mass(tensor: &safetensors::tensor::TensorView<'_>) -> Result<
             row_idx += 1;
         }
     }
-    Ok(max_row_mass)
+    Ok(TensorAnalysis {
+        max_row_mass,
+        fits_i16,
+    })
 }
 
 fn tensor_names_len(safetensors: &SafeTensors<'_>) -> usize {
@@ -393,20 +472,24 @@ fn prepare_output_dir(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn payload_len_for_tensor(tensor: &safetensors::tensor::TensorView<'_>) -> Result<usize> {
+fn payload_len_for_tensor(
+    tensor: &safetensors::tensor::TensorView<'_>,
+    element_width: DetWgtElementWidth,
+) -> Result<usize> {
     let element_count = tensor
         .shape()
         .iter()
         .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
         .ok_or_else(|| anyhow!("tensor shape overflowed"))?;
     element_count
-        .checked_mul(4)
+        .checked_mul(element_width.byte_width())
         .ok_or_else(|| anyhow!("tensor payload byte count overflowed"))
 }
 
 fn write_tensor_payload_as_wgt(
     writer: &mut impl Write,
     tensor: &safetensors::tensor::TensorView<'_>,
+    element_width: DetWgtElementWidth,
 ) -> Result<()> {
     let bytes_per_scalar = bytes_per_scalar(tensor.dtype())?;
     let element_count = tensor
@@ -424,14 +507,15 @@ fn write_tensor_payload_as_wgt(
         );
     }
 
-    let mut chunk_buffer = Vec::with_capacity(16_384 * 4);
+    let chunk_capacity = 16_384 * element_width.byte_width();
+    let mut chunk_buffer = Vec::with_capacity(chunk_capacity);
     for encoded_value in tensor.data().chunks_exact(bytes_per_scalar) {
         let decoded = decode_scalar(encoded_value, tensor.dtype())?;
         if !decoded.is_finite() {
             bail!("non-finite source values are not supported");
         }
-        chunk_buffer.extend_from_slice(&wgt_to_le_bytes(f32_to_wgt(decoded)));
-        if chunk_buffer.len() >= 16_384 * 4 {
+        encode_wgt_bits(f32_to_wgt(decoded).to_bits(), element_width, &mut chunk_buffer);
+        if chunk_buffer.len() >= chunk_capacity {
             writer.write_all(&chunk_buffer)?;
             chunk_buffer.clear();
         }
@@ -439,43 +523,6 @@ fn write_tensor_payload_as_wgt(
     if !chunk_buffer.is_empty() {
         writer.write_all(&chunk_buffer)?;
     }
-    Ok(())
-}
-
-fn write_artifact_header(writer: &mut impl Write, tensor_count: u64) -> Result<()> {
-    writer.write_all(DET_WGT_ARTIFACT_MAGIC)?;
-    writer.write_all(&DET_WGT_ARTIFACT_FORMAT_VERSION.to_le_bytes())?;
-    writer.write_all(&DET_NUM_SPEC_VERSION.to_le_bytes())?;
-    writer.write_all(&tensor_count.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_tensor_header(
-    writer: &mut impl Write,
-    tensor: &ConvertedTensor,
-    payload_len: usize,
-    max_row_mass: u64,
-) -> Result<()> {
-    let name_bytes = tensor.name.as_bytes();
-    let name_len = u32::try_from(name_bytes.len()).map_err(|_| anyhow!("tensor name too long"))?;
-    let rank = u32::try_from(tensor.shape.len()).map_err(|_| anyhow!("tensor rank too large"))?;
-    let element_count = tensor
-        .shape
-        .iter()
-        .try_fold(1_u64, |acc, dim| acc.checked_mul(*dim as u64))
-        .ok_or_else(|| anyhow!("tensor shape overflowed"))?;
-    let payload_len =
-        u64::try_from(payload_len).map_err(|_| anyhow!("tensor payload too large"))?;
-
-    writer.write_all(&name_len.to_le_bytes())?;
-    writer.write_all(name_bytes)?;
-    writer.write_all(&rank.to_le_bytes())?;
-    for dim in &tensor.shape {
-        writer.write_all(&(*dim as u64).to_le_bytes())?;
-    }
-    writer.write_all(&element_count.to_le_bytes())?;
-    writer.write_all(&payload_len.to_le_bytes())?;
-    writer.write_all(&max_row_mass.to_le_bytes())?;
     Ok(())
 }
 
@@ -516,7 +563,8 @@ mod tests {
     use raster_inference::load_transformer_state_model_from_det_num_wgt_path;
 
     use super::{
-        convert_model_to_det_num_wgt_artifact, CliArgs, CONFIG_FILENAME, OUTPUT_WEIGHTS_FILENAME,
+        convert_model_to_det_num_wgt_artifact, padding_for_offset, CliArgs, DetWgtElementWidth,
+        CONFIG_FILENAME, OUTPUT_WEIGHTS_FILENAME,
     };
     use safetensors::{
         tensor::{serialize_to_file, TensorView},
@@ -542,6 +590,8 @@ mod tests {
         name: String,
         shape: Vec<u64>,
         max_row_mass: u64,
+        /// Canonical (widened) payload values, identical for both storage
+        /// widths.
         payload: Vec<i32>,
     }
 
@@ -573,6 +623,7 @@ mod tests {
             output_dir: output_dir.clone(),
             config: None,
             report_bounds: false,
+            report_widths: false,
         })
         .unwrap();
 
@@ -625,6 +676,7 @@ mod tests {
             output_dir: output_dir.clone(),
             config: None,
             report_bounds: false,
+            report_widths: false,
         })
         .unwrap();
 
@@ -662,6 +714,7 @@ mod tests {
             output_dir: output_dir_a.clone(),
             config: None,
             report_bounds: false,
+            report_widths: false,
         })
         .unwrap();
         convert_model_to_det_num_wgt_artifact(&CliArgs {
@@ -669,6 +722,7 @@ mod tests {
             output_dir: output_dir_b.clone(),
             config: None,
             report_bounds: false,
+            report_widths: false,
         })
         .unwrap();
 
@@ -704,6 +758,7 @@ mod tests {
             output_dir: output_dir.clone(),
             config: None,
             report_bounds: false,
+            report_widths: false,
         })
         .expect_err("row mass bound violation should fail conversion");
         assert!(
@@ -735,6 +790,7 @@ mod tests {
             output_dir: output_dir.clone(),
             config: None,
             report_bounds: false,
+            report_widths: false,
         })
         .expect("rank-1 tensor with large mass should convert");
 
@@ -858,6 +914,7 @@ mod tests {
             output_dir: output_dir.clone(),
             config: None,
             report_bounds: false,
+            report_widths: false,
         })
         .unwrap();
 
@@ -882,11 +939,8 @@ mod tests {
         let mut cursor = 0usize;
         assert_eq!(&bytes[cursor..cursor + 8], b"DNWGTV0\0");
         cursor += 8;
-        assert_eq!(
-            read_u32(bytes, &mut cursor),
-            super::DET_WGT_ARTIFACT_FORMAT_VERSION
-        );
-        assert_eq!(read_u32(bytes, &mut cursor), super::DET_NUM_SPEC_VERSION);
+        assert_eq!(read_u32(bytes, &mut cursor), 2, "artifact should be detwgt v2");
+        assert_eq!(read_u32(bytes, &mut cursor), 1, "spec version should be 1");
         let tensor_count = read_u64(bytes, &mut cursor) as usize;
 
         let mut tensors = Vec::with_capacity(tensor_count);
@@ -900,13 +954,24 @@ mod tests {
                 shape.push(read_u64(bytes, &mut cursor));
             }
             let element_count = read_u64(bytes, &mut cursor) as usize;
+            let element_width = DetWgtElementWidth::from_tag(read_u32(bytes, &mut cursor))
+                .expect("element width tag should be valid");
             let payload_len = read_u64(bytes, &mut cursor) as usize;
-            assert_eq!(payload_len, element_count * 4);
+            assert_eq!(payload_len, element_count * element_width.byte_width());
             let max_row_mass = read_u64(bytes, &mut cursor);
-            let payload: Vec<i32> = bytes[cursor..cursor + payload_len]
-                .chunks_exact(4)
-                .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
-                .collect();
+            let padding_len = padding_for_offset(cursor as u64);
+            assert!(
+                bytes[cursor..cursor + padding_len].iter().all(|byte| *byte == 0),
+                "payload padding must be zero"
+            );
+            cursor += padding_len;
+            assert_eq!(cursor % 64, 0, "payload must start 64-byte aligned");
+            let payload =
+                raster_inference::shared::numerics::det_num::decode_wgt_bits_le(
+                    &bytes[cursor..cursor + payload_len],
+                    element_width,
+                )
+                .unwrap();
             cursor += payload_len;
             let row_len = shape.last().copied().unwrap_or(1).max(1) as usize;
             let recomputed_max_row_mass = payload

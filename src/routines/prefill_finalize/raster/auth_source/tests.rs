@@ -290,6 +290,7 @@ fn det_source(
         total_rows: rows,
         total_cols: cols,
         data_offset,
+        element_width: crate::shared::numerics::det_num::DetWgtElementWidth::I32,
         row_offset: 0,
         row_count: rows,
         col_offset: 0,

@@ -39,3 +39,7 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 [[bench]]
 name = "det_inference"
 harness = false
+
+[[bench]]
+name = "det_gemv"
+harness = false

@@ -1793,11 +1793,11 @@ fn matrix_row_wgts_from_det_matrix(
     let end = start
         .checked_add(matrix.cols)
         .ok_or_else(|| anyhow!("Gemma {label} row offset overflowed"))?;
-    Ok(matrix.values[start..end]
-        .iter()
-        .copied()
-        .map(Wgt::from_bits)
-        .collect())
+    let row = matrix
+        .values
+        .get_widened(start, end)
+        .ok_or_else(|| anyhow!("Gemma {label} row range is out of bounds"))?;
+    Ok(row.into_iter().map(Wgt::from_bits).collect())
 }
 
 fn validate_det_matrix_shape(matrix: &DetNumMatrix, label: &str) -> Result<()> {
