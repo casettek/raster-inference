@@ -181,14 +181,15 @@ fn compute_prefill_ple_inputs_det(
         let model_projection_det =
             crate::io::materialize_det_num_ple_model_projection(ple_global, layer_idx)?
                 .ok_or_else(|| {
-                    anyhow!("deterministic linear sequence projection requires canonical det_weight")
+                    anyhow!(
+                        "deterministic linear sequence projection requires canonical det_weight"
+                    )
                 })?;
 
         let mut combined_rows = Vec::with_capacity(token_ids.len());
         for (row_idx, token_id) in token_ids.iter().enumerate() {
-            let embedded_row = crate::io::load_ple_token_embedding_row_internal(
-                ple_global, layer_idx, *token_id,
-            )?;
+            let embedded_row =
+                crate::io::load_ple_token_embedding_row_internal(ple_global, layer_idx, *token_id)?;
             let mut embedded = embedded_row
                 .det_values()
                 .map(<[Act]>::to_vec)

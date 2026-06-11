@@ -199,7 +199,8 @@ fn untied_model() -> Gemma4TransformerModel {
                     Wgt::from_num(0.0).to_bits(),
                     Wgt::from_num(0.0).to_bits(),
                     Wgt::from_num(1.0).to_bits(),
-                ].into(),
+                ]
+                .into(),
             })),
         },
         None,

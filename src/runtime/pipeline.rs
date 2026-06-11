@@ -199,14 +199,12 @@ pub fn decode_step_with_mode(
     ));
     trace_event("decode.layer_stack");
     let mut range_state = match execution_mode {
-        InferenceExecutionMode::Fp32 => {
-            crate::decode_layer_range::native::init_state_with_mode(
-                transformer_decode_state,
-                next_token,
-                model,
-                execution_mode,
-            )?
-        }
+        InferenceExecutionMode::Fp32 => crate::decode_layer_range::native::init_state_with_mode(
+            transformer_decode_state,
+            next_token,
+            model,
+            execution_mode,
+        )?,
         InferenceExecutionMode::Deterministic => {
             crate::decode_layer_range::native::deterministic_tiles::init_state(
                 transformer_decode_state,
@@ -972,7 +970,8 @@ mod tests {
                     0,
                     Act::from_num(1.0).to_bits(),
                     0,
-                ].into(),
+                ]
+                .into(),
             })),
         };
         let token_ids = vec![1, 0];
@@ -1781,7 +1780,8 @@ mod tests {
                         Act::from_num(1.0).to_bits(),
                         0,
                         0,
-                    ].into(),
+                    ]
+                    .into(),
                 })),
             },
             final_logit_softcapping: None,

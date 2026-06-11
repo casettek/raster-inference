@@ -51,8 +51,7 @@ fn bench_model() -> Gemma4TransformerModel {
         Ok(dir) => PathBuf::from(dir),
         Err(_) => build_fixture_model_dir(),
     };
-    load_transformer_state_model_from_det_num_wgt_path(&model_dir)
-        .expect("bench model should load")
+    load_transformer_state_model_from_det_num_wgt_path(&model_dir).expect("bench model should load")
 }
 
 fn token_ids(len: usize) -> Vec<u32> {
@@ -128,13 +127,8 @@ fn det_decode(criterion: &mut Criterion) {
             bencher.iter_batched(
                 || decode_state.clone(),
                 |state| {
-                    decode_step_with_mode(
-                        state,
-                        1,
-                        &model,
-                        InferenceExecutionMode::Deterministic,
-                    )
-                    .expect("bench decode step should succeed")
+                    decode_step_with_mode(state, 1, &model, InferenceExecutionMode::Deterministic)
+                        .expect("bench decode step should succeed")
                 },
                 BatchSize::LargeInput,
             )
@@ -220,14 +214,15 @@ fn build_fixture_model_dir() -> PathBuf {
 
     let mut rng = FixtureRng(0xbe9c_be9c_be9c_be9c);
     let mut tensors = Vec::new();
-    let push = |tensors: &mut Vec<FixtureTensor>, name: String, shape: &[usize], values: Vec<f32>| {
-        assert_eq!(shape.iter().product::<usize>(), values.len());
-        tensors.push(FixtureTensor {
-            name,
-            shape: shape.to_vec(),
-            values,
-        });
-    };
+    let push =
+        |tensors: &mut Vec<FixtureTensor>, name: String, shape: &[usize], values: Vec<f32>| {
+            assert_eq!(shape.iter().product::<usize>(), values.len());
+            tensors.push(FixtureTensor {
+                name,
+                shape: shape.to_vec(),
+                values,
+            });
+        };
 
     push(
         &mut tensors,

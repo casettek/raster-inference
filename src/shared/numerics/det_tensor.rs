@@ -382,7 +382,10 @@ impl DetKvCacheData {
     }
 
     pub(crate) fn nested_key_rows(&self, head_idx: usize) -> Vec<Vec<Act>> {
-        self.keys[head_idx].iter_rows().map(<[Act]>::to_vec).collect()
+        self.keys[head_idx]
+            .iter_rows()
+            .map(<[Act]>::to_vec)
+            .collect()
     }
 
     pub(crate) fn nested_value_rows(&self, head_idx: usize) -> Vec<Vec<Act>> {

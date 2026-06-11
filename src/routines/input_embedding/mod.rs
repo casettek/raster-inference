@@ -120,8 +120,7 @@ fn input_embedding_checkpoint_payload(
         "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
         "raster": raster_payload,
     });
-    if let Some(embedded_prompt_activations_sha256) = token_embeddings.activations_sha256.as_ref()
-    {
+    if let Some(embedded_prompt_activations_sha256) = token_embeddings.activations_sha256.as_ref() {
         // Deterministic-mode payloads carry only canonical commitments
         // (spec v1); fp32 mode keeps the compatibility fields.
         payload["embedded_prompt_activations"] = json!(token_embeddings.activations.clone());

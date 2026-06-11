@@ -18,7 +18,10 @@ pub(crate) fn trace_checkpoint(input: PrefillRangeFinalizeCheckpoint<'_>) -> boo
     let deterministic = input.execution_mode == Some("deterministic");
     let current_internal = input.current_activations.clone_internal();
     let token_count = if deterministic {
-        current_internal.det_values().map(<[Vec<_>]>::len).unwrap_or(0)
+        current_internal
+            .det_values()
+            .map(<[Vec<_>]>::len)
+            .unwrap_or(0)
     } else {
         input.current_activations.activations.len()
     };
@@ -54,8 +57,7 @@ pub(crate) fn trace_checkpoint(input: PrefillRangeFinalizeCheckpoint<'_>) -> boo
             payload["current_activations"] = json!(current_activations);
             payload["layer_caches"] =
                 json!(crate::trace::serialize_layer_caches(input.layer_caches));
-            payload["completed_layer_output_sha256s"] =
-                json!(input.completed_layer_output_sha256s);
+            payload["completed_layer_output_sha256s"] = json!(input.completed_layer_output_sha256s);
         }
         if let Some(execution_mode) = input.execution_mode {
             payload["execution_mode"] = json!(execution_mode);

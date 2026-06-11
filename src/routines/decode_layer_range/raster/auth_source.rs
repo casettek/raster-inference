@@ -377,7 +377,9 @@ impl AuthenticatedGemmaDecodeLayerRangeSource {
         };
         let final_scalars = GemmaDecodeFinalScalars {
             rms_norm_eps: model.rms_norm_eps_det.ok_or_else(|| {
-                anyhow!("deterministic raster decode layer range requires canonical RMSNorm epsilon")
+                anyhow!(
+                    "deterministic raster decode layer range requires canonical RMSNorm epsilon"
+                )
             })?,
             final_logit_softcapping,
         };

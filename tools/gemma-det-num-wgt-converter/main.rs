@@ -10,8 +10,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
 use raster_inference::shared::numerics::det_num::artifact::{
-    encode_wgt_bits, file_header_bytes, padding_for_offset, tensor_header_bytes,
-    DetWgtElementWidth,
+    encode_wgt_bits, file_header_bytes, padding_for_offset, tensor_header_bytes, DetWgtElementWidth,
 };
 use raster_inference::shared::numerics::det_num::{f32_to_wgt, DET_WGT_ROW_MASS_LIMIT};
 use safetensors::{Dtype, SafeTensors};
@@ -56,7 +55,10 @@ fn print_width_summary(tensor_bounds: &[TensorBounds]) {
         .iter()
         .filter(|bounds| bounds.element_width == DetWgtElementWidth::I16)
         .count();
-    let total_bytes: u64 = tensor_bounds.iter().map(|bounds| bounds.payload_bytes).sum();
+    let total_bytes: u64 = tensor_bounds
+        .iter()
+        .map(|bounds| bounds.payload_bytes)
+        .sum();
     let i16_eligible_bytes: u64 = tensor_bounds
         .iter()
         .filter(|bounds| bounds.element_width == DetWgtElementWidth::I16)
@@ -514,7 +516,11 @@ fn write_tensor_payload_as_wgt(
         if !decoded.is_finite() {
             bail!("non-finite source values are not supported");
         }
-        encode_wgt_bits(f32_to_wgt(decoded).to_bits(), element_width, &mut chunk_buffer);
+        encode_wgt_bits(
+            f32_to_wgt(decoded).to_bits(),
+            element_width,
+            &mut chunk_buffer,
+        );
         if chunk_buffer.len() >= chunk_capacity {
             writer.write_all(&chunk_buffer)?;
             chunk_buffer.clear();
@@ -939,7 +945,11 @@ mod tests {
         let mut cursor = 0usize;
         assert_eq!(&bytes[cursor..cursor + 8], b"DNWGTV0\0");
         cursor += 8;
-        assert_eq!(read_u32(bytes, &mut cursor), 2, "artifact should be detwgt v2");
+        assert_eq!(
+            read_u32(bytes, &mut cursor),
+            2,
+            "artifact should be detwgt v2"
+        );
         assert_eq!(read_u32(bytes, &mut cursor), 1, "spec version should be 1");
         let tensor_count = read_u64(bytes, &mut cursor) as usize;
 
@@ -961,17 +971,18 @@ mod tests {
             let max_row_mass = read_u64(bytes, &mut cursor);
             let padding_len = padding_for_offset(cursor as u64);
             assert!(
-                bytes[cursor..cursor + padding_len].iter().all(|byte| *byte == 0),
+                bytes[cursor..cursor + padding_len]
+                    .iter()
+                    .all(|byte| *byte == 0),
                 "payload padding must be zero"
             );
             cursor += padding_len;
             assert_eq!(cursor % 64, 0, "payload must start 64-byte aligned");
-            let payload =
-                raster_inference::shared::numerics::det_num::decode_wgt_bits_le(
-                    &bytes[cursor..cursor + payload_len],
-                    element_width,
-                )
-                .unwrap();
+            let payload = raster_inference::shared::numerics::det_num::decode_wgt_bits_le(
+                &bytes[cursor..cursor + payload_len],
+                element_width,
+            )
+            .unwrap();
             cursor += payload_len;
             let row_len = shape.last().copied().unwrap_or(1).max(1) as usize;
             let recomputed_max_row_mass = payload

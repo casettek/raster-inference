@@ -44,10 +44,11 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
     let activation_ref = raster_state.activation_state_ref.as_ref().ok_or_else(|| {
         anyhow::anyhow!("decode transition finalize detour requires activation state ref")
     })?;
-    let activation_state = crate::decode_layer_range::raster::materialize_activation_sequence_from_ref(
-        &raster_state.artifact_store_roots,
-        activation_ref,
-    )?;
+    let activation_state =
+        crate::decode_layer_range::raster::materialize_activation_sequence_from_ref(
+            &raster_state.artifact_store_roots,
+            activation_ref,
+        )?;
     let materialized =
         crate::decode_layer_range::materialize_decode_state_from_raster_state_for_trace(
             &raster_state,

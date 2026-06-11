@@ -36,20 +36,22 @@ pub(crate) fn init_raster_state_from_decode_loop(
     let source =
         raster::auth_source::RasterDecodeLayerRangeSource::for_current_integrity_mode(source)?;
     let output_source_prefix = format!("decode.layer_range.position_{}", decode_state.position);
-    let next_token = crate::shared::artifacts::raster_artifact_store::read_selected_token_from_roots(
-        &decode_state.artifact_store_roots,
-        &selected_token_ref,
-    )?;
-    let (_artifact_store_roots, state) = raster::init_decode_layer_range_state_from_refs_with_roots(
-        decode_state.artifact_store_roots,
-        decode_state.position,
-        decode_state.token_count,
-        decode_state.layer_caches,
-        next_token,
-        &source,
-        raster_sizing,
-        output_source_prefix,
-    )?;
+    let next_token =
+        crate::shared::artifacts::raster_artifact_store::read_selected_token_from_roots(
+            &decode_state.artifact_store_roots,
+            &selected_token_ref,
+        )?;
+    let (_artifact_store_roots, state) =
+        raster::init_decode_layer_range_state_from_refs_with_roots(
+            decode_state.artifact_store_roots,
+            decode_state.position,
+            decode_state.token_count,
+            decode_state.layer_caches,
+            next_token,
+            &source,
+            raster_sizing,
+            output_source_prefix,
+        )?;
     Ok(state)
 }
 
@@ -89,7 +91,10 @@ fn run_raster_with_source(
     }
     let layer_start = state.next_layer_idx();
     let layer_limit = layer_start
-        .saturating_add(layer_range_width(decode_layer_range_width, state.layer_count()))
+        .saturating_add(layer_range_width(
+            decode_layer_range_width,
+            state.layer_count(),
+        ))
         .min(state.layer_count());
     while state.next_layer_idx() < layer_limit {
         let roots = state.artifact_store_roots().clone();
@@ -114,21 +119,19 @@ pub(crate) fn raster_state_from_native_state(
     );
     let mut roots = ArtifactIo::export_store_roots();
     let decode_input = raster_row_from_internal(&state.decode_input, "decode layer range input")?;
-    let (next_roots, decode_input_ref) =
-        raster::insert_decode_activation_row_with_roots(
-            &roots,
-            format!("{output_source_prefix}.input.selected_token_embedding"),
-            &decode_input,
-        )?;
+    let (next_roots, decode_input_ref) = raster::insert_decode_activation_row_with_roots(
+        &roots,
+        format!("{output_source_prefix}.input.selected_token_embedding"),
+        &decode_input,
+    )?;
     roots = next_roots;
     let current_activation =
         raster_row_from_internal(&state.current_activation, "decode layer range activation")?;
-    let (next_roots, current_activation_ref) =
-        raster::insert_decode_activation_row_with_roots(
-            &roots,
-            format!("{output_source_prefix}.input.current_activation"),
-            &current_activation,
-        )?;
+    let (next_roots, current_activation_ref) = raster::insert_decode_activation_row_with_roots(
+        &roots,
+        format!("{output_source_prefix}.input.current_activation"),
+        &current_activation,
+    )?;
     roots = next_roots;
     let original_layer_caches = insert_layer_cache_slots(
         roots,
@@ -181,16 +184,14 @@ pub(crate) fn native_state_from_raster_state(
     .clone_internal()
     .last_row()
     .ok_or_else(|| anyhow!("raster decode layer range returned no decode input row"))?;
-    let updated_layer_caches =
-        raster::materialize_decode_layer_caches_from_roots(
-            raster_state.artifact_store_roots(),
-            raster_state.updated_layer_caches(),
-        )?;
-    let effective_layer_caches =
-        raster::materialize_decode_layer_caches_from_roots(
-            raster_state.artifact_store_roots(),
-            &raster_state.effective_layer_caches(),
-        )?;
+    let updated_layer_caches = raster::materialize_decode_layer_caches_from_roots(
+        raster_state.artifact_store_roots(),
+        raster_state.updated_layer_caches(),
+    )?;
+    let effective_layer_caches = raster::materialize_decode_layer_caches_from_roots(
+        raster_state.artifact_store_roots(),
+        &raster_state.effective_layer_caches(),
+    )?;
 
     Ok(DecodeLayerRangeState {
         decode_input,
@@ -531,11 +532,10 @@ pub(crate) fn activation_state_from_row(row: &InternalActivationRow) -> Activati
     match row.det_values() {
         Some(det_values) => {
             // Deterministic rows carry only the canonical commitment (spec v1).
-            let internal =
-                InternalActivationSequence::from_det_values(vec![det_values.to_vec()]);
-            let det_activations_sha256 = internal.det_values().map(
-                crate::shared::numerics::transformer_kernels::build_det_activation_commitment,
-            );
+            let internal = InternalActivationSequence::from_det_values(vec![det_values.to_vec()]);
+            let det_activations_sha256 = internal
+                .det_values()
+                .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
             ActivationSequence::from_det_internal(internal, det_activations_sha256)
         }
         None => {

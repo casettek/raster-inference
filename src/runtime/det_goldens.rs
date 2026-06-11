@@ -373,14 +373,15 @@ struct FixtureTensor {
 fn fixture_tensors() -> Vec<FixtureTensor> {
     let mut rng = FixtureRng(0x5eed_5eed_5eed_5eed);
     let mut tensors = Vec::new();
-    let push = |tensors: &mut Vec<FixtureTensor>, name: String, shape: &[usize], values: Vec<f32>| {
-        assert_eq!(shape.iter().product::<usize>(), values.len());
-        tensors.push(FixtureTensor {
-            name,
-            shape: shape.to_vec(),
-            values,
-        });
-    };
+    let push =
+        |tensors: &mut Vec<FixtureTensor>, name: String, shape: &[usize], values: Vec<f32>| {
+            assert_eq!(shape.iter().product::<usize>(), values.len());
+            tensors.push(FixtureTensor {
+                name,
+                shape: shape.to_vec(),
+                values,
+            });
+        };
 
     push(
         &mut tensors,

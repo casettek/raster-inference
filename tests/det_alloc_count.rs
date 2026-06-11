@@ -240,14 +240,15 @@ fn fixture_model() -> Gemma4TransformerModel {
 
     let mut rng = FixtureRng(0xa110ca7e_a110ca7e);
     let mut tensors = Vec::new();
-    let push = |tensors: &mut Vec<FixtureTensor>, name: String, shape: &[usize], values: Vec<f32>| {
-        assert_eq!(shape.iter().product::<usize>(), values.len());
-        tensors.push(FixtureTensor {
-            name,
-            shape: shape.to_vec(),
-            values,
-        });
-    };
+    let push =
+        |tensors: &mut Vec<FixtureTensor>, name: String, shape: &[usize], values: Vec<f32>| {
+            assert_eq!(shape.iter().product::<usize>(), values.len());
+            tensors.push(FixtureTensor {
+                name,
+                shape: shape.to_vec(),
+                values,
+            });
+        };
 
     push(
         &mut tensors,
@@ -358,4 +359,3 @@ fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) {
     let bytes = encode_det_wgt_artifact(&specs).expect("detwgt v2 should encode");
     fs::write(path, bytes).expect("detwgt should write");
 }
-

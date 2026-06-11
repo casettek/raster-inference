@@ -19,9 +19,8 @@ use crate::shared::model::transformer::{
     InternalActivationSequence, LayerKvCache, ResolvedGemma4LayerWeights, WgtPayload,
 };
 use crate::shared::numerics::det_num::{
-    add_sat, attention_softmax_into, gelu_pytorch_tanh_act, mul_sat, requantize,
-    rms_norm_in_place, rope_rotate_pairs_in_place, scale_act, softcap_act,
-    value_rms_norm_in_place, Acc, Act, Wgt,
+    add_sat, attention_softmax_into, gelu_pytorch_tanh_act, mul_sat, requantize, rms_norm_in_place,
+    rope_rotate_pairs_in_place, scale_act, softcap_act, value_rms_norm_in_place, Acc, Act, Wgt,
 };
 use crate::shared::numerics::det_simd;
 use crate::shared::numerics::det_tensor::{ActSlab, DetKvCacheData, HeadSlab};
@@ -77,7 +76,9 @@ fn use_parallel() -> bool {
 // Boundary conversions
 // ---------------------------------------------------------------------------
 
-pub(crate) fn slab_from_internal_sequence(internal: &InternalActivationSequence) -> Result<ActSlab> {
+pub(crate) fn slab_from_internal_sequence(
+    internal: &InternalActivationSequence,
+) -> Result<ActSlab> {
     let rows = internal
         .det_values()
         .ok_or_else(|| anyhow!("deterministic sequence operation requires canonical Act rows"))?;
@@ -356,7 +357,13 @@ fn attention_output_into(
         logits_scratch.push(requantize(Acc::from_bits(score_bits)));
     }
     attention_softmax_into(logits_scratch, exp_scratch, weights_scratch);
-    det_weighted_sum_flat_into(weights_scratch, windows.values, head_dim, acc_scratch, output);
+    det_weighted_sum_flat_into(
+        weights_scratch,
+        windows.values,
+        head_dim,
+        acc_scratch,
+        output,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -430,8 +437,7 @@ fn apply_rope_slab(
     if rotary_dim == 0 {
         return Ok(());
     }
-    let base =
-        base_det.ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
+    let base = base_det.ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
     let rows = heads.rows().max(1);
     let cols = heads.cols().max(1);
     // Flat (head, row) work items; the row's sequence position is its index
@@ -452,7 +458,11 @@ fn apply_rope_slab(
             .enumerate()
             .for_each(rotate);
     } else {
-        heads.as_flat_mut().chunks_mut(cols).enumerate().for_each(rotate);
+        heads
+            .as_flat_mut()
+            .chunks_mut(cols)
+            .enumerate()
+            .for_each(rotate);
     }
     Ok(())
 }
@@ -468,8 +478,7 @@ fn apply_rope_row_heads(
     if rotary_dim == 0 {
         return Ok(());
     }
-    let base =
-        base_det.ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
+    let base = base_det.ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
     for row in rows.chunks_mut(head_dim.max(1)) {
         rope_rotate_pairs_in_place(row, rotary_dim, freq_base_dim, base, position);
     }
@@ -529,8 +538,16 @@ fn det_attention_prefill(
     let mut k = reshape_to_heads(&raw_k, layer.num_kv_heads, layer.head_dim)?;
     let mut v = reshape_to_heads(&raw_v, layer.num_kv_heads, layer.head_dim)?;
 
-    apply_head_rms_norm_slab(&mut q, layer.q_norm_weight_det.as_deref(), layer.rms_norm_eps_det)?;
-    apply_head_rms_norm_slab(&mut k, layer.k_norm_weight_det.as_deref(), layer.rms_norm_eps_det)?;
+    apply_head_rms_norm_slab(
+        &mut q,
+        layer.q_norm_weight_det.as_deref(),
+        layer.rms_norm_eps_det,
+    )?;
+    apply_head_rms_norm_slab(
+        &mut k,
+        layer.k_norm_weight_det.as_deref(),
+        layer.rms_norm_eps_det,
+    )?;
     apply_value_rms_norm_slab(&mut v, layer.rms_norm_eps_det)?;
 
     apply_rope_slab(
@@ -621,8 +638,7 @@ fn det_attention_prefill(
         let mut exp_scratch = Vec::with_capacity(seq_len);
         let mut weights_scratch = Vec::with_capacity(seq_len);
         let mut acc_scratch = Vec::with_capacity(layer.head_dim);
-        for (item_idx, output_row) in head_outputs.as_flat_mut().chunks_mut(head_dim).enumerate()
-        {
+        for (item_idx, output_row) in head_outputs.as_flat_mut().chunks_mut(head_dim).enumerate() {
             compute_item(
                 item_idx,
                 output_row,
@@ -945,9 +961,9 @@ pub(crate) fn det_layer_decode(
     for row in scratch.k.chunks_mut(head_dim) {
         rms_norm_row_checked(row, k_norm_weight, k_norm_eps)?;
     }
-    let value_eps = layer.rms_norm_eps_det.ok_or_else(|| {
-        anyhow!("deterministic value RMSNorm requires canonical Acc epsilon")
-    })?;
+    let value_eps = layer
+        .rms_norm_eps_det
+        .ok_or_else(|| anyhow!("deterministic value RMSNorm requires canonical Acc epsilon"))?;
     for row in scratch.v.chunks_mut(head_dim) {
         value_rms_norm_in_place(row, value_eps);
     }
@@ -983,9 +999,9 @@ pub(crate) fn det_layer_decode(
 
     // Attention.
     let attention_cache = donor_cache.unwrap_or(cache);
-    let attention_det = attention_cache.det_data().ok_or_else(|| {
-        anyhow!("deterministic attention requires canonical key cache rows")
-    })?;
+    let attention_det = attention_cache
+        .det_data()
+        .ok_or_else(|| anyhow!("deterministic attention requires canonical key cache rows"))?;
     let key_start = attention_window
         .map(|window| attention_cache.current_len().saturating_sub(window))
         .unwrap_or(0);
@@ -1221,9 +1237,9 @@ pub(crate) fn det_hidden_to_logits(
             let embedding_source = embedding_source.ok_or_else(|| {
                 anyhow!("deterministic tied embedding logits require a .detwgt embedding source")
             })?;
-            crate::io::materialize_det_num_embedding_matrix(embedding_source)?.ok_or_else(
-                || anyhow!("deterministic tied embedding logits require a .detwgt embedding matrix"),
-            )?
+            crate::io::materialize_det_num_embedding_matrix(embedding_source)?.ok_or_else(|| {
+                anyhow!("deterministic tied embedding logits require a .detwgt embedding matrix")
+            })?
         }
         Gemma4LogitsProjection::UntiedLmHead {
             det_weight: None, ..
@@ -1379,8 +1395,7 @@ mod tests {
             let mut wide_output = vec![Act::from_bits(0); rows];
             let mut narrow_output = vec![Act::from_bits(0); rows];
             det_linear_into(&input, &wide, &mut wide_output).expect("i32 GEMV should succeed");
-            det_linear_into(&input, &narrow, &mut narrow_output)
-                .expect("i16 GEMV should succeed");
+            det_linear_into(&input, &narrow, &mut narrow_output).expect("i16 GEMV should succeed");
             assert_eq!(
                 bits(&narrow_output),
                 bits(&wide_output),

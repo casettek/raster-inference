@@ -279,11 +279,9 @@ fn xorshift64(state: &mut u64) -> u64 {
 }
 
 fn mac_fold_left_to_right(terms: &[(i32, i32)]) -> i64 {
-    terms
-        .iter()
-        .fold(0_i64, |acc_bits, (a_bits, b_bits)| {
-            mac_bits(acc_bits, *a_bits, *b_bits)
-        })
+    terms.iter().fold(0_i64, |acc_bits, (a_bits, b_bits)| {
+        mac_bits(acc_bits, *a_bits, *b_bits)
+    })
 }
 
 fn mac_tree_reduce(terms: &[(i32, i32)]) -> i64 {
@@ -335,7 +333,9 @@ fn mac_reduction_is_schedule_independent() {
     let mut term_sets: Vec<(String, Vec<(i32, i32)>)> = Vec::new();
 
     // Randomized term sets covering vector-lane tail classes.
-    for len in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100] {
+    for len in [
+        1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100,
+    ] {
         let terms = (0..len)
             .map(|_| {
                 (
@@ -424,10 +424,7 @@ fn saturating_sum_of_non_negative_terms_is_schedule_independent() {
             "all_max_terms".to_string(),
             vec![i64::MAX, i64::MAX, i64::MAX],
         ),
-        (
-            "exact_boundary_sum".to_string(),
-            vec![i64::MAX - 10, 10, 0],
-        ),
+        ("exact_boundary_sum".to_string(), vec![i64::MAX - 10, 10, 0]),
     ];
     for len in [3usize, 8, 33] {
         let terms = (0..len)

@@ -322,14 +322,15 @@ fn fixture_model_with_policy(
 fn fixture_tensors() -> Vec<FixtureTensor> {
     let mut rng = FixtureRng(0x00a5_c4ed_0a5c_4ed1);
     let mut tensors = Vec::new();
-    let push = |tensors: &mut Vec<FixtureTensor>, name: String, shape: &[usize], values: Vec<f32>| {
-        assert_eq!(shape.iter().product::<usize>(), values.len());
-        tensors.push(FixtureTensor {
-            name,
-            shape: shape.to_vec(),
-            values,
-        });
-    };
+    let push =
+        |tensors: &mut Vec<FixtureTensor>, name: String, shape: &[usize], values: Vec<f32>| {
+            assert_eq!(shape.iter().product::<usize>(), values.len());
+            tensors.push(FixtureTensor {
+                name,
+                shape: shape.to_vec(),
+                values,
+            });
+        };
 
     push(
         &mut tensors,

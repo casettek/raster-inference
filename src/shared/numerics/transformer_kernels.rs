@@ -3700,7 +3700,8 @@ mod tests {
                 Act::from_num(-0.75).to_bits(),
                 Act::from_num(0.125).to_bits(),
                 Act::from_num(1.5).to_bits(),
-            ].into(),
+            ]
+            .into(),
         };
         let input = [1.5, -0.5, 0.25];
         let quantized_input = input
@@ -3727,7 +3728,8 @@ mod tests {
                 Act::from_num(-0.75).to_bits(),
                 Act::from_num(1.5).to_bits(),
                 Act::from_num(2.0).to_bits(),
-            ].into(),
+            ]
+            .into(),
         };
         let inputs = vec![
             vec![1.0, -0.5, 0.25],
@@ -3982,7 +3984,8 @@ mod tests {
                 0,
                 0,
                 0,
-            ].into(),
+            ]
+            .into(),
         }));
 
         let without_det =
@@ -4093,7 +4096,8 @@ mod tests {
                 0,
                 0,
                 0,
-            ].into(),
+            ]
+            .into(),
         }));
 
         let without_det =
@@ -4204,7 +4208,8 @@ mod tests {
                 0,
                 0,
                 0,
-            ].into(),
+            ]
+            .into(),
         }));
 
         let without_det =
@@ -5284,7 +5289,10 @@ mod tests {
 
         assert_eq!(logits.len(), 2);
         assert_eq!(extracted.logits, logits);
-        assert!(extracted.final_logits_sha256.as_deref().is_some_and(|sha| !sha.is_empty()));
+        assert!(extracted
+            .final_logits_sha256
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty()));
     }
 
     #[test]
@@ -5557,7 +5565,11 @@ mod tests {
     fn slab_activation_commitment_matches_nested_builder() {
         let rows = vec![
             vec![Act::from_bits(1), Act::from_bits(-2), Act::from_bits(3)],
-            vec![Act::from_bits(7), Act::from_bits(0), Act::from_bits(i32::MAX)],
+            vec![
+                Act::from_bits(7),
+                Act::from_bits(0),
+                Act::from_bits(i32::MAX),
+            ],
         ];
         let slab = crate::shared::numerics::det_tensor::ActSlab::from_rows(&rows)
             .expect("slab should build");
@@ -5600,12 +5612,28 @@ mod tests {
 
         let act = |bits: i32| Act::from_bits(bits);
         let keys = vec![
-            vec![vec![act(1), act(2)], vec![act(3), act(4)], vec![act(5), act(6)]],
-            vec![vec![act(7), act(8)], vec![act(9), act(10)], vec![act(11), act(12)]],
+            vec![
+                vec![act(1), act(2)],
+                vec![act(3), act(4)],
+                vec![act(5), act(6)],
+            ],
+            vec![
+                vec![act(7), act(8)],
+                vec![act(9), act(10)],
+                vec![act(11), act(12)],
+            ],
         ];
         let values = vec![
-            vec![vec![act(-1), act(-2)], vec![act(-3), act(-4)], vec![act(-5), act(-6)]],
-            vec![vec![act(-7), act(-8)], vec![act(-9), act(-10)], vec![act(-11), act(-12)]],
+            vec![
+                vec![act(-1), act(-2)],
+                vec![act(-3), act(-4)],
+                vec![act(-5), act(-6)],
+            ],
+            vec![
+                vec![act(-7), act(-8)],
+                vec![act(-9), act(-10)],
+                vec![act(-11), act(-12)],
+            ],
         ];
 
         // Exercise the compaction path: append then trim with a sliding window
@@ -5621,7 +5649,10 @@ mod tests {
         );
         cache = append_kv_cache_head_buffer_with_mode(
             cache,
-            &AttentionHeadRowBuffer::from_acts(vec![vec![act(13), act(14)], vec![act(15), act(16)]]),
+            &AttentionHeadRowBuffer::from_acts(vec![
+                vec![act(13), act(14)],
+                vec![act(15), act(16)],
+            ]),
             &AttentionHeadRowBuffer::from_acts(vec![
                 vec![act(-13), act(-14)],
                 vec![act(-15), act(-16)],

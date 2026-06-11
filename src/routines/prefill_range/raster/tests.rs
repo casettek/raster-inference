@@ -560,8 +560,16 @@ fn chunked_projection_matches_deterministic_prefill_layer() {
         .expect("deterministic prefill layer should run");
 
     assert_eq!(
-        raster.0.clone_internal().det_values().map(<[Vec<Act>]>::to_vec),
-        deterministic.0.clone_internal().det_values().map(<[Vec<Act>]>::to_vec)
+        raster
+            .0
+            .clone_internal()
+            .det_values()
+            .map(<[Vec<Act>]>::to_vec),
+        deterministic
+            .0
+            .clone_internal()
+            .det_values()
+            .map(<[Vec<Act>]>::to_vec)
     );
     assert_eq!(
         raster.0.det_activations_sha256,
@@ -766,8 +774,16 @@ fn assert_raster_matches_deterministic_with_ple(
         .expect("deterministic prefill layer should run");
 
     assert_eq!(
-        raster.0.clone_internal().det_values().map(<[Vec<Act>]>::to_vec),
-        deterministic.0.clone_internal().det_values().map(<[Vec<Act>]>::to_vec)
+        raster
+            .0
+            .clone_internal()
+            .det_values()
+            .map(<[Vec<Act>]>::to_vec),
+        deterministic
+            .0
+            .clone_internal()
+            .det_values()
+            .map(<[Vec<Act>]>::to_vec)
     );
     assert_eq!(
         raster.0.det_activations_sha256,

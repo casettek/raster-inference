@@ -340,7 +340,11 @@ where
     for (dim_idx, out) in output.iter_mut().enumerate().take(width) {
         let mut acc_bits = 0_i64;
         for (row_idx, weight) in weights.iter().enumerate() {
-            acc_bits = mac_bits(acc_bits, row_at(row_idx)[dim_idx].to_bits(), weight.to_bits());
+            acc_bits = mac_bits(
+                acc_bits,
+                row_at(row_idx)[dim_idx].to_bits(),
+                weight.to_bits(),
+            );
         }
         *out = requantize(Acc::from_bits(acc_bits));
     }

@@ -311,9 +311,8 @@ impl DetNumTensorReader {
                 );
             }
 
-            let element_width =
-                DetWgtElementWidth::from_tag(read_u32(&bytes, &mut cursor)?)
-                    .with_context(|| format!("tensor `{name}` has an invalid element width"))?;
+            let element_width = DetWgtElementWidth::from_tag(read_u32(&bytes, &mut cursor)?)
+                .with_context(|| format!("tensor `{name}` has an invalid element width"))?;
 
             let payload_len = usize::try_from(read_u64(&bytes, &mut cursor)?)
                 .map_err(|_| anyhow!("tensor payload length does not fit into usize"))?;
@@ -1286,10 +1285,12 @@ pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
     } else {
         Gemma4LogitsProjection::UntiedLmHead {
             weight: reader.load_matrix("model.language_model.lm_head.weight")?,
-            det_weight: Some(std::sync::Arc::new(decode_det_num_matrix_from_source_shared(
-                &reader.resolve_full_matrix_source("model.language_model.lm_head.weight")?,
-                &reader.mmap,
-            )?)),
+            det_weight: Some(std::sync::Arc::new(
+                decode_det_num_matrix_from_source_shared(
+                    &reader.resolve_full_matrix_source("model.language_model.lm_head.weight")?,
+                    &reader.mmap,
+                )?,
+            )),
         }
     };
 
@@ -1441,26 +1442,27 @@ pub(crate) fn load_ple_token_embedding_row_internal(
             return Ok(InternalActivationRow::from_values(cached_row));
         }
     }
-    let row = match source {
-        Gemma4PleMatrixSource::Materialized(matrix) => {
-            InternalActivationRow::from_values(matrix_row(matrix, row_idx)?)
-        }
-        Gemma4PleMatrixSource::Lazy(source) => {
-            let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
-            InternalActivationRow::from_values(decode_matrix_row_from_source(
-                source,
-                row_idx,
-                mmap.as_ref(),
-            )?)
-        }
-        Gemma4PleMatrixSource::DetNumLazy(source) => {
-            let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
-            // Single-track deterministic load: no f32 mirror.
-            InternalActivationRow::from_det_values_only(
-                decode_matrix_row_acts_from_det_num_source(source, row_idx, mmap.as_ref())?,
-            )
-        }
-    };
+    let row =
+        match source {
+            Gemma4PleMatrixSource::Materialized(matrix) => {
+                InternalActivationRow::from_values(matrix_row(matrix, row_idx)?)
+            }
+            Gemma4PleMatrixSource::Lazy(source) => {
+                let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
+                InternalActivationRow::from_values(decode_matrix_row_from_source(
+                    source,
+                    row_idx,
+                    mmap.as_ref(),
+                )?)
+            }
+            Gemma4PleMatrixSource::DetNumLazy(source) => {
+                let mmap = ple_mmap_for_path(ple_global, &source.weights_path)?;
+                // Single-track deterministic load: no f32 mirror.
+                InternalActivationRow::from_det_values_only(
+                    decode_matrix_row_acts_from_det_num_source(source, row_idx, mmap.as_ref())?,
+                )
+            }
+        };
     ple_global
         .token_row_cache
         .lock()
@@ -1936,13 +1938,11 @@ fn decode_det_num_matrix_from_source_shared(
         let aligned = (mmap.as_ptr() as usize + byte_offset) % elem_bytes == 0;
         if in_bounds && aligned {
             let values = match source.element_width {
-                DetWgtElementWidth::I32 => {
-                    crate::shared::model::transformer::DetNumValues::Mmap {
-                        map: mmap.clone(),
-                        byte_offset,
-                        len,
-                    }
-                }
+                DetWgtElementWidth::I32 => crate::shared::model::transformer::DetNumValues::Mmap {
+                    map: mmap.clone(),
+                    byte_offset,
+                    len,
+                },
                 DetWgtElementWidth::I16 => {
                     crate::shared::model::transformer::DetNumValues::MmapI16 {
                         map: mmap.clone(),
@@ -2625,7 +2625,9 @@ fn decode_embedding_rows_for_token_ids(
 
     Ok(match execution_mode {
         InferenceExecutionMode::Fp32 => InternalActivationSequence::from_values(activations),
-        InferenceExecutionMode::Deterministic => InternalActivationSequence::from_det_values_only(acts),
+        InferenceExecutionMode::Deterministic => {
+            InternalActivationSequence::from_det_values_only(acts)
+        }
     })
 }
 
@@ -2690,7 +2692,9 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
 
     Ok(match execution_mode {
         InferenceExecutionMode::Fp32 => InternalActivationSequence::from_values(activations),
-        InferenceExecutionMode::Deterministic => InternalActivationSequence::from_det_values_only(acts),
+        InferenceExecutionMode::Deterministic => {
+            InternalActivationSequence::from_det_values_only(acts)
+        }
     })
 }
 
@@ -3042,8 +3046,7 @@ mod tests {
         let misaligned_path = model_dir.join("misaligned.detwgt");
         fs::write(&misaligned_path, &misaligned_bytes).unwrap();
         let misaligned_file = File::open(&misaligned_path).unwrap();
-        let misaligned_mmap =
-            std::sync::Arc::new(unsafe { Mmap::map(&misaligned_file) }.unwrap());
+        let misaligned_mmap = std::sync::Arc::new(unsafe { Mmap::map(&misaligned_file) }.unwrap());
         let misaligned_source = DetNumTensorSliceSource {
             weights_path: misaligned_path,
             total_rows: 2,
@@ -3055,11 +3058,9 @@ mod tests {
             col_offset: 0,
             col_count: 3,
         };
-        let copied = super::decode_det_num_matrix_from_source_shared(
-            &misaligned_source,
-            &misaligned_mmap,
-        )
-        .expect("misaligned matrix should load via copy");
+        let copied =
+            super::decode_det_num_matrix_from_source_shared(&misaligned_source, &misaligned_mmap)
+                .expect("misaligned matrix should load via copy");
         assert!(!copied.values.is_mmap_backed());
         assert_eq!(copied.values.to_widened_vec(), payload_values);
 
@@ -3501,20 +3502,44 @@ mod tests {
             .expect("deterministic model should retain raw down_proj weights");
         assert_eq!(det_q_proj.rows, 4);
         assert_eq!(det_q_proj.cols, 4);
-        assert_eq!(det_q_proj.values.wgt_bits(0), f32_to_wgt(q_proj_values[0]).to_bits());
-        assert_eq!(det_q_proj.values.wgt_bits(1), f32_to_wgt(q_proj_values[1]).to_bits());
+        assert_eq!(
+            det_q_proj.values.wgt_bits(0),
+            f32_to_wgt(q_proj_values[0]).to_bits()
+        );
+        assert_eq!(
+            det_q_proj.values.wgt_bits(1),
+            f32_to_wgt(q_proj_values[1]).to_bits()
+        );
         assert_eq!(det_k_proj.rows, 2);
         assert_eq!(det_k_proj.cols, 4);
-        assert_eq!(det_k_proj.values.wgt_bits(0), f32_to_wgt(k_proj_values[0]).to_bits());
-        assert_eq!(det_k_proj.values.wgt_bits(1), f32_to_wgt(k_proj_values[1]).to_bits());
+        assert_eq!(
+            det_k_proj.values.wgt_bits(0),
+            f32_to_wgt(k_proj_values[0]).to_bits()
+        );
+        assert_eq!(
+            det_k_proj.values.wgt_bits(1),
+            f32_to_wgt(k_proj_values[1]).to_bits()
+        );
         assert_eq!(det_v_proj.rows, 2);
         assert_eq!(det_v_proj.cols, 4);
-        assert_eq!(det_v_proj.values.wgt_bits(0), f32_to_wgt(v_proj_values[0]).to_bits());
-        assert_eq!(det_v_proj.values.wgt_bits(1), f32_to_wgt(v_proj_values[1]).to_bits());
+        assert_eq!(
+            det_v_proj.values.wgt_bits(0),
+            f32_to_wgt(v_proj_values[0]).to_bits()
+        );
+        assert_eq!(
+            det_v_proj.values.wgt_bits(1),
+            f32_to_wgt(v_proj_values[1]).to_bits()
+        );
         assert_eq!(det_o_proj.rows, 4);
         assert_eq!(det_o_proj.cols, 4);
-        assert_eq!(det_o_proj.values.wgt_bits(0), f32_to_wgt(o_proj_values[0]).to_bits());
-        assert_eq!(det_o_proj.values.wgt_bits(1), f32_to_wgt(o_proj_values[1]).to_bits());
+        assert_eq!(
+            det_o_proj.values.wgt_bits(0),
+            f32_to_wgt(o_proj_values[0]).to_bits()
+        );
+        assert_eq!(
+            det_o_proj.values.wgt_bits(1),
+            f32_to_wgt(o_proj_values[1]).to_bits()
+        );
         assert_eq!(fp32_lm_head.values[0], lm_head_values[0]);
         assert_eq!(det_lm_head.rows, 3);
         assert_eq!(det_lm_head.cols, 4);
@@ -3768,7 +3793,12 @@ mod tests {
         assert_eq!(det_ple.layer_projection_det.as_ref().unwrap().rows, 4);
         assert_eq!(det_ple.layer_projection_det.as_ref().unwrap().cols, 2);
         assert_eq!(
-            det_ple.layer_projection_det.as_ref().unwrap().values.wgt_bits(0),
+            det_ple
+                .layer_projection_det
+                .as_ref()
+                .unwrap()
+                .values
+                .wgt_bits(0),
             f32_to_wgt(layer_projection_values[0]).to_bits()
         );
         assert_eq!(det_global_projection.rows, 2);

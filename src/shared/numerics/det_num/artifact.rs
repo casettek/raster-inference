@@ -59,10 +59,7 @@ impl DetWgtElementWidth {
 /// Returns the storage width a tensor qualifies for: `I16` when every
 /// canonical weight bit pattern fits `i16`, else `I32`.
 pub fn select_element_width(wgt_bits: &[i32]) -> DetWgtElementWidth {
-    if wgt_bits
-        .iter()
-        .all(|bits| i16::try_from(*bits).is_ok())
-    {
+    if wgt_bits.iter().all(|bits| i16::try_from(*bits).is_ok()) {
         DetWgtElementWidth::I16
     } else {
         DetWgtElementWidth::I32
@@ -122,8 +119,8 @@ pub fn tensor_header_bytes(
 pub fn encode_wgt_bits(bits: i32, element_width: DetWgtElementWidth, out: &mut Vec<u8>) {
     match element_width {
         DetWgtElementWidth::I16 => {
-            let narrow = i16::try_from(bits)
-                .expect("i16 storage width requires every value to fit i16");
+            let narrow =
+                i16::try_from(bits).expect("i16 storage width requires every value to fit i16");
             out.extend_from_slice(&narrow.to_le_bytes());
         }
         DetWgtElementWidth::I32 => out.extend_from_slice(&bits.to_le_bytes()),

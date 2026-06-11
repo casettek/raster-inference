@@ -1622,10 +1622,14 @@ pub(crate) fn trace_raster_checkpoint(
     state: &DecodeLayerRangeRasterState,
     layer_start: usize,
 ) -> Result<bool> {
-    let current_activation =
-        materialize_activation_sequence_from_ref(state.artifact_store_roots(), state.current_activation_ref())?;
-    let layer_caches =
-        materialize_decode_layer_caches_from_roots(state.artifact_store_roots(), &state.effective_layer_caches())?;
+    let current_activation = materialize_activation_sequence_from_ref(
+        state.artifact_store_roots(),
+        state.current_activation_ref(),
+    )?;
+    let layer_caches = materialize_decode_layer_caches_from_roots(
+        state.artifact_store_roots(),
+        &state.effective_layer_caches(),
+    )?;
     crate::decode_layer_range::trace_checkpoint_payload(
         state.next_token(),
         state.position(),

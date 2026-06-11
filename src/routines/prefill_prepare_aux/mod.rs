@@ -192,8 +192,7 @@ fn prefill_prepare_aux_checkpoint_payload(
         "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
         "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
     });
-    if let Some(embedded_prompt_activations_sha256) = token_embeddings.activations_sha256.as_ref()
-    {
+    if let Some(embedded_prompt_activations_sha256) = token_embeddings.activations_sha256.as_ref() {
         // Deterministic-mode payloads carry only canonical commitments
         // (spec v1); fp32 mode keeps the compatibility fields.
         payload["embedded_prompt_activations"] = json!(token_embeddings.activations.clone());

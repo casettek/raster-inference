@@ -145,8 +145,7 @@ mod neon {
             vaddq_s64(vaddq_s64(acc0, acc1), vaddq_s64(acc2, acc3)),
             vaddq_s64(vaddq_s64(acc4, acc5), vaddq_s64(acc6, acc7)),
         );
-        let mut total =
-            vgetq_lane_s64::<0>(acc).wrapping_add(vgetq_lane_s64::<1>(acc));
+        let mut total = vgetq_lane_s64::<0>(acc).wrapping_add(vgetq_lane_s64::<1>(acc));
         for idx in chunks * 16..len {
             total = total.wrapping_add(
                 i64::from(*acts.get_unchecked(idx)) * i64::from(*wgts.get_unchecked(idx)),
@@ -198,8 +197,7 @@ mod neon {
             vaddq_s64(vaddq_s64(acc0, acc1), vaddq_s64(acc2, acc3)),
             vaddq_s64(vaddq_s64(acc4, acc5), vaddq_s64(acc6, acc7)),
         );
-        let mut total =
-            vgetq_lane_s64::<0>(acc).wrapping_add(vgetq_lane_s64::<1>(acc));
+        let mut total = vgetq_lane_s64::<0>(acc).wrapping_add(vgetq_lane_s64::<1>(acc));
         for idx in chunks * 16..len {
             total = total.wrapping_add(
                 i64::from(*acts.get_unchecked(idx)) * i64::from(*wgts.get_unchecked(idx)),
@@ -233,8 +231,8 @@ mod neon {
         }
         for idx in chunks * 4..len {
             let acc_value = acc.get_unchecked_mut(idx);
-            *acc_value = acc_value
-                .wrapping_add(i64::from(*row.get_unchecked(idx)) * i64::from(weight));
+            *acc_value =
+                acc_value.wrapping_add(i64::from(*row.get_unchecked(idx)) * i64::from(weight));
         }
     }
 }
@@ -390,7 +388,10 @@ mod tests {
                 let wgts = fuzz_i32(&mut rng, len);
                 let reference = dot_i32_scalar(&acts, &wgts);
                 let simd = unsafe { neon::dot_i32(&acts, &wgts) };
-                assert_eq!(simd, reference, "NEON dot diverged at len {len} seed {seed}");
+                assert_eq!(
+                    simd, reference,
+                    "NEON dot diverged at len {len} seed {seed}"
+                );
             }
         }
     }
@@ -426,8 +427,7 @@ mod tests {
             let mut rng = Rng(seed.wrapping_mul(0xA076_1D64_78BD_642F));
             for len in fuzz_lengths() {
                 let row = fuzz_i32(&mut rng, len);
-                let weight =
-                    ADVERSARIAL_I32[(rng.next() as usize) % ADVERSARIAL_I32.len()];
+                let weight = ADVERSARIAL_I32[(rng.next() as usize) % ADVERSARIAL_I32.len()];
                 let mut reference = fuzz_i32(&mut rng, len)
                     .into_iter()
                     .map(i64::from)
