@@ -1,3 +1,13 @@
+//! Composed inference bundle helpers built from the routines.
+//!
+//! This module is **not** on the production inference path: the
+//! phase-sequencing skeleton (`runtime::sequence`) calls the executors in
+//! `runtime::executors` directly. The bundles here (`run_prefill_pass*`,
+//! `decode_step*`, `run_output_decode*`, `run_transformer_state_transition*`)
+//! exist for tests, benches, and golden capture that exercise prefill/decode
+//! spans without full run orchestration, plus `validate_sampling_config`,
+//! which the executors share.
+
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
@@ -103,30 +113,6 @@ fn embed_token_ids(
         trace_event("prefill.embed_tokens");
         crate::io::embed_input_tokens_from_gemma_source_with_mode(
             token_ids,
-            embedding_source,
-            execution_mode,
-        )
-    } else {
-        anyhow::bail!(
-            "transformer state model is missing both embedding_table and embedding_source"
-        )
-    }
-}
-
-fn embed_token_id_sequence_with_mode(
-    token_id: u32,
-    model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
-) -> Result<ActivationSequence> {
-    if let Some(ref embedding_table) = model.embedding_table {
-        crate::shared::numerics::transformer_kernels::embed_input_tokens_with_mode(
-            &[token_id],
-            embedding_table,
-            execution_mode,
-        )
-    } else if let Some(ref embedding_source) = model.embedding_source {
-        crate::io::embed_input_tokens_from_gemma_source_with_mode(
-            &[token_id],
             embedding_source,
             execution_mode,
         )

@@ -28,7 +28,6 @@ This repo does not yet include:
 - stochastic sampling logic (`temperature`, `top_k`, `top_p`, repetition penalties)
 - multimodal support
 - streaming or partial token deltas
-- Raster DSL integration
 
 ## Phase IDs And Routines
 
@@ -62,13 +61,23 @@ Today the implemented serial path produces:
 
 ## File Layout
 
-- `src/checkpoints.rs`: protocol `phase_id` and `routine` taxonomy for checkpoint names
-- `src/io.rs`: thin disk-loading helpers for local assets
-- `src/prompt_prepare/`, `src/prefill_prepare_aux/`, `src/prefill_layer/`, `src/prefill_finalize/`, `src/decode_select_token/`, `src/decode_transition/`, `src/output_finalize/`: routine implementation details
-- `src/shared/`: shared contracts and transformer kernels
-- `src/pipeline.rs`: consolidated composed inference helpers built from the routines
-- `src/lib.rs`: public API and protocol-aligned aggregate state
+- `src/runtime/checkpoints.rs`: protocol `phase_id` and `routine` taxonomy for checkpoint names, plus the raster detour spec/controller
+- `src/runtime/trace.rs`: checkpoint emission, terminal-checkpoint tracking, and serialized trace artifact writing
+- `src/runtime/sequence.rs`: the phase-sequencing skeleton — the single place that knows the canonical routine order
+- `src/runtime/executors/`: the executor seam — `native.rs` (native deterministic/fp32 executor with selective raster detour hooks) and `raster.rs` (full root-backed raster tile executor)
+- `src/runtime/roles/`: protocol role entry points — `claimer.rs` (`claimer::run`) and `challenger.rs` (`challenger::audit`, replay/compare/detour)
+- `src/runtime/inference.rs`: inference control/outcome types plus the deprecated legacy entry points (thin shims over `sequence::run`)
+- `src/runtime/pipeline.rs`: composed prefill/decode bundle helpers for tests, benches, and golden capture (not on the production path)
+- `src/routines/<routine>/{native,raster}/`: routine implementation details (tiles, types, utils, auth sources)
+- `src/shared/api/`: request/outcome types and the challenger's audit report types
+- `src/shared/model/gemma/`: all Gemma model-family code — transformer weight types, tokenizer, and weight/tokenizer loaders (see `docs/model-agnostic-layers.md`)
+- `src/shared/`: shared contracts, artifacts, and transformer kernels
+- `src/io.rs`: generic disk-loading helpers (chat templates, tokenizer files, safetensors/mmap infrastructure)
+- `src/dsl/`: raster tile DSL machinery
+- `src/lib.rs`: curated public API surface
 - `src/main.rs`: tiny CLI for local smoke tests
+- `tests/goldens/`: golden checkpoint trace artifacts (byte-identity contract; see `tests/golden_traces.rs`)
+- `assets/tiny-gemma-dev/`: checked-in hermetic test model bundle
 
 ## Philosophy
 
