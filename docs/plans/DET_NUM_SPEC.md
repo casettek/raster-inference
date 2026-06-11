@@ -233,6 +233,8 @@ This section defines which execution schedules are conforming. It is normative.
 
 5. **Schedule-dependence is the forbidden property.** Any implementation whose committed canonical values depend on thread count, lane width, chunk size, scheduling order, or hardware backend is non-conforming, regardless of how the dependence arises.
 
+Enforcement (wired): the `parallelism_lint` test denies parallelism constructs in guest-profile sources (`det_num`, `raster_kernels`, `routines/*/raster`), and the `schedule_parity` test asserts identical det checkpoint commitments for the full prefill + decode pipeline across serial and 2/4/8-thread schedules.
+
 ---
 
 ## Canonical source conversion rules
@@ -362,7 +364,7 @@ These tests are the executable form of §2's contract and must run in CI permane
 
 ### Cross-schedule end-to-end tests
 
-- full reference-model deterministic prefill + decode under: serial reference, multicore output-parallel, and (when present) vectorized backends — identical canonical checkpoint commitments at every checkpoint
+- full reference-model deterministic prefill + decode under: serial reference, multicore output-parallel, and (when present) vectorized backends — identical canonical checkpoint commitments at every checkpoint (implemented: `tests/schedule_parity.rs`)
 - debug vs release parity; x86 vs ARM parity
 
 ### Migration validation

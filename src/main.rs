@@ -30,6 +30,7 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
+    configure_rayon_thread_pool()?;
     let cli_args = CliArgs::parse(env::args().skip(1))?;
     if cli_args.prompt.is_empty() {
         print_usage();
@@ -400,6 +401,27 @@ impl CliArgs {
             prompt: positional_args[4..].join(" "),
         })
     }
+}
+
+/// Builds the global rayon pool with `RASTER_NUM_THREADS` worker threads when
+/// the variable is set; otherwise rayon's default pool (one thread per
+/// logical core) is used. Parallelism is pure scheduling — committed bytes
+/// are identical for every thread count. `RASTER_PARALLELISM=off` forces the
+/// serial reference kernel paths regardless of pool size.
+fn configure_rayon_thread_pool() -> anyhow::Result<()> {
+    let Ok(value) = env::var("RASTER_NUM_THREADS") else {
+        return Ok(());
+    };
+    let threads = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("RASTER_NUM_THREADS must be a positive integer"))?;
+    if threads == 0 {
+        anyhow::bail!("RASTER_NUM_THREADS must be greater than zero");
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .map_err(|error| anyhow::anyhow!("failed to build rayon thread pool: {error}"))
 }
 
 fn parse_raster_unchecked_test_mode_flag() -> anyhow::Result<RasterIntegrityMode> {

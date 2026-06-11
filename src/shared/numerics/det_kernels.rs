@@ -27,6 +27,43 @@ use crate::shared::numerics::det_num::{
 use crate::shared::numerics::det_tensor::{ActSlab, DetKvCacheData, HeadSlab};
 
 // ---------------------------------------------------------------------------
+// Parallelism controls
+//
+// Parallelism here is pure scheduling (DET_NUM_SPEC "Parallelism legality"):
+// work is only ever split across disjoint output coordinates, each computed
+// with the canonical serial semantics and placed at its specified output
+// index, so committed bytes are identical across every schedule. The
+// `schedule_parity` integration test enforces this.
+// ---------------------------------------------------------------------------
+
+/// Minimum output-row count before the GEMV driver splits across the rayon
+/// pool; below this the per-job scheduling overhead exceeds the win.
+const DET_GEMV_MIN_PAR_ROWS: usize = 128;
+
+/// Minimum output rows per parallel GEMV chunk, amortizing rayon scheduling
+/// overhead over enough dot products to matter.
+const DET_GEMV_MIN_ROWS_PER_CHUNK: usize = 64;
+
+/// False when `RASTER_PARALLELISM=off` forces the serial reference schedule
+/// (debugging, differential testing, guest-parity sanity runs). Read once per
+/// process.
+fn parallelism_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RASTER_PARALLELISM")
+            .map(|value| !value.eq_ignore_ascii_case("off"))
+            .unwrap_or(true)
+    })
+}
+
+/// True when parallel drivers may split work across the rayon pool. With a
+/// single-thread pool the serial reference path is used directly so the hot
+/// loops stay allocation-free.
+fn use_parallel() -> bool {
+    parallelism_enabled() && rayon::current_num_threads() > 1
+}
+
+// ---------------------------------------------------------------------------
 // Boundary conversions
 // ---------------------------------------------------------------------------
 
@@ -52,6 +89,29 @@ pub(crate) fn row_from_internal(internal: &InternalActivationRow) -> Result<Vec<
 // Elementwise / projection primitives
 // ---------------------------------------------------------------------------
 
+/// Serial canonical GEMV core shared by every linear driver: computes output
+/// rows `row_offset..row_offset + output.len()` of `weight · input`. Each
+/// output element is one canonical wrapping-MAC reduction followed by a
+/// requantize, independent of how rows are partitioned across callers.
+fn det_linear_rows_into(
+    input: &[Act],
+    weight: &DetNumMatrix,
+    row_offset: usize,
+    output: &mut [Act],
+) {
+    let weight_values = weight.values.as_slice();
+    for (chunk_row_idx, out) in output.iter_mut().enumerate() {
+        let row_start = (row_offset + chunk_row_idx) * weight.cols;
+        let mut acc_bits = 0_i64;
+        for (col_idx, act) in input.iter().enumerate() {
+            acc_bits = mac_bits(acc_bits, act.to_bits(), weight_values[row_start + col_idx]);
+        }
+        *out = requantize(Acc::from_bits(acc_bits));
+    }
+}
+
+/// Serial reference GEMV. Kept as the canonical reference entry point and
+/// equality oracle for the parallel driver.
 fn det_linear_into(input: &[Act], weight: &DetNumMatrix, output: &mut [Act]) -> Result<()> {
     if input.len() != weight.cols {
         bail!(
@@ -61,16 +121,36 @@ fn det_linear_into(input: &[Act], weight: &DetNumMatrix, output: &mut [Act]) -> 
         );
     }
     debug_assert_eq!(output.len(), weight.rows);
+    det_linear_rows_into(input, weight, 0, output);
+    Ok(())
+}
 
-    let weight_values = weight.values.as_slice();
-    for (row_idx, out) in output.iter_mut().enumerate() {
-        let row_offset = row_idx * weight.cols;
-        let mut acc_bits = 0_i64;
-        for (col_idx, act) in input.iter().enumerate() {
-            acc_bits = mac_bits(acc_bits, act.to_bits(), weight_values[row_offset + col_idx]);
-        }
-        *out = requantize(Acc::from_bits(acc_bits));
+/// Output-row-parallel GEMV driver: partitions `0..weight.rows` into
+/// contiguous chunks, computes each chunk with the serial canonical core, and
+/// writes into disjoint `&mut` output slices. Placement is index-addressed,
+/// so results are bit-identical to `det_linear_into` for every thread count
+/// and chunk size.
+fn det_linear_into_par(input: &[Act], weight: &DetNumMatrix, output: &mut [Act]) -> Result<()> {
+    if input.len() != weight.cols {
+        bail!(
+            "deterministic linear input width mismatch: {} vs {}",
+            input.len(),
+            weight.cols
+        );
     }
+    debug_assert_eq!(output.len(), weight.rows);
+    if !use_parallel() || weight.rows < DET_GEMV_MIN_PAR_ROWS {
+        det_linear_rows_into(input, weight, 0, output);
+        return Ok(());
+    }
+    let chunk_rows =
+        DET_GEMV_MIN_ROWS_PER_CHUNK.max(weight.rows.div_ceil(rayon::current_num_threads()));
+    output
+        .par_chunks_mut(chunk_rows)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            det_linear_rows_into(input, weight, chunk_idx * chunk_rows, out_chunk);
+        });
     Ok(())
 }
 
@@ -83,11 +163,19 @@ fn det_linear_slab(input: &ActSlab, weight: &DetNumMatrix) -> Result<ActSlab> {
         );
     }
     let mut output = ActSlab::zeroed(input.rows(), weight.rows);
-    output
-        .as_flat_mut()
-        .par_chunks_mut(weight.rows)
-        .zip(input.as_flat().par_chunks(input.cols().max(1)))
-        .try_for_each(|(out_row, in_row)| det_linear_into(in_row, weight, out_row))?;
+    if use_parallel() {
+        output
+            .as_flat_mut()
+            .par_chunks_mut(weight.rows)
+            .zip(input.as_flat().par_chunks(input.cols().max(1)))
+            .try_for_each(|(out_row, in_row)| det_linear_into(in_row, weight, out_row))?;
+    } else {
+        output
+            .as_flat_mut()
+            .chunks_mut(weight.rows)
+            .zip(input.as_flat().chunks(input.cols().max(1)))
+            .try_for_each(|(out_row, in_row)| det_linear_into(in_row, weight, out_row))?;
+    }
     Ok(output)
 }
 
@@ -124,10 +212,17 @@ fn rms_norm_slab(
 ) -> Result<ActSlab> {
     let (weight, eps) = rms_norm_weights(weight_det, eps_det)?;
     let mut output = input.clone();
-    output
-        .as_flat_mut()
-        .par_chunks_mut(input.cols().max(1))
-        .try_for_each(|row| rms_norm_row_checked(row, weight, eps))?;
+    if use_parallel() {
+        output
+            .as_flat_mut()
+            .par_chunks_mut(input.cols().max(1))
+            .try_for_each(|row| rms_norm_row_checked(row, weight, eps))?;
+    } else {
+        output
+            .as_flat_mut()
+            .chunks_mut(input.cols().max(1))
+            .try_for_each(|row| rms_norm_row_checked(row, weight, eps))?;
+    }
     Ok(output)
 }
 
@@ -241,24 +336,33 @@ fn apply_head_rms_norm_slab(
 ) -> Result<()> {
     let (weight, eps) = rms_norm_weights(weight_det, eps_det)?;
     let cols = heads.cols().max(1);
-    heads
-        .heads_chunks_mut()
-        .par_bridge()
-        .try_for_each(|head| {
-            head.chunks_mut(cols)
-                .try_for_each(|row| rms_norm_row_checked(row, weight, eps))
-        })
+    if use_parallel() {
+        heads
+            .as_flat_mut()
+            .par_chunks_mut(cols)
+            .try_for_each(|row| rms_norm_row_checked(row, weight, eps))
+    } else {
+        heads
+            .as_flat_mut()
+            .chunks_mut(cols)
+            .try_for_each(|row| rms_norm_row_checked(row, weight, eps))
+    }
 }
 
 fn apply_value_rms_norm_slab(heads: &mut HeadSlab, eps_det: Option<Acc>) -> Result<()> {
     let eps = eps_det
         .ok_or_else(|| anyhow!("deterministic value RMSNorm requires canonical Acc epsilon"))?;
     let cols = heads.cols().max(1);
-    heads.heads_chunks_mut().par_bridge().for_each(|head| {
-        for row in head.chunks_mut(cols) {
+    if use_parallel() {
+        heads
+            .as_flat_mut()
+            .par_chunks_mut(cols)
+            .for_each(|row| value_rms_norm_in_place(row, eps));
+    } else {
+        for row in heads.as_flat_mut().chunks_mut(cols) {
             value_rms_norm_in_place(row, eps);
         }
-    });
+    }
     Ok(())
 }
 
@@ -274,18 +378,28 @@ fn apply_rope_slab(
     }
     let base =
         base_det.ok_or_else(|| anyhow!("deterministic RoPE requires canonical Acc base"))?;
+    let rows = heads.rows().max(1);
     let cols = heads.cols().max(1);
-    heads.heads_chunks_mut().par_bridge().for_each(|head| {
-        for (position, row) in head.chunks_mut(cols).enumerate() {
-            rope_rotate_pairs_in_place(
-                row,
-                rotary_dim,
-                freq_base_dim,
-                base,
-                position_offset + position,
-            );
-        }
-    });
+    // Flat (head, row) work items; the row's sequence position is its index
+    // within the head.
+    let rotate = move |(row_idx, row): (usize, &mut [Act])| {
+        rope_rotate_pairs_in_place(
+            row,
+            rotary_dim,
+            freq_base_dim,
+            base,
+            position_offset + (row_idx % rows),
+        );
+    };
+    if use_parallel() {
+        heads
+            .as_flat_mut()
+            .par_chunks_mut(cols)
+            .enumerate()
+            .for_each(rotate);
+    } else {
+        heads.as_flat_mut().chunks_mut(cols).enumerate().for_each(rotate);
+    }
     Ok(())
 }
 
@@ -387,47 +501,78 @@ fn det_attention_prefill(
         Some(DetKvCacheData::from_head_slabs(&k, &v, retained))
     };
 
-    // Per-head attention into a head-major output slab; each head writes its
-    // own contiguous chunk, with zero allocation inside the (head, query)
-    // loop beyond the per-head scratch reuse.
+    // Attention into a head-major output slab, flattened to one work item per
+    // (head, query) so machines with more cores than heads stay saturated.
+    // Each item writes its own disjoint `head_dim` output row at an
+    // index-addressed position; per-item placement is order-independent.
     let mut head_outputs = HeadSlab::zeroed(layer.num_heads, seq_len, layer.head_dim);
-    head_outputs
-        .heads_chunks_mut()
-        .enumerate()
-        .par_bridge()
-        .try_for_each(|(head_idx, head_out)| -> Result<()> {
-            let kv_head_idx = head_idx / kv_groups;
-            let mut logits_scratch = Vec::with_capacity(seq_len);
-            let mut exp_scratch = Vec::with_capacity(seq_len);
-            let mut weights_scratch = Vec::with_capacity(seq_len);
-            for (query_idx, output_row) in
-                head_out.chunks_mut(layer.head_dim.max(1)).enumerate()
-            {
-                let start = attention_window
-                    .map(|window| query_idx.saturating_add(1).saturating_sub(window))
-                    .unwrap_or(0);
-                let row_count = query_idx + 1 - start;
-                let query = q.head_row(head_idx, query_idx);
-                let windows = match donor_cache {
-                    Some(donor) => cache_windows(donor, kv_head_idx, start, row_count),
-                    None => AttentionWindows {
-                        keys: k.head_rows_window(kv_head_idx, start, row_count),
-                        values: v.head_rows_window(kv_head_idx, start, row_count),
-                        rows: row_count,
-                    },
-                };
-                attention_output_into(
-                    query,
-                    &windows,
-                    layer.head_dim,
-                    &mut logits_scratch,
-                    &mut exp_scratch,
-                    &mut weights_scratch,
-                    output_row,
-                );
-            }
-            Ok(())
-        })?;
+    let head_dim = layer.head_dim.max(1);
+    let q = &q;
+    let k = &k;
+    let v = &v;
+    let compute_item = move |item_idx: usize,
+                             output_row: &mut [Act],
+                             logits_scratch: &mut Vec<Act>,
+                             exp_scratch: &mut Vec<Acc>,
+                             weights_scratch: &mut Vec<Act>| {
+        let head_idx = item_idx / seq_len;
+        let query_idx = item_idx % seq_len;
+        let kv_head_idx = head_idx / kv_groups;
+        let start = attention_window
+            .map(|window| query_idx.saturating_add(1).saturating_sub(window))
+            .unwrap_or(0);
+        let row_count = query_idx + 1 - start;
+        let query = q.head_row(head_idx, query_idx);
+        let windows = match donor_cache {
+            Some(donor) => cache_windows(donor, kv_head_idx, start, row_count),
+            None => AttentionWindows {
+                keys: k.head_rows_window(kv_head_idx, start, row_count),
+                values: v.head_rows_window(kv_head_idx, start, row_count),
+                rows: row_count,
+            },
+        };
+        attention_output_into(
+            query,
+            &windows,
+            layer.head_dim,
+            logits_scratch,
+            exp_scratch,
+            weights_scratch,
+            output_row,
+        );
+    };
+    if use_parallel() {
+        head_outputs
+            .as_flat_mut()
+            .par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each_init(
+                || (Vec::new(), Vec::new(), Vec::new()),
+                |(logits_scratch, exp_scratch, weights_scratch), (item_idx, output_row)| {
+                    compute_item(
+                        item_idx,
+                        output_row,
+                        logits_scratch,
+                        exp_scratch,
+                        weights_scratch,
+                    );
+                },
+            );
+    } else {
+        let mut logits_scratch = Vec::with_capacity(seq_len);
+        let mut exp_scratch = Vec::with_capacity(seq_len);
+        let mut weights_scratch = Vec::with_capacity(seq_len);
+        for (item_idx, output_row) in head_outputs.as_flat_mut().chunks_mut(head_dim).enumerate()
+        {
+            compute_item(
+                item_idx,
+                output_row,
+                &mut logits_scratch,
+                &mut exp_scratch,
+                &mut weights_scratch,
+            );
+        }
+    }
 
     // Combine head-major outputs into seq-major rows for the output projection.
     let mut combined = ActSlab::zeroed(seq_len, layer.num_heads * layer.head_dim);
@@ -710,13 +855,13 @@ pub(crate) fn det_layer_decode(
     let q_weight = require_det_weight(layer.q_proj_det.as_deref(), projection_error)?;
     let k_weight = require_det_weight(layer.k_proj_det.as_deref(), projection_error)?;
     let q = reset(&mut scratch.q, q_weight.rows);
-    det_linear_into(&scratch.normed, q_weight, q)?;
+    det_linear_into_par(&scratch.normed, q_weight, q)?;
     let k = reset(&mut scratch.k, k_weight.rows);
-    det_linear_into(&scratch.normed, k_weight, k)?;
+    det_linear_into_par(&scratch.normed, k_weight, k)?;
     let v_len = if layer.v_proj.is_some() {
         let v_weight = require_det_weight(layer.v_proj_det.as_deref(), projection_error)?;
         let v = reset(&mut scratch.v, v_weight.rows);
-        det_linear_into(&scratch.normed, v_weight, v)?;
+        det_linear_into_par(&scratch.normed, v_weight, v)?;
         v_weight.rows
     } else if layer.attention_k_eq_v {
         let v = reset(&mut scratch.v, k_weight.rows);
@@ -785,23 +930,50 @@ pub(crate) fn det_layer_decode(
         .unwrap_or(0);
     let window_len = attention_det.len().saturating_sub(key_start);
     let attn_combined = reset(&mut scratch.attn_combined, layer.num_heads * layer.head_dim);
-    for head_idx in 0..layer.num_heads {
-        let kv_head_idx = head_idx / kv_groups;
-        let windows = cache_windows(attention_det, kv_head_idx, key_start, window_len);
-        let query = &scratch.q[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
-        attention_output_into(
-            query,
-            &windows,
-            layer.head_dim,
-            &mut scratch.logits,
-            &mut scratch.exp_terms,
-            &mut scratch.weights,
-            &mut attn_combined[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim],
-        );
+    if use_parallel() && layer.num_heads > 1 {
+        // Each head writes its own disjoint `head_dim` chunk of the combined
+        // output; per-job scratch keeps canonical per-head computations
+        // independent of scheduling.
+        let q = &scratch.q;
+        attn_combined
+            .par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each_init(
+                || (Vec::new(), Vec::new(), Vec::new()),
+                |(logits_scratch, exp_scratch, weights_scratch), (head_idx, output)| {
+                    let kv_head_idx = head_idx / kv_groups;
+                    let windows = cache_windows(attention_det, kv_head_idx, key_start, window_len);
+                    let query = &q[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
+                    attention_output_into(
+                        query,
+                        &windows,
+                        layer.head_dim,
+                        logits_scratch,
+                        exp_scratch,
+                        weights_scratch,
+                        output,
+                    );
+                },
+            );
+    } else {
+        for head_idx in 0..layer.num_heads {
+            let kv_head_idx = head_idx / kv_groups;
+            let windows = cache_windows(attention_det, kv_head_idx, key_start, window_len);
+            let query = &scratch.q[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim];
+            attention_output_into(
+                query,
+                &windows,
+                layer.head_dim,
+                &mut scratch.logits,
+                &mut scratch.exp_terms,
+                &mut scratch.weights,
+                &mut attn_combined[head_idx * layer.head_dim..(head_idx + 1) * layer.head_dim],
+            );
+        }
     }
     let o_weight = require_det_weight(layer.o_proj_det.as_deref(), projection_error)?;
     let attn_out = reset(&mut scratch.attn_out, o_weight.rows);
-    det_linear_into(&scratch.attn_combined, o_weight, attn_out)?;
+    det_linear_into_par(&scratch.attn_combined, o_weight, attn_out)?;
 
     // Post-attention norm + residual.
     let (post_attn_weight, post_attn_eps) = rms_norm_weights(
@@ -826,21 +998,21 @@ pub(crate) fn det_layer_decode(
         "deterministic MLP gate projection requires canonical det_weight",
     )?;
     let gate = reset(&mut scratch.gate, gate_weight.rows);
-    det_linear_into(&scratch.ff_normed, gate_weight, gate)?;
+    det_linear_into_par(&scratch.ff_normed, gate_weight, gate)?;
     gelu_in_place(gate);
     let up_weight = require_det_weight(
         layer.up_proj_det.as_deref(),
         "deterministic MLP up projection requires canonical det_weight",
     )?;
     let up = reset(&mut scratch.up, up_weight.rows);
-    det_linear_into(&scratch.ff_normed, up_weight, up)?;
+    det_linear_into_par(&scratch.ff_normed, up_weight, up)?;
     mul_in_place(&mut scratch.gate, &scratch.up)?;
     let down_weight = require_det_weight(
         layer.down_proj_det.as_deref(),
         "deterministic MLP down projection requires canonical det_weight",
     )?;
     let ff_out = reset(&mut scratch.ff_out, down_weight.rows);
-    det_linear_into(&scratch.gate, down_weight, ff_out)?;
+    det_linear_into_par(&scratch.gate, down_weight, ff_out)?;
     let (post_ff_weight, post_ff_eps) = rms_norm_weights(
         layer.post_feedforward_layernorm_weight_det.as_deref(),
         layer.rms_norm_eps_det,
@@ -853,13 +1025,13 @@ pub(crate) fn det_layer_decode(
         let input_gate_weight =
             require_det_weight(ple.input_gate_det.as_deref(), projection_error)?;
         let ple_gate = reset(&mut scratch.ple_gate, input_gate_weight.rows);
-        det_linear_into(&scratch.xs, input_gate_weight, ple_gate)?;
+        det_linear_into_par(&scratch.xs, input_gate_weight, ple_gate)?;
         gelu_in_place(ple_gate);
         mul_in_place(&mut scratch.ple_gate, per_layer_input)?;
         let layer_projection_weight =
             require_det_weight(ple.layer_projection_det.as_deref(), projection_error)?;
         let ple_projected = reset(&mut scratch.ple_projected, layer_projection_weight.rows);
-        det_linear_into(&scratch.ple_gate, layer_projection_weight, ple_projected)?;
+        det_linear_into_par(&scratch.ple_gate, layer_projection_weight, ple_projected)?;
         let (ple_norm_weight, ple_norm_eps) = rms_norm_weights(
             ple.post_input_norm_weight_det.as_deref(),
             layer.rms_norm_eps_det,
@@ -928,7 +1100,7 @@ pub(crate) fn det_decode_ple_input(
     )?;
     output.clear();
     output.resize(model_projection.rows, Act::from_bits(0));
-    det_linear_into(input, model_projection, output)?;
+    det_linear_into_par(input, model_projection, output)?;
     let projection_scalar = ple_global
         .projection_scalar_det
         .ok_or_else(|| anyhow!("deterministic row scaling requires canonical Act scalar"))?;
@@ -1001,7 +1173,7 @@ pub(crate) fn det_hidden_to_logits(
         );
     }
     let mut logits = vec![Act::from_bits(0); det_weight.rows];
-    det_linear_into(&normed, &det_weight, &mut logits)?;
+    det_linear_into_par(&normed, &det_weight, &mut logits)?;
 
     if let Some(_softcap) = final_logit_softcapping {
         let softcap = final_logit_softcapping_det.ok_or_else(|| {
@@ -1012,4 +1184,72 @@ pub(crate) fn det_hidden_to_logits(
         }
     }
     Ok(logits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::model::transformer::DetNumValues;
+
+    fn fixture_matrix(rows: usize, cols: usize) -> DetNumMatrix {
+        let values = (0..rows * cols)
+            .map(|idx| ((idx as i64).wrapping_mul(2_654_435_761) % 131_072) as i32 - 65_536)
+            .collect::<Vec<_>>();
+        DetNumMatrix {
+            rows,
+            cols,
+            values: DetNumValues::Owned(values),
+        }
+    }
+
+    fn fixture_input(cols: usize) -> Vec<Act> {
+        (0..cols)
+            .map(|idx| Act::from_bits(((idx as i64).wrapping_mul(40_503) % 98_304) as i32 - 49_152))
+            .collect()
+    }
+
+    fn bits(values: &[Act]) -> Vec<i32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    #[test]
+    fn parallel_gemv_matches_serial_reference_across_thread_counts() {
+        // Enough rows to force parallel splitting, plus a ragged tail chunk.
+        let rows = DET_GEMV_MIN_PAR_ROWS * 3 + 17;
+        let cols = 64;
+        let weight = fixture_matrix(rows, cols);
+        let input = fixture_input(cols);
+
+        let mut reference = vec![Act::from_bits(0); rows];
+        det_linear_into(&input, &weight, &mut reference).expect("serial GEMV should succeed");
+
+        for threads in [1_usize, 2, 3, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("scoped pool should build");
+            let mut output = vec![Act::from_bits(0); rows];
+            pool.install(|| det_linear_into_par(&input, &weight, &mut output))
+                .expect("parallel GEMV should succeed");
+            assert_eq!(
+                bits(&output),
+                bits(&reference),
+                "GEMV diverged from serial reference with {threads} threads"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_gemv_serial_fallback_below_row_threshold() {
+        let rows = DET_GEMV_MIN_PAR_ROWS - 1;
+        let cols = 32;
+        let weight = fixture_matrix(rows, cols);
+        let input = fixture_input(cols);
+
+        let mut reference = vec![Act::from_bits(0); rows];
+        det_linear_into(&input, &weight, &mut reference).expect("serial GEMV should succeed");
+        let mut output = vec![Act::from_bits(0); rows];
+        det_linear_into_par(&input, &weight, &mut output).expect("driver should succeed");
+        assert_eq!(bits(&output), bits(&reference));
+    }
 }

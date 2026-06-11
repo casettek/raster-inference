@@ -137,9 +137,10 @@ impl HeadSlab {
         &self.data[begin..begin + len * self.cols]
     }
 
-    /// Head-disjoint mutable chunks (one per head), for head-parallel writers.
-    pub(crate) fn heads_chunks_mut(&mut self) -> std::slice::ChunksMut<'_, Act> {
-        self.data.chunks_mut(self.rows * self.cols)
+    /// Flat mutable view over the whole head-major buffer, for row-disjoint
+    /// (head, row) parallel writers.
+    pub(crate) fn as_flat_mut(&mut self) -> &mut [Act] {
+        &mut self.data
     }
 }
 
