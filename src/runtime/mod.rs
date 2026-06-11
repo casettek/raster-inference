@@ -3,4 +3,5 @@ pub mod checkpoints;
 mod det_goldens;
 pub mod inference;
 pub(crate) mod pipeline;
+pub mod sequence;
 pub mod trace;
