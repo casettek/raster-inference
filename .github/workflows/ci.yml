@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --check
+      # Report-only until the existing lint debt is cleared; promoting this
+      # to `-D warnings` is a tracked follow-up. Some findings (e.g.
+      # clippy::approx_constant on deterministic kernel test fixtures) are
+      # intentional and will need explicit allows.
+      - name: clippy (report-only)
+        run: cargo clippy --all-targets
+        continue-on-error: true
+
+  test:
+    name: Test suite (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test
+
+  parity-gate:
+    name: Determinism parity gate (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Runs all four parity test categories, including the full-raster
+      # Verified-mode leg that is ignored in debug builds (see
+      # tests/e2e_checkpoint_parity.rs and docs/parity-gate.md).
+      - name: end-to-end checkpoint parity
+        run: cargo test --release --test e2e_checkpoint_parity

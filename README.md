@@ -194,3 +194,7 @@ To validate a converted deterministic artifact against the current baseline:
 For small deterministic fixtures, exact agreement is the target. For real converted Gemma checkpoints, Phase 1 is meant to show whether the converted weight format preserves output quality closely enough before the repo switches to a full `det_num` arithmetic path.
 
 The automated parity suite now also includes softcap-sensitive and cache-sensitive fixtures that keep unrelated behavior quiet so drift is attributable to deterministic routing, canonical KV reuse, activation carryover, or final logit softcapping. These fixtures are routing/parity checks, not quality verdicts. Real-model validation remains manual: run representative prompts through both the FP32 baseline and the deterministic path, then compare output quality rather than requiring exact token identity once deterministic-only seams are active.
+
+## Determinism Parity Gate
+
+CI enforces end-to-end checkpoint trace parity (native-deterministic vs raster, self-reproducibility, thread-count invariance, detour smoke parity) on every push and PR. See [docs/parity-gate.md](docs/parity-gate.md) for what the gate guarantees and how to run it locally.
