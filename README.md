@@ -19,7 +19,7 @@ This repo only targets:
 - one serial input-to-transformer path
 - one prompt-prefill Gemma 4 text path through all decoder layers
 - one minimal output-decode greedy loop built on final-position logits
-- one opt-in deterministic weight-path for comparing converted `model.detwgt` artifacts against the FP32 baseline
+- one deterministic weight-path running converted `model.detwgt` artifacts with `det_num` fixed-point arithmetic
 - no scheduler, server, cache manager, or framework abstraction
 
 This repo does not yet include:
@@ -64,7 +64,7 @@ Today the implemented serial path produces:
 - `src/runtime/checkpoints.rs`: protocol `phase_id` and `routine` taxonomy for checkpoint names, plus the raster detour spec/controller
 - `src/runtime/trace.rs`: checkpoint emission, terminal-checkpoint tracking, and serialized trace artifact writing
 - `src/runtime/sequence.rs`: the phase-sequencing skeleton — the single place that knows the canonical routine order
-- `src/runtime/executors/`: the executor seam — `native.rs` (native deterministic/fp32 executor with selective raster detour hooks) and `raster.rs` (full root-backed raster tile executor)
+- `src/runtime/executors/`: the executor seam — `native.rs` (native deterministic executor with selective raster detour hooks) and `raster.rs` (full root-backed raster tile executor)
 - `src/runtime/roles/`: protocol role entry points — `claimer.rs` (`claimer::run`), `challenger.rs` (`challenger::audit`, replay/compare/detour), and `detour.rs` (`detour::run`, the shared single-routine raster detour)
 - `src/runtime/inference.rs`: inference control/outcome types plus the deprecated legacy entry points (thin shims over `sequence::run`)
 - `src/runtime/pipeline.rs`: composed prefill/decode bundle helpers for tests, benches, and golden capture (not on the production path)
@@ -98,7 +98,7 @@ For the working porting method and the first-batch tile plan, see
 
 ## CLI
 
-The CLI is a thin shell over the protocol role APIs (`claimer::run`, `challenger::audit`, `detour::run`) with one subcommand per protocol action. Every subcommand runs deterministic execution with checkpoint commitment on; the fp32 baseline is not reachable from the CLI. Run `raster-inference <subcommand> --help` for the full flag list.
+The CLI is a thin shell over the protocol role APIs (`claimer::run`, `challenger::audit`, `detour::run`) with one subcommand per protocol action. Every subcommand runs deterministic execution with checkpoint commitment on. Run `raster-inference <subcommand> --help` for the full flag list.
 
 ### Common flags
 
@@ -191,15 +191,14 @@ For fast local runs, generate the tiny representative Gemma-style bundle:
 cargo run --bin tiny-gemma-dev -- --output-dir assets/tiny-gemma-dev --force
 ```
 
-The generated bundle includes `config.json`, `model.safetensors`, `model.detwgt`,
-`tokenizer.json`, and `chat_template.jinja`. It keeps the deterministic `Wgt`
-artifact format while shrinking the model to tiny PLE-enabled layers with a
-small Gemma-compatible BPE tokenizer. (`model.safetensors` is the fp32 baseline,
-used only by the library-level parity suites.)
+The generated bundle includes `config.json`, `model.detwgt`, `tokenizer.json`,
+and `chat_template.jinja`. It keeps the deterministic `Wgt` artifact format
+while shrinking the model to tiny PLE-enabled layers with a small
+Gemma-compatible BPE tokenizer.
 
 ### Deterministic path notes
 
-The deterministic path is a **converted-weight parity path** with a canonical-state runtime core. It requires `.detwgt` provenance, loads canonical `Wgt` bytes from `model.detwgt`, keeps deterministic KV cache rows and layer activations in canonical `Act` form across deterministic prefill/decode boundaries, and converts config-derived scalars once into canonical `Act`/`Acc` carriers. The existing `f32` fields remain compatibility views for public API and JSON consumers.
+The deterministic path is a **converted-weight path** with a canonical-state runtime core. It requires `.detwgt` weights, loads canonical `Wgt` bytes from `model.detwgt`, keeps deterministic KV cache rows and layer activations in canonical `Act` form across deterministic prefill/decode boundaries, and converts config-derived scalars once into canonical `Act`/`Acc` carriers. The existing `f32` fields remain compatibility views for public API and JSON consumers.
 
 Deterministic checkpoints may include optional `det_*_sha256` fields next to the compatibility hashes. Compatibility fields such as `activations_sha256`, `final_logits_sha256`, and serialized `layer_caches` still describe the public f32 views; `det_*` fields describe canonical fixed-point bytes and are omitted when deterministic internals are not present.
 
@@ -212,20 +211,14 @@ The `state` JSON in `claim`/`detour` output includes:
 - `output_decode.generated_token_ids_sha256`: SHA-256 digest of the generated token IDs
 - `output_decode.stop_reason`: currently `max_new_tokens`
 
-## Comparison Workflow
+## Regression Coverage
 
-To validate a converted deterministic artifact against the current baseline (the fp32 path is no longer reachable from the CLI; use the library entry points, e.g. `sequence::run` with an fp32-mode request, as the parity suites do):
+Deterministic behavior is locked by two golden suites:
 
-1. Run the prompt once against the original FP32 model path.
-2. Run the same prompt again in deterministic mode against the converted `model.detwgt` directory.
-3. Compare:
-   - `output_decode.generated_text`
-   - `output_decode.generated_token_ids_sha256`
-   - `transformer_state_transition.prefill_logits.final_logits_sha256`
+- `src/runtime/det_goldens.rs` asserts every canonical (`det_*`) commitment — embeddings, per-layer outputs, KV caches, logits, and end-to-end generated tokens — is bit-identical to `testdata/det_commitment_goldens.json` across debug and release builds.
+- `tests/golden_traces.rs` asserts the serialized checkpoint trace artifacts are byte-identical to the goldens in `tests/goldens/`.
 
-For small deterministic fixtures, exact agreement is the target. For real converted Gemma checkpoints, Phase 1 is meant to show whether the converted weight format preserves output quality closely enough before the repo switches to a full `det_num` arithmetic path.
-
-The automated parity suite now also includes softcap-sensitive and cache-sensitive fixtures that keep unrelated behavior quiet so drift is attributable to deterministic routing, canonical KV reuse, activation carryover, or final logit softcapping. These fixtures are routing/parity checks, not quality verdicts. Real-model validation remains manual: run representative prompts through both the FP32 baseline and the deterministic path, then compare output quality rather than requiring exact token identity once deterministic-only seams are active.
+Real-model validation remains manual: run representative prompts through the deterministic path on a converted `model.detwgt` and review output quality.
 
 ## Determinism Parity Gate
 

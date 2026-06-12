@@ -29,11 +29,10 @@ use raster_inference::shared::numerics::det_num::{
     encode_det_wgt_artifact_with_widths, f32_to_wgt, DetWgtTensorSpec, DetWgtWidthPolicy,
 };
 use raster_inference::routines::input_embedding;
-use raster_inference::runtime::pipeline::{decode_step_with_mode, run_prefill_pass_with_mode};
+use raster_inference::runtime::pipeline::{decode_step, run_prefill_pass};
 use raster_inference::shared::model::transformer::{Gemma4TransformerModel, TransformerDecodeState};
 use raster_inference::{
-    load_transformer_state_model_from_det_num_wgt_path, InferenceExecutionMode,
-    PromptPreparationState,
+    load_transformer_state_model_from_det_num_wgt_path, PromptPreparationState,
 };
 
 const PREFILL_SEQ_LENS: &[usize] = &[128, 512, 2048];
@@ -73,20 +72,11 @@ fn prefill_decode_state(
     context_len: usize,
 ) -> TransformerDecodeState {
     let prompt_token_ids = token_ids(context_len);
-    let token_embeddings = input_embedding::run(
-        &prompt_token_ids,
-        model,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("bench embedding should succeed");
-    run_prefill_pass_with_mode(
-        &prompt_preparation(&prompt_token_ids),
-        model,
-        &token_embeddings,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("bench prefill should succeed")
-    .transformer_decode_state
+    let token_embeddings = input_embedding::run(&prompt_token_ids, model)
+        .expect("bench embedding should succeed");
+    run_prefill_pass(&prompt_preparation(&prompt_token_ids), model, &token_embeddings)
+        .expect("bench prefill should succeed")
+        .transformer_decode_state
 }
 
 fn det_prefill(criterion: &mut Criterion) {
@@ -95,23 +85,14 @@ fn det_prefill(criterion: &mut Criterion) {
     group.sample_size(10);
     for &seq_len in PREFILL_SEQ_LENS {
         let prompt_token_ids = token_ids(seq_len);
-        let token_embeddings = input_embedding::run(
-            &prompt_token_ids,
-            &model,
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("bench embedding should succeed");
+        let token_embeddings = input_embedding::run(&prompt_token_ids, &model)
+            .expect("bench embedding should succeed");
         let preparation = prompt_preparation(&prompt_token_ids);
         group.throughput(Throughput::Elements(seq_len as u64));
         group.bench_function(format!("seq_{seq_len}"), |bencher| {
             bencher.iter(|| {
-                run_prefill_pass_with_mode(
-                    &preparation,
-                    &model,
-                    &token_embeddings,
-                    InferenceExecutionMode::Deterministic,
-                )
-                .expect("bench prefill should succeed")
+                run_prefill_pass(&preparation, &model, &token_embeddings)
+                    .expect("bench prefill should succeed")
             })
         });
     }
@@ -129,8 +110,7 @@ fn det_decode(criterion: &mut Criterion) {
             bencher.iter_batched(
                 || decode_state.clone(),
                 |state| {
-                    decode_step_with_mode(state, 1, &model, InferenceExecutionMode::Deterministic)
-                        .expect("bench decode step should succeed")
+                    decode_step(state, 1, &model).expect("bench decode step should succeed")
                 },
                 BatchSize::LargeInput,
             )

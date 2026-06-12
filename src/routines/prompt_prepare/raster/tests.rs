@@ -206,7 +206,6 @@ fn run_returns_root_backed_prompt_state() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: crate::shared::api::input::InferenceExecutionMode::Deterministic,
         sampling: crate::shared::api::input::SamplingConfig::default(),
     };
     let model = ModelSpec {

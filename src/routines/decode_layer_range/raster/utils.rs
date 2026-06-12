@@ -1639,7 +1639,6 @@ pub(crate) fn trace_raster_checkpoint(
         state.layer_count(),
         &current_activation,
         &layer_caches,
-        state.completed_layer_output_sha256s().to_vec(),
         Some(state.completed_layer_output_det_sha256s().to_vec()),
         Some("deterministic"),
     )

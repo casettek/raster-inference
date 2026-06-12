@@ -12,9 +12,8 @@ use crate::routines::output_finalize::run as run_output_finalize;
 use crate::routines::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource;
 use crate::routines::prefill_finalize::run as run_prefill_finalize;
 use crate::routines::prefill_prepare_aux::run as run_prefill_prepare_aux;
-use crate::routines::prefill_range::run as run_prefill_range;
 use crate::routines::prompt_prepare::run as run_prompt_prepare;
-use crate::runtime::pipeline::decode_step_with_mode;
+use crate::runtime::pipeline::decode_step;
 use crate::shared::model::gemma::tokenizer::GemmaAddedToken;
 use crate::shared::model::gemma::tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaBpeMerge, GemmaTokenizerSpec, GemmaVocabEntry,
@@ -24,19 +23,16 @@ use crate::shared::model::transformer::{
     InternalActivationSequence, InternalLogits,
 };
 use crate::shared::model::transformer::{
-    EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
-    Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleLayerWeights, Gemma4TransformerModel,
-    MatrixF32,
+    Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
+    Gemma4PleLayerWeights, Gemma4TransformerModel, MatrixF32,
 };
 use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
-use crate::shared::numerics::transformer_kernels::embed_input_tokens;
 use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
 use crate::shared::raster_kernels::transformer::RasterActivationSequence;
 use crate::shared::tensors::raster_tensor_artifacts::insert_activation_sequence_artifact_ref;
 use crate::{
-    DecodeState, InferenceControls, InferenceExecutionMode, InferenceRequest, InferenceRunOutcome,
-    InferenceState, ModelSpec, OutputDecodeStopReason, RasterDetourSpec, SamplingConfig,
-    TextDecodingPolicy,
+    DecodeState, InferenceControls, InferenceRequest, InferenceRunOutcome, ModelSpec,
+    OutputDecodeStopReason, RasterDetourSpec, SamplingConfig, TextDecodingPolicy,
 };
 use std::{
     env, fs, process,
@@ -54,31 +50,6 @@ fn run_inference_with_controls(
     controls: &InferenceControls,
 ) -> anyhow::Result<InferenceRunOutcome> {
     crate::runtime::sequence::run(request, model, tokenizer, transformer_model, controls)
-}
-
-fn run_inference(
-    request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &Tokenizer,
-    transformer_model: &Gemma4TransformerModel,
-) -> anyhow::Result<InferenceState> {
-    match run_inference_with_controls(
-        request,
-        model,
-        tokenizer,
-        transformer_model,
-        &InferenceControls::default(),
-    )? {
-        InferenceRunOutcome::Completed(state) => Ok(state),
-        InferenceRunOutcome::Paused(paused) => anyhow::bail!(
-            "inference paused unexpectedly at checkpoint {}",
-            paused.terminal_checkpoint_id
-        ),
-        InferenceRunOutcome::RasterPromptPrepared(state) => anyhow::bail!(
-            "raster inference stopped at unsupported routine boundary {}",
-            state.terminal_checkpoint_id
-        ),
-    }
 }
 
 fn trace_test_lock() -> &'static Mutex<()> {
@@ -253,7 +224,6 @@ fn deterministic_prompt_request(max_new_tokens: usize) -> InferenceRequest {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(max_new_tokens),
             temperature: Some(1.0),
@@ -578,8 +548,6 @@ fn deterministic_no_ple_model_fixture() -> DeterministicModelFixture {
         det_zero_matrix(4, 8),
     ]);
     let mut layer_sources = layer_sources.into_iter();
-    model.provenance = Gemma4ModelProvenance::DetNumWgt;
-    model.embedding_table = None;
     model.embedding_source = Some(GemmaEmbeddingTensorSource::Deterministic {
         source,
         scale: 1.0,
@@ -750,15 +718,6 @@ fn next_fixture_counter() -> u64 {
 
 fn test_transformer_model() -> Gemma4TransformerModel {
     Gemma4TransformerModel {
-        provenance: Gemma4ModelProvenance::Fp32,
-        embedding_table: Some(EmbeddingTable {
-            rows: vec![
-                vec![0.0, 0.0, 0.0, 0.0],
-                vec![0.0, 0.0, 0.0, 0.0],
-                vec![0.0, 0.0, 0.0, 0.0],
-            ],
-            scale: 1.0,
-        }),
         embedding_source: None,
         layers: vec![Gemma4LayerWeights {
             attention_kind: Gemma4AttentionKind::Sliding,
@@ -1474,11 +1433,10 @@ fn deterministic_cpu_prefill_layer_checkpoint_commitment_matches_raster() {
 
     let deterministic_payload = crate::trace::with_checkpointing_enabled(true, || {
         crate::trace::start_inference_trace(&json!({ "test": "deterministic-prefill-layer" }));
-        crate::routines::prefill_range::run_with_mode_internal_with_detour(
+        crate::routines::prefill_range::run_internal_with_detour(
             InternalActivationSequence::from_det_values(input_rows.clone()),
             &transformer_fixture.model,
             None,
-            InferenceExecutionMode::Deterministic,
             None,
             None,
             1,
@@ -1561,20 +1519,17 @@ fn deterministic_cpu_prefill_finalize_checkpoint_commitment_matches_raster() {
 
     let deterministic_payload = crate::trace::with_checkpointing_enabled(true, || {
         crate::trace::start_inference_trace(&json!({ "test": "deterministic-prefill-finalize" }));
-        let (final_hidden_states, layer_caches) =
-            crate::routines::prefill_range::run_with_mode_internal(
-                InternalActivationSequence::from_det_values(input_rows.clone()),
-                &transformer_fixture.model,
-                None,
-                InferenceExecutionMode::Deterministic,
-            )
-            .expect("deterministic prefill layer should run");
+        let (final_hidden_states, layer_caches) = crate::routines::prefill_range::run_internal(
+            InternalActivationSequence::from_det_values(input_rows.clone()),
+            &transformer_fixture.model,
+            None,
+        )
+        .expect("deterministic prefill layer should run");
         crate::routines::prefill_finalize::run(
             &token_ids,
             &transformer_fixture.model,
             final_hidden_states,
             layer_caches,
-            InferenceExecutionMode::Deterministic,
         )
         .expect("deterministic prefill finalize should run");
         crate::trace::checkpoint_payload_for_tests()
@@ -1652,7 +1607,7 @@ fn deterministic_cpu_decode_select_checkpoint_commitment_matches_raster() {
             crate::shared::model::transformer::TransformerDecodeState::default(),
         );
         decode_state.set_internal_logits(internal_logits.clone());
-        run_decode_select_token(&mut decode_state, 1, InferenceExecutionMode::Deterministic)
+        run_decode_select_token(&mut decode_state, 1)
             .expect("deterministic decode select should run");
         crate::trace::checkpoint_payload_for_tests()
     });
@@ -1680,13 +1635,13 @@ fn deterministic_cpu_decode_select_checkpoint_commitment_matches_raster() {
 fn routine_exports_support_manual_inference_orchestration() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
-    let transformer_model = test_transformer_model();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
+    let transformer_model = &transformer_fixture.model;
     let request = InferenceRequest {
         prompt_bytes: b"prompt".to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
         sampling: SamplingConfig {
             max_new_tokens: Some(1),
             temperature: Some(1.0),
@@ -1697,33 +1652,29 @@ fn routine_exports_support_manual_inference_orchestration() {
 
     let prompt_preparation =
         run_prompt_prepare(&request, &model, &tokenizer).expect("prompt prepare");
-    let token_embeddings = embed_input_tokens(
+    let token_embeddings = crate::routines::input_embedding::run(
         &prompt_preparation.prompt_token_ids,
-        transformer_model
-            .embedding_table
-            .as_ref()
-            .expect("embedding table"),
+        transformer_model,
     )
     .expect("embed tokens");
     let ple_inputs = run_prefill_prepare_aux(
         &prompt_preparation.prompt_token_ids,
-        &transformer_model,
+        transformer_model,
         &token_embeddings,
-        InferenceExecutionMode::Fp32,
     )
     .expect("prefill prepare aux");
-    let (final_hidden_states, layer_caches) = run_prefill_range(
-        &token_embeddings.activations,
-        &transformer_model,
-        ple_inputs.as_ref(),
-    )
-    .expect("prefill layer");
+    let (final_hidden_states, layer_caches) =
+        crate::routines::prefill_range::run_internal(
+            token_embeddings.clone_internal(),
+            transformer_model,
+            ple_inputs.as_ref(),
+        )
+        .expect("prefill layer");
     let prefill = run_prefill_finalize(
         &prompt_preparation.prompt_token_ids,
-        &transformer_model,
+        transformer_model,
         final_hidden_states,
         layer_caches,
-        InferenceExecutionMode::Fp32,
     )
     .expect("prefill finalize");
 
@@ -1733,14 +1684,13 @@ fn routine_exports_support_manual_inference_orchestration() {
         prefill.transformer_decode_state.clone(),
     );
     decode_state.set_internal_logits(prefill.transformer_state.prefill_logits.clone_internal());
-    let next_token = run_decode_select_token(&mut decode_state, 1, InferenceExecutionMode::Fp32)
-        .expect("decode select token");
+    let next_token =
+        run_decode_select_token(&mut decode_state, 1).expect("decode select token");
     let next_token = next_token.expect("should select a token");
-    let decode_transition = decode_step_with_mode(
+    let decode_transition = decode_step(
         std::mem::take(&mut decode_state.transformer_decode_state),
         next_token,
-        &transformer_model,
-        InferenceExecutionMode::Fp32,
+        transformer_model,
     )
     .expect("decode transition");
     decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());
@@ -1808,7 +1758,6 @@ fn run_inference_with_controls_raster_uses_ple_ref_bridge() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(1),
             temperature: Some(1.0),

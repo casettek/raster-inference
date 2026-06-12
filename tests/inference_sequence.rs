@@ -11,15 +11,14 @@ use raster_inference::shared::model::gemma::tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaBpeMerge, GemmaTokenizerSpec, GemmaVocabEntry,
 };
 use raster_inference::shared::model::transformer::{
-    DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, Gemma4AttentionKind,
-    Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
+    DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4TransformerModel,
     GemmaEmbeddingTensorSource, MatrixF32,
 };
 use raster_inference::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
 use raster_inference::{
-    InferenceControls, InferenceExecutionMode, InferenceRequest, InferenceRunOutcome,
-    InferenceState, ModelSpec, OutputDecodeStopReason, RasterDetourSpec, SamplingConfig,
-    TextDecodingPolicy,
+    InferenceControls, InferenceRequest, InferenceRunOutcome, InferenceState, ModelSpec,
+    OutputDecodeStopReason, RasterDetourSpec, SamplingConfig, TextDecodingPolicy,
 };
 use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -97,7 +96,6 @@ fn deterministic_prompt_request(max_new_tokens: usize) -> InferenceRequest {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(max_new_tokens),
             temperature: Some(1.0),
@@ -277,8 +275,6 @@ fn deterministic_no_ple_model_fixture() -> DeterministicModelFixture {
         det_zero_matrix(4, 8),
     ]);
     let mut layer_sources = layer_sources.into_iter();
-    model.provenance = Gemma4ModelProvenance::DetNumWgt;
-    model.embedding_table = None;
     model.embedding_source = Some(GemmaEmbeddingTensorSource::Deterministic {
         source,
         scale: 1.0,
@@ -409,15 +405,6 @@ fn next_fixture_counter() -> u64 {
 
 fn test_transformer_model() -> Gemma4TransformerModel {
     Gemma4TransformerModel {
-        provenance: Gemma4ModelProvenance::Fp32,
-        embedding_table: Some(EmbeddingTable {
-            rows: vec![
-                vec![0.0, 0.0, 0.0, 0.0],
-                vec![0.0, 0.0, 0.0, 0.0],
-                vec![0.0, 0.0, 0.0, 0.0],
-            ],
-            scale: 1.0,
-        }),
         embedding_source: None,
         layers: vec![Gemma4LayerWeights {
             attention_kind: Gemma4AttentionKind::Sliding,
@@ -484,13 +471,12 @@ fn zero_matrix(rows: usize, cols: usize) -> MatrixF32 {
 fn run_inference_generates_greedy_text_for_max_new_tokens() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
-    let transformer_model = test_transformer_model();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
     let request = InferenceRequest {
         prompt_bytes: b"prompt".to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -499,7 +485,7 @@ fn run_inference_generates_greedy_text_for_max_new_tokens() {
         },
     };
 
-    let inference_state = run_inference(&request, &model, &tokenizer, &transformer_model)
+    let inference_state = run_inference(&request, &model, &tokenizer, &transformer_fixture.model)
         .expect("inference should succeed");
 
     assert_eq!(
@@ -525,13 +511,12 @@ fn run_inference_generates_greedy_text_for_max_new_tokens() {
 fn run_inference_returns_empty_generation_when_max_new_tokens_is_zero() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
-    let transformer_model = test_transformer_model();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
     let request = InferenceRequest {
         prompt_bytes: b"prompt".to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -540,7 +525,7 @@ fn run_inference_returns_empty_generation_when_max_new_tokens_is_zero() {
         },
     };
 
-    let inference_state = run_inference(&request, &model, &tokenizer, &transformer_model)
+    let inference_state = run_inference(&request, &model, &tokenizer, &transformer_fixture.model)
         .expect("inference should succeed");
 
     assert!(inference_state.output_decode.generated_token_ids.is_empty());
@@ -552,13 +537,12 @@ fn run_inference_returns_empty_generation_when_max_new_tokens_is_zero() {
 fn run_inference_rejects_non_default_sampling_before_decode_loop() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
-    let transformer_model = test_transformer_model();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
     let request = InferenceRequest {
         prompt_bytes: b"prompt".to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
         sampling: SamplingConfig {
             max_new_tokens: Some(1),
             temperature: Some(1.0),
@@ -567,47 +551,9 @@ fn run_inference_rejects_non_default_sampling_before_decode_loop() {
         },
     };
 
-    let error = run_inference(&request, &model, &tokenizer, &transformer_model)
+    let error = run_inference(&request, &model, &tokenizer, &transformer_fixture.model)
         .expect_err("top_k should fail");
     assert!(error.to_string().contains("top_k"));
-}
-
-#[test]
-fn run_inference_rejects_raster_detour_without_deterministic_execution() {
-    let tokenizer = test_tokenizer();
-    let model = test_model_spec();
-    let transformer_model = test_transformer_model();
-    let request = InferenceRequest {
-        prompt_bytes: b"prompt".to_vec(),
-        text_decoding_policy: TextDecodingPolicy::Utf8,
-        add_generation_prompt: false,
-        add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
-        sampling: SamplingConfig {
-            max_new_tokens: Some(1),
-            temperature: Some(1.0),
-            top_k: None,
-            top_p: None,
-        },
-    };
-
-    let error = run_inference_with_controls(
-        &request,
-        &model,
-        &tokenizer,
-        &transformer_model,
-        &InferenceControls {
-            raster_detour: Some(
-                RasterDetourSpec::parse("input.embedding").expect("detour should parse"),
-            ),
-            ..InferenceControls::default()
-        },
-    )
-    .expect_err("detour should require deterministic execution");
-
-    assert!(error
-        .to_string()
-        .contains("selective raster detour requires deterministic execution"));
 }
 
 #[test]
@@ -620,7 +566,6 @@ fn run_inference_reports_unsupported_selected_raster_detour() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(1),
             temperature: Some(1.0),
@@ -661,7 +606,6 @@ fn run_inference_reports_unmatched_selected_raster_detour() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -758,7 +702,6 @@ fn run_inference_counts_prefill_layer_detour_occurrences() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -811,7 +754,6 @@ fn run_inference_rejects_full_raster_with_raster_detour() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -851,7 +793,6 @@ fn run_inference_validates_raster_sizing_for_detour() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -1598,44 +1539,6 @@ fn run_inference_reports_unmatched_decode_transition_detour() {
 }
 
 #[test]
-fn run_inference_rejects_decode_transition_detour_without_deterministic_execution() {
-    let tokenizer = test_tokenizer();
-    let model = test_model_spec();
-    let transformer_model = test_transformer_model();
-    let request = InferenceRequest {
-        prompt_bytes: b"prompt".to_vec(),
-        text_decoding_policy: TextDecodingPolicy::Utf8,
-        add_generation_prompt: false,
-        add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
-        sampling: SamplingConfig {
-            max_new_tokens: Some(1),
-            temperature: Some(1.0),
-            top_k: None,
-            top_p: None,
-        },
-    };
-
-    let error = run_inference_with_controls(
-        &request,
-        &model,
-        &tokenizer,
-        &transformer_model,
-        &InferenceControls {
-            raster_detour: Some(
-                RasterDetourSpec::parse("decode.layer_range").expect("detour should parse"),
-            ),
-            ..InferenceControls::default()
-        },
-    )
-    .expect_err("decode transition detour should require deterministic execution");
-
-    assert!(error
-        .to_string()
-        .contains("selective raster detour requires deterministic execution"));
-}
-
-#[test]
 fn run_inference_validates_projection_sizing_for_decode_transition_detour() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
@@ -1807,13 +1710,12 @@ fn run_inference_decode_select_token_detour_runs_in_unchecked_integrity_mode() {
 fn run_inference_with_controls_pauses_after_prompt_prepare_checkpoint() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
-    let transformer_model = test_transformer_model();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
     let request = InferenceRequest {
         prompt_bytes: b"prompt".to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -1826,13 +1728,13 @@ fn run_inference_with_controls_pauses_after_prompt_prepare_checkpoint() {
         &request,
         &model,
         &tokenizer,
-        &transformer_model,
+        &transformer_fixture.model,
         &InferenceControls {
             commit_checkpoints: false,
             terminal_checkpoint: Some("prompt.prepare".to_string()),
             raster: false,
             raster_detour: None,
-            raster_tokenizer_source: None,
+            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -1847,17 +1749,12 @@ fn run_inference_with_controls_pauses_after_prompt_prepare_checkpoint() {
     .expect("inference should pause");
 
     match paused {
-        InferenceRunOutcome::Paused(state) => {
+        InferenceRunOutcome::RasterPromptPrepared(state) => {
             assert_eq!(state.terminal_checkpoint_id, "prompt.prepare");
-            assert_eq!(
-                state.input_embedding.prompt_preparation.prompt_token_ids,
-                vec![1]
-            );
-            assert!(state.transformer_state_transition.is_none());
-            assert!(state.output_decode.is_none());
+            assert_eq!(state.prompt_preparation.prompt_token_count, 1);
         }
         InferenceRunOutcome::Completed(_) => panic!("expected paused inference"),
-        InferenceRunOutcome::RasterPromptPrepared(_) => panic!("expected paused inference"),
+        InferenceRunOutcome::Paused(_) => panic!("expected raster prompt prepared pause"),
     }
 }
 
@@ -1872,7 +1769,6 @@ fn deterministic_cpu_prompt_prepare_checkpoint_matches_raster_shape() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -1937,7 +1833,6 @@ fn run_inference_with_controls_raster_can_pause_after_input_embedding() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -2000,7 +1895,6 @@ fn run_inference_with_controls_raster_can_pause_after_prefill_prepare_aux() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -2063,7 +1957,6 @@ fn run_inference_with_controls_raster_can_pause_after_prefill_layer() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -2112,16 +2005,14 @@ fn run_inference_with_controls_raster_can_pause_after_prefill_layer() {
 fn run_inference_with_controls_pauses_after_second_prefill_layer_checkpoint() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
-    let mut transformer_model = test_transformer_model();
-    transformer_model
-        .layers
-        .push(transformer_model.layers[0].clone());
+    let mut transformer_fixture = deterministic_no_ple_model_fixture();
+    let first_layer = transformer_fixture.model.layers[0].clone();
+    transformer_fixture.model.layers.push(first_layer);
     let request = InferenceRequest {
         prompt_bytes: b"prompt".to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
         sampling: SamplingConfig {
             max_new_tokens: Some(1),
             temperature: Some(1.0),
@@ -2134,7 +2025,7 @@ fn run_inference_with_controls_pauses_after_second_prefill_layer_checkpoint() {
         &request,
         &model,
         &tokenizer,
-        &transformer_model,
+        &transformer_fixture.model,
         &InferenceControls {
             commit_checkpoints: false,
             terminal_checkpoint: Some("prefill.range_finalize:2".to_string()),
@@ -2175,7 +2066,6 @@ fn run_inference_with_controls_raster_can_pause_after_prefill_finalize() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -2234,7 +2124,6 @@ fn run_inference_with_controls_raster_runs_decode_select_token() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -2297,7 +2186,6 @@ fn run_inference_with_controls_raster_can_pause_after_decode_transition() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -2382,7 +2270,6 @@ fn run_inference_with_controls_raster_can_pause_after_output_finalize() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(1),
             temperature: Some(1.0),
@@ -2429,54 +2316,6 @@ fn run_inference_with_controls_raster_can_pause_after_output_finalize() {
 }
 
 #[test]
-fn run_inference_with_controls_raster_rejects_non_deterministic_request() {
-    let tokenizer = test_tokenizer();
-    let model = test_model_spec();
-    let transformer_model = test_transformer_model();
-    let request = InferenceRequest {
-        prompt_bytes: b"prompt".to_vec(),
-        text_decoding_policy: TextDecodingPolicy::Utf8,
-        add_generation_prompt: false,
-        add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
-        sampling: SamplingConfig {
-            max_new_tokens: Some(0),
-            temperature: Some(1.0),
-            top_k: None,
-            top_p: None,
-        },
-    };
-
-    let error = run_inference_with_controls(
-        &request,
-        &model,
-        &tokenizer,
-        &transformer_model,
-        &InferenceControls {
-            commit_checkpoints: false,
-            terminal_checkpoint: None,
-            raster: true,
-            raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
-            raster_projection_rows_per_tile: None,
-            raster_attention_kv_rows_per_tile: None,
-            raster_sequence_rows_per_tile: None,
-            raster_head_rows_per_tile: None,
-            prefill_token_range_width: None,
-            decode_layer_range_width: None,
-            raster_tokenizer_bpe_pairs_per_tile: None,
-            raster_tokenizer_bpe_pieces_per_tile: None,
-            raster_output_byte_flush_bytes_per_tile: None,
-        },
-    )
-    .expect_err("raster inference should reject fp32 requests");
-
-    assert!(error
-        .to_string()
-        .contains("requires deterministic execution"));
-}
-
-#[test]
 fn run_inference_with_controls_raster_rejects_non_deterministic_model() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
@@ -2486,7 +2325,6 @@ fn run_inference_with_controls_raster_rejects_non_deterministic_model() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -2517,9 +2355,9 @@ fn run_inference_with_controls_raster_rejects_non_deterministic_model() {
             raster_output_byte_flush_bytes_per_tile: None,
         },
     )
-    .expect_err("raster inference should reject fp32 models");
+    .expect_err("raster inference should reject models without .detwgt weights");
 
-    assert!(error.to_string().contains(".detwgt artifact"));
+    assert!(error.to_string().contains(".detwgt"));
 }
 
 #[test]
@@ -2532,7 +2370,6 @@ fn run_inference_with_controls_raster_rejects_zero_projection_rows_per_tile() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -2578,7 +2415,6 @@ fn run_inference_with_controls_raster_rejects_zero_attention_kv_rows_per_tile() 
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -2624,7 +2460,6 @@ fn run_inference_with_controls_raster_rejects_zero_sequence_rows_per_tile() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -2670,7 +2505,6 @@ fn run_inference_with_controls_raster_rejects_zero_head_rows_per_tile() {
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(0),
             temperature: Some(1.0),
@@ -2743,13 +2577,12 @@ fn raster_sizing_controls_reject_zero_output_tokenizer_chunks() {
 fn run_inference_with_controls_pauses_after_prefill_finalize_checkpoint() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
-    let transformer_model = test_transformer_model();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
     let request = InferenceRequest {
         prompt_bytes: b"prompt".to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
         sampling: SamplingConfig {
             max_new_tokens: Some(2),
             temperature: Some(1.0),
@@ -2762,7 +2595,7 @@ fn run_inference_with_controls_pauses_after_prefill_finalize_checkpoint() {
         &request,
         &model,
         &tokenizer,
-        &transformer_model,
+        &transformer_fixture.model,
         &InferenceControls {
             commit_checkpoints: false,
             terminal_checkpoint: Some("prefill.finalize".to_string()),
@@ -2805,13 +2638,12 @@ fn run_inference_with_controls_pauses_after_prefill_finalize_checkpoint() {
 fn inference_state_serializes_with_protocol_phase_keys() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
-    let transformer_model = test_transformer_model();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
     let request = InferenceRequest {
         prompt_bytes: b"prompt".to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: InferenceExecutionMode::Fp32,
         sampling: SamplingConfig {
             max_new_tokens: Some(1),
             temperature: Some(1.0),
@@ -2820,7 +2652,7 @@ fn inference_state_serializes_with_protocol_phase_keys() {
         },
     };
 
-    let inference_state = run_inference(&request, &model, &tokenizer, &transformer_model)
+    let inference_state = run_inference(&request, &model, &tokenizer, &transformer_fixture.model)
         .expect("inference should succeed");
     let serialized = serde_json::to_value(&inference_state).expect("serialize inference state");
     let object = serialized

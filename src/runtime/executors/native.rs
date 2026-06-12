@@ -24,8 +24,8 @@ use crate::runtime::inference::{
 use crate::runtime::sequence::reached_terminal_checkpoint_id;
 use crate::runtime::trace;
 use crate::shared::api::input::{
-    InferenceExecutionMode, InferenceRequest, ModelSpec, PromptPreparationState,
-    RasterPromptPreparationState, SamplingConfig,
+    InferenceRequest, ModelSpec, PromptPreparationState, RasterPromptPreparationState,
+    SamplingConfig,
 };
 use crate::shared::api::output::OutputDecodeState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -66,9 +66,7 @@ pub(crate) fn run_prompt_prepare(
     let prompt_preparation = prompt_prepare::run(request, model, tokenizer)?;
     let mut raster_checkpoint_roots = None;
     let mut raster_checkpoint_state = None;
-    if request.execution_mode == InferenceExecutionMode::Deterministic
-        && controls.raster_tokenizer_source.is_some()
-    {
+    if controls.raster_tokenizer_source.is_some() {
         let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
             "deterministic CPU prompt.prepare checkpoint requires an authenticated Gemma tokenizer",
         )?;
@@ -116,14 +114,12 @@ pub(crate) fn run_input_embedding(
     prompt_token_ids: &[u32],
     model: &ModelSpec,
     transformer_model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
     raster_prompt_preparation: Option<&RasterPromptPreparationState>,
 ) -> Result<(
     ActivationSequence,
     Option<input_embedding::raster::RasterInputEmbeddingOutput>,
 )> {
-    let token_embeddings =
-        input_embedding::run(prompt_token_ids, transformer_model, execution_mode)?;
+    let token_embeddings = input_embedding::run(prompt_token_ids, transformer_model)?;
     let input_embedding_output = raster_prompt_preparation
         .map(|raster_prompt_preparation| {
             let embedding_source =
@@ -151,7 +147,6 @@ pub(crate) fn run_input_embedding(
 /// checkpoint was reached inside the phase (after emitting `phase_paused`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_prefill(
-    request: &InferenceRequest,
     model: &ModelSpec,
     transformer_model: &Gemma4TransformerModel,
     controls: &InferenceControls,
@@ -184,12 +179,7 @@ pub(crate) fn run_prefill(
         )?;
         prefill_prepare_aux::materialize_prefill_ple_inputs(ple_input_refs.as_ref())?
     } else {
-        prefill_prepare_aux::run(
-            prompt_token_ids,
-            transformer_model,
-            token_embeddings,
-            request.execution_mode,
-        )?
+        prefill_prepare_aux::run(prompt_token_ids, transformer_model, token_embeddings)?
     };
     if let Some(terminal_checkpoint_id) = reached_terminal_checkpoint_id(controls) {
         trace::phase_paused(PhaseId::TransformerStateTransition);
@@ -214,11 +204,10 @@ pub(crate) fn run_prefill(
                 raster_sizing: raster_sizing_controls
                     .expect("raster sizing controls should be validated"),
             });
-    let (final_hidden_states, layer_caches) = prefill_range::run_with_mode_internal_with_detour(
+    let (final_hidden_states, layer_caches) = prefill_range::run_internal_with_detour(
         token_embeddings.clone_internal(),
         transformer_model,
         ple_inputs.as_ref(),
-        request.execution_mode,
         Some(raster_detour_controller),
         prefill_layer_raster_detour,
         raster_sizing_controls
@@ -250,7 +239,6 @@ pub(crate) fn run_prefill(
             transformer_model,
             final_hidden_states,
             layer_caches,
-            request.execution_mode,
         )?
     };
     Ok(ControlFlow::Continue(prefill))
@@ -269,7 +257,6 @@ pub(crate) fn run_output_decode(
     tokenizer: &Tokenizer,
     raster_tokenizer: Option<&AuthenticatedGemmaTokenizer>,
     transformer_model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
     mut detour_controller: Option<&mut RasterDetourController>,
     raster_sizing: Option<RasterSizingControls>,
 ) -> Result<OutputDecodeState> {
@@ -336,7 +323,7 @@ pub(crate) fn run_output_decode(
                 raster_sizing,
             )?
         } else {
-            crate::routines::decode_select_token::run(&mut decode_state, max_new_tokens, execution_mode)?
+            crate::routines::decode_select_token::run(&mut decode_state, max_new_tokens)?
                 .expect("stop condition should have returned earlier")
         };
 
@@ -346,23 +333,12 @@ pub(crate) fn run_output_decode(
             .unwrap_or(crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH);
         let decode_state_before_transition = decode_state.clone();
         let transformer_decode_state = std::mem::take(&mut decode_state.transformer_decode_state);
-        let mut range_state = match execution_mode {
-            InferenceExecutionMode::Fp32 => {
-                crate::routines::decode_layer_range::native::init_state_with_mode(
-                    transformer_decode_state,
-                    next_token,
-                    transformer_model,
-                    execution_mode,
-                )?
-            }
-            InferenceExecutionMode::Deterministic => {
-                crate::routines::decode_layer_range::native::deterministic_tiles::init_state(
-                    transformer_decode_state,
-                    next_token,
-                    transformer_model,
-                )?
-            }
-        };
+        let mut range_state =
+            crate::routines::decode_layer_range::native::deterministic_tiles::init_state(
+                transformer_decode_state,
+                next_token,
+                transformer_model,
+            )?;
         while !range_state.is_complete() {
             let detour_decode_layer_range = detour_controller
                 .as_deref_mut()
@@ -386,24 +362,12 @@ pub(crate) fn run_output_decode(
                         raster_sizing,
                     )?;
             } else {
-                let (next_range_state, _reached_terminal) = match execution_mode {
-                    InferenceExecutionMode::Fp32 => {
-                        crate::routines::decode_layer_range::native::run_range_with_mode(
-                            range_state,
-                            transformer_model,
-                            decode_layer_range_width,
-                            execution_mode,
-                            None,
-                        )?
-                    }
-                    InferenceExecutionMode::Deterministic => {
-                        crate::routines::decode_layer_range::native::deterministic_tiles::run_range(
-                            range_state,
-                            transformer_model,
-                            decode_layer_range_width,
-                        )?
-                    }
-                };
+                let (next_range_state, _reached_terminal) =
+                    crate::routines::decode_layer_range::native::deterministic_tiles::run_range(
+                        range_state,
+                        transformer_model,
+                        decode_layer_range_width,
+                    )?;
                 range_state = next_range_state;
             }
         }
@@ -430,11 +394,7 @@ pub(crate) fn run_output_decode(
                 raster_sizing,
             )?
         } else {
-            crate::routines::decode_transition_finalize::native::run_with_mode(
-                range_state,
-                transformer_model,
-                execution_mode,
-            )?
+            crate::routines::decode_transition_finalize::native::run(range_state, transformer_model)?
         };
         decode_transition_states.push(decode_transition.activation_state.clone());
         decode_state.set_internal_logits(decode_transition.prefill_logits.clone_internal());

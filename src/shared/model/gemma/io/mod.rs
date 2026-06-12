@@ -13,15 +13,13 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use memmap2::Mmap;
-use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+use safetensors::Dtype;
 use sha2::Digest;
 
 use crate::io::{
-    bytes_per_scalar, copy_f32_bytes_into_slice, decode_f32_bytes_to_vec, decode_matrix,
-    decode_scalar, decode_single_scalar, decode_vector, parse_safetensors_metadata,
-    CachedTensorFile, CachedTensorView, TensorBytes,
+    bytes_per_scalar, copy_f32_bytes_into_slice, decode_f32_bytes_to_vec, decode_scalar,
+    decode_single_scalar, decode_vector, parse_safetensors_metadata, TensorBytes,
 };
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::model::gemma::tokenizer::{
     GemmaAddedToken, GemmaBpeMerge, GemmaDecoderMetadata, GemmaTokenizerSpec, GemmaVocabEntry,
 };
@@ -32,8 +30,8 @@ use crate::shared::model::gemma::transformer::{
     ResolvedGemma4PleLayerWeights,
 };
 use crate::shared::model::transformer::{
-    ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable,
-    InternalActivationRow, InternalActivationSequence, MatrixF32,
+    ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, InternalActivationRow,
+    InternalActivationSequence, MatrixF32,
 };
 use crate::shared::numerics::det_num::{
     decode_wgt_bits_le, f32_to_acc, f32_to_act, scale_act, Act, DetWgtElementWidth, Wgt,
@@ -46,11 +44,6 @@ const GEMMA_EMBED_TENSOR_NAMES: &[&str] = &[
     "language_model.embed_tokens.weight",
     "embed_tokens.weight",
 ];
-
-#[derive(Clone, serde::Deserialize)]
-struct SafetensorsIndex {
-    weight_map: HashMap<String, String>,
-}
 
 #[derive(serde::Deserialize)]
 struct GemmaConfigFile {
@@ -187,25 +180,6 @@ fn kv_shared_layer_index(config: &GemmaTextConfigFile, layer_idx: usize) -> Resu
                 "Gemma layer {layer_idx} is configured to share KV without a prior `{attention_type}` donor layer"
             )
         })
-}
-
-enum GemmaModelSource {
-    Single {
-        root_dir: PathBuf,
-        weights_path: PathBuf,
-    },
-    Indexed {
-        root_dir: PathBuf,
-        index: SafetensorsIndex,
-    },
-}
-
-impl GemmaModelSource {
-    fn root_dir(&self) -> &Path {
-        match self {
-            Self::Single { root_dir, .. } | Self::Indexed { root_dir, .. } => root_dir.as_path(),
-        }
-    }
 }
 
 struct DetNumModelSource {
@@ -427,14 +401,6 @@ impl DetNumTensorReader {
         self.resolve_matrix_source(tensor_name, 0, tensor.shape[0], 0, tensor.shape[1])
     }
 
-    fn load_vector(&self, tensor_name: &str) -> Result<Vec<f32>> {
-        Ok(self
-            .load_vector_wgt(tensor_name)?
-            .into_iter()
-            .map(|value| det_wgt_to_f32(value.to_bits()))
-            .collect())
-    }
-
     fn load_vector_wgt(&self, tensor_name: &str) -> Result<Vec<Wgt>> {
         let tensor = self.tensors.get(tensor_name).ok_or_else(|| {
             anyhow!("failed to load tensor `{tensor_name}` from deterministic artifact")
@@ -450,12 +416,6 @@ impl DetNumTensorReader {
             .into_iter()
             .map(Wgt::from_bits)
             .collect())
-    }
-
-    fn load_optional_scalar(&self, tensor_name: &str) -> Result<Option<f32>> {
-        Ok(self
-            .load_optional_scalar_wgt(tensor_name)?
-            .map(|value| det_wgt_to_f32(value.to_bits())))
     }
 
     fn load_optional_scalar_wgt(&self, tensor_name: &str) -> Result<Option<Wgt>> {
@@ -559,159 +519,6 @@ impl DetNumTensorReader {
             anyhow!("failed to locate tensor `{tensor_name}` in deterministic artifact")
         })?;
         Ok(self.weights_path.clone())
-    }
-}
-
-struct GemmaTensorReader {
-    source: GemmaModelSource,
-    cached_files: HashMap<PathBuf, CachedTensorFile>,
-}
-
-impl GemmaTensorReader {
-    fn new(source: GemmaModelSource) -> Self {
-        Self {
-            source,
-            cached_files: HashMap::new(),
-        }
-    }
-
-    fn load_first_available_tensor_metadata(
-        &mut self,
-        tensor_names: &[&str],
-    ) -> Result<(String, usize, usize)> {
-        for tensor_name in tensor_names {
-            if let Ok(tensor) = self.load_tensor(tensor_name) {
-                let shape = tensor.shape();
-                if shape.len() != 2 {
-                    bail!("expected rank-2 tensor for {tensor_name}, got shape {shape:?}");
-                }
-                return Ok(((*tensor_name).to_string(), shape[0], shape[1]));
-            }
-        }
-
-        bail!("failed to locate any of the requested tensors: {tensor_names:?}")
-    }
-
-    fn load_matrix(&mut self, tensor_name: &str) -> Result<MatrixF32> {
-        let tensor = self.load_tensor(tensor_name)?;
-        decode_matrix(&tensor)
-    }
-
-    fn load_vector(&mut self, tensor_name: &str) -> Result<Vec<f32>> {
-        let tensor = self.load_tensor(tensor_name)?;
-        decode_vector(&tensor)
-    }
-
-    fn resolve_matrix_source(&mut self, tensor_name: &str) -> Result<Gemma4LayerMatrixSource> {
-        let path = self.path_for_tensor(tensor_name)?;
-        let cached_file = self.cached_file_for_path(&path)?;
-        let metadata = cached_file.tensor_metadata(tensor_name, &path)?;
-        if metadata.shape.len() != 2 {
-            bail!(
-                "expected rank-2 tensor for {tensor_name}, got shape {:?}",
-                metadata.shape
-            );
-        }
-        let rows = metadata.shape[0];
-        let cols = metadata.shape[1];
-        Ok(Gemma4LayerMatrixSource::from_source(
-            self.resolve_matrix_slice_source(tensor_name, 0, rows, 0, cols)?,
-        ))
-    }
-
-    fn resolve_optional_matrix_source(
-        &mut self,
-        tensor_name: &str,
-    ) -> Result<Option<Gemma4LayerMatrixSource>> {
-        match self.resolve_matrix_source(tensor_name) {
-            Ok(source) => Ok(Some(source)),
-            Err(_) => Ok(None),
-        }
-    }
-
-    fn load_optional_scalar(&mut self, tensor_name: &str) -> Result<Option<f32>> {
-        match self.load_tensor(tensor_name) {
-            Ok(tensor) => Ok(Some(decode_single_scalar(&tensor)?)),
-            Err(_) => Ok(None),
-        }
-    }
-
-    fn load_tensor(&mut self, tensor_name: &str) -> Result<CachedTensorView<'_>> {
-        let path = self.path_for_tensor(tensor_name)?;
-        let cached_file = self.cached_file_for_path(&path)?;
-        cached_file.tensor(tensor_name, &path)
-    }
-
-    fn resolve_matrix_slice_source(
-        &mut self,
-        tensor_name: &str,
-        row_offset: usize,
-        row_count: usize,
-        col_offset: usize,
-        col_count: usize,
-    ) -> Result<GemmaTensorSliceSource> {
-        let path = self.path_for_tensor(tensor_name)?;
-        let cached_file = self.cached_file_for_path(&path)?;
-        let metadata = cached_file.tensor_metadata(tensor_name, &path)?;
-        if metadata.shape.len() != 2 {
-            bail!(
-                "expected rank-2 tensor for {tensor_name}, got shape {:?}",
-                metadata.shape
-            );
-        }
-        let total_rows = metadata.shape[0];
-        let total_cols = metadata.shape[1];
-        if row_offset + row_count > total_rows || col_offset + col_count > total_cols {
-            bail!(
-                "matrix slice [{row_offset}..{}, {col_offset}..{}] is out of bounds for shape {:?}",
-                row_offset + row_count,
-                col_offset + col_count,
-                metadata.shape
-            );
-        }
-
-        Ok(GemmaTensorSliceSource {
-            weights_path: path,
-            dtype: metadata.dtype,
-            total_rows,
-            total_cols,
-            data_offset: metadata.data_offset,
-            row_offset,
-            row_count,
-            col_offset,
-            col_count,
-        })
-    }
-
-    fn path_for_tensor(&self, tensor_name: &str) -> Result<PathBuf> {
-        match &self.source {
-            GemmaModelSource::Single { weights_path, .. } => Ok(weights_path.clone()),
-            GemmaModelSource::Indexed { root_dir, index } => {
-                let shard = index.weight_map.get(tensor_name).ok_or_else(|| {
-                    anyhow!("failed to locate tensor {tensor_name} in model.safetensors.index.json")
-                })?;
-                Ok(root_dir.join(shard))
-            }
-        }
-    }
-
-    fn cached_file_for_path(&mut self, path: &Path) -> Result<&CachedTensorFile> {
-        if !self.cached_files.contains_key(path) {
-            let file = File::open(path)
-                .with_context(|| format!("failed to open safetensors file {}", path.display()))?;
-            let mmap = unsafe { Mmap::map(&file) }
-                .with_context(|| format!("failed to mmap safetensors file {}", path.display()))?;
-            let tensors = parse_safetensors_metadata(&mmap, path)?;
-            self.cached_files
-                .insert(path.to_path_buf(), CachedTensorFile { mmap, tensors });
-        }
-
-        self.cached_files.get(path).ok_or_else(|| {
-            anyhow!(
-                "failed to cache safetensors metadata for {}",
-                path.display()
-            )
-        })
     }
 }
 
@@ -953,93 +760,6 @@ fn validate_gemma_tokenizer_decoder_json(
     }))
 }
 
-pub fn load_embedding_table_from_gemma_model_path<P: AsRef<Path>>(
-    path: P,
-) -> Result<EmbeddingTable> {
-    let mut model = load_transformer_state_model_from_gemma_model_path(path)?;
-    let source = model
-        .embedding_source
-        .take()
-        .ok_or_else(|| anyhow!("transformer state model is missing an embedding source"))?;
-    load_full_embedding_table_from_source(&source)
-}
-
-pub fn load_transformer_state_model_from_gemma_model_path<P: AsRef<Path>>(
-    path: P,
-) -> Result<Gemma4TransformerModel> {
-    // let _trace = trace_scope("io.load_transformer_state_model_from_gemma_model_path");
-    let source = resolve_gemma_model_source(path.as_ref())?;
-    let config = load_gemma_text_config(source.root_dir().join("config.json"))?;
-
-    if config.enable_moe_block {
-        bail!("transformer state model currently only supports Gemma 4 dense layers, not MoE checkpoints");
-    }
-    if config.hidden_activation != "gelu_pytorch_tanh" {
-        bail!(
-            "transformer state model currently only supports gelu_pytorch_tanh, got {}",
-            config.hidden_activation
-        );
-    }
-    if config.num_hidden_layers != config.layer_types.len() {
-        bail!(
-            "Gemma config layer count mismatch: num_hidden_layers={} vs layer_types={}",
-            config.num_hidden_layers,
-            config.layer_types.len()
-        );
-    }
-
-    let mut reader = GemmaTensorReader::new(source);
-    let (embedding_tensor_name, _vocab_size, hidden_size) =
-        reader.load_first_available_tensor_metadata(GEMMA_EMBED_TENSOR_NAMES)?;
-    let first_shared_layer_idx = first_kv_shared_layer_idx(&config);
-    let mut kv_donor_layers = HashSet::new();
-    if first_shared_layer_idx < config.num_hidden_layers {
-        for shared_layer_idx in first_shared_layer_idx..config.num_hidden_layers {
-            if let Some(donor_layer_idx) = kv_shared_layer_index(&config, shared_layer_idx)? {
-                kv_donor_layers.insert(donor_layer_idx);
-            }
-        }
-    }
-    let mut layers = Vec::with_capacity(config.num_hidden_layers);
-    for layer_idx in 0..config.num_hidden_layers {
-        // trace_event(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
-        layers.push(load_gemma4_layer_weights(
-            &mut reader,
-            &config,
-            layer_idx,
-            kv_donor_layers.contains(&layer_idx),
-        )?);
-    }
-    let ple_global = load_ple_global_weights(&mut reader, &config)?;
-    // trace_event("io.load_final_norm_weight");
-    let final_norm_weight = reader.load_vector("model.language_model.norm.weight")?;
-    // trace_event("io.load_logits_projection");
-    let logits_projection = if config.tie_word_embeddings() {
-        Gemma4LogitsProjection::TiedEmbedding(reader.load_matrix(&embedding_tensor_name)?)
-    } else {
-        Gemma4LogitsProjection::UntiedLmHead {
-            weight: reader.load_matrix("model.language_model.lm_head.weight")?,
-            det_weight: None,
-        }
-    };
-    let embedding_source = build_embedding_source(&reader, &embedding_tensor_name, hidden_size);
-
-    Ok(Gemma4TransformerModel {
-        provenance: crate::shared::model::transformer::Gemma4ModelProvenance::Fp32,
-        embedding_table: None,
-        embedding_source: Some(embedding_source),
-        layers,
-        ple_global,
-        final_norm_weight,
-        final_norm_weight_det: None,
-        logits_projection,
-        final_logit_softcapping: config.final_logit_softcapping,
-        final_logit_softcapping_det: None,
-        rms_norm_eps: config.rms_norm_eps,
-        rms_norm_eps_det: None,
-    })
-}
-
 pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
     path: P,
 ) -> Result<Gemma4TransformerModel> {
@@ -1107,8 +827,6 @@ pub fn load_transformer_state_model_from_det_num_wgt_path<P: AsRef<Path>>(
     };
 
     Ok(Gemma4TransformerModel {
-        provenance: crate::shared::model::transformer::Gemma4ModelProvenance::DetNumWgt,
-        embedding_table: None,
         embedding_source: Some(embedding_source),
         layers,
         ple_global,
@@ -1135,49 +853,6 @@ fn det_wgt_vec_to_f32(values: &[Wgt]) -> Vec<f32> {
 
 fn det_wgt_to_act(value: Wgt) -> Act {
     Act::from_bits(value.to_bits())
-}
-
-fn load_ple_global_weights(
-    reader: &mut GemmaTensorReader,
-    config: &GemmaTextConfigFile,
-) -> Result<Option<Gemma4PleGlobalWeights>> {
-    // let _trace = trace_scope("io.load_ple_global_weights");
-    let hidden_size = config.hidden_size;
-    let ple_dim = config.hidden_size_per_layer_input.unwrap_or(0);
-    if ple_dim == 0 {
-        return Ok(None);
-    }
-
-    let ple_vocab_size = config
-        .vocab_size_per_layer_input
-        .unwrap_or(config.vocab_size);
-    let mut token_embeddings = Vec::with_capacity(config.num_hidden_layers);
-    let mut model_projections = Vec::with_capacity(config.num_hidden_layers);
-    for layer_idx in 0..config.num_hidden_layers {
-        token_embeddings.push(reader.resolve_matrix_slice_source(
-            "model.language_model.embed_tokens_per_layer.weight",
-            0,
-            ple_vocab_size,
-            layer_idx * ple_dim,
-            ple_dim,
-        )?);
-        model_projections.push(reader.resolve_matrix_slice_source(
-            "model.language_model.per_layer_model_projection.weight",
-            layer_idx * ple_dim,
-            ple_dim,
-            0,
-            hidden_size,
-        )?);
-    }
-
-    Ok(Some(Gemma4PleGlobalWeights::from_sources(
-        token_embeddings,
-        model_projections,
-        reader.load_vector("model.language_model.per_layer_projection_norm.weight")?,
-        (ple_dim as f32).sqrt(),
-        (hidden_size as f32).powf(-0.5),
-        2f32.powf(-0.5),
-    )))
 }
 
 fn load_det_num_ple_global_weights(
@@ -1789,110 +1464,6 @@ fn matrix_row(matrix: &MatrixF32, row_idx: usize) -> Result<Vec<f32>> {
     Ok(matrix.values[start..end].to_vec())
 }
 
-fn load_gemma4_layer_weights(
-    reader: &mut GemmaTensorReader,
-    config: &GemmaTextConfigFile,
-    layer_idx: usize,
-    is_kv_donor: bool,
-) -> Result<Gemma4LayerWeights> {
-    // let _trace = trace_scope(format!("io.load_gemma4_layer_weights layer={layer_idx}"));
-    let layer_prefix = format!("model.language_model.layers.{layer_idx}");
-    let attention_kind = config.attention_kind_for_layer(layer_idx)?;
-    let is_sliding = attention_kind == Gemma4AttentionKind::Sliding;
-    let head_dim = if is_sliding {
-        config.head_dim
-    } else {
-        config.global_head_dim()
-    };
-    let num_kv_heads = if is_sliding {
-        config.num_key_value_heads
-    } else if config.attention_k_eq_v() {
-        config
-            .num_global_key_value_heads
-            .unwrap_or(config.num_key_value_heads)
-    } else {
-        config.num_key_value_heads
-    };
-    let partial_rotary_dim = if is_sliding {
-        head_dim
-    } else {
-        ((head_dim as f32) * config.full_attention_partial_rotary_factor()) as usize
-    };
-    let kv_shared_layer_index = kv_shared_layer_index(config, layer_idx)?;
-    let effective_sliding_window = config.effective_sliding_window();
-    let ple = if config.hidden_size_per_layer_input.unwrap_or(0) > 0 {
-        Some(Gemma4PleLayerWeights {
-            input_gate: reader
-                .resolve_matrix_source(&format!("{layer_prefix}.per_layer_input_gate.weight"))?,
-            layer_projection: reader
-                .resolve_matrix_source(&format!("{layer_prefix}.per_layer_projection.weight"))?,
-            post_input_norm_weight: reader
-                .load_vector(&format!("{layer_prefix}.post_per_layer_input_norm.weight"))?,
-            post_input_norm_weight_det: None,
-        })
-    } else {
-        None
-    };
-
-    Ok(Gemma4LayerWeights {
-        attention_kind,
-        hidden_size: config.hidden_size,
-        num_heads: config.num_attention_heads,
-        num_kv_heads,
-        head_dim,
-        sliding_window: is_sliding.then_some(effective_sliding_window),
-        cache_sliding_window: if is_sliding && !is_kv_donor {
-            Some(effective_sliding_window)
-        } else {
-            None
-        },
-        rms_norm_eps: config.rms_norm_eps,
-        rms_norm_eps_det: None,
-        rope_base: if is_sliding {
-            config.rope_local_base_freq()
-        } else {
-            config.rope_full_base_freq()
-        },
-        rope_base_det: None,
-        partial_rotary_dim,
-        rope_freq_base_dim: head_dim,
-        kv_shared_layer_index,
-        attention_k_eq_v: !is_sliding && config.attention_k_eq_v(),
-        q_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.q_proj.weight"))?,
-        k_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.k_proj.weight"))?,
-        v_proj: if !is_sliding && config.attention_k_eq_v() {
-            reader.resolve_optional_matrix_source(&format!(
-                "{layer_prefix}.self_attn.v_proj.weight"
-            ))?
-        } else {
-            Some(reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.v_proj.weight"))?)
-        },
-        o_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.self_attn.o_proj.weight"))?,
-        q_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.q_norm.weight"))?,
-        q_norm_weight_det: None,
-        k_norm_weight: reader.load_vector(&format!("{layer_prefix}.self_attn.k_norm.weight"))?,
-        k_norm_weight_det: None,
-        input_layernorm_weight: reader
-            .load_vector(&format!("{layer_prefix}.input_layernorm.weight"))?,
-        input_layernorm_weight_det: None,
-        post_attention_layernorm_weight: reader
-            .load_vector(&format!("{layer_prefix}.post_attention_layernorm.weight"))?,
-        post_attention_layernorm_weight_det: None,
-        pre_feedforward_layernorm_weight: reader
-            .load_vector(&format!("{layer_prefix}.pre_feedforward_layernorm.weight"))?,
-        pre_feedforward_layernorm_weight_det: None,
-        post_feedforward_layernorm_weight: reader
-            .load_vector(&format!("{layer_prefix}.post_feedforward_layernorm.weight"))?,
-        post_feedforward_layernorm_weight_det: None,
-        gate_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.gate_proj.weight"))?,
-        up_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.up_proj.weight"))?,
-        down_proj: reader.resolve_matrix_source(&format!("{layer_prefix}.mlp.down_proj.weight"))?,
-        ple,
-        layer_scalar: reader.load_optional_scalar(&format!("{layer_prefix}.layer_scalar"))?,
-        layer_scalar_det: None,
-    })
-}
-
 fn load_det_num_gemma4_layer_weights(
     reader: &DetNumTensorReader,
     config: &GemmaTextConfigFile,
@@ -2048,14 +1619,6 @@ pub fn embed_input_tokens_from_gemma_source(
     token_ids: &[u32],
     source: &GemmaEmbeddingTensorSource,
 ) -> Result<ActivationSequence> {
-    embed_input_tokens_from_gemma_source_with_mode(token_ids, source, InferenceExecutionMode::Fp32)
-}
-
-pub fn embed_input_tokens_from_gemma_source_with_mode(
-    token_ids: &[u32],
-    source: &GemmaEmbeddingTensorSource,
-    execution_mode: InferenceExecutionMode,
-) -> Result<ActivationSequence> {
     // let _trace = trace_scope("io.embed_input_tokens_from_gemma_source");
     if token_ids.is_empty() {
         bail!("transformer embedding requires at least one token id");
@@ -2081,38 +1644,17 @@ pub fn embed_input_tokens_from_gemma_source_with_mode(
                 source.col_count,
                 *scale,
                 &mmap,
-                execution_mode,
             )?
         }
-        _ if execution_mode == InferenceExecutionMode::Deterministic => {
-            bail!("deterministic embedding requires a .detwgt embedding source")
-        }
-        _ => with_embedding_tensor(source, |tensor| {
-            decode_embedding_rows_for_token_ids(
-                tensor,
-                token_ids,
-                source.hidden_size(),
-                source.scale(),
-                execution_mode,
-            )
-        })?,
+        _ => bail!("deterministic embedding requires a .detwgt embedding source"),
     };
     let det_activations_sha256 = internal
         .det_values()
         .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment);
-    Ok(match execution_mode {
-        InferenceExecutionMode::Deterministic => {
-            ActivationSequence::from_det_internal(internal, det_activations_sha256)
-        }
-        InferenceExecutionMode::Fp32 => {
-            let activations = internal.clone_f32();
-            let activations_sha256 = build_activation_commitment(&activations);
-            let mut activation_sequence =
-                ActivationSequence::from_internal(internal, activations_sha256);
-            activation_sequence.det_activations_sha256 = det_activations_sha256;
-            activation_sequence
-        }
-    })
+    Ok(ActivationSequence::from_det_internal(
+        internal,
+        det_activations_sha256,
+    ))
 }
 
 fn build_det_num_embedding_source(
@@ -2129,76 +1671,6 @@ fn build_det_num_embedding_source(
             det_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         },
     ))
-}
-
-fn build_embedding_source(
-    reader: &GemmaTensorReader,
-    tensor_name: &str,
-    hidden_size: usize,
-) -> GemmaEmbeddingTensorSource {
-    let scale = (hidden_size as f32).sqrt();
-    match &reader.source {
-        GemmaModelSource::Single { weights_path, .. } => GemmaEmbeddingTensorSource::Single {
-            weights_path: weights_path.clone(),
-            tensor_name: tensor_name.to_string(),
-            hidden_size,
-            scale,
-        },
-        GemmaModelSource::Indexed { root_dir, index } => GemmaEmbeddingTensorSource::Indexed {
-            root_dir: root_dir.clone(),
-            weight_map: index.weight_map.clone(),
-            tensor_name: tensor_name.to_string(),
-            hidden_size,
-            scale,
-        },
-    }
-}
-
-fn resolve_gemma_model_source(path: &Path) -> Result<GemmaModelSource> {
-    if path.is_dir() {
-        let index_path = path.join("model.safetensors.index.json");
-        if index_path.is_file() {
-            return Ok(GemmaModelSource::Indexed {
-                root_dir: path.to_path_buf(),
-                index: load_safetensors_index(&index_path)?,
-            });
-        }
-
-        for filename in ["model.safetensors", "consolidated.safetensors"] {
-            let candidate = path.join(filename);
-            if candidate.is_file() {
-                return Ok(GemmaModelSource::Single {
-                    root_dir: path.to_path_buf(),
-                    weights_path: candidate,
-                });
-            }
-        }
-    }
-
-    if path.extension().is_some_and(|ext| ext == "json") {
-        return Ok(GemmaModelSource::Indexed {
-            root_dir: path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-            index: load_safetensors_index(path)?,
-        });
-    }
-
-    if path.extension().is_some_and(|ext| ext == "safetensors") {
-        return Ok(GemmaModelSource::Single {
-            root_dir: path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-            weights_path: path.to_path_buf(),
-        });
-    }
-
-    bail!(
-        "unsupported model path {}: expected a model directory, .safetensors file, or model.safetensors.index.json",
-        path.display()
-    )
 }
 
 fn resolve_det_num_model_source(path: &Path) -> Result<DetNumModelSource> {
@@ -2246,52 +1718,12 @@ fn resolve_det_num_model_source(path: &Path) -> Result<DetNumModelSource> {
     )
 }
 
-fn load_safetensors_index(path: &Path) -> Result<SafetensorsIndex> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read index file {}", path.display()))?;
-    serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse index JSON from {}", path.display()))
-}
-
 fn load_gemma_text_config(path: PathBuf) -> Result<GemmaTextConfigFile> {
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("failed to read Gemma config from {}", path.display()))?;
     let config: GemmaConfigFile = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse Gemma config from {}", path.display()))?;
     Ok(config.text_config)
-}
-
-fn load_full_embedding_table_from_source(
-    source: &GemmaEmbeddingTensorSource,
-) -> Result<EmbeddingTable> {
-    let matrix = match source {
-        GemmaEmbeddingTensorSource::Deterministic { source, .. } => {
-            let file = File::open(&source.weights_path).with_context(|| {
-                format!(
-                    "failed to open deterministic artifact {}",
-                    source.weights_path.display()
-                )
-            })?;
-            let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
-                format!(
-                    "failed to mmap deterministic artifact {}",
-                    source.weights_path.display()
-                )
-            })?;
-            decode_matrix_slice_from_det_num_source(source, &mmap)?
-        }
-        _ => with_embedding_tensor(source, |tensor| decode_matrix(tensor))?,
-    };
-
-    let mut rows = Vec::with_capacity(matrix.rows);
-    for row_idx in 0..matrix.rows {
-        rows.push(matrix.values[row_idx * matrix.cols..(row_idx + 1) * matrix.cols].to_vec());
-    }
-
-    Ok(EmbeddingTable {
-        rows,
-        scale: source.scale(),
-    })
 }
 
 pub(crate) fn materialize_det_num_embedding_matrix(
@@ -2332,124 +1764,12 @@ pub(crate) fn materialize_det_num_embedding_matrix(
     Ok(Some(matrix))
 }
 
-fn with_embedding_tensor<T>(
-    source: &GemmaEmbeddingTensorSource,
-    f: impl FnOnce(&TensorView<'_>) -> Result<T>,
-) -> Result<T> {
-    let path = match source {
-        GemmaEmbeddingTensorSource::Single { weights_path, .. } => weights_path.clone(),
-        GemmaEmbeddingTensorSource::Indexed {
-            root_dir,
-            weight_map,
-            tensor_name,
-            ..
-        } => root_dir.join(
-            weight_map
-                .get(tensor_name)
-                .ok_or_else(|| anyhow!("failed to locate tensor {tensor_name} in weight map"))?,
-        ),
-        GemmaEmbeddingTensorSource::Deterministic { .. } => {
-            bail!("deterministic embedding sources are not backed by safetensors tensors")
-        }
-    };
-
-    let file = File::open(&path)
-        .with_context(|| format!("failed to open safetensors file {}", path.display()))?;
-    let mmap = unsafe { Mmap::map(&file) }
-        .with_context(|| format!("failed to mmap safetensors file {}", path.display()))?;
-    let safetensors = SafeTensors::deserialize(mmap.as_ref())
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("failed to deserialize safetensors file {}", path.display()))?;
-
-    let tensor_name = match source {
-        GemmaEmbeddingTensorSource::Single { tensor_name, .. }
-        | GemmaEmbeddingTensorSource::Indexed { tensor_name, .. } => tensor_name.as_str(),
-        GemmaEmbeddingTensorSource::Deterministic { .. } => {
-            bail!("deterministic embedding sources are not backed by safetensors tensors")
-        }
-    };
-
-    let tensor = safetensors
-        .tensor(tensor_name)
-        .map_err(anyhow::Error::msg)
-        .with_context(|| {
-            format!(
-                "failed to load tensor {tensor_name} from {}",
-                path.display()
-            )
-        })?;
-
-    f(&tensor)
-}
-
-fn decode_embedding_rows_for_token_ids(
-    tensor: &impl TensorBytes,
-    token_ids: &[u32],
-    hidden_size: usize,
-    scale: f32,
-    execution_mode: InferenceExecutionMode,
-) -> Result<InternalActivationSequence> {
-    let shape = tensor.shape();
-    if shape.len() != 2 {
-        bail!("expected rank-2 embedding tensor, got shape {shape:?}");
-    }
-    if shape[1] != hidden_size {
-        bail!(
-            "embedding tensor width mismatch: expected {hidden_size}, got {}",
-            shape[1]
-        );
-    }
-
-    let bytes_per_scalar = bytes_per_scalar(tensor.dtype())?;
-    let row_bytes = hidden_size
-        .checked_mul(bytes_per_scalar)
-        .ok_or_else(|| anyhow!("embedding row byte size overflowed"))?;
-
-    let mut activations = Vec::with_capacity(token_ids.len());
-    let mut acts = Vec::with_capacity(token_ids.len());
-    for token_id in token_ids {
-        let row_idx = usize::try_from(*token_id).expect("u32 should fit into usize");
-        if row_idx >= shape[0] {
-            bail!("token id {token_id} is out of bounds for embedding tensor");
-        }
-        let encoded_row = &tensor.data()[row_idx * row_bytes..(row_idx + 1) * row_bytes];
-        let row = if tensor.dtype() == Dtype::F32 {
-            decode_f32_bytes_to_vec(encoded_row)?
-        } else {
-            let mut row = Vec::with_capacity(hidden_size);
-            for encoded_value in encoded_row.chunks_exact(bytes_per_scalar) {
-                row.push(decode_scalar(encoded_value, tensor.dtype())?);
-            }
-            row
-        };
-        match execution_mode {
-            InferenceExecutionMode::Fp32 => {
-                activations.push(row.into_iter().map(|value| value * scale).collect());
-            }
-            InferenceExecutionMode::Deterministic => {
-                acts.push(scale_act_row(
-                    row.into_iter().map(f32_to_act).collect(),
-                    scale,
-                ));
-            }
-        }
-    }
-
-    Ok(match execution_mode {
-        InferenceExecutionMode::Fp32 => InternalActivationSequence::from_values(activations),
-        InferenceExecutionMode::Deterministic => {
-            InternalActivationSequence::from_det_values_only(acts)
-        }
-    })
-}
-
 fn decode_embedding_rows_for_token_ids_from_det_num(
     source: &DetNumTensorSliceSource,
     token_ids: &[u32],
     hidden_size: usize,
     scale: f32,
     mmap: &Mmap,
-    execution_mode: InferenceExecutionMode,
 ) -> Result<InternalActivationSequence> {
     if source.row_offset != 0
         || source.row_count != source.total_rows
@@ -2468,7 +1788,6 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
     let row_bytes = hidden_size
         .checked_mul(source.element_width.byte_width())
         .ok_or_else(|| anyhow!("embedding row byte size overflowed"))?;
-    let mut activations = Vec::with_capacity(token_ids.len());
     let mut acts = Vec::with_capacity(token_ids.len());
     for token_id in token_ids {
         let row_idx = usize::try_from(*token_id).expect("u32 should fit into usize");
@@ -2486,28 +1805,11 @@ fn decode_embedding_rows_for_token_ids_from_det_num(
             .get(start..end)
             .ok_or_else(|| anyhow!("embedding row byte range is out of bounds"))?;
         let row_bits = decode_wgt_bits_le(encoded_row, source.element_width)?;
-        match execution_mode {
-            InferenceExecutionMode::Fp32 => {
-                activations.push(
-                    row_bits
-                        .into_iter()
-                        .map(|bits| det_wgt_to_f32(bits) * scale)
-                        .collect(),
-                );
-            }
-            InferenceExecutionMode::Deterministic => {
-                let row = row_bits.into_iter().map(Act::from_bits).collect();
-                acts.push(scale_act_row(row, scale));
-            }
-        }
+        let row = row_bits.into_iter().map(Act::from_bits).collect();
+        acts.push(scale_act_row(row, scale));
     }
 
-    Ok(match execution_mode {
-        InferenceExecutionMode::Fp32 => InternalActivationSequence::from_values(activations),
-        InferenceExecutionMode::Deterministic => {
-            InternalActivationSequence::from_det_values_only(acts)
-        }
-    })
+    Ok(InternalActivationSequence::from_det_values_only(acts))
 }
 
 fn scale_act_row(row: Vec<Act>, scale: f32) -> Vec<Act> {
@@ -2515,16 +1817,6 @@ fn scale_act_row(row: Vec<Act>, scale: f32) -> Vec<Act> {
     row.into_iter()
         .map(|value| scale_act(value, scale))
         .collect()
-}
-
-fn build_activation_commitment(activations: &[Vec<f32>]) -> String {
-    let mut hasher = sha2::Sha256::new();
-    for row in activations {
-        for value in row {
-            hasher.update(value.to_le_bytes());
-        }
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]

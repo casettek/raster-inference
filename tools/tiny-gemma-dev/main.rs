@@ -9,12 +9,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use raster_inference::shared::numerics::det_num::{
     encode_det_wgt_artifact, f32_to_wgt, DetWgtTensorSpec,
 };
-use safetensors::tensor::{serialize_to_file, TensorView};
 use serde_json::json;
 
 const DEFAULT_OUTPUT_DIR: &str = "assets/tiny-gemma-dev";
 const CONFIG_FILENAME: &str = "config.json";
-const FP32_WEIGHTS_FILENAME: &str = "model.safetensors";
 const DET_WEIGHTS_FILENAME: &str = "model.detwgt";
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
 const CHAT_TEMPLATE_FILENAME: &str = "chat_template.jinja";
@@ -46,7 +44,6 @@ fn run() -> Result<()> {
         summary.tensor_count,
         summary.output_dir.display()
     );
-    println!("FP32 weights: {}", summary.fp32_weights_path.display());
     println!(
         "Deterministic weights: {}",
         summary.det_weights_path.display()
@@ -95,7 +92,6 @@ impl CliArgs {
 struct GenerationSummary {
     output_dir: PathBuf,
     tensor_count: usize,
-    fp32_weights_path: PathBuf,
     det_weights_path: PathBuf,
     tokenizer_path: PathBuf,
 }
@@ -118,14 +114,12 @@ fn write_tiny_gemma_dev_bundle(args: &CliArgs) -> Result<GenerationSummary> {
 
     let tensors = tiny_model_tensors();
     let config_path = args.output_dir.join(CONFIG_FILENAME);
-    let fp32_weights_path = args.output_dir.join(FP32_WEIGHTS_FILENAME);
     let det_weights_path = args.output_dir.join(DET_WEIGHTS_FILENAME);
     let tokenizer_path = args.output_dir.join(TOKENIZER_FILENAME);
     let chat_template_path = args.output_dir.join(CHAT_TEMPLATE_FILENAME);
 
     fs::write(&config_path, tiny_config_json())
         .with_context(|| format!("failed to write {}", config_path.display()))?;
-    write_fp32_model_file(&fp32_weights_path, &tensors)?;
     write_detwgt_file(&det_weights_path, &tensors)?;
     fs::write(&tokenizer_path, tiny_gemma_tokenizer_json())
         .with_context(|| format!("failed to write {}", tokenizer_path.display()))?;
@@ -138,7 +132,6 @@ fn write_tiny_gemma_dev_bundle(args: &CliArgs) -> Result<GenerationSummary> {
     Ok(GenerationSummary {
         output_dir: args.output_dir.clone(),
         tensor_count: tensors.len(),
-        fp32_weights_path,
         det_weights_path,
         tokenizer_path,
     })
@@ -169,7 +162,6 @@ fn prepare_output_dir(output_dir: &Path, force: bool) -> Result<()> {
     if force {
         for filename in [
             CONFIG_FILENAME,
-            FP32_WEIGHTS_FILENAME,
             DET_WEIGHTS_FILENAME,
             TOKENIZER_FILENAME,
             CHAT_TEMPLATE_FILENAME,
@@ -514,26 +506,6 @@ fn pattern_values(len: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-fn write_fp32_model_file(path: &Path, tensors: &[FixtureTensor]) -> Result<()> {
-    let byte_storage = tensors
-        .iter()
-        .map(|tensor| f32_to_bytes(&tensor.values))
-        .collect::<Vec<_>>();
-    let mut metadata = BTreeMap::new();
-    for (tensor, bytes) in tensors.iter().zip(byte_storage.iter()) {
-        metadata.insert(
-            tensor.name.clone(),
-            TensorView::new(safetensors::Dtype::F32, tensor.shape.clone(), bytes)
-                .map_err(anyhow::Error::msg)
-                .with_context(|| format!("failed to build tensor view for `{}`", tensor.name))?,
-        );
-    }
-    serialize_to_file(&metadata, &None, path)
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
 fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) -> Result<()> {
     let specs = tensors
         .iter()
@@ -552,11 +524,4 @@ fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) -> Result<()> {
     fs::write(path, bytes)
         .with_context(|| format!("failed to write deterministic artifact {}", path.display()))?;
     Ok(())
-}
-
-fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
 }

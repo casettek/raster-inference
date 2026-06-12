@@ -1,19 +1,16 @@
 use super::{
-    decode_embedding_rows_for_token_ids, decode_embedding_rows_for_token_ids_from_det_num,
-    decode_matrix_row_from_source, decode_matrix_slice_from_source, decode_single_scalar,
-    decode_vector, load_ple_model_projection, load_ple_token_embedding_row_internal,
-    load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, parse_gemma_tokenizer_spec_bytes,
+    decode_embedding_rows_for_token_ids_from_det_num, decode_matrix_row_from_source,
+    decode_matrix_slice_from_source, decode_single_scalar, decode_vector,
+    load_transformer_state_model_from_det_num_wgt_path, parse_gemma_tokenizer_spec_bytes,
     parse_safetensors_metadata,
 };
 use crate::io::decode_matrix_slice;
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::model::transformer::DetNumTensorSliceSource;
 use crate::shared::numerics::det_num::{
     f32_to_wgt, wgt_to_le_bytes, Act, DetWgtElementWidth, DetWgtTensorSpec, DET_NUM_SPEC_VERSION,
     DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
-use crate::shared::model::transformer::{Gemma4AttentionKind, Gemma4LogitsProjection};
+use crate::shared::model::transformer::Gemma4LogitsProjection;
 use memmap2::Mmap;
 use safetensors::tensor::{serialize_to_file, TensorView};
 use std::{
@@ -77,42 +74,6 @@ fn decode_vector_and_scalar_copy_f32_values_directly() {
 
     assert_eq!(decode_vector(&vector).unwrap(), vec![1.25, -2.5, 3.75]);
     assert_eq!(decode_single_scalar(&scalar).unwrap(), 9.5);
-}
-
-#[test]
-fn decode_embedding_rows_for_token_ids_applies_scale_after_f32_copy() {
-    let bytes = f32_to_bytes(&[1.0, 2.0, -3.0, 4.0, 5.0, -6.0]);
-    let tensor = TensorView::new(safetensors::Dtype::F32, vec![3, 2], &bytes).unwrap();
-
-    let rows =
-        decode_embedding_rows_for_token_ids(&tensor, &[2, 0], 2, 0.5, InferenceExecutionMode::Fp32)
-            .unwrap();
-
-    assert_eq!(rows.clone_f32(), vec![vec![2.5, -3.0], vec![0.5, 1.0]]);
-}
-
-#[test]
-fn decode_embedding_rows_for_token_ids_requantizes_scale_on_deterministic_path() {
-    let bytes = f32_to_bytes(&[1.0 / 65_536.0]);
-    let tensor = TensorView::new(safetensors::Dtype::F32, vec![1, 1], &bytes).unwrap();
-
-    let fp32 =
-        decode_embedding_rows_for_token_ids(&tensor, &[0], 1, 0.5, InferenceExecutionMode::Fp32)
-            .unwrap();
-    let det = decode_embedding_rows_for_token_ids(
-        &tensor,
-        &[0],
-        1,
-        0.5,
-        InferenceExecutionMode::Deterministic,
-    )
-    .unwrap();
-
-    // Single-track deterministic embedding: no f32 mirror, requantized
-    // scale collapses the sub-resolution value to canonical zero.
-    assert!(det.as_f32_slice().is_empty());
-    assert_eq!(det.det_values().unwrap()[0][0].to_bits(), 0);
-    assert!(fp32.as_f32_slice()[0][0] > 0.0);
 }
 
 #[test]
@@ -209,15 +170,8 @@ fn decode_det_num_embedding_rows_preserves_raw_act_bits() {
         col_count: 1,
     };
 
-    let decoded = decode_embedding_rows_for_token_ids_from_det_num(
-        &source,
-        &[0],
-        1,
-        1.0,
-        &mmap,
-        InferenceExecutionMode::Deterministic,
-    )
-    .unwrap();
+    let decoded =
+        decode_embedding_rows_for_token_ids_from_det_num(&source, &[0], 1, 1.0, &mmap).unwrap();
 
     assert_eq!(decoded.det_values().unwrap()[0][0], canonical);
     // Single-track deterministic embedding: no f32 mirror is materialized.
@@ -266,86 +220,7 @@ fn decode_lazy_f32_ple_rows_and_slices() {
 }
 
 #[test]
-fn load_transformer_model_loads_arbitrary_layers_and_untied_lm_head() {
-    let model_dir = create_test_model_dir("untied");
-    write_config(
-        &model_dir,
-        r#"{
-  "text_config": {
-    "enable_moe_block": false,
-    "final_logit_softcapping": 7.5,
-    "global_head_dim": 2,
-    "head_dim": 2,
-    "hidden_activation": "gelu_pytorch_tanh",
-    "hidden_size": 4,
-    "layer_types": ["sliding_attention", "full_attention"],
-    "num_global_key_value_heads": 1,
-    "num_attention_heads": 2,
-    "num_hidden_layers": 2,
-    "num_key_value_heads": 1,
-    "rms_norm_eps": 0.000001,
-    "rope_parameters": {
-      "full_attention": { "partial_rotary_factor": 1.0, "rope_theta": 12345.0 },
-      "sliding_attention": { "rope_theta": 10000.0 }
-    },
-    "sliding_window": 5,
-    "tie_word_embeddings": false,
-    "vocab_size": 3,
-    "attention_k_eq_v": true
-  }
-}"#,
-    );
-    let mut tensors = vec![matrix_tensor(
-        "model.language_model.embed_tokens.weight",
-        &[3, 4],
-        &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
-    )];
-    tensors.extend(layer_tensors(0, 1.0, true));
-    tensors.extend(layer_tensors(1, 2.0, false));
-    tensors.push(vector_tensor(
-        "model.language_model.norm.weight",
-        &[4],
-        &[1.0, 1.0, 1.0, 1.0],
-    ));
-    tensors.push(matrix_tensor(
-        "model.language_model.lm_head.weight",
-        &[3, 4],
-        &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-    ));
-    tensors.push(scalar_tensor(
-        "model.language_model.layers.1.layer_scalar",
-        0.5,
-    ));
-    write_model_file(&model_dir, &tensors);
-
-    let model = load_transformer_state_model_from_gemma_model_path(&model_dir).unwrap();
-    let first_layer = crate::io::resolve_layer_weights(&model.layers[0]).unwrap();
-    let second_layer = crate::io::resolve_layer_weights(&model.layers[1]).unwrap();
-
-    assert_eq!(model.layers.len(), 2);
-    assert_eq!(model.layers[0].attention_kind, Gemma4AttentionKind::Sliding);
-    assert_eq!(model.layers[1].attention_kind, Gemma4AttentionKind::Full);
-    assert_eq!(model.layers[0].rope_freq_base_dim, 2);
-    assert_eq!(model.layers[1].rope_freq_base_dim, 2);
-    assert_eq!(first_layer.q_proj.values[0], 1.0);
-    assert_eq!(second_layer.q_proj.values[0], 2.0);
-    assert!(second_layer.v_proj.is_none());
-    assert_eq!(model.layers[1].layer_scalar, Some(0.5));
-    assert_eq!(model.final_norm_weight, vec![1.0, 1.0, 1.0, 1.0]);
-    assert_eq!(model.final_logit_softcapping, Some(7.5));
-    match &model.logits_projection {
-        Gemma4LogitsProjection::UntiedLmHead { weight, det_weight } => {
-            assert_eq!(weight.rows, 3);
-            assert_eq!(weight.cols, 4);
-            assert!(det_weight.is_none());
-        }
-        other => panic!("expected untied lm head, got {other:?}"),
-    }
-}
-
-#[test]
 fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_attention_and_mlp_projections() {
-    let fp32_dir = create_test_model_dir("fp32-mlp-proj");
     let det_dir = create_test_model_dir("det-mlp-proj");
     let config = r#"{
   "text_config": {
@@ -363,7 +238,6 @@ fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_attention_and_mlp
     "vocab_size": 3
   }
 }"#;
-    write_config(&fp32_dir, config);
     write_config(&det_dir, config);
 
     let q_proj_values = [
@@ -391,87 +265,6 @@ fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_attention_and_mlp
         0.5, -0.25, 0.125, 0.0, 1.0, -1.0, 0.75, -0.5, 0.25, 0.5, -0.75, 0.0, 0.5, 0.25, -0.125,
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     ];
-    write_model_file(
-        &fp32_dir,
-        &[
-            matrix_tensor(
-                "model.language_model.embed_tokens.weight",
-                &[3, 4],
-                &[0.0; 12],
-            ),
-            matrix_tensor(
-                "model.language_model.layers.0.self_attn.q_proj.weight",
-                &[4, 4],
-                &q_proj_values,
-            ),
-            matrix_tensor(
-                "model.language_model.layers.0.self_attn.k_proj.weight",
-                &[2, 4],
-                &k_proj_values,
-            ),
-            matrix_tensor(
-                "model.language_model.layers.0.self_attn.v_proj.weight",
-                &[2, 4],
-                &v_proj_values,
-            ),
-            matrix_tensor(
-                "model.language_model.layers.0.self_attn.o_proj.weight",
-                &[4, 4],
-                &o_proj_values,
-            ),
-            vector_tensor(
-                "model.language_model.layers.0.self_attn.q_norm.weight",
-                &[2],
-                &[1.0, 1.0],
-            ),
-            vector_tensor(
-                "model.language_model.layers.0.self_attn.k_norm.weight",
-                &[2],
-                &[1.0, 1.0],
-            ),
-            vector_tensor(
-                "model.language_model.layers.0.input_layernorm.weight",
-                &[4],
-                &[1.0; 4],
-            ),
-            vector_tensor(
-                "model.language_model.layers.0.post_attention_layernorm.weight",
-                &[4],
-                &[1.0; 4],
-            ),
-            vector_tensor(
-                "model.language_model.layers.0.pre_feedforward_layernorm.weight",
-                &[4],
-                &[1.0; 4],
-            ),
-            vector_tensor(
-                "model.language_model.layers.0.post_feedforward_layernorm.weight",
-                &[4],
-                &[1.0; 4],
-            ),
-            matrix_tensor(
-                "model.language_model.layers.0.mlp.gate_proj.weight",
-                &[8, 4],
-                &gate_proj_values,
-            ),
-            matrix_tensor(
-                "model.language_model.layers.0.mlp.up_proj.weight",
-                &[8, 4],
-                &up_proj_values,
-            ),
-            matrix_tensor(
-                "model.language_model.layers.0.mlp.down_proj.weight",
-                &[4, 8],
-                &down_proj_values,
-            ),
-            vector_tensor("model.language_model.norm.weight", &[4], &[1.0; 4]),
-            matrix_tensor(
-                "model.language_model.lm_head.weight",
-                &[3, 4],
-                &lm_head_values,
-            ),
-        ],
-    );
     write_detwgt_file(
         &det_dir,
         &[
@@ -554,17 +347,8 @@ fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_attention_and_mlp
         ],
     );
 
-    let fp32_model = load_transformer_state_model_from_gemma_model_path(&fp32_dir).unwrap();
     let det_model = load_transformer_state_model_from_det_num_wgt_path(&det_dir).unwrap();
-    let fp32_layer = super::resolve_layer_weights(&fp32_model.layers[0]).unwrap();
     let det_layer = super::resolve_layer_weights(&det_model.layers[0]).unwrap();
-    let fp32_lm_head = match &fp32_model.logits_projection {
-        Gemma4LogitsProjection::UntiedLmHead { weight, det_weight } => {
-            assert!(det_weight.is_none());
-            weight
-        }
-        other => panic!("expected untied lm head, got {other:?}"),
-    };
     let det_lm_head = match &det_model.logits_projection {
         Gemma4LogitsProjection::UntiedLmHead { weight, det_weight } => {
             assert_eq!(weight.rows, 3);
@@ -576,13 +360,6 @@ fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_attention_and_mlp
         other => panic!("expected untied lm head, got {other:?}"),
     };
 
-    assert!(fp32_layer.q_proj_det.is_none());
-    assert!(fp32_layer.k_proj_det.is_none());
-    assert!(fp32_layer.v_proj_det.is_none());
-    assert!(fp32_layer.o_proj_det.is_none());
-    assert!(fp32_layer.gate_proj_det.is_none());
-    assert!(fp32_layer.up_proj_det.is_none());
-    assert!(fp32_layer.down_proj_det.is_none());
     let det_q_proj = det_layer
         .q_proj_det
         .expect("deterministic model should retain raw q_proj weights");
@@ -644,7 +421,6 @@ fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_attention_and_mlp
         det_o_proj.values.wgt_bits(1),
         f32_to_wgt(o_proj_values[1]).to_bits()
     );
-    assert_eq!(fp32_lm_head.values[0], lm_head_values[0]);
     assert_eq!(det_lm_head.rows, 3);
     assert_eq!(det_lm_head.cols, 4);
     assert_eq!(
@@ -689,7 +465,6 @@ fn resolve_layer_weights_only_attaches_raw_det_weights_for_det_attention_and_mlp
 
 #[test]
 fn resolve_layer_weights_and_ple_globals_attach_raw_det_ple_weights() {
-    let fp32_dir = create_test_model_dir("fp32-ple-proj");
     let det_dir = create_test_model_dir("det-ple-proj");
     let config = r#"{
   "text_config": {
@@ -709,60 +484,11 @@ fn resolve_layer_weights_and_ple_globals_attach_raw_det_ple_weights() {
     "vocab_size_per_layer_input": 3
   }
 }"#;
-    write_config(&fp32_dir, config);
     write_config(&det_dir, config);
 
     let input_gate_values = [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let layer_projection_values = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let global_projection_values = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
-    let mut fp32_tensors = vec![matrix_tensor(
-        "model.language_model.embed_tokens.weight",
-        &[3, 4],
-        &[0.0; 12],
-    )];
-    fp32_tensors.extend(layer_tensors(0, 0.0, true));
-    fp32_tensors.push(matrix_tensor(
-        "model.language_model.layers.0.per_layer_input_gate.weight",
-        &[2, 4],
-        &input_gate_values,
-    ));
-    fp32_tensors.push(matrix_tensor(
-        "model.language_model.layers.0.per_layer_projection.weight",
-        &[4, 2],
-        &layer_projection_values,
-    ));
-    fp32_tensors.push(matrix_tensor(
-        "model.language_model.embed_tokens_per_layer.weight",
-        &[3, 2],
-        &[0.0; 6],
-    ));
-    fp32_tensors.push(matrix_tensor(
-        "model.language_model.per_layer_model_projection.weight",
-        &[2, 4],
-        &global_projection_values,
-    ));
-    fp32_tensors.push(vector_tensor(
-        "model.language_model.layers.0.post_per_layer_input_norm.weight",
-        &[4],
-        &[1.0; 4],
-    ));
-    fp32_tensors.push(vector_tensor(
-        "model.language_model.per_layer_projection_norm.weight",
-        &[2],
-        &[1.0, 1.0],
-    ));
-    fp32_tensors.push(vector_tensor(
-        "model.language_model.norm.weight",
-        &[4],
-        &[1.0; 4],
-    ));
-    fp32_tensors.push(matrix_tensor(
-        "model.language_model.lm_head.weight",
-        &[3, 4],
-        &[0.0; 12],
-    ));
-    write_model_file(&fp32_dir, &fp32_tensors);
 
     let mut det_tensors = vec![det_matrix_tensor(
         "model.language_model.embed_tokens.weight",
@@ -870,11 +596,8 @@ fn resolve_layer_weights_and_ple_globals_attach_raw_det_ple_weights() {
     ]);
     write_detwgt_file(&det_dir, &det_tensors);
 
-    let fp32_model = load_transformer_state_model_from_gemma_model_path(&fp32_dir).unwrap();
     let det_model = load_transformer_state_model_from_det_num_wgt_path(&det_dir).unwrap();
-    let fp32_layer = super::resolve_layer_weights(&fp32_model.layers[0]).unwrap();
     let det_layer = super::resolve_layer_weights(&det_model.layers[0]).unwrap();
-    let fp32_ple = fp32_layer.ple.expect("fp32 PLE should resolve");
     let det_ple = det_layer.ple.expect("det PLE should resolve");
     let det_global_projection = super::materialize_det_num_ple_model_projection(
         det_model
@@ -886,8 +609,6 @@ fn resolve_layer_weights_and_ple_globals_attach_raw_det_ple_weights() {
     .unwrap()
     .expect("det PLE model projection should materialize");
 
-    assert!(fp32_ple.input_gate_det.is_none());
-    assert!(fp32_ple.layer_projection_det.is_none());
     assert_eq!(det_ple.input_gate_det.as_ref().unwrap().rows, 2);
     assert_eq!(det_ple.input_gate_det.as_ref().unwrap().cols, 4);
     assert_eq!(
@@ -911,226 +632,6 @@ fn resolve_layer_weights_and_ple_globals_attach_raw_det_ple_weights() {
         det_global_projection.values.wgt_bits(0),
         f32_to_wgt(global_projection_values[0]).to_bits()
     );
-}
-
-#[test]
-fn load_transformer_model_reuses_embeddings_for_tied_projection() {
-    let model_dir = create_test_model_dir("tied");
-    write_config(
-        &model_dir,
-        r#"{
-  "text_config": {
-    "enable_moe_block": false,
-    "head_dim": 2,
-    "hidden_activation": "gelu_pytorch_tanh",
-    "hidden_size": 4,
-    "layer_types": ["sliding_attention"],
-    "num_attention_heads": 2,
-    "num_hidden_layers": 1,
-    "num_key_value_heads": 1,
-    "rms_norm_eps": 0.000001,
-    "sliding_window": 5,
-    "tie_word_embeddings": true,
-    "vocab_size": 3
-  }
-}"#,
-    );
-    let mut tensors = vec![matrix_tensor(
-        "model.language_model.embed_tokens.weight",
-        &[3, 4],
-        &[
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-        ],
-    )];
-    tensors.extend(layer_tensors(0, 1.0, true));
-    tensors.push(vector_tensor(
-        "model.language_model.norm.weight",
-        &[4],
-        &[1.0, 1.0, 1.0, 1.0],
-    ));
-    write_model_file(&model_dir, &tensors);
-
-    let model = load_transformer_state_model_from_gemma_model_path(&model_dir).unwrap();
-
-    match &model.logits_projection {
-        Gemma4LogitsProjection::TiedEmbedding(weight) => {
-            assert_eq!(weight.rows, 3);
-            assert_eq!(weight.cols, 4);
-            assert_eq!(weight.values[0], 1.0);
-            assert_eq!(weight.values[11], 12.0);
-        }
-        other => panic!("expected tied embedding projection, got {other:?}"),
-    }
-}
-
-#[test]
-fn load_transformer_model_builds_lazy_ple_sources() {
-    let model_dir = create_test_model_dir("lazy-ple");
-    write_config(
-        &model_dir,
-        r#"{
-  "text_config": {
-    "enable_moe_block": false,
-    "head_dim": 2,
-    "hidden_activation": "gelu_pytorch_tanh",
-    "hidden_size": 4,
-    "hidden_size_per_layer_input": 2,
-    "layer_types": ["sliding_attention"],
-    "num_attention_heads": 2,
-    "num_hidden_layers": 1,
-    "num_key_value_heads": 1,
-    "rms_norm_eps": 0.000001,
-    "sliding_window": 5,
-    "tie_word_embeddings": true,
-    "vocab_size": 3,
-    "vocab_size_per_layer_input": 3
-  }
-}"#,
-    );
-    let mut tensors = vec![matrix_tensor(
-        "model.language_model.embed_tokens.weight",
-        &[3, 4],
-        &[
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-        ],
-    )];
-    tensors.extend(layer_tensors(0, 1.0, true));
-    tensors.extend(ple_layer_tensors(0, 1.0));
-    tensors.push(matrix_tensor(
-        "model.language_model.embed_tokens_per_layer.weight",
-        &[3, 2],
-        &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-    ));
-    tensors.push(matrix_tensor(
-        "model.language_model.per_layer_model_projection.weight",
-        &[2, 4],
-        &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-    ));
-    tensors.push(vector_tensor(
-        "model.language_model.per_layer_projection_norm.weight",
-        &[2],
-        &[1.0, 1.0],
-    ));
-    tensors.push(vector_tensor(
-        "model.language_model.norm.weight",
-        &[4],
-        &[1.0, 1.0, 1.0, 1.0],
-    ));
-    write_model_file(&model_dir, &tensors);
-
-    let model = load_transformer_state_model_from_gemma_model_path(&model_dir).unwrap();
-    let ple_global = model.ple_global.as_ref().expect("PLE globals should load");
-
-    assert_eq!(ple_global.token_embedding_layer_count(), 1);
-    assert_eq!(ple_global.model_projection_layer_count(), 1);
-    assert_eq!(ple_global.projection_norm_weight, vec![1.0, 1.0]);
-    assert_eq!(ple_global.embedding_scale, 2f32.sqrt());
-    assert_eq!(
-        load_ple_token_embedding_row_internal(ple_global, 0, 1)
-            .unwrap()
-            .clone_f32(),
-        vec![0.3, 0.4]
-    );
-    let projection = load_ple_model_projection(ple_global, 0).unwrap();
-    assert_eq!(projection.rows, 2);
-    assert_eq!(projection.cols, 4);
-    assert_eq!(
-        projection.values,
-        vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-    );
-}
-
-#[test]
-fn load_transformer_model_parses_effective_window_and_kv_sharing_metadata() {
-    let model_dir = create_test_model_dir("shared-kv");
-    write_config(
-        &model_dir,
-        r#"{
-  "text_config": {
-    "enable_moe_block": false,
-    "head_dim": 2,
-    "hidden_activation": "gelu_pytorch_tanh",
-    "hidden_size": 4,
-    "layer_types": ["sliding_attention", "sliding_attention"],
-    "num_attention_heads": 2,
-    "num_hidden_layers": 2,
-    "num_key_value_heads": 1,
-    "num_kv_shared_layers": 1,
-    "rms_norm_eps": 0.000001,
-    "sliding_window": 5,
-    "tie_word_embeddings": true,
-    "use_bidirectional_attention": "all",
-    "vocab_size": 3
-  }
-}"#,
-    );
-    let mut tensors = vec![matrix_tensor(
-        "model.language_model.embed_tokens.weight",
-        &[3, 4],
-        &[
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-        ],
-    )];
-    tensors.extend(layer_tensors(0, 1.0, true));
-    tensors.extend(layer_tensors(1, 2.0, true));
-    tensors.push(vector_tensor(
-        "model.language_model.norm.weight",
-        &[4],
-        &[1.0, 1.0, 1.0, 1.0],
-    ));
-    write_model_file(&model_dir, &tensors);
-
-    let model = load_transformer_state_model_from_gemma_model_path(&model_dir).unwrap();
-
-    assert_eq!(model.layers[0].sliding_window, Some(3));
-    assert_eq!(model.layers[0].cache_sliding_window, None);
-    assert_eq!(model.layers[0].kv_shared_layer_index, None);
-    assert_eq!(model.layers[1].sliding_window, Some(3));
-    assert_eq!(model.layers[1].kv_shared_layer_index, Some(0));
-}
-
-#[test]
-fn load_transformer_model_rejects_kv_sharing_without_a_donor_layer() {
-    let model_dir = create_test_model_dir("invalid-shared-kv");
-    write_config(
-        &model_dir,
-        r#"{
-  "text_config": {
-    "enable_moe_block": false,
-    "head_dim": 2,
-    "hidden_activation": "gelu_pytorch_tanh",
-    "hidden_size": 4,
-    "layer_types": ["sliding_attention"],
-    "num_attention_heads": 2,
-    "num_hidden_layers": 1,
-    "num_key_value_heads": 1,
-    "num_kv_shared_layers": 1,
-    "rms_norm_eps": 0.000001,
-    "sliding_window": 5,
-    "tie_word_embeddings": true,
-    "vocab_size": 3
-  }
-}"#,
-    );
-    let mut tensors = vec![matrix_tensor(
-        "model.language_model.embed_tokens.weight",
-        &[3, 4],
-        &[
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-        ],
-    )];
-    tensors.extend(layer_tensors(0, 1.0, true));
-    tensors.push(vector_tensor(
-        "model.language_model.norm.weight",
-        &[4],
-        &[1.0, 1.0, 1.0, 1.0],
-    ));
-    write_model_file(&model_dir, &tensors);
-
-    let error = load_transformer_state_model_from_gemma_model_path(&model_dir)
-        .expect_err("missing donor should fail");
-
-    assert!(error.to_string().contains("share KV without a prior"));
 }
 
 fn create_test_model_dir(suffix: &str) -> PathBuf {
@@ -1266,109 +767,6 @@ fn write_detwgt_file(dir: &Path, tensors: &[FixtureTensor]) {
     fs::write(dir.join("model.detwgt"), bytes).unwrap();
 }
 
-fn layer_tensors(layer_idx: usize, base: f32, include_v_proj: bool) -> Vec<FixtureTensor> {
-    let prefix = format!("model.language_model.layers.{layer_idx}");
-    let mut tensors = vec![
-        matrix_tensor(
-            &format!("{prefix}.self_attn.q_proj.weight"),
-            &[4, 4],
-            &[base; 16],
-        ),
-        matrix_tensor(
-            &format!("{prefix}.self_attn.k_proj.weight"),
-            &[2, 4],
-            &[base; 8],
-        ),
-        matrix_tensor(
-            &format!("{prefix}.self_attn.o_proj.weight"),
-            &[4, 4],
-            &[base; 16],
-        ),
-        vector_tensor(
-            &format!("{prefix}.self_attn.q_norm.weight"),
-            &[2],
-            &[1.0, 1.0],
-        ),
-        vector_tensor(
-            &format!("{prefix}.self_attn.k_norm.weight"),
-            &[2],
-            &[1.0, 1.0],
-        ),
-        vector_tensor(&format!("{prefix}.input_layernorm.weight"), &[4], &[1.0; 4]),
-        vector_tensor(
-            &format!("{prefix}.post_attention_layernorm.weight"),
-            &[4],
-            &[1.0; 4],
-        ),
-        vector_tensor(
-            &format!("{prefix}.pre_feedforward_layernorm.weight"),
-            &[4],
-            &[1.0; 4],
-        ),
-        vector_tensor(
-            &format!("{prefix}.post_feedforward_layernorm.weight"),
-            &[4],
-            &[1.0; 4],
-        ),
-        matrix_tensor(
-            &format!("{prefix}.mlp.gate_proj.weight"),
-            &[8, 4],
-            &[0.0; 32],
-        ),
-        matrix_tensor(&format!("{prefix}.mlp.up_proj.weight"), &[8, 4], &[0.0; 32]),
-        matrix_tensor(
-            &format!("{prefix}.mlp.down_proj.weight"),
-            &[4, 8],
-            &[0.0; 32],
-        ),
-    ];
-    if include_v_proj {
-        tensors.push(matrix_tensor(
-            &format!("{prefix}.self_attn.v_proj.weight"),
-            &[2, 4],
-            &[base; 8],
-        ));
-    }
-    tensors
-}
-
-fn ple_layer_tensors(layer_idx: usize, base: f32) -> Vec<FixtureTensor> {
-    let prefix = format!("model.language_model.layers.{layer_idx}");
-    vec![
-        matrix_tensor(
-            &format!("{prefix}.per_layer_input_gate.weight"),
-            &[2, 4],
-            &[base; 8],
-        ),
-        matrix_tensor(
-            &format!("{prefix}.per_layer_projection.weight"),
-            &[4, 2],
-            &[base; 8],
-        ),
-        vector_tensor(
-            &format!("{prefix}.post_per_layer_input_norm.weight"),
-            &[4],
-            &[1.0, 1.0, 1.0, 1.0],
-        ),
-    ]
-}
-
-fn matrix_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTensor {
-    FixtureTensor {
-        name: name.to_string(),
-        shape: shape.to_vec(),
-        bytes: f32_to_bytes(values),
-    }
-}
-
-fn vector_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTensor {
-    FixtureTensor {
-        name: name.to_string(),
-        shape: shape.to_vec(),
-        bytes: f32_to_bytes(values),
-    }
-}
-
 fn det_matrix_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTensor {
     FixtureTensor {
         name: name.to_string(),
@@ -1382,14 +780,6 @@ fn det_vector_tensor(name: &str, shape: &[usize], values: &[f32]) -> FixtureTens
         name: name.to_string(),
         shape: shape.to_vec(),
         bytes: det_wgt_bytes(values),
-    }
-}
-
-fn scalar_tensor(name: &str, value: f32) -> FixtureTensor {
-    FixtureTensor {
-        name: name.to_string(),
-        shape: vec![1],
-        bytes: value.to_le_bytes().to_vec(),
     }
 }
 

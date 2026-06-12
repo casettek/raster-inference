@@ -3,7 +3,6 @@ use super::{
     init_select_next_token, main, scan_next_token_logit, DecodeSelectArgmaxState,
     DecodeSelectSelectedState, RasterDecodeSelectInputRoots,
 };
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::OutputDecodeStopReason;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -88,11 +87,8 @@ fn main_matches_native_deterministic_selection() {
     let internal = InternalLogits::from_det_values(det_logits.clone());
     let input = input_roots(vec![10], vec![], det_logits, 1, 1, "native").expect("input roots");
 
-    let native = crate::routines::decode_select_token::native::select_next_token_internal(
-        &internal,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("native deterministic selection should run");
+    let native = crate::routines::decode_select_token::native::select_next_token_internal(&internal)
+        .expect("native deterministic selection should run");
     let output = main(input).expect("raster select should run");
 
     assert_eq!(output.next_token, native);

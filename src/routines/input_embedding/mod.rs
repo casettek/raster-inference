@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::runtime::checkpoints::RoutineId;
-use crate::shared::api::input::{InferenceExecutionMode, RasterPromptPreparationState};
+use crate::shared::api::input::RasterPromptPreparationState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactStoreRoots, RasterRoutineOutput,
@@ -14,13 +14,9 @@ pub mod raster;
 
 use self::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
 
-pub fn run(
-    prompt_token_ids: &[u32],
-    model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
-) -> Result<ActivationSequence> {
+pub fn run(prompt_token_ids: &[u32], model: &Gemma4TransformerModel) -> Result<ActivationSequence> {
     let _routine = crate::trace::routine_scope(RoutineId::InputEmbedding, "");
-    native::run(prompt_token_ids, model, execution_mode)
+    native::run(prompt_token_ids, model)
 }
 
 pub fn run_raster(
@@ -114,20 +110,12 @@ fn input_embedding_checkpoint_payload(
         })
     });
 
-    let mut payload = json!({
+    json!({
         "prompt_token_ids": prompt_token_ids,
         "prompt_token_ids_sha256": crate::trace::sha256_hex(&prompt_token_ids),
         "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
         "raster": raster_payload,
-    });
-    if let Some(embedded_prompt_activations_sha256) = token_embeddings.activations_sha256.as_ref() {
-        // Deterministic-mode payloads carry only canonical commitments
-        // (spec v1); fp32 mode keeps the compatibility fields.
-        payload["embedded_prompt_activations"] = json!(token_embeddings.activations.clone());
-        payload["embedded_prompt_activations_sha256"] =
-            json!(embedded_prompt_activations_sha256.clone());
-    }
-    payload
+    })
 }
 
 #[cfg(test)]

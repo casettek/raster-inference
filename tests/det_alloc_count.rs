@@ -19,11 +19,10 @@ use raster_inference::shared::numerics::det_num::{
     encode_det_wgt_artifact, f32_to_wgt, DetWgtTensorSpec,
 };
 use raster_inference::routines::input_embedding;
-use raster_inference::runtime::pipeline::{decode_step_with_mode, run_prefill_pass_with_mode};
+use raster_inference::runtime::pipeline::{decode_step, run_prefill_pass};
 use raster_inference::shared::model::transformer::{Gemma4TransformerModel, TransformerDecodeState};
 use raster_inference::{
-    load_transformer_state_model_from_det_num_wgt_path, InferenceExecutionMode,
-    PromptPreparationState,
+    load_transformer_state_model_from_det_num_wgt_path, PromptPreparationState,
 };
 
 struct CountingAllocator;
@@ -113,23 +112,11 @@ fn det_prefill_allocations_scale_subquadratically() {
 fn decode_step_allocations(model: &Gemma4TransformerModel, context_len: usize) -> u64 {
     let mut decode_state = prefill_decode_state(model, context_len);
     // Warm-up step (fills lazy weight caches and scratch capacities).
-    let step = decode_step_with_mode(
-        decode_state,
-        1,
-        model,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("warm-up decode step should succeed");
+    let step = decode_step(decode_state, 1, model).expect("warm-up decode step should succeed");
     decode_state = step.transformer_decode_state;
 
     let before = allocations();
-    let step = decode_step_with_mode(
-        decode_state,
-        2,
-        model,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("measured decode step should succeed");
+    let step = decode_step(decode_state, 2, model).expect("measured decode step should succeed");
     let after = allocations();
     drop(step);
     after - before
@@ -146,20 +133,11 @@ fn prefill_allocations(model: &Gemma4TransformerModel, seq_len: usize) -> u64 {
 
 fn run_prefill(model: &Gemma4TransformerModel, seq_len: usize) -> TransformerDecodeState {
     let prompt_token_ids = token_ids(seq_len);
-    let token_embeddings = input_embedding::run(
-        &prompt_token_ids,
-        model,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("embedding should succeed");
-    run_prefill_pass_with_mode(
-        &prompt_preparation(&prompt_token_ids),
-        model,
-        &token_embeddings,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("prefill should succeed")
-    .transformer_decode_state
+    let token_embeddings =
+        input_embedding::run(&prompt_token_ids, model).expect("embedding should succeed");
+    run_prefill_pass(&prompt_preparation(&prompt_token_ids), model, &token_embeddings)
+        .expect("prefill should succeed")
+        .transformer_decode_state
 }
 
 fn prefill_decode_state(

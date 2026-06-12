@@ -35,7 +35,7 @@ use crate::runtime::inference::{
     PausedInferenceState,
 };
 use crate::runtime::trace;
-use crate::shared::api::input::{InferenceExecutionMode, InferenceRequest, ModelSpec};
+use crate::shared::api::input::{InferenceRequest, ModelSpec};
 use crate::shared::artifacts::integrity_mode::current_raster_integrity_mode;
 use crate::shared::model::transformer::Gemma4TransformerModel;
 
@@ -52,16 +52,8 @@ pub fn run(
     let terminal_checkpoint = controls.terminal_checkpoint_spec()?;
     trace::with_terminal_checkpoint(terminal_checkpoint.clone(), || {
         trace::with_checkpointing_enabled(controls.commit_checkpoints, || {
-            if controls.raster && request.execution_mode != InferenceExecutionMode::Deterministic {
-                anyhow::bail!("raster tile inference requires deterministic execution");
-            }
             if controls.raster && controls.raster_detour.is_some() {
                 anyhow::bail!("--raster and selective raster detour cannot be used together");
-            }
-            if controls.raster_detour.is_some()
-                && request.execution_mode != InferenceExecutionMode::Deterministic
-            {
-                anyhow::bail!("selective raster detour requires deterministic execution");
             }
             let mut policy = ExecutionPolicy::from_controls(controls);
             let count_raster_tiles = policy.is_full_raster() || policy.is_detour_active();
@@ -74,12 +66,11 @@ pub fn run(
             } else {
                 None
             };
-            transformer_model.validate_execution_mode(request.execution_mode)?;
             trace::start_inference_trace(&json!({
                 "model_id": model.model_id,
-                "execution_mode": request.execution_mode,
+                "execution_mode": "deterministic",
                 "det_num_spec_version": crate::shared::numerics::det_num::DET_NUM_SPEC_VERSION,
-                "model_provenance": format!("{:?}", transformer_model.provenance),
+                "model_provenance": "DetNumWgt",
                 "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
                 "max_new_tokens": request.sampling.max_new_tokens,
                 "transformer_layer_count": transformer_model.layers.len(),
@@ -151,7 +142,6 @@ pub fn run(
                         &prompt_preparation.prompt_token_ids,
                         model,
                         transformer_model,
-                        request.execution_mode,
                         raster_prompt_preparation_for_embedding.as_ref(),
                     )?
                 };
@@ -162,20 +152,6 @@ pub fn run(
                         .det_activations_sha256
                         .clone(),
                 };
-                if request.execution_mode != InferenceExecutionMode::Deterministic {
-                    trace::trace_checkpoint(
-                        "prompt.prepare",
-                        &json!({
-                            "prompt_text": prompt_preparation.prompt_text.clone(),
-                            "prompt_token_ids": prompt_preparation.prompt_token_ids.clone(),
-                            "prompt_token_ids_sha256": prompt_preparation.prompt_token_ids_sha256.clone(),
-                            "embedded_prompt_activations": token_embeddings.activations.clone(),
-                            "embedded_prompt_activations_sha256": token_embeddings.activations_sha256.clone(),
-                            "det_embedded_prompt_activations_sha256": token_embeddings.det_activations_sha256.clone(),
-                            "sampling": request.sampling.clone(),
-                        }),
-                    );
-                }
                 let input_embedding_raster_refs_for_checkpoint = if policy.is_full_raster()
                     || selected_raster_detour_routine == Some(RoutineId::InputEmbedding)
                 {
@@ -229,7 +205,6 @@ pub fn run(
                     }
                 } else {
                     match native::run_prefill(
-                        request,
                         model,
                         transformer_model,
                         controls,
@@ -285,7 +260,6 @@ pub fn run(
                         tokenizer,
                         controls.raster_tokenizer_source.as_ref(),
                         transformer_model,
-                        request.execution_mode,
                         Some(policy.detour_controller_mut()),
                         raster_sizing_controls,
                     )?

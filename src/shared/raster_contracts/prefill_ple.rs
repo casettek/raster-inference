@@ -16,7 +16,7 @@ use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactStoreRoots,
 };
 use crate::shared::model::transformer::{
-    Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
+    Gemma4PleGlobalWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
 };
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
@@ -412,7 +412,6 @@ impl AuthenticatedGemmaPleSource {
             .collect();
         Self::from_ple_global(
             identifier,
-            model.provenance,
             layers,
             model.ple_global.clone(),
             model.rms_norm_eps_det,
@@ -421,7 +420,6 @@ impl AuthenticatedGemmaPleSource {
 
     pub fn from_ple_global(
         identifier: impl Into<String>,
-        provenance: Gemma4ModelProvenance,
         layer_configs: Vec<GemmaPleLayerConfig>,
         ple_global: Option<Gemma4PleGlobalWeights>,
         rms_norm_eps_det: Option<Acc>,
@@ -454,12 +452,6 @@ impl AuthenticatedGemmaPleSource {
                 committed_source: RefCell::new(None),
             });
         };
-
-        if provenance != Gemma4ModelProvenance::DetNumWgt {
-            bail!(
-                "deterministic raster PLE source requires a model loaded from a .detwgt artifact"
-            );
-        }
 
         ensure_model_backing_is_canonical(&ple_global)?;
         let projection_norm_weights = canonical_projection_norm_weights(&ple_global)?;
@@ -514,13 +506,7 @@ impl AuthenticatedGemmaPleSource {
         identifier: impl Into<String>,
         layer_configs: Vec<GemmaPleLayerConfig>,
     ) -> Result<Self> {
-        Self::from_ple_global(
-            identifier,
-            Gemma4ModelProvenance::DetNumWgt,
-            layer_configs,
-            None,
-            None,
-        )
+        Self::from_ple_global(identifier, layer_configs, None, None)
     }
 
     pub fn identifier(&self) -> &str {
@@ -1218,14 +1204,14 @@ mod tests {
         AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleLayerMetadataRequest,
         GemmaPleMetadataRequest, GemmaPleModelProjectionRowRequest,
         GemmaPleProjectionNormWeightsRequest, GemmaPleScalars, GemmaPleScalarsRequest,
-        GemmaPleTokenEmbeddingRowRequest, RasterPrefillPleSource,
+        GemmaPleTokenEmbeddingRowRequest,
     };
     #[cfg(feature = "unchecked-raster-integrity")]
     use crate::shared::artifacts::integrity_mode::{
         with_raster_integrity_mode, RasterIntegrityMode,
     };
     use crate::shared::model::transformer::{
-        DetNumTensorSliceSource, Gemma4ModelProvenance, Gemma4PleGlobalWeights, MatrixF32,
+        DetNumTensorSliceSource, Gemma4PleGlobalWeights, MatrixF32,
     };
     use crate::shared::numerics::det_num::{Acc, Act, Wgt};
     use std::path::{Path, PathBuf};
@@ -1356,7 +1342,6 @@ mod tests {
         );
         let source = AuthenticatedGemmaPleSource::from_ple_global(
             "det-source-ple",
-            Gemma4ModelProvenance::DetNumWgt,
             vec![GemmaPleLayerConfig {
                 has_ple: true,
                 hidden_width: 3,
@@ -1457,40 +1442,6 @@ mod tests {
     }
 
     #[test]
-    fn construction_rejects_fp32_ple_backing() {
-        let ple_global = Gemma4PleGlobalWeights::from_materialized(
-            vec![MatrixF32 {
-                rows: 2,
-                cols: 2,
-                values: vec![1.0, 0.0, 0.0, 1.0],
-            }],
-            vec![MatrixF32 {
-                rows: 2,
-                cols: 3,
-                values: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            }],
-            vec![1.0, 1.0],
-            1.0,
-            1.0,
-            1.0,
-        );
-
-        let error = AuthenticatedGemmaPleSource::from_ple_global(
-            "fp32-ple",
-            Gemma4ModelProvenance::Fp32,
-            vec![GemmaPleLayerConfig {
-                has_ple: true,
-                hidden_width: 3,
-            }],
-            Some(ple_global),
-            Some(Acc::from_num(0.001)),
-        )
-        .expect_err("fp32 PLE backing should fail");
-
-        assert!(error.to_string().contains(".detwgt artifact"));
-    }
-
-    #[test]
     fn construction_rejects_non_canonical_ple_weights() {
         let ple_global = Gemma4PleGlobalWeights::from_materialized(
             vec![MatrixF32 {
@@ -1511,7 +1462,6 @@ mod tests {
 
         let error = AuthenticatedGemmaPleSource::from_ple_global(
             "non-canonical-ple",
-            Gemma4ModelProvenance::DetNumWgt,
             vec![GemmaPleLayerConfig {
                 has_ple: true,
                 hidden_width: 3,

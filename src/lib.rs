@@ -38,7 +38,7 @@ pub use runtime::trace;
 
 // Request/response API types.
 pub use shared::api::input::{
-    InferenceExecutionMode, InferenceRequest, MessageRole, ModelSpec, PromptPreparationState,
+    InferenceRequest, MessageRole, ModelSpec, PromptPreparationState,
     RasterPromptPreparationState, SamplingConfig, TextDecodingPolicy, TextMessage,
 };
 pub use shared::api::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
@@ -48,5 +48,4 @@ pub use shared::artifacts::integrity_mode::RasterIntegrityMode;
 pub use io::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
     load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path,
 };

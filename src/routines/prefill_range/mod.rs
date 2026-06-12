@@ -1,6 +1,5 @@
 use crate::routines::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::runtime::checkpoints::{RasterDetourController, RoutineId};
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
@@ -39,13 +38,8 @@ pub(crate) fn trace_checkpoints(
     prefill_token_range_width: usize,
     execution_mode: Option<&str>,
 ) -> Result<bool> {
-    let deterministic = execution_mode == Some("deterministic");
     let internal = layer_output.clone_internal();
-    let token_count = if deterministic {
-        internal.det_values().map(<[Vec<_>]>::len).unwrap_or(0)
-    } else {
-        layer_output.activations.len()
-    };
+    let token_count = internal.det_values().map(<[Vec<_>]>::len).unwrap_or(0);
     for (range_start, range_end) in range_bounds(token_count, prefill_token_range_width) {
         let _routine = crate::trace::routine_scope(
             RoutineId::PrefillRange,
@@ -64,17 +58,6 @@ pub(crate) fn trace_checkpoints(
                 "token_count": token_count,
                 "det_range_activations_sha256": det_range_activations_sha256,
             });
-            if !deterministic {
-                // Deterministic-mode payloads carry only canonical commitments
-                // (spec v1); fp32 mode keeps the compatibility fields.
-                let activations = &layer_output.activations;
-                payload["range_activations"] = json!(activations[range_start..range_end].to_vec());
-                payload["range_activations_sha256"] = json!(
-                    crate::shared::numerics::transformer_kernels::build_activation_commitment(
-                        &activations[range_start..range_end]
-                    )
-                );
-            }
             if let Some(execution_mode) = execution_mode {
                 payload["execution_mode"] = json!(execution_mode);
             }
@@ -105,25 +88,10 @@ pub fn run(
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    run_with_mode(
-        input_activations,
-        model,
-        ple_inputs,
-        InferenceExecutionMode::Fp32,
-    )
-}
-
-pub fn run_with_mode(
-    input_activations: &[Vec<f32>],
-    model: &Gemma4TransformerModel,
-    ple_inputs: Option<&Gemma4PrefillPleInputs>,
-    execution_mode: InferenceExecutionMode,
-) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    run_with_mode_internal(
+    run_internal(
         InternalActivationSequence::from_values(input_activations.to_vec()),
         model,
         ple_inputs,
-        execution_mode,
     )
 }
 
@@ -337,55 +305,43 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
     })
 }
 
-pub(crate) fn run_with_mode_internal(
+pub(crate) fn run_internal(
     input_activations: InternalActivationSequence,
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
-    execution_mode: InferenceExecutionMode,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    run_with_mode_internal_with_detour(
+    run_internal_with_detour(
         input_activations,
         model,
         ple_inputs,
-        execution_mode,
         None,
         None,
         crate::InferenceControls::DEFAULT_PREFILL_TOKEN_RANGE_WIDTH,
     )
 }
 
-pub(crate) fn run_with_mode_internal_with_detour(
+pub(crate) fn run_internal_with_detour(
     input_activations: InternalActivationSequence,
     model: &Gemma4TransformerModel,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
-    execution_mode: InferenceExecutionMode,
     detour_controller: Option<&mut RasterDetourController>,
     raster_detour: Option<PrefillLayerRasterDetour<'_>>,
     prefill_token_range_width: usize,
 ) -> Result<(ActivationSequence, Vec<LayerKvCache>)> {
-    model.validate_execution_mode(execution_mode)?;
-    match execution_mode {
-        InferenceExecutionMode::Fp32 => native::run_with_range_width(
-            input_activations.as_f32_slice(),
+    match detour_controller {
+        Some(detour_controller) => native::deterministic_tiles::run_internal_with_detour(
+            input_activations,
+            model,
+            ple_inputs,
+            Some(detour_controller),
+            raster_detour,
+            prefill_token_range_width,
+        ),
+        None => native::deterministic_tiles::run_internal_with_range_width(
+            input_activations,
             model,
             ple_inputs,
             prefill_token_range_width,
         ),
-        InferenceExecutionMode::Deterministic => match detour_controller {
-            Some(detour_controller) => native::deterministic_tiles::run_internal_with_detour(
-                input_activations,
-                model,
-                ple_inputs,
-                Some(detour_controller),
-                raster_detour,
-                prefill_token_range_width,
-            ),
-            None => native::deterministic_tiles::run_internal_with_range_width(
-                input_activations,
-                model,
-                ple_inputs,
-                prefill_token_range_width,
-            ),
-        },
     }
 }

@@ -13,7 +13,7 @@ use crate::shared::artifacts::external_artifacts::{
 use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
     DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
     Gemma4PleMatrixSource, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
 };
 use crate::shared::numerics::det_num::{scale_act, Acc, Act, Wgt};
@@ -339,12 +339,6 @@ impl AuthenticatedGemmaDecodeLayerRangeSource {
         model: &Gemma4TransformerModel,
     ) -> Result<Self> {
         let identifier = validate_identifier(identifier.into())?;
-        if model.provenance != Gemma4ModelProvenance::DetNumWgt {
-            bail!(
-                "deterministic raster decode layer range source requires a model loaded from a .detwgt artifact"
-            );
-        }
-
         let (embedding, embedding_scale) = canonical_embedding(model)?;
         let mut layers = Vec::with_capacity(model.layers.len());
         let mut backing_layers = Vec::with_capacity(model.layers.len());

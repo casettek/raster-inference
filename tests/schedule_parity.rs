@@ -22,11 +22,10 @@ use raster_inference::shared::numerics::det_num::{
     encode_det_wgt_artifact_with_widths, f32_to_wgt, DetWgtTensorSpec, DetWgtWidthPolicy,
 };
 use raster_inference::routines::input_embedding;
-use raster_inference::runtime::pipeline::{decode_step_with_mode, run_prefill_pass_with_mode};
+use raster_inference::runtime::pipeline::{decode_step, run_prefill_pass};
 use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
-    load_transformer_state_model_from_det_num_wgt_path, InferenceExecutionMode,
-    PromptPreparationState,
+    load_transformer_state_model_from_det_num_wgt_path, PromptPreparationState,
 };
 
 const PREFILL_TOKENS: usize = 64;
@@ -180,19 +179,10 @@ fn capture_with_threads(model: &Gemma4TransformerModel, threads: usize) -> Sched
 
 fn capture_schedule(model: &Gemma4TransformerModel) -> ScheduleCapture {
     let prompt_token_ids = token_ids(PREFILL_TOKENS);
-    let token_embeddings = input_embedding::run(
-        &prompt_token_ids,
-        model,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("input embedding should succeed");
-    let prefill = run_prefill_pass_with_mode(
-        &prompt_preparation(&prompt_token_ids),
-        model,
-        &token_embeddings,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("prefill should succeed");
+    let token_embeddings = input_embedding::run(&prompt_token_ids, model)
+        .expect("input embedding should succeed");
+    let prefill = run_prefill_pass(&prompt_preparation(&prompt_token_ids), model, &token_embeddings)
+        .expect("prefill should succeed");
 
     let embedding = token_embeddings.det_activations_sha256.clone();
     let prefill_final_hidden = prefill.transformer_state.activation_states[0]
@@ -210,13 +200,8 @@ fn capture_schedule(model: &Gemma4TransformerModel) -> ScheduleCapture {
     let mut decode_steps = Vec::with_capacity(DECODE_STEPS);
     for step_idx in 0..DECODE_STEPS {
         let next_token = ((step_idx * 11 + 3) % VOCAB) as u32;
-        let step = decode_step_with_mode(
-            decode_state,
-            next_token,
-            model,
-            InferenceExecutionMode::Deterministic,
-        )
-        .expect("decode step should succeed");
+        let step =
+            decode_step(decode_state, next_token, model).expect("decode step should succeed");
         decode_steps.push((
             step.activation_state.det_activations_sha256.clone(),
             step.prefill_logits.det_final_logits_sha256.clone(),

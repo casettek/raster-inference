@@ -18,10 +18,8 @@ use crate::shared::model::transformer::{EmbeddingTable, MatrixF32};
 /// Compatibility re-exports for the pre-containment paths; new code should
 /// import Gemma loaders from `shared::model::gemma::io`.
 pub use crate::shared::model::gemma::io::{
-    embed_input_tokens_from_gemma_source, embed_input_tokens_from_gemma_source_with_mode,
-    load_embedding_table_from_gemma_model_path, load_gemma_tokenizer_spec_from_path,
-    load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, parse_gemma_tokenizer_spec_bytes,
+    embed_input_tokens_from_gemma_source, load_gemma_tokenizer_spec_from_path,
+    load_transformer_state_model_from_det_num_wgt_path, parse_gemma_tokenizer_spec_bytes,
 };
 pub(crate) use crate::shared::model::gemma::io::{
     load_ple_model_projection, load_ple_token_embedding_row_internal,

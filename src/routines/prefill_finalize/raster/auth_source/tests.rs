@@ -4,8 +4,8 @@ use super::{
     GemmaPrefillFinalizeProjectionRowRequest, GemmaPrefillFinalizeScalarsRequest,
 };
 use crate::shared::model::transformer::{
-    DetNumMatrix, DetNumTensorSliceSource, Gemma4LogitsProjection, Gemma4ModelProvenance,
-    Gemma4TransformerModel, GemmaEmbeddingTensorSource, MatrixF32,
+    DetNumMatrix, DetNumTensorSliceSource, Gemma4LogitsProjection, Gemma4TransformerModel,
+    GemmaEmbeddingTensorSource, MatrixF32,
 };
 use crate::shared::numerics::det_num::{Acc, Wgt};
 use anyhow::{Context, Result};
@@ -151,17 +151,6 @@ fn tied_source_honors_nonzero_embedding_data_offset() {
 }
 
 #[test]
-fn construction_rejects_fp32_model_provenance() {
-    let mut model = untied_model();
-    model.provenance = Gemma4ModelProvenance::Fp32;
-
-    let error = AuthenticatedGemmaPrefillFinalizeSource::from_model("fp32", &model)
-        .expect_err("fp32 model should fail");
-
-    assert!(error.to_string().contains(".detwgt artifact"));
-}
-
-#[test]
 fn construction_rejects_missing_softcap_scalar() {
     let mut model = untied_model();
     model.final_logit_softcapping = Some(1.0);
@@ -231,8 +220,6 @@ fn base_model(
     embedding_source: Option<GemmaEmbeddingTensorSource>,
 ) -> Gemma4TransformerModel {
     Gemma4TransformerModel {
-        provenance: Gemma4ModelProvenance::DetNumWgt,
-        embedding_table: None,
         embedding_source,
         layers: vec![],
         ple_global: None,

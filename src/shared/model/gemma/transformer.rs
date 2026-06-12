@@ -11,13 +11,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::Result;
 use memmap2::Mmap;
 use safetensors::Dtype;
 
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::model::transformer::{
-    DetNumMatrix, DetNumTensorSliceSource, EmbeddingTable, InternalActivationSequence, MatrixF32,
+    DetNumMatrix, DetNumTensorSliceSource, InternalActivationSequence, MatrixF32,
 };
 use crate::shared::numerics::det_num::{f32_to_act, f32_to_wgt, Acc, Act, Wgt};
 
@@ -126,34 +124,6 @@ impl Gemma4PleGlobalWeights {
             model_projections
                 .into_iter()
                 .map(Gemma4PleMatrixSource::Materialized)
-                .collect(),
-            projection_norm_weight,
-            None,
-            embedding_scale,
-            None,
-            projection_scalar,
-            None,
-            input_scale,
-            None,
-        )
-    }
-
-    pub(crate) fn from_sources(
-        token_embeddings: Vec<GemmaTensorSliceSource>,
-        model_projections: Vec<GemmaTensorSliceSource>,
-        projection_norm_weight: Vec<f32>,
-        embedding_scale: f32,
-        projection_scalar: f32,
-        input_scale: f32,
-    ) -> Self {
-        Self::new(
-            token_embeddings
-                .into_iter()
-                .map(Gemma4PleMatrixSource::Lazy)
-                .collect(),
-            model_projections
-                .into_iter()
-                .map(Gemma4PleMatrixSource::Lazy)
                 .collect(),
             projection_norm_weight,
             None,
@@ -550,16 +520,8 @@ impl PartialEq for GemmaEmbeddingTensorSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Gemma4ModelProvenance {
-    Fp32,
-    DetNumWgt,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gemma4TransformerModel {
-    pub provenance: Gemma4ModelProvenance,
-    pub embedding_table: Option<EmbeddingTable>,
     pub embedding_source: Option<GemmaEmbeddingTensorSource>,
     pub layers: Vec<Gemma4LayerWeights>,
     pub ple_global: Option<Gemma4PleGlobalWeights>,
@@ -570,18 +532,4 @@ pub struct Gemma4TransformerModel {
     pub final_logit_softcapping_det: Option<Act>,
     pub rms_norm_eps: f32,
     pub rms_norm_eps_det: Option<Acc>,
-}
-
-impl Gemma4TransformerModel {
-    pub fn validate_execution_mode(&self, execution_mode: InferenceExecutionMode) -> Result<()> {
-        if execution_mode == InferenceExecutionMode::Deterministic
-            && self.provenance != Gemma4ModelProvenance::DetNumWgt
-        {
-            anyhow::bail!(
-                "deterministic execution requires a model loaded from a .detwgt artifact"
-            );
-        }
-
-        Ok(())
-    }
 }

@@ -12,8 +12,7 @@ use raster_inference::{
     challenger, claimer, detour, load_chat_template, load_gemma_tokenizer_spec_from_path,
     load_tokenizer_from_path, load_transformer_state_model_from_det_num_wgt_path, protocol, trace,
     AuditOutcome, AuthenticatedGemmaTokenizer, ClaimerOptions, ClaimerRunOutcome, ExecutionTuning,
-    InferenceExecutionMode, InferenceRequest, ModelSpec, RasterDetourSpec, SamplingConfig,
-    TextDecodingPolicy,
+    InferenceRequest, ModelSpec, RasterDetourSpec, SamplingConfig, TextDecodingPolicy,
 };
 
 /// Exit code when `audit` finds a divergence (`0` = no divergence,
@@ -324,7 +323,6 @@ impl RunContext {
             text_decoding_policy: TextDecodingPolicy::Utf8,
             add_generation_prompt: true,
             add_special_tokens: true,
-            execution_mode: InferenceExecutionMode::Deterministic,
             sampling: SamplingConfig {
                 max_new_tokens: Some(common.max_new_tokens),
                 temperature: Some(protocol::SAMPLING_TEMPERATURE),

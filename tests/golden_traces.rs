@@ -14,32 +14,22 @@
 //! UPDATE_GOLDENS=1 cargo test --release --test golden_traces -- --ignored
 //! ```
 //!
-//! Configuration matrix (invalid combinations excluded — raster and detour
-//! require deterministic execution):
+//! Configuration matrix:
 //!
-//! | Golden                          | Mode | Path                       | Terminal checkpoint            |
-//! |---------------------------------|------|----------------------------|--------------------------------|
-//! | `native-det-full`               | det  | native                     | none (runs to completion)      |
-//! | `native-det-terminal`           | det  | native                     | `prefill.finalize`             |
-//! | `detour-prefill-range`          | det  | detour at `prefill.range`  | none                           |
-//! | `raster-full`                   | det  | full raster                | none                           |
-//! | `raster-terminal`               | det  | full raster                | `decode.transition_finalize`   |
-//! | `fp32-native-full`              | fp32 | native                     | none                           |
+//! | Golden                          | Path                       | Terminal checkpoint            |
+//! |---------------------------------|----------------------------|--------------------------------|
+//! | `native-det-full`               | native                     | none (runs to completion)      |
+//! | `native-det-terminal`           | native                     | `prefill.finalize`             |
+//! | `detour-prefill-range`          | detour at `prefill.range`  | none                           |
+//! | `raster-full`                   | full raster                | none                           |
+//! | `raster-terminal`               | full raster                | `decode.transition_finalize`   |
 //!
 //! The two full-raster legs perform Verified-mode Merkle proof work per tile
 //! and are feasible only in optimized builds; like the e2e parity gate they
 //! are ignored under `debug_assertions` and run via
 //! `cargo test --release --test golden_traces`.
 //!
-//! The fp32 golden is gated to macOS: fp32 checkpoint payloads include values
-//! produced through platform libm transcendentals (softmax `exp`, …) whose
-//! last-ulp behavior differs across platforms, so its bytes are only
-//! reproducible on the platform that captured it. The deterministic and
-//! raster goldens use the det_num integer numerics and are platform-exact.
-
-// The parity/golden suites intentionally exercise the deprecated legacy
-// entry points: they are what proves the shims stay equivalent.
-#![allow(deprecated)]
+//! All goldens use the det_num integer numerics and are platform-exact.
 
 use std::{
     env, fs,
@@ -57,8 +47,7 @@ use raster_inference::shared::model::gemma::tokenizer::AuthenticatedGemmaTokeniz
 use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
-    load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, sequence, InferenceControls, InferenceExecutionMode,
+    load_transformer_state_model_from_det_num_wgt_path, sequence, InferenceControls,
     InferenceRequest, InferenceRunOutcome, ModelSpec, RasterDetourSpec, SamplingConfig,
     TextDecodingPolicy,
 };
@@ -87,15 +76,6 @@ impl Fixture {
         Self::load_with_model(
             load_transformer_state_model_from_det_num_wgt_path(&tiny_gemma_dir())
                 .expect("tiny-gemma-dev deterministic weights should load"),
-        )
-    }
-
-    /// Fp32 execution requires the safetensors-backed model, mirroring the
-    /// CLI's fp32 model-loading path.
-    fn load_fp32() -> Self {
-        Self::load_with_model(
-            load_transformer_state_model_from_gemma_model_path(&tiny_gemma_dir())
-                .expect("tiny-gemma-dev safetensors weights should load"),
         )
     }
 
@@ -136,13 +116,12 @@ fn goldens_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/goldens")
 }
 
-fn request(prompt: &str, mode: InferenceExecutionMode, max_new_tokens: usize) -> InferenceRequest {
+fn request(prompt: &str, max_new_tokens: usize) -> InferenceRequest {
     InferenceRequest {
         prompt_bytes: prompt.as_bytes().to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: true,
         add_special_tokens: true,
-        execution_mode: mode,
         sampling: SamplingConfig {
             max_new_tokens: Some(max_new_tokens),
             temperature: Some(1.0),
@@ -230,7 +209,7 @@ fn golden_native_det_full() {
     let fixture = Fixture::load();
     let (outcome, artifact) = run_and_capture_artifact(
         &fixture,
-        &request(LONG_PROMPT, InferenceExecutionMode::Deterministic, 2),
+        &request(LONG_PROMPT, 2),
         &InferenceControls {
             commit_checkpoints: true,
             raster_tokenizer_source: Some(fixture.raster_tokenizer_source()),
@@ -247,7 +226,7 @@ fn golden_native_det_terminal() {
     let fixture = Fixture::load();
     let (outcome, artifact) = run_and_capture_artifact(
         &fixture,
-        &request(LONG_PROMPT, InferenceExecutionMode::Deterministic, 2),
+        &request(LONG_PROMPT, 2),
         &InferenceControls {
             commit_checkpoints: true,
             terminal_checkpoint: Some("prefill.finalize".to_string()),
@@ -270,7 +249,7 @@ fn golden_detour_prefill_range() {
     let fixture = Fixture::load();
     let (outcome, artifact) = run_and_capture_artifact(
         &fixture,
-        &request(SHORT_PROMPT, InferenceExecutionMode::Deterministic, 2),
+        &request(SHORT_PROMPT, 2),
         &InferenceControls {
             commit_checkpoints: true,
             raster_detour: Some(
@@ -295,7 +274,7 @@ fn golden_raster_full() {
     let fixture = Fixture::load();
     let (outcome, artifact) = run_and_capture_artifact(
         &fixture,
-        &request(SHORT_PROMPT, InferenceExecutionMode::Deterministic, 1),
+        &request(SHORT_PROMPT, 1),
         &InferenceControls {
             commit_checkpoints: true,
             raster: true,
@@ -318,7 +297,7 @@ fn golden_raster_terminal() {
     let fixture = Fixture::load();
     let (outcome, artifact) = run_and_capture_artifact(
         &fixture,
-        &request(SHORT_PROMPT, InferenceExecutionMode::Deterministic, 2),
+        &request(SHORT_PROMPT, 2),
         &InferenceControls {
             commit_checkpoints: true,
             terminal_checkpoint: Some("decode.transition_finalize".to_string()),
@@ -334,25 +313,4 @@ fn golden_raster_terminal() {
         _ => panic!("expected run to pause at decode.transition_finalize"),
     }
     assert_matches_golden("raster-terminal", &artifact);
-}
-
-#[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "fp32 checkpoint payloads depend on platform libm; this golden was \
-              captured on macOS (det goldens are platform-exact, fp32 is not)"
-)]
-fn golden_fp32_native_full() {
-    let _guard = suite_lock();
-    let fixture = Fixture::load_fp32();
-    let (outcome, artifact) = run_and_capture_artifact(
-        &fixture,
-        &request(LONG_PROMPT, InferenceExecutionMode::Fp32, 2),
-        &InferenceControls {
-            commit_checkpoints: true,
-            ..Default::default()
-        },
-    );
-    assert!(matches!(outcome, InferenceRunOutcome::Completed(_)));
-    assert_matches_golden("fp32-native-full", &artifact);
 }

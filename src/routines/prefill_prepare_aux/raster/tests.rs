@@ -1,10 +1,9 @@
 use super::*;
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactId;
 use crate::shared::model::transformer::{
     ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleGlobalWeights,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
     Gemma4PleLayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
     InternalActivationSequence, MatrixF32,
 };
@@ -295,13 +294,8 @@ fn no_ple_globals_match_native_none_output() {
     let native_model = no_ple_model(2);
 
     let raster = run_materialized(&[0], &input, &source, 1).expect("raster PLE should run");
-    let native = crate::routines::prefill_prepare_aux::run(
-        &[0],
-        &native_model,
-        &input,
-        InferenceExecutionMode::Deterministic,
-    )
-    .expect("native PLE should run");
+    let native = crate::routines::prefill_prepare_aux::run(&[0], &native_model, &input)
+        .expect("native PLE should run");
 
     assert_eq!(raster, native);
     assert!(raster.is_none());
@@ -828,7 +822,6 @@ fn unsupported_fp32_only_ple_source_fails_closed() {
 
     let error = AuthenticatedGemmaPleSource::from_ple_global(
         "fp32-ple",
-        Gemma4ModelProvenance::DetNumWgt,
         vec![GemmaPleLayerConfig {
             has_ple: true,
             hidden_width: 2,
@@ -978,9 +971,7 @@ fn native_prefill_ple_inputs(
         input.clone_internal(),
         &fixture.layers,
         &fixture.native_ple_global,
-        0.0,
         Some(f32_to_acc(0.0)),
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native PLE should run")
 }
@@ -1158,8 +1149,6 @@ fn test_layer(hidden_width: usize, has_ple: bool) -> Gemma4LayerWeights {
 
 fn no_ple_model(hidden_width: usize) -> Gemma4TransformerModel {
     Gemma4TransformerModel {
-        provenance: Gemma4ModelProvenance::DetNumWgt,
-        embedding_table: None,
         embedding_source: None,
         layers: vec![test_layer(hidden_width, false)],
         ple_global: None,

@@ -17,7 +17,7 @@ use crate::runtime::inference::{InferenceControls, InferenceRunOutcome, Inferenc
 use crate::runtime::roles::ExecutionTuning;
 use crate::runtime::{sequence, trace};
 use crate::shared::api::audit::DetourArtifact;
-use crate::shared::api::input::{InferenceExecutionMode, InferenceRequest, ModelSpec};
+use crate::shared::api::input::{InferenceRequest, ModelSpec};
 use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::Gemma4TransformerModel;
 
@@ -42,9 +42,6 @@ pub fn run(
     spec: RasterDetourSpec,
     tuning: &ExecutionTuning,
 ) -> Result<DetourOutcome> {
-    if request.execution_mode != InferenceExecutionMode::Deterministic {
-        anyhow::bail!("raster detour requires deterministic execution");
-    }
     let mut controls = InferenceControls {
         commit_checkpoints: true,
         raster_detour: Some(spec),

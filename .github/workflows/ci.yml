@@ -55,7 +55,6 @@ jobs:
         run: cargo test --release --test e2e_checkpoint_parity
       # Byte-identity gate for the committed trace artifact format: every
       # configuration in tests/golden_traces.rs must reproduce its checked-in
-      # golden exactly (includes the release-only full-raster legs; the fp32
-      # golden is macOS-only and self-ignores here).
+      # golden exactly (includes the release-only full-raster legs).
       - name: golden trace artifacts
         run: cargo test --release --test golden_traces

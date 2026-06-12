@@ -1,7 +1,6 @@
 use anyhow::Result;
 
 use crate::runtime::checkpoints::RoutineId;
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
     ActivationSequence, Gemma4TransformerModel, LayerKvCache, TransformerPrefillResult,
@@ -18,19 +17,12 @@ pub fn run(
     model: &Gemma4TransformerModel,
     final_hidden_states: ActivationSequence,
     layer_caches: Vec<LayerKvCache>,
-    execution_mode: InferenceExecutionMode,
 ) -> Result<TransformerPrefillResult> {
     let _routine = crate::trace::routine_scope(
         RoutineId::PrefillFinalize,
         format!("tokens={}", prompt_token_ids.len()),
     );
-    native::run(
-        prompt_token_ids,
-        model,
-        final_hidden_states,
-        layer_caches,
-        execution_mode,
-    )
+    native::run(prompt_token_ids, model, final_hidden_states, layer_caches)
 }
 
 #[cfg(test)]

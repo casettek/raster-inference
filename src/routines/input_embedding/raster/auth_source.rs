@@ -12,8 +12,7 @@ use crate::shared::artifacts::external_artifacts::{
 #[cfg(feature = "unchecked-raster-integrity")]
 use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
-    DetNumTensorSliceSource, Gemma4ModelProvenance, Gemma4TransformerModel,
-    GemmaEmbeddingTensorSource,
+    DetNumTensorSliceSource, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
 };
 use crate::shared::numerics::det_num::{scale_act, Act};
 use crate::shared::raster_kernels::transformer::det_num_tensor_slice_row_wgts;
@@ -102,10 +101,6 @@ impl AuthenticatedGemmaInputEmbeddingSource {
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
     ) -> Result<Self> {
-        if model.provenance != Gemma4ModelProvenance::DetNumWgt {
-            bail!("deterministic raster input embedding requires a model loaded from a .detwgt artifact");
-        }
-
         let (source, scale) = match model.embedding_source.as_ref() {
             Some(GemmaEmbeddingTensorSource::Deterministic { source, scale, .. }) => {
                 (source.clone(), Act::from_num(*scale))

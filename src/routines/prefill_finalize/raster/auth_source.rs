@@ -10,8 +10,7 @@ use crate::shared::artifacts::external_artifacts::{
 #[cfg(feature = "unchecked-raster-integrity")]
 use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
-    DetNumMatrix, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4TransformerModel,
-    GemmaEmbeddingTensorSource,
+    DetNumMatrix, Gemma4LogitsProjection, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
 };
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
@@ -137,12 +136,6 @@ impl AuthenticatedGemmaPrefillFinalizeSource {
         model: &Gemma4TransformerModel,
     ) -> Result<Self> {
         let identifier = validate_identifier(identifier.into())?;
-        if model.provenance != Gemma4ModelProvenance::DetNumWgt {
-            bail!(
-                "deterministic raster prefill finalize source requires a model loaded from a .detwgt artifact"
-            );
-        }
-
         let final_norm_weights = canonical_final_norm_weights(&model.final_norm_weight_det)?;
         let rms_norm_eps = model.rms_norm_eps_det.ok_or_else(|| {
             anyhow!("deterministic raster prefill finalize requires canonical RMSNorm epsilon")

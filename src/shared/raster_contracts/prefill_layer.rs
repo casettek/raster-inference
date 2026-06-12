@@ -12,8 +12,7 @@ use crate::shared::artifacts::external_artifacts::{
 #[cfg(feature = "unchecked-raster-integrity")]
 use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
-    Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4ModelProvenance,
-    Gemma4TransformerModel,
+    Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4TransformerModel,
 };
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
@@ -238,12 +237,6 @@ impl AuthenticatedGemmaPrefillLayerSource {
         model: &Gemma4TransformerModel,
     ) -> Result<Self> {
         let identifier = validate_identifier(identifier.into())?;
-        if model.provenance != Gemma4ModelProvenance::DetNumWgt {
-            bail!(
-                "deterministic raster prefill layer source requires a model loaded from a .detwgt artifact"
-            );
-        }
-
         let mut layers = Vec::with_capacity(model.layers.len());
         let mut backing_layers = Vec::with_capacity(model.layers.len());
         for (layer_idx, layer) in model.layers.iter().enumerate() {
@@ -995,8 +988,7 @@ mod tests {
     };
     use crate::shared::model::transformer::{
         DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights,
-        Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleLayerWeights,
-        Gemma4TransformerModel, MatrixF32,
+        Gemma4LogitsProjection, Gemma4PleLayerWeights, Gemma4TransformerModel, MatrixF32,
     };
     use crate::shared::numerics::det_num::{Acc, Act, Wgt};
     use anyhow::{Context, Result};
@@ -1178,17 +1170,6 @@ mod tests {
     }
 
     #[test]
-    fn construction_rejects_fp32_model_provenance() {
-        let (_path, mut model) = canonical_model(false, false);
-        model.provenance = Gemma4ModelProvenance::Fp32;
-
-        let error = AuthenticatedGemmaPrefillLayerSource::from_model("fp32", &model)
-            .expect_err("fp32 model should fail");
-
-        assert!(error.to_string().contains(".detwgt artifact"));
-    }
-
-    #[test]
     fn construction_rejects_non_canonical_layer_matrix() {
         let (_path, mut model) = canonical_model(false, false);
         model.layers[0].q_proj = Gemma4LayerMatrixSource::from(MatrixF32 {
@@ -1301,8 +1282,6 @@ mod tests {
         (
             path,
             Gemma4TransformerModel {
-                provenance: Gemma4ModelProvenance::DetNumWgt,
-                embedding_table: None,
                 embedding_source: None,
                 layers: vec![layer],
                 ple_global: None,

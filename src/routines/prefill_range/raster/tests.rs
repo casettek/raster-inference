@@ -8,7 +8,7 @@ use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
     ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4ModelProvenance, Gemma4PleLayerWeights,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleLayerWeights,
     Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence, MatrixF32,
 };
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
@@ -680,8 +680,6 @@ fn ple_input_shape_mismatch_fails_closed() {
 #[test]
 fn zero_layer_source_fails_closed() {
     let model = Gemma4TransformerModel {
-        provenance: Gemma4ModelProvenance::DetNumWgt,
-        embedding_table: None,
         embedding_source: None,
         layers: Vec::new(),
         ple_global: None,
@@ -962,8 +960,6 @@ fn no_ple_model() -> (PathBuf, Gemma4TransformerModel) {
     (
         path,
         Gemma4TransformerModel {
-            provenance: Gemma4ModelProvenance::DetNumWgt,
-            embedding_table: None,
             embedding_source: None,
             layers: vec![layer],
             ple_global: None,
@@ -1058,8 +1054,6 @@ fn nonzero_model(has_ple: bool, has_layer_scalar: bool) -> (PathBuf, Gemma4Trans
     (
         path,
         Gemma4TransformerModel {
-            provenance: Gemma4ModelProvenance::DetNumWgt,
-            embedding_table: None,
             embedding_source: None,
             layers: vec![layer],
             ple_global: None,
@@ -1145,8 +1139,6 @@ fn ple_width_differs_from_hidden_model() -> (PathBuf, Gemma4TransformerModel) {
     (
         path,
         Gemma4TransformerModel {
-            provenance: Gemma4ModelProvenance::DetNumWgt,
-            embedding_table: None,
             embedding_source: None,
             layers: vec![layer],
             ple_global: None,
@@ -1224,8 +1216,6 @@ fn multi_head_sliding_model() -> (PathBuf, Gemma4TransformerModel) {
     (
         path,
         Gemma4TransformerModel {
-            provenance: Gemma4ModelProvenance::DetNumWgt,
-            embedding_table: None,
             embedding_source: None,
             layers: vec![layer],
             ple_global: None,

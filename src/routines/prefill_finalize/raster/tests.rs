@@ -8,7 +8,6 @@ use crate::routines::prefill_finalize::raster::auth_source::{
     AuthenticatedGemmaPrefillFinalizeSource, RasterPrefillFinalizeSource,
 };
 use crate::routines::prefill_range::raster::PrefillLayerCacheSlot;
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     activation_row_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
@@ -16,8 +15,8 @@ use crate::shared::artifacts::raster_artifact_store::{
 };
 use crate::shared::model::transformer::{
     ActivationSequence, DetNumMatrix, DetNumTensorSliceSource, Gemma4LogitsProjection,
-    Gemma4ModelProvenance, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
-    InternalActivationSequence, LayerKvCache, MatrixF32,
+    Gemma4TransformerModel, GemmaEmbeddingTensorSource, InternalActivationSequence, LayerKvCache,
+    MatrixF32,
 };
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::{
@@ -51,7 +50,6 @@ fn raster_finalize_matches_native_deterministic_for_untied_projection() {
         &model,
         final_hidden_states,
         vec![],
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native finalize should run");
 
@@ -92,7 +90,6 @@ fn ref_backed_finalize_matches_native_deterministic_for_untied_projection() {
         &model,
         final_hidden_states,
         vec![],
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native finalize should run");
 
@@ -193,7 +190,6 @@ fn raster_finalize_matches_native_deterministic_for_tied_projection() {
         &model,
         final_hidden_states,
         vec![],
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native finalize should run");
 
@@ -222,7 +218,6 @@ fn ref_backed_finalize_matches_native_deterministic_for_tied_projection() {
         &model,
         final_hidden_states,
         vec![],
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native finalize should run");
 
@@ -251,7 +246,6 @@ fn raster_finalize_matches_native_deterministic_with_softcap() {
         &model,
         final_hidden_states,
         vec![],
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native finalize should run");
 
@@ -301,7 +295,6 @@ fn ref_backed_finalize_matches_native_deterministic_with_softcap() {
         &model,
         final_hidden_states,
         vec![],
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native finalize should run");
 
@@ -516,7 +509,6 @@ fn raster_finalize_uses_internal_det_row_not_public_f32_view() {
         &model,
         final_hidden_states,
         vec![],
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native finalize should run");
 
@@ -644,7 +636,6 @@ fn native_prefill_layer_output_adapter_feeds_raster_finalize_detour() {
         &model,
         final_hidden_states,
         vec![layer_cache],
-        InferenceExecutionMode::Deterministic,
     )
     .expect("native finalize should run");
 
@@ -899,8 +890,6 @@ fn base_model(
     embedding_source: Option<GemmaEmbeddingTensorSource>,
 ) -> Gemma4TransformerModel {
     Gemma4TransformerModel {
-        provenance: Gemma4ModelProvenance::DetNumWgt,
-        embedding_table: None,
         embedding_source,
         layers: vec![],
         ple_global: None,

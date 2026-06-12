@@ -20,7 +20,7 @@ use crate::runtime::{sequence, trace};
 use crate::shared::api::audit::{
     AuditOutcome, CheckpointDivergence, ClaimedTrace, ClaimedTraceEntry,
 };
-use crate::shared::api::input::{InferenceExecutionMode, InferenceRequest, ModelSpec};
+use crate::shared::api::input::{InferenceRequest, ModelSpec};
 use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::Gemma4TransformerModel;
 
@@ -62,9 +62,6 @@ pub fn audit(
     claimed_trace: &[u8],
     tuning: &ExecutionTuning,
 ) -> Result<AuditOutcome> {
-    if request.execution_mode != InferenceExecutionMode::Deterministic {
-        anyhow::bail!("challenger audit requires deterministic execution");
-    }
     let claimed = ClaimedTrace::from_json_bytes(claimed_trace)?;
 
     let mut replay_controls = InferenceControls {

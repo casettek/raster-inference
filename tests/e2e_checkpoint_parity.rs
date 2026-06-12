@@ -60,7 +60,7 @@ use raster_inference::shared::model::gemma::tokenizer::AuthenticatedGemmaTokeniz
 use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
-    load_transformer_state_model_from_det_num_wgt_path, sequence, InferenceControls, InferenceExecutionMode,
+    load_transformer_state_model_from_det_num_wgt_path, sequence, InferenceControls,
     InferenceRequest, InferenceRunOutcome, ModelSpec, PausedInferenceState, RasterDetourSpec,
     SamplingConfig, TextDecodingPolicy,
 };
@@ -129,7 +129,6 @@ fn deterministic_request(prompt: &str, max_new_tokens: usize) -> InferenceReques
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: true,
         add_special_tokens: true,
-        execution_mode: InferenceExecutionMode::Deterministic,
         sampling: SamplingConfig {
             max_new_tokens: Some(max_new_tokens),
             temperature: Some(1.0),

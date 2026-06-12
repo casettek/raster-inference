@@ -613,8 +613,6 @@ fn no_ple_model(sliding: bool) -> (PathBuf, Gemma4TransformerModel) {
     (
         path,
         Gemma4TransformerModel {
-            provenance: Gemma4ModelProvenance::DetNumWgt,
-            embedding_table: None,
             embedding_source: Some(GemmaEmbeddingTensorSource::Deterministic {
                 source: embedding_source,
                 scale: 1.0,

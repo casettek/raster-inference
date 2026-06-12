@@ -2,7 +2,6 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 
 use crate::runtime::checkpoints::RoutineId;
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -578,7 +577,6 @@ pub(crate) fn trace_checkpoint(
                 state.layer_count,
                 &state.activation_state(),
                 &state.effective_layer_caches(),
-                state.completed_layer_output_sha256s.clone(),
                 Some(state.completed_layer_output_det_sha256s.clone()),
                 execution_mode,
             )
@@ -595,7 +593,6 @@ pub(crate) fn trace_checkpoint_payload(
     layer_count: usize,
     current_activation: &ActivationSequence,
     layer_caches: &[LayerKvCache],
-    completed_layer_output_sha256s: Vec<String>,
     completed_layer_output_det_sha256s: Option<Vec<Option<String>>>,
     execution_mode: Option<&str>,
 ) -> Result<bool> {
@@ -608,7 +605,6 @@ pub(crate) fn trace_checkpoint_payload(
         layer_count,
         current_activation,
         layer_caches,
-        completed_layer_output_sha256s,
         completed_layer_output_det_sha256s,
         execution_mode,
     );
@@ -628,11 +624,9 @@ fn decode_layer_range_checkpoint_json(
     layer_count: usize,
     current_activation: &ActivationSequence,
     layer_caches: &[LayerKvCache],
-    completed_layer_output_sha256s: Vec<String>,
     completed_layer_output_det_sha256s: Option<Vec<Option<String>>>,
     execution_mode: Option<&str>,
 ) -> serde_json::Value {
-    let deterministic = execution_mode == Some("deterministic");
     let current_internal = current_activation.clone_internal();
     let mut payload = json!({
         "next_token": next_token,
@@ -646,14 +640,6 @@ fn decode_layer_range_checkpoint_json(
             .map(crate::shared::numerics::transformer_kernels::build_det_activation_commitment),
         "det_layer_caches_sha256": crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment(layer_caches),
     });
-    if !deterministic {
-        // Deterministic-mode payloads carry only canonical commitments
-        // (spec v1); fp32 mode keeps the compatibility fields.
-        payload["current_activation"] = json!(current_activation.activations.clone());
-        payload["current_activation_sha256"] = json!(current_activation.activations_sha256);
-        payload["layer_caches"] = json!(crate::trace::serialize_layer_caches(layer_caches));
-        payload["completed_layer_output_sha256s"] = json!(completed_layer_output_sha256s);
-    }
     if let Some(execution_mode) = execution_mode {
         payload["execution_mode"] = json!(execution_mode);
     }
@@ -666,22 +652,11 @@ fn decode_layer_range_checkpoint_json(
 pub(crate) fn embed_decode_token(
     next_token: u32,
     model: &Gemma4TransformerModel,
-    execution_mode: InferenceExecutionMode,
 ) -> Result<InternalActivationRow> {
-    let embedded_token = if let Some(ref embedding_table) = model.embedding_table {
-        crate::shared::numerics::transformer_kernels::embed_input_tokens_with_mode(
-            &[next_token],
-            embedding_table,
-            execution_mode,
-        )?
-    } else if let Some(ref embedding_source) = model.embedding_source {
-        crate::io::embed_input_tokens_from_gemma_source_with_mode(
-            &[next_token],
-            embedding_source,
-            execution_mode,
-        )?
+    let embedded_token = if let Some(ref embedding_source) = model.embedding_source {
+        crate::io::embed_input_tokens_from_gemma_source(&[next_token], embedding_source)?
     } else {
-        bail!("transformer state model is missing both embedding_table and embedding_source")
+        bail!("transformer state model is missing an embedding_source")
     };
     embedded_token
         .clone_internal()

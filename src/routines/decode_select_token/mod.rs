@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::runtime::checkpoints::RoutineId;
-use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::api::output::DecodeState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 #[cfg(test)]
@@ -17,11 +16,7 @@ use crate::RasterSizingControls;
 pub mod native;
 pub mod raster;
 
-pub fn run(
-    decode_state: &mut DecodeState,
-    max_new_tokens: usize,
-    execution_mode: InferenceExecutionMode,
-) -> Result<Option<u32>> {
+pub fn run(decode_state: &mut DecodeState, max_new_tokens: usize) -> Result<Option<u32>> {
     let _routine = crate::trace::routine_scope(
         RoutineId::SelectOutputToken,
         format!(
@@ -36,7 +31,7 @@ pub fn run(
     }
 
     let logits = decode_state.clone_internal_logits();
-    let next_token = native::select_next_token_internal(&logits, execution_mode)?;
+    let next_token = native::select_next_token_internal(&logits)?;
     decode_state.full_token_ids = native::append_token(&decode_state.full_token_ids, next_token);
     decode_state.generated_token_ids =
         native::append_token(&decode_state.generated_token_ids, next_token);

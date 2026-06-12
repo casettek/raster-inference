@@ -1,15 +1,12 @@
-//! Golden regression gate for canonical (`det_*`) and fp32 commitments.
+//! Golden regression gate for canonical (`det_*`) commitments.
 //!
-//! Runs deterministic and fp32 inference end-to-end on fixed fixtures covering
-//! full + sliding-window attention, donor (shared-KV) layers, PLE layers, and a
+//! Runs deterministic inference end-to-end on fixed fixtures covering full +
+//! sliding-window attention, donor (shared-KV) layers, PLE layers, and a
 //! 64-token decode, then asserts every commitment is bit-identical to the
 //! checked-in goldens in `testdata/det_commitment_goldens.json`.
 //!
 //! Regenerate goldens (only when an intentional contract change lands) with:
 //! `RASTER_BLESS_DET_GOLDENS=1 cargo test det_goldens`
-
-// Exercises the deprecated legacy entry point on purpose (shim equivalence).
-#![allow(deprecated)]
 
 use std::{
     fs,
@@ -20,18 +17,14 @@ use std::{
 use serde_json::{json, Value};
 use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, Tokenizer};
 
+use crate::load_transformer_state_model_from_det_num_wgt_path;
 use crate::runtime::pipeline;
 use crate::shared::api::input::{
-    InferenceExecutionMode, InferenceRequest, ModelSpec, PromptPreparationState, SamplingConfig,
-    TextDecodingPolicy,
+    InferenceRequest, ModelSpec, PromptPreparationState, SamplingConfig, TextDecodingPolicy,
 };
 use crate::shared::model::transformer::Gemma4TransformerModel;
 use crate::shared::numerics::det_num::{encode_det_wgt_artifact, f32_to_wgt, DetWgtTensorSpec};
 use crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment;
-use crate::{
-    load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path,
-};
 
 const DECODE_TOKENS: usize = 64;
 const PROMPT: &str = "w0 w1 w2 w3 w4 w5";
@@ -41,7 +34,7 @@ fn golden_path() -> PathBuf {
 }
 
 #[test]
-fn det_and_fp32_commitments_match_goldens() {
+fn det_commitments_match_goldens() {
     let mut fixtures = serde_json::Map::new();
     for (name, donor) in [("donor_ple", true), ("no_donor_ple", false)] {
         fixtures.insert(name.to_string(), run_fixture(name, donor));
@@ -65,13 +58,6 @@ fn det_and_fp32_commitments_match_goldens() {
     for (fixture_name, golden_fixture) in golden.as_object().expect("golden object") {
         let captured_fixture = &captured[fixture_name];
         for (mode_name, golden_mode) in golden_fixture.as_object().expect("fixture object") {
-            // Canonical deterministic commitments are stable across build
-            // profiles; fp32 commitments are sensitive to the optimization
-            // level (pre-existing f32 behavior), so they are only compared in
-            // the debug profile the goldens were blessed under.
-            if mode_name == "fp32" && !cfg!(debug_assertions) {
-                continue;
-            }
             assert_eq!(
                 &captured_fixture[mode_name], golden_mode,
                 "{fixture_name}/{mode_name} commitments diverged from goldens"
@@ -81,24 +67,23 @@ fn det_and_fp32_commitments_match_goldens() {
 }
 
 fn run_fixture(name: &str, donor: bool) -> Value {
-    let (det_model, fp32_model) = build_fixture_models(name, donor);
-    let det = capture_mode(&det_model, InferenceExecutionMode::Deterministic);
-    let fp32 = capture_mode(&fp32_model, InferenceExecutionMode::Fp32);
-    json!({ "det": det, "fp32": fp32 })
+    let det_model = build_fixture_model(name, donor);
+    let det = capture_det(&det_model);
+    json!({ "det": det })
 }
 
-fn capture_mode(model: &Gemma4TransformerModel, mode: InferenceExecutionMode) -> Value {
+fn capture_det(model: &Gemma4TransformerModel) -> Value {
     let tokenizer = test_tokenizer();
     let model_spec = test_model_spec();
     let prompt_preparation =
-        crate::routines::prompt_prepare::run(&test_request(mode), &model_spec, &tokenizer)
+        crate::routines::prompt_prepare::run(&test_request(), &model_spec, &tokenizer)
             .expect("prompt preparation should succeed");
 
     // Routine-level capture: embedding, prefill, per-step decode.
     let token_embeddings =
-        crate::routines::input_embedding::run(&prompt_preparation.prompt_token_ids, model, mode)
+        crate::routines::input_embedding::run(&prompt_preparation.prompt_token_ids, model)
             .expect("input embedding should succeed");
-    let prefill = pipeline::run_prefill_pass_with_mode(
+    let prefill = pipeline::run_prefill_pass(
         &PromptPreparationState {
             prompt_text: prompt_preparation.prompt_text.clone(),
             prompt_token_ids: prompt_preparation.prompt_token_ids.clone(),
@@ -106,38 +91,27 @@ fn capture_mode(model: &Gemma4TransformerModel, mode: InferenceExecutionMode) ->
         },
         model,
         &token_embeddings,
-        mode,
     )
     .expect("prefill should succeed");
     let final_hidden = &prefill.transformer_state.activation_states[0];
     let prefill_logits = &prefill.transformer_state.prefill_logits;
 
-    let prefill_capture = match mode {
-        InferenceExecutionMode::Deterministic => json!({
-            "embedding": token_embeddings.det_activations_sha256,
-            "final_hidden": final_hidden.det_activations_sha256,
-            "logits": prefill_logits.det_final_logits_sha256,
-            "kv": build_det_kv_cache_commitment(&prefill.transformer_decode_state.layer_caches),
-        }),
-        InferenceExecutionMode::Fp32 => json!({
-            "embedding": token_embeddings.activations_sha256,
-            "final_hidden": final_hidden.activations_sha256,
-            "logits": prefill_logits.final_logits_sha256,
-            "kv": fp32_kv_commitment(&prefill.transformer_decode_state.layer_caches),
-        }),
-    };
+    let prefill_capture = json!({
+        "embedding": token_embeddings.det_activations_sha256,
+        "final_hidden": final_hidden.det_activations_sha256,
+        "logits": prefill_logits.det_final_logits_sha256,
+        "kv": build_det_kv_cache_commitment(&prefill.transformer_decode_state.layer_caches),
+    });
 
     // Per-layer capture for the first decode step via the real layer-range routine.
     let first_token = crate::routines::decode_select_token::native::select_next_token_internal(
         &prefill_logits.clone_internal(),
-        mode,
     )
     .expect("token selection should succeed");
     let first_step_layers = capture_first_step_layers(
         model,
         prefill.transformer_decode_state.clone(),
         first_token,
-        mode,
     );
 
     // Per-step decode capture (DECODE_TOKENS steps).
@@ -146,24 +120,16 @@ fn capture_mode(model: &Gemma4TransformerModel, mode: InferenceExecutionMode) ->
     let mut logits = prefill_logits.clone_internal();
     for _ in 0..DECODE_TOKENS {
         let next_token =
-            crate::routines::decode_select_token::native::select_next_token_internal(&logits, mode)
+            crate::routines::decode_select_token::native::select_next_token_internal(&logits)
                 .expect("token selection should succeed");
-        let step = pipeline::decode_step_with_mode(decode_state, next_token, model, mode)
+        let step = pipeline::decode_step(decode_state, next_token, model)
             .expect("decode step should succeed");
-        let step_capture = match mode {
-            InferenceExecutionMode::Deterministic => json!({
-                "token": next_token,
-                "activation": step.activation_state.det_activations_sha256,
-                "logits": step.prefill_logits.det_final_logits_sha256,
-                "kv": build_det_kv_cache_commitment(&step.transformer_decode_state.layer_caches),
-            }),
-            InferenceExecutionMode::Fp32 => json!({
-                "token": next_token,
-                "activation": step.activation_state.activations_sha256,
-                "logits": step.prefill_logits.final_logits_sha256,
-                "kv": fp32_kv_commitment(&step.transformer_decode_state.layer_caches),
-            }),
-        };
+        let step_capture = json!({
+            "token": next_token,
+            "activation": step.activation_state.det_activations_sha256,
+            "logits": step.prefill_logits.det_final_logits_sha256,
+            "kv": build_det_kv_cache_commitment(&step.transformer_decode_state.layer_caches),
+        });
         decode_steps.push(step_capture);
         decode_state = step.transformer_decode_state;
         logits = step.prefill_logits.clone_internal();
@@ -171,7 +137,7 @@ fn capture_mode(model: &Gemma4TransformerModel, mode: InferenceExecutionMode) ->
 
     // End-to-end capture through the public entry point.
     let outcome = crate::runtime::sequence::run(
-        &test_request(mode),
+        &test_request(),
         &test_model_spec(),
         &tokenizer,
         model,
@@ -197,64 +163,38 @@ fn capture_first_step_layers(
     model: &Gemma4TransformerModel,
     decode_state: crate::shared::model::transformer::TransformerDecodeState,
     next_token: u32,
-    mode: InferenceExecutionMode,
 ) -> Value {
-    let mut state = match mode {
-        InferenceExecutionMode::Deterministic => {
-            crate::routines::decode_layer_range::native::deterministic_tiles::init_state(
-                decode_state,
-                next_token,
-                model,
-            )
-        }
-        InferenceExecutionMode::Fp32 => crate::routines::decode_layer_range::native::init_state_with_mode(
-            decode_state,
-            next_token,
-            model,
-            mode,
-        ),
-    }
+    let mut state = crate::routines::decode_layer_range::native::deterministic_tiles::init_state(
+        decode_state,
+        next_token,
+        model,
+    )
     .expect("decode layer range init should succeed");
 
     let mut layers = Vec::with_capacity(state.layer_count);
     while !state.is_complete() {
-        let (next_state, _) = match mode {
-            InferenceExecutionMode::Deterministic => {
-                crate::routines::decode_layer_range::native::deterministic_tiles::run_range(state, model, 1)
-            }
-            InferenceExecutionMode::Fp32 => {
-                crate::routines::decode_layer_range::native::run_range_with_mode(state, model, 1, mode, None)
-            }
-        }
-        .expect("decode layer range should succeed");
+        let (next_state, _) =
+            crate::routines::decode_layer_range::native::deterministic_tiles::run_range(
+                state, model, 1,
+            )
+            .expect("decode layer range should succeed");
         state = next_state;
         let effective_caches = state.effective_layer_caches();
-        let layer_capture = match mode {
-            InferenceExecutionMode::Deterministic => json!({
-                "layer_output": state.completed_layer_output_det_sha256s.last().cloned(),
-                "kv": build_det_kv_cache_commitment(&effective_caches),
-            }),
-            InferenceExecutionMode::Fp32 => json!({
-                "layer_output": state.completed_layer_output_sha256s.last().cloned(),
-                "kv": fp32_kv_commitment(&effective_caches),
-            }),
-        };
+        let layer_capture = json!({
+            "layer_output": state.completed_layer_output_det_sha256s.last().cloned(),
+            "kv": build_det_kv_cache_commitment(&effective_caches),
+        });
         layers.push(layer_capture);
     }
     Value::Array(layers)
 }
 
-fn fp32_kv_commitment(caches: &[crate::shared::model::transformer::LayerKvCache]) -> String {
-    crate::trace::sha256_hex(&crate::trace::serialize_layer_caches(caches))
-}
-
-fn test_request(mode: InferenceExecutionMode) -> InferenceRequest {
+fn test_request() -> InferenceRequest {
     InferenceRequest {
         prompt_bytes: PROMPT.as_bytes().to_vec(),
         text_decoding_policy: TextDecodingPolicy::Utf8,
         add_generation_prompt: false,
         add_special_tokens: false,
-        execution_mode: mode,
         sampling: SamplingConfig {
             max_new_tokens: Some(DECODE_TOKENS),
             temperature: Some(1.0),
@@ -303,25 +243,15 @@ const FF: usize = 8;
 const VOCAB: usize = 9;
 const PLE_DIM: usize = 2;
 
-fn build_fixture_models(
-    name: &str,
-    donor: bool,
-) -> (Gemma4TransformerModel, Gemma4TransformerModel) {
+fn build_fixture_model(name: &str, donor: bool) -> Gemma4TransformerModel {
     let det_dir = create_temp_dir(&format!("det-golden-{name}-det"));
-    let fp32_dir = create_temp_dir(&format!("det-golden-{name}-fp32"));
     let config = fixture_config(donor);
     fs::write(det_dir.join("config.json"), &config).expect("config should write");
-    fs::write(fp32_dir.join("config.json"), &config).expect("config should write");
 
     let tensors = fixture_tensors();
     write_detwgt_file(&det_dir.join("model.detwgt"), &tensors);
-    write_fp32_model_file(&fp32_dir.join("model.safetensors"), &tensors);
 
-    let det_model = load_transformer_state_model_from_det_num_wgt_path(&det_dir)
-        .expect("det fixture should load");
-    let fp32_model = load_transformer_state_model_from_gemma_model_path(&fp32_dir)
-        .expect("fp32 fixture should load");
-    (det_model, fp32_model)
+    load_transformer_state_model_from_det_num_wgt_path(&det_dir).expect("det fixture should load")
 }
 
 fn fixture_config(donor: bool) -> String {
@@ -530,33 +460,6 @@ fn create_temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("raster-inference-{label}-{unique}"));
     fs::create_dir_all(&dir).expect("temp dir should create");
     dir
-}
-
-fn write_fp32_model_file(path: &Path, tensors: &[FixtureTensor]) {
-    let mut byte_storage = Vec::with_capacity(tensors.len());
-    for tensor in tensors {
-        byte_storage.push(
-            tensor
-                .values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<_>>(),
-        );
-    }
-    let mut metadata = std::collections::BTreeMap::new();
-    for (tensor, bytes) in tensors.iter().zip(byte_storage.iter()) {
-        metadata.insert(
-            tensor.name.clone(),
-            safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F32,
-                tensor.shape.clone(),
-                bytes,
-            )
-            .expect("tensor view should build"),
-        );
-    }
-    safetensors::tensor::serialize_to_file(&metadata, &None, path)
-        .expect("safetensors should write");
 }
 
 fn write_detwgt_file(path: &Path, tensors: &[FixtureTensor]) {
