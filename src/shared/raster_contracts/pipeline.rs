@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 
-use crate::decode_layer_range::raster::DecodeLayerCacheSlot;
-use crate::prefill_range::raster::PrefillLayerCacheSlot;
+use crate::routines::decode_layer_range::raster::DecodeLayerCacheSlot;
+use crate::routines::prefill_range::raster::PrefillLayerCacheSlot;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };

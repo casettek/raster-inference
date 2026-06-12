@@ -1,4 +1,4 @@
-use crate::decode_layer_range::raster::auth_source::{
+use crate::routines::decode_layer_range::raster::auth_source::{
     GemmaDecodeLayerMatrixKind, GemmaDecodeLayerMetadata, GemmaDecodePleScalars,
 };
 use crate::shared::artifacts::raster_artifact_store::{

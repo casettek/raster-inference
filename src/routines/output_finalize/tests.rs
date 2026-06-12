@@ -10,7 +10,7 @@ use crate::shared::artifacts::raster_artifact_store::{
     activation_row_leaf, token_id_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,
     RasterArtifactMetadata, RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
-use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
+use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::{InternalLogits, TransformerDecodeState};
 use crate::shared::numerics::det_num::Act;
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;

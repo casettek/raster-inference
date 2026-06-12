@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use tokenizers::Tokenizer;
 
-use crate::input_embedding;
+use crate::routines::input_embedding;
 use crate::runtime::checkpoints::{PhaseId, RoutineId};
 use crate::runtime::executors::{native, raster, ExecutionPolicy, StepMode};
 use crate::runtime::inference::{

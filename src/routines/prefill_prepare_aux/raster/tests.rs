@@ -237,7 +237,7 @@ fn prefill_prepare_aux_roots_can_be_built_from_input_embedding_refs() {
     )
     .expect("activation ref");
     let input_embedding_roots = ArtifactIo::export_store_roots();
-    let input_embedding_refs = crate::input_embedding::raster::RasterInputEmbeddingRefs {
+    let input_embedding_refs = crate::routines::input_embedding::raster::RasterInputEmbeddingRefs {
         source_id: "embedding-fixture".to_string(),
         embedding_source_root: "embedding-source-root".to_string(),
         prompt_token_ids_root: token_ids_ref.root().to_string(),
@@ -295,7 +295,7 @@ fn no_ple_globals_match_native_none_output() {
     let native_model = no_ple_model(2);
 
     let raster = run_materialized(&[0], &input, &source, 1).expect("raster PLE should run");
-    let native = crate::prefill_prepare_aux::run(
+    let native = crate::routines::prefill_prepare_aux::run(
         &[0],
         &native_model,
         &input,
@@ -479,14 +479,14 @@ fn prefill_ple_state_serializes_refs_not_activation_rows() {
 
     let (artifact_store_roots, refs) =
         finalize_prefill_ple_input_refs(artifact_store_roots, state).expect("finalize");
-    let refs = crate::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
+    let refs = crate::routines::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
         artifact_store_roots,
         refs.as_deref(),
     )
     .expect("read manifest")
     .expect("PLE refs");
     let finalized =
-        crate::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(&refs))
+        crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(&refs))
             .expect("materialize refs")
             .expect("PLE inputs");
     let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
@@ -588,7 +588,7 @@ fn prefill_ple_ref_manifest_serializes_refs_not_activation_rows() {
         raster_sizing_with_projection_rows(1),
     )
     .expect("raster PLE refs should run");
-    let refs = crate::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
+    let refs = crate::routines::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
         artifact_store_roots,
         manifest_root.as_deref(),
     )
@@ -601,7 +601,7 @@ fn prefill_ple_ref_manifest_serializes_refs_not_activation_rows() {
     assert!(!encoded.contains("act_bits"));
 
     let materialized =
-        crate::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(&refs))
+        crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(&refs))
             .expect("materialize refs")
             .expect("PLE inputs");
     let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
@@ -961,11 +961,11 @@ fn run_materialized_with_sizing(
     raster_sizing: RasterSizingControls,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let (artifact_store_roots, manifest_root) = run(token_ids, input, source, raster_sizing)?;
-    let refs = crate::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
+    let refs = crate::routines::prefill_prepare_aux::prefill_ple_input_refs_from_manifest(
         artifact_store_roots,
         manifest_root.as_deref(),
     )?;
-    crate::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(refs.as_ref())
+    crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(refs.as_ref())
 }
 
 fn native_prefill_ple_inputs(
@@ -973,7 +973,7 @@ fn native_prefill_ple_inputs(
     token_ids: &[u32],
     input: &ActivationSequence,
 ) -> Gemma4PrefillPleInputs {
-    crate::prefill_prepare_aux::native::compute_prefill_ple_inputs_internal(
+    crate::routines::prefill_prepare_aux::native::compute_prefill_ple_inputs_internal(
         token_ids,
         input.clone_internal(),
         &fixture.layers,

@@ -3,7 +3,7 @@ use super::{
     raster_cache_from_layer_cache, register_decode_layer_cache_with_roots, run,
     RasterDecodeLayerRangeInputRefs, RasterDecodeLayerRangeInputRoots,
 };
-use crate::decode_layer_range::raster::auth_source::{
+use crate::routines::decode_layer_range::raster::auth_source::{
     AuthenticatedGemmaDecodeLayerRangeSource, RasterDecodeLayerRangeSource,
 };
 use crate::shared::api::input::InferenceExecutionMode;
@@ -92,7 +92,7 @@ fn raster_decode_layer_range_matches_deterministic_no_ple() {
 
     let raster = run(decode_state.clone(), 1, &committed_source, raster_sizing(1))
         .expect("raster decode should run");
-    let deterministic = crate::decode_layer_range::run_full_step_with_mode(
+    let deterministic = crate::routines::decode_layer_range::run_full_step_with_mode(
         decode_state,
         1,
         &model,
@@ -131,7 +131,7 @@ fn root_backed_main_reads_selected_token_ref() {
     )
     .expect("root-backed raster decode should run")
     .transition_result;
-    let deterministic = crate::decode_layer_range::run_full_step_with_mode(
+    let deterministic = crate::routines::decode_layer_range::run_full_step_with_mode(
         decode_state,
         1,
         &model,
@@ -225,7 +225,7 @@ fn root_backed_state_main_returns_refs_without_materialized_transition_result() 
     assert_eq!(row_count, 1);
     assert!(width > 0);
 
-    let deterministic = crate::decode_layer_range::run_full_step_with_mode(
+    let deterministic = crate::routines::decode_layer_range::run_full_step_with_mode(
         decode_state,
         1,
         &model,
@@ -350,7 +350,7 @@ fn raster_decode_layer_range_matches_across_projection_and_attention_chunks() {
         .expect("source should build");
     let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(3);
-    let deterministic = crate::decode_layer_range::run_full_step_with_mode(
+    let deterministic = crate::routines::decode_layer_range::run_full_step_with_mode(
         decode_state.clone(),
         1,
         &model,
@@ -417,7 +417,7 @@ fn raster_decode_layer_range_matches_sliding_cache_window() {
         let decode_state = decode_state_with_cache(cache_len);
         let raster = run(decode_state.clone(), 1, &committed_source, raster_sizing(1))
             .expect("raster decode should run");
-        let deterministic = crate::decode_layer_range::run_full_step_with_mode(
+        let deterministic = crate::routines::decode_layer_range::run_full_step_with_mode(
             decode_state,
             1,
             &model,
@@ -514,7 +514,7 @@ fn assert_raster_matches_deterministic(
         raster_sizing_with_attention(2, 1),
     )
     .expect("raster decode should run");
-    let deterministic = crate::decode_layer_range::run_full_step_with_mode(
+    let deterministic = crate::routines::decode_layer_range::run_full_step_with_mode(
         decode_state,
         1,
         model,

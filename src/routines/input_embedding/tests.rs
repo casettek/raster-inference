@@ -1,5 +1,5 @@
 use super::{materialize_input_embedding_refs_for_trace, run_raster};
-use crate::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
+use crate::routines::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
 use crate::shared::api::input::RasterPromptPreparationState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{

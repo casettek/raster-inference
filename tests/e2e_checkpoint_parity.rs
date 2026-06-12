@@ -56,10 +56,11 @@ use std::{
 
 use raster_inference::shared::artifacts::artifact_io::ArtifactIo;
 use raster_inference::shared::artifacts::external_artifacts::reset_external_source_store;
+use raster_inference::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
+use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
-    load_transformer_state_model_from_det_num_wgt_path, run_inference_with_controls,
-    AuthenticatedGemmaTokenizer, Gemma4TransformerModel, InferenceControls, InferenceExecutionMode,
+    load_transformer_state_model_from_det_num_wgt_path, sequence, InferenceControls, InferenceExecutionMode,
     InferenceRequest, InferenceRunOutcome, ModelSpec, PausedInferenceState, RasterDetourSpec,
     SamplingConfig, TextDecodingPolicy,
 };
@@ -170,7 +171,7 @@ fn run_and_capture_trace(
     ArtifactIo::reset_store();
     reset_external_source_store();
 
-    let outcome = run_inference_with_controls(
+    let outcome = sequence::run(
         request,
         &fixture.model_spec,
         &fixture.tokenizer,

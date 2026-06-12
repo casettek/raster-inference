@@ -6,7 +6,7 @@ use crate::shared::artifacts::raster_artifact_store::{
     token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterArtifactRef,
     RasterArtifactStoreRoots, RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
 };
-use crate::shared::model::gemma_tokenizer::{
+use crate::shared::model::gemma::tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaBpeState, GemmaNormalizedText, GemmaPreTokenizedText,
     GemmaSpecialTokenAtRequest, GemmaTokenIdRequest, GemmaTokenizerMetadata,
     GemmaTokenizerMetadataRequest, GemmaTokenizerSpec,

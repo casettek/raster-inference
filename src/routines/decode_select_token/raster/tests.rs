@@ -88,7 +88,7 @@ fn main_matches_native_deterministic_selection() {
     let internal = InternalLogits::from_det_values(det_logits.clone());
     let input = input_roots(vec![10], vec![], det_logits, 1, 1, "native").expect("input roots");
 
-    let native = crate::decode_select_token::native::select_next_token_internal(
+    let native = crate::routines::decode_select_token::native::select_next_token_internal(
         &internal,
         InferenceExecutionMode::Deterministic,
     )

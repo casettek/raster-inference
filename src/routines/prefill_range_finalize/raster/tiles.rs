@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 
 use crate::dsl::prelude::tile;
-use crate::prefill_range::raster::{PrefillLayerRasterState, PrefillLayerStep};
+use crate::routines::prefill_range::raster::{PrefillLayerRasterState, PrefillLayerStep};
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 
 use super::utils::update_prefill_range_state_refs_with_roots;

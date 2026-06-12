@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::decode_transition_finalize::raster::auth_source::RasterDecodeTransitionSource;
+use crate::routines::decode_transition_finalize::raster::auth_source::RasterDecodeTransitionSource;
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
 
 use super::types::RasterDecodeTransitionFinalizeInput;
@@ -10,7 +10,7 @@ pub fn run_raster(
     completed_range_state: RasterDecodeTransitionFinalizeInput,
     source: &RasterDecodeTransitionSource<'_>,
 ) -> Result<RasterDecodeLoopState> {
-    let output = crate::decode_layer_range::raster::finalize_state_refs_with_roots(
+    let output = crate::routines::decode_layer_range::raster::finalize_state_refs_with_roots(
         completed_range_state.artifact_store_roots().clone(),
         completed_range_state,
         source,

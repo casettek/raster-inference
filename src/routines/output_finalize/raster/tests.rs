@@ -5,12 +5,12 @@ use super::{
     DEFAULT_OUTPUT_BYTE_FLUSH_BYTES_PER_TILE,
 };
 use crate::dsl::{start_tile_invocation_counting, stop_tile_invocation_counting};
-use crate::output_finalize::raster::auth_source::materialize_text_from_roots;
+use crate::routines::output_finalize::raster::auth_source::materialize_text_from_roots;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterArtifactStoreRoots,
 };
-use crate::shared::model::gemma_tokenizer::{
+use crate::shared::model::gemma::tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaTokenizerSpec,
     GemmaVocabEntry,
 };

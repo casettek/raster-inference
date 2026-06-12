@@ -8,7 +8,7 @@ use tokenizers::Tokenizer;
 use crate::runtime::inference::{InferenceControls, InferenceRunOutcome, InferenceState};
 use crate::runtime::{sequence, trace};
 use crate::shared::api::input::{InferenceRequest, ModelSpec};
-use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
+use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::Gemma4TransformerModel;
 
 /// Result of a claimer run: the final inference state plus the serialized

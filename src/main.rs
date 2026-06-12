@@ -1,13 +1,13 @@
 use std::{env, path::PathBuf, process};
 
 use raster_inference::shared::artifacts::integrity_mode::with_raster_integrity_mode;
+use raster_inference::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
     load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, sequence, trace,
-    AuthenticatedGemmaTokenizer, InferenceControls, InferenceExecutionMode, InferenceRequest,
-    InferenceRunOutcome, ModelSpec, RasterDetourSpec, RasterIntegrityMode, SamplingConfig,
-    TextDecodingPolicy,
+    load_transformer_state_model_from_gemma_model_path, sequence, trace, InferenceControls,
+    InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, ModelSpec, RasterDetourSpec,
+    RasterIntegrityMode, SamplingConfig, TextDecodingPolicy,
 };
 
 const CLI_MAX_NEW_TOKENS: usize = 3;

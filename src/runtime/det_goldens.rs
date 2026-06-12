@@ -30,7 +30,7 @@ use crate::shared::numerics::det_num::{encode_det_wgt_artifact, f32_to_wgt, DetW
 use crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment;
 use crate::{
     load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, run_inference,
+    load_transformer_state_model_from_gemma_model_path,
 };
 
 const DECODE_TOKENS: usize = 64;
@@ -91,12 +91,12 @@ fn capture_mode(model: &Gemma4TransformerModel, mode: InferenceExecutionMode) ->
     let tokenizer = test_tokenizer();
     let model_spec = test_model_spec();
     let prompt_preparation =
-        crate::prompt_prepare::run(&test_request(mode), &model_spec, &tokenizer)
+        crate::routines::prompt_prepare::run(&test_request(mode), &model_spec, &tokenizer)
             .expect("prompt preparation should succeed");
 
     // Routine-level capture: embedding, prefill, per-step decode.
     let token_embeddings =
-        crate::input_embedding::run(&prompt_preparation.prompt_token_ids, model, mode)
+        crate::routines::input_embedding::run(&prompt_preparation.prompt_token_ids, model, mode)
             .expect("input embedding should succeed");
     let prefill = pipeline::run_prefill_pass_with_mode(
         &PromptPreparationState {
@@ -128,7 +128,7 @@ fn capture_mode(model: &Gemma4TransformerModel, mode: InferenceExecutionMode) ->
     };
 
     // Per-layer capture for the first decode step via the real layer-range routine.
-    let first_token = crate::decode_select_token::native::select_next_token_internal(
+    let first_token = crate::routines::decode_select_token::native::select_next_token_internal(
         &prefill_logits.clone_internal(),
         mode,
     )
@@ -146,7 +146,7 @@ fn capture_mode(model: &Gemma4TransformerModel, mode: InferenceExecutionMode) ->
     let mut logits = prefill_logits.clone_internal();
     for _ in 0..DECODE_TOKENS {
         let next_token =
-            crate::decode_select_token::native::select_next_token_internal(&logits, mode)
+            crate::routines::decode_select_token::native::select_next_token_internal(&logits, mode)
                 .expect("token selection should succeed");
         let step = pipeline::decode_step_with_mode(decode_state, next_token, model, mode)
             .expect("decode step should succeed");
@@ -170,8 +170,17 @@ fn capture_mode(model: &Gemma4TransformerModel, mode: InferenceExecutionMode) ->
     }
 
     // End-to-end capture through the public entry point.
-    let state = run_inference(&test_request(mode), &test_model_spec(), &tokenizer, model)
-        .expect("end-to-end inference should succeed");
+    let outcome = crate::runtime::sequence::run(
+        &test_request(mode),
+        &test_model_spec(),
+        &tokenizer,
+        model,
+        &crate::InferenceControls::default(),
+    )
+    .expect("end-to-end inference should succeed");
+    let crate::InferenceRunOutcome::Completed(state) = outcome else {
+        panic!("end-to-end inference should complete");
+    };
 
     json!({
         "prefill": prefill_capture,
@@ -192,13 +201,13 @@ fn capture_first_step_layers(
 ) -> Value {
     let mut state = match mode {
         InferenceExecutionMode::Deterministic => {
-            crate::decode_layer_range::native::deterministic_tiles::init_state(
+            crate::routines::decode_layer_range::native::deterministic_tiles::init_state(
                 decode_state,
                 next_token,
                 model,
             )
         }
-        InferenceExecutionMode::Fp32 => crate::decode_layer_range::native::init_state_with_mode(
+        InferenceExecutionMode::Fp32 => crate::routines::decode_layer_range::native::init_state_with_mode(
             decode_state,
             next_token,
             model,
@@ -211,10 +220,10 @@ fn capture_first_step_layers(
     while !state.is_complete() {
         let (next_state, _) = match mode {
             InferenceExecutionMode::Deterministic => {
-                crate::decode_layer_range::native::deterministic_tiles::run_range(state, model, 1)
+                crate::routines::decode_layer_range::native::deterministic_tiles::run_range(state, model, 1)
             }
             InferenceExecutionMode::Fp32 => {
-                crate::decode_layer_range::native::run_range_with_mode(state, model, 1, mode, None)
+                crate::routines::decode_layer_range::native::run_range_with_mode(state, model, 1, mode, None)
             }
         }
         .expect("decode layer range should succeed");

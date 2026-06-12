@@ -1,6 +1,6 @@
 use crate::shared::api::input::RasterPromptPreparationState;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
-use crate::shared::model::gemma_tokenizer::GemmaBpeState;
+use crate::shared::model::gemma::tokenizer::GemmaBpeState;
 
 // Types and constants used by the raster sequences and tiles.
 

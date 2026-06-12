@@ -13,14 +13,33 @@ use raster_inference::shared::numerics::det_num::{
     encode_det_wgt_artifact, f32_to_wgt, DetWgtTensorSpec, DET_NUM_SPEC_VERSION,
     DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
-use raster_inference::Gemma4LogitsProjection;
+use raster_inference::shared::model::transformer::{Gemma4LogitsProjection, Gemma4TransformerModel};
 use raster_inference::{
     load_transformer_state_model_from_det_num_wgt_path,
-    load_transformer_state_model_from_gemma_model_path, run_inference, InferenceExecutionMode,
-    InferenceRequest, ModelSpec, SamplingConfig, TextDecodingPolicy,
+    load_transformer_state_model_from_gemma_model_path, sequence, InferenceControls,
+    InferenceExecutionMode, InferenceRequest, InferenceRunOutcome, InferenceState, ModelSpec,
+    SamplingConfig, TextDecodingPolicy,
 };
 use safetensors::tensor::{serialize_to_file, TensorView};
 use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, Tokenizer};
+
+fn run_inference(
+    request: &InferenceRequest,
+    model: &ModelSpec,
+    tokenizer: &Tokenizer,
+    transformer_model: &Gemma4TransformerModel,
+) -> anyhow::Result<InferenceState> {
+    match sequence::run(
+        request,
+        model,
+        tokenizer,
+        transformer_model,
+        &InferenceControls::default(),
+    )? {
+        InferenceRunOutcome::Completed(state) => Ok(state),
+        other => anyhow::bail!("inference stopped before completion: {other:?}"),
+    }
+}
 
 #[test]
 fn deterministic_loader_reconstructs_tied_embedding_projection() {

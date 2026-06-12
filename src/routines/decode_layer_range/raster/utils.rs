@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::decode_layer_range::raster::auth_source::{
+use crate::routines::decode_layer_range::raster::auth_source::{
     GemmaDecodeLayerMatrixRowRequest, GemmaDecodeLayerMetadata,
     GemmaDecodePleModelProjectionRowRequest, GemmaDecodeProjectionRowRequest,
     RasterDecodeLayerRangeSource,
@@ -1630,7 +1630,7 @@ pub(crate) fn trace_raster_checkpoint(
         state.artifact_store_roots(),
         &state.effective_layer_caches(),
     )?;
-    crate::decode_layer_range::trace_checkpoint_payload(
+    crate::routines::decode_layer_range::trace_checkpoint_payload(
         state.next_token(),
         state.position(),
         state.token_count(),

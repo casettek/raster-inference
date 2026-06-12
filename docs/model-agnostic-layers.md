@@ -40,11 +40,10 @@ containment only.
 
 ## Compatibility re-exports
 
-To keep the containment refactor mechanical, the pre-containment import
-paths still work via re-exports and are slated for removal once call sites
-migrate:
+To keep the containment refactor mechanical, two pre-containment import
+paths still work via re-exports (the `shared::model::gemma_tokenizer` alias
+and the crate-root flat re-exports have been removed):
 
-- `shared::model::gemma_tokenizer` → alias of `shared::model::gemma::tokenizer`,
 - `shared::model::transformer::Gemma4*` → re-exported from
   `shared::model::gemma::transformer`,
 - `io::load_*gemma*` / det-wgt loaders → re-exported from

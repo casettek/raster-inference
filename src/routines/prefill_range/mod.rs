@@ -1,4 +1,4 @@
-use crate::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::routines::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::runtime::checkpoints::{RasterDetourController, RoutineId};
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;

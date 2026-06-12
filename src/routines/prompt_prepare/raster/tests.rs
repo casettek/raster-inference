@@ -17,7 +17,7 @@ use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     self, RasterArtifactId, RasterBpePieceSequenceRef, RasterTokenIdSequenceRef,
 };
-use crate::shared::model::gemma_tokenizer::{
+use crate::shared::model::gemma::tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaAddedToken, GemmaBpeMerge, GemmaBpeOutput,
     GemmaPreTokenizedText, GemmaTokenizerSpec, GemmaVocabEntry,
 };

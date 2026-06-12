@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::json;
 
-use crate::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::routines::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;

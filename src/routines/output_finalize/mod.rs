@@ -8,7 +8,7 @@ use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     token_id_leaf, RasterArtifactId, RasterArtifactMetadata, RasterTokenIdSequenceRef,
 };
-use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
+use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
 use crate::RasterSizingControls;
 

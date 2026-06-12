@@ -80,15 +80,15 @@ fn run_prefill_pass_for_token_ids(
         model.layers.len()
     ));
     let ple_inputs =
-        crate::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
+        crate::routines::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings, execution_mode)?;
     trace_event("prefill.layer_stack");
-    let (final_hidden_states, layer_caches) = crate::prefill_range::run_with_mode_internal(
+    let (final_hidden_states, layer_caches) = crate::routines::prefill_range::run_with_mode_internal(
         token_embeddings.clone_internal(),
         model,
         ple_inputs.as_ref(),
         execution_mode,
     )?;
-    crate::prefill_finalize::run(
+    crate::routines::prefill_finalize::run(
         prompt_token_ids,
         model,
         final_hidden_states,
@@ -178,14 +178,14 @@ pub fn decode_step_with_mode(
     ));
     trace_event("decode.layer_stack");
     let mut range_state = match execution_mode {
-        InferenceExecutionMode::Fp32 => crate::decode_layer_range::native::init_state_with_mode(
+        InferenceExecutionMode::Fp32 => crate::routines::decode_layer_range::native::init_state_with_mode(
             transformer_decode_state,
             next_token,
             model,
             execution_mode,
         )?,
         InferenceExecutionMode::Deterministic => {
-            crate::decode_layer_range::native::deterministic_tiles::init_state(
+            crate::routines::decode_layer_range::native::deterministic_tiles::init_state(
                 transformer_decode_state,
                 next_token,
                 model,
@@ -194,7 +194,7 @@ pub fn decode_step_with_mode(
     };
     while !range_state.is_complete() {
         let (next_range_state, _) = match execution_mode {
-            InferenceExecutionMode::Fp32 => crate::decode_layer_range::native::run_range_with_mode(
+            InferenceExecutionMode::Fp32 => crate::routines::decode_layer_range::native::run_range_with_mode(
                 range_state,
                 model,
                 crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH,
@@ -202,7 +202,7 @@ pub fn decode_step_with_mode(
                 None,
             )?,
             InferenceExecutionMode::Deterministic => {
-                crate::decode_layer_range::native::deterministic_tiles::run_range(
+                crate::routines::decode_layer_range::native::deterministic_tiles::run_range(
                     range_state,
                     model,
                     crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH,
@@ -212,7 +212,7 @@ pub fn decode_step_with_mode(
         range_state = next_range_state;
     }
     trace_event("decode.project_to_logits");
-    crate::decode_transition_finalize::native::run_with_mode(range_state, model, execution_mode)
+    crate::routines::decode_transition_finalize::native::run_with_mode(range_state, model, execution_mode)
 }
 
 pub fn run_output_decode(
@@ -270,10 +270,13 @@ mod tests {
             ActivationSequence, DetNumMatrix, InternalActivationSequence,
         },
         shared::numerics::det_num::{act_to_f32, Act},
+        shared::model::transformer::{
+            EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
+            Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+            Gemma4TransformerModel, MatrixF32,
+        },
         shared::numerics::transformer_kernels::{build_activation_commitment, embed_input_tokens},
-        EmbeddingTable, Gemma4AttentionKind, Gemma4LayerWeights, Gemma4LogitsProjection,
-        Gemma4ModelProvenance, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
-        Gemma4TransformerModel, MatrixF32, PromptPreparationState, SamplingConfig,
+        PromptPreparationState, SamplingConfig,
     };
 
     #[test]
@@ -670,7 +673,7 @@ mod tests {
         );
         final_hidden_states.activations = vec![vec![0.0, 1.0, 0.0, 0.0]];
 
-        let prefill = crate::prefill_finalize::run(
+        let prefill = crate::routines::prefill_finalize::run(
             &[0],
             &model,
             final_hidden_states,

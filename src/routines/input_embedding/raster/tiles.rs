@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 
 use crate::dsl::prelude::{call_recur_tile, call_tile, sequence, tile};
-use crate::input_embedding::raster::auth_source::{
+use crate::routines::input_embedding::raster::auth_source::{
     GemmaInputEmbeddingMetadataRequest, GemmaInputEmbeddingRowRequest, RasterInputEmbeddingSource,
 };
 use crate::shared::artifacts::artifact_io::ArtifactIo;

@@ -95,7 +95,7 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
                 )
             })?;
             let xs_internal = internal_sequence_from_slab(&xs);
-            let output = crate::prefill_range::run_selected_raster_detour_from_native_boundary(
+            let output = crate::routines::prefill_range::run_selected_raster_detour_from_native_boundary(
                 &xs_internal,
                 layer_idx,
                 &layer_caches,
@@ -149,7 +149,7 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
             internal_sequence_from_slab(&xs),
             Some(layer_output_det_sha256),
         );
-        if crate::prefill_range::trace_checkpoints(
+        if crate::routines::prefill_range::trace_checkpoints(
             layer_idx,
             &current_activations,
             prefill_token_range_width,
@@ -157,7 +157,7 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
         )? {
             break;
         }
-        if crate::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
+        if crate::routines::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
             execution_mode: Some("deterministic"),
             layer_idx,
             current_activations: &current_activations,

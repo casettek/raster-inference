@@ -14,7 +14,7 @@ use std::ops::ControlFlow;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
+use crate::routines::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
 use crate::runtime::checkpoints::{PhaseId, RasterDetourController, RoutineId};
 use crate::runtime::inference::{
     InferenceControls, InferenceRunOutcome, RasterPromptPreparedState,
@@ -30,7 +30,7 @@ use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
-use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
+use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::{
     ActivationSequence, Gemma4TransformerModel, InternalActivationSequence,
     TransformerPrefillResult,
@@ -42,7 +42,7 @@ use crate::shared::tensors::raster_tensor_artifacts::{
 };
 use crate::trace::{trace_event, trace_scope};
 use crate::RasterSizingControls;
-use crate::{
+use crate::routines::{
     input_embedding, prefill_finalize, prefill_prepare_aux, prefill_range, prompt_prepare,
 };
 
@@ -235,7 +235,7 @@ pub(crate) fn run_prefill(
         return Ok(ControlFlow::Break(terminal_checkpoint_id));
     }
     let finalize_source =
-        crate::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource::from_model(
+        crate::routines::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource::from_model(
             model.model_id.clone(),
             transformer_model,
         )?;
@@ -296,20 +296,20 @@ pub(crate) fn run_output_decode(
     let mut decode_state = initial_decode_state;
 
     loop {
-        if crate::decode_select_token::raster::check_stop_condition(
+        if crate::routines::decode_select_token::raster::check_stop_condition(
             decode_state.generated_token_count,
             max_new_tokens,
         )
         .is_some()
         {
             trace_event("output.detokenize");
-            let output_refs = crate::output_finalize::run_raster(
+            let output_refs = crate::routines::output_finalize::run_raster(
                 decode_state.clone(),
                 raster_tokenizer,
                 raster_sizing.output_byte_flush_bytes_per_tile,
             )?;
             let mut output_decode_state =
-                crate::output_finalize::materialize_output_decode_state_for_api(
+                crate::routines::output_finalize::materialize_output_decode_state_for_api(
                     decode_state,
                     output_refs,
                 )?;
@@ -323,13 +323,13 @@ pub(crate) fn run_output_decode(
         }
 
         trace_event("decode.select_token");
-        let (selected_state, select_output) = crate::decode_select_token::run_raster_with_sizing(
+        let (selected_state, select_output) = crate::routines::decode_select_token::run_raster_with_sizing(
             decode_state,
             max_new_tokens,
             raster_sizing,
         )?;
         let select_output = select_output.expect("stop condition should have returned earlier");
-        crate::decode_select_token::trace_raster_checkpoint_from_state(
+        crate::routines::decode_select_token::trace_raster_checkpoint_from_state(
             &selected_state,
             select_output.next_token,
             max_new_tokens,
@@ -337,25 +337,25 @@ pub(crate) fn run_output_decode(
 
         trace_event("decode.step");
         let source =
-            crate::decode_layer_range::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource::from_model(
+            crate::routines::decode_layer_range::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource::from_model(
                 format!("decode.layer_range.position_{}", selected_state.position),
                 transformer_model,
             )?;
         let selected_state_for_finalize = selected_state.clone();
-        let mut range_state = crate::decode_layer_range::init_raster_state_from_decode_loop(
+        let mut range_state = crate::routines::decode_layer_range::init_raster_state_from_decode_loop(
             selected_state,
             select_output.selected_token_ref,
             &source,
             raster_sizing,
         )?;
         while !range_state.is_complete() {
-            range_state = crate::decode_layer_range::run_raster(
+            range_state = crate::routines::decode_layer_range::run_raster(
                 range_state,
                 &source,
                 raster_sizing.decode_layer_range_width,
             )?;
         }
-        decode_state = crate::decode_transition_finalize::run_raster(
+        decode_state = crate::routines::decode_transition_finalize::run_raster(
             selected_state_for_finalize,
             range_state,
             &source,
@@ -364,7 +364,7 @@ pub(crate) fn run_output_decode(
             decode_transition_state_refs
                 .push((decode_state.artifact_store_roots.clone(), activation_ref));
         }
-        crate::decode_transition_finalize::finalize_raster_state_for_trace(&decode_state)?;
+        crate::routines::decode_transition_finalize::finalize_raster_state_for_trace(&decode_state)?;
         if crate::trace::reached_terminal_checkpoint_id().is_some() {
             let materialized_transition_states = decode_transition_state_refs
                 .into_iter()
@@ -417,14 +417,14 @@ fn build_current_output_decode_state_from_raster_state(
 ) -> Result<OutputDecodeState> {
     let generated_token_ids = match decode_state.generated_token_ids_ref.as_ref() {
         Some(generated_token_ids_ref) => {
-            crate::output_finalize::raster::materialize_token_ids_from_roots(
+            crate::routines::output_finalize::raster::materialize_token_ids_from_roots(
                 &decode_state.artifact_store_roots,
                 generated_token_ids_ref,
             )?
         }
         None => Vec::new(),
     };
-    crate::output_finalize::raster::run_with_byte_flush_bytes_per_tile(
+    crate::routines::output_finalize::raster::run_with_byte_flush_bytes_per_tile(
         &generated_token_ids,
         raster_tokenizer,
         raster_sizing.output_byte_flush_bytes_per_tile,

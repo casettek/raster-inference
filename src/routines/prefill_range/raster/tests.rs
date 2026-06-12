@@ -1,7 +1,7 @@
 use crate::dsl::prelude::auth_read;
-use crate::input_embedding::raster::RasterInputEmbeddingRefs;
-use crate::prefill_range::native::deterministic_tiles;
-use crate::prefill_range::{
+use crate::routines::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::routines::prefill_range::native::deterministic_tiles;
+use crate::routines::prefill_range::{
     materialize_prefill_layer_output_refs_from_roots_for_trace, run_raster,
 };
 use crate::shared::artifacts::artifact_io::ArtifactIo;

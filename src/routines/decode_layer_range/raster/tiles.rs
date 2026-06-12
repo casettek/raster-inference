@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 
-use crate::decode_layer_range::raster::auth_source::{
+use crate::routines::decode_layer_range::raster::auth_source::{
     GemmaDecodeAttentionKind, GemmaDecodeEmbeddingRowRequest, GemmaDecodeFinalNormWeightsRequest,
     GemmaDecodeFinalScalarsRequest, GemmaDecodeLayerMatrixKind, GemmaDecodeLayerMetadata,
     GemmaDecodeLayerMetadataRequest, GemmaDecodeLayerNormKind, GemmaDecodeLayerNormWeightsRequest,
@@ -2874,7 +2874,7 @@ fn finalize_decode_ple_input_work(
 #[tile]
 fn read_decode_ple_scalars(
     source: &RasterDecodeLayerRangeSource<'_>,
-) -> Result<crate::decode_layer_range::raster::auth_source::GemmaDecodePleScalars> {
+) -> Result<crate::routines::decode_layer_range::raster::auth_source::GemmaDecodePleScalars> {
     auth_read!(source, GemmaDecodePleScalarsRequest)
 }
 
@@ -3047,7 +3047,7 @@ fn finalize_decode_projection_work_with_roots(
 fn read_decode_layer_scalars(
     source: &RasterDecodeLayerRangeSource<'_>,
     layer_idx: usize,
-) -> Result<crate::decode_layer_range::raster::auth_source::GemmaDecodeLayerScalars> {
+) -> Result<crate::routines::decode_layer_range::raster::auth_source::GemmaDecodeLayerScalars> {
     auth_read!(source, GemmaDecodeLayerScalarsRequest { layer_idx })
 }
 

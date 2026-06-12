@@ -1,4 +1,4 @@
-use crate::output_finalize::raster::auth_source::{
+use crate::routines::output_finalize::raster::auth_source::{
     OutputPendingBytesRef, OutputTextRef, OutputTokenIdsCommitmentState, OutputUtf8ValidationState,
 };
 use crate::shared::api::output::OutputDecodeStopReason;

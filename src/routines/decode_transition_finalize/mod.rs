@@ -23,7 +23,7 @@ pub fn run_raster(
 
 pub(crate) fn run_selected_raster_detour_from_native_boundary(
     decode_state: &DecodeState,
-    completed_range_state: crate::decode_layer_range::DecodeLayerRangeState,
+    completed_range_state: crate::routines::decode_layer_range::DecodeLayerRangeState,
     source: &AuthenticatedGemmaDecodeTransitionSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<TransformerDecodeStepResult> {
@@ -32,11 +32,11 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
         completed_range_state.position
     );
     let prior_raster_state =
-        crate::decode_layer_range::prepare_raster_decode_loop_state_from_native(
+        crate::routines::decode_layer_range::prepare_raster_decode_loop_state_from_native(
             decode_state,
             &source_prefix,
         )?;
-    let completed_range_state = crate::decode_layer_range::raster_state_from_native_state(
+    let completed_range_state = crate::routines::decode_layer_range::raster_state_from_native_state(
         completed_range_state,
         raster_sizing,
     )?;
@@ -45,15 +45,15 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
         anyhow::anyhow!("decode transition finalize detour requires activation state ref")
     })?;
     let activation_state =
-        crate::decode_layer_range::raster::materialize_activation_sequence_from_ref(
+        crate::routines::decode_layer_range::raster::materialize_activation_sequence_from_ref(
             &raster_state.artifact_store_roots,
             activation_ref,
         )?;
     let materialized =
-        crate::decode_layer_range::materialize_decode_state_from_raster_state_for_trace(
+        crate::routines::decode_layer_range::materialize_decode_state_from_raster_state_for_trace(
             &raster_state,
         )?;
-    let prefill_logits = crate::decode_layer_range::prefill_logits_from_internal(
+    let prefill_logits = crate::routines::decode_layer_range::prefill_logits_from_internal(
         materialized.clone_internal_logits(),
     );
 
@@ -102,14 +102,14 @@ pub(crate) fn finalize_raster_state_for_trace(
     decode_state: &crate::shared::raster_contracts::pipeline::RasterDecodeLoopState,
 ) -> Result<()> {
     let decode_state =
-        crate::decode_layer_range::materialize_decode_state_from_raster_state_for_trace(
+        crate::routines::decode_layer_range::materialize_decode_state_from_raster_state_for_trace(
             decode_state,
         )?;
     trace_checkpoint(&decode_state)
 }
 
 fn generated_token_ids_commitment(decode_state: &DecodeState) -> Result<String> {
-    crate::output_finalize::native::build_output_decode_commitment(
+    crate::routines::output_finalize::native::build_output_decode_commitment(
         &decode_state.generated_token_ids,
     )
 }

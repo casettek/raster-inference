@@ -2,7 +2,7 @@ use super::types::*;
 
 use anyhow::{bail, Result};
 
-use crate::output_finalize::raster::auth_source::{
+use crate::routines::output_finalize::raster::auth_source::{
     OutputPendingBytesRef, OutputUtf8ValidationState,
 };
 use crate::shared::api::output::OutputDecodeStopReason;
@@ -11,7 +11,7 @@ use crate::shared::artifacts::raster_artifact_store::{
     read_token_id_from_ref_roots, token_id_leaf, RasterArtifactId, RasterArtifactStoreRoots,
     RasterTokenIdSequenceRef,
 };
-use crate::shared::model::gemma_tokenizer::{AuthenticatedGemmaTokenizer, GemmaDecodedToken};
+use crate::shared::model::gemma::tokenizer::{AuthenticatedGemmaTokenizer, GemmaDecodedToken};
 
 pub fn validate_output_byte_flush_bytes_per_tile(bytes_per_tile: usize) -> Result<()> {
     if bytes_per_tile == 0 {
@@ -62,7 +62,7 @@ pub(in super::super) fn append_pending_byte_with_roots(
         let (roots, _builder) = ArtifactIo::start_builder_with_roots(
             &state.artifact_store_roots,
             RasterArtifactId::new(source_name.clone())?,
-            crate::output_finalize::raster::auth_source::output_pending_bytes_metadata()?,
+            crate::routines::output_finalize::raster::auth_source::output_pending_bytes_metadata()?,
         )?;
         state.artifact_store_roots = roots;
         state.pending_bytes_builder_source_name = Some(source_name);
@@ -75,7 +75,7 @@ pub(in super::super) fn append_pending_byte_with_roots(
         &state.artifact_store_roots,
         &source_name,
         state.pending_bytes_written,
-        crate::output_finalize::raster::auth_source::pending_byte_leaf(byte),
+        crate::routines::output_finalize::raster::auth_source::pending_byte_leaf(byte),
     )?;
     state.artifact_store_roots = roots;
     state.pending_bytes_written += 1;
@@ -224,7 +224,7 @@ pub(in super::super) fn append_text_chunk_with_roots(
         &state.artifact_store_roots,
         &state.text_builder_source_name,
         state.text_chunk_count,
-        crate::output_finalize::raster::auth_source::text_chunk_leaf(chunk),
+        crate::routines::output_finalize::raster::auth_source::text_chunk_leaf(chunk),
     )?;
     state.artifact_store_roots = roots;
     state.text_chunk_count += 1;
@@ -246,7 +246,7 @@ pub(in super::super) fn read_pending_byte_from_ref_roots(
     }
     let artifact_ref = pending_ref.artifact_ref();
     let read = ArtifactIo::read_authenticated_leaf_from_roots(roots, artifact_ref, byte_idx)?;
-    crate::output_finalize::raster::auth_source::decode_pending_byte_leaf(read.bytes())
+    crate::routines::output_finalize::raster::auth_source::decode_pending_byte_leaf(read.bytes())
 }
 
 pub(in super::super) fn read_pending_byte_range_from_ref_roots(

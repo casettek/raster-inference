@@ -3,8 +3,8 @@ use anyhow::{anyhow, bail, Result};
 use crate::dsl::prelude::{
     auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
-use crate::input_embedding::raster::RasterInputEmbeddingRefs;
-use crate::prefill_range_finalize::raster::finalize_prefill_range_step_with_roots;
+use crate::routines::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::routines::prefill_range_finalize::raster::finalize_prefill_range_step_with_roots;
 use crate::runtime::checkpoints::RoutineId;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::raster_contracts::prefill_layer::{

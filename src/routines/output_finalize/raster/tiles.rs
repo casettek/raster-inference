@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::dsl::prelude::{auth_read, call_recur_tile, call_seq, call_tile, sequence, tile};
-use crate::output_finalize::raster::auth_source::{
+use crate::routines::output_finalize::raster::auth_source::{
     build_output_token_ids_commitment, OutputTextRef, OutputTokenIdsCommitmentState,
 };
 use crate::shared::api::output::{OutputDecodeState, OutputDecodeStopReason};
@@ -9,7 +9,7 @@ use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     read_token_id_from_ref_roots, RasterArtifactId, RasterArtifactStoreRoots,
 };
-use crate::shared::model::gemma_tokenizer::{
+use crate::shared::model::gemma::tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaDecoderMetadataRequest, GemmaTokenByIdRequest,
 };
 
@@ -77,7 +77,7 @@ pub fn run_with_byte_flush_bytes_per_tile(
         &refs.artifact_store_roots,
         &refs.refs.generated_token_ids_ref,
     )?;
-    let generated_text = crate::output_finalize::raster::auth_source::materialize_text_from_roots(
+    let generated_text = crate::routines::output_finalize::raster::auth_source::materialize_text_from_roots(
         &refs.artifact_store_roots,
         &refs.refs.generated_text_ref,
     )?;
@@ -103,7 +103,7 @@ pub fn detokenize_output_tokens_with_byte_flush_bytes_per_tile(
         "output.finalize.detokenize",
     )?;
     let refs = call_seq!(main, input_roots, tokenizer)?;
-    crate::output_finalize::raster::auth_source::materialize_text_from_roots(
+    crate::routines::output_finalize::raster::auth_source::materialize_text_from_roots(
         &refs.artifact_store_roots,
         &refs.refs.generated_text_ref,
     )
@@ -157,7 +157,7 @@ pub fn init_raster_output_detokenize(
     let (next_roots, _builder) = ArtifactIo::start_builder_with_roots(
         &artifact_store_roots,
         RasterArtifactId::new(input_roots.output_text_source_name.clone())?,
-        crate::output_finalize::raster::auth_source::output_text_metadata()?,
+        crate::routines::output_finalize::raster::auth_source::output_text_metadata()?,
     )?;
     artifact_store_roots = next_roots;
 

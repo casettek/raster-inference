@@ -21,9 +21,11 @@ use std::{
 use raster_inference::shared::numerics::det_num::{
     encode_det_wgt_artifact_with_widths, f32_to_wgt, DetWgtTensorSpec, DetWgtWidthPolicy,
 };
+use raster_inference::routines::input_embedding;
+use raster_inference::runtime::pipeline::{decode_step_with_mode, run_prefill_pass_with_mode};
+use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
-    decode_step_with_mode, input_embedding, load_transformer_state_model_from_det_num_wgt_path,
-    run_prefill_pass_with_mode, Gemma4TransformerModel, InferenceExecutionMode,
+    load_transformer_state_model_from_det_num_wgt_path, InferenceExecutionMode,
     PromptPreparationState,
 };
 

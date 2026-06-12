@@ -1,11 +1,11 @@
 use anyhow::Result;
 use serde_json::json;
 
-use crate::prefill_range::raster::utils::{
+use crate::routines::prefill_range::raster::utils::{
     layer_caches_from_raster, materialize_prefill_activation_sequence_from_roots,
     materialize_prefill_layer_caches_from_roots, raster_sequence_acts,
 };
-use crate::prefill_range::raster::{PrefillLayerCacheSlot, PrefillLayerRasterState};
+use crate::routines::prefill_range::raster::{PrefillLayerCacheSlot, PrefillLayerRasterState};
 use crate::routines::prefill_range_finalize::PrefillRangeFinalizeCheckpoint;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{ActivationSequence, InternalActivationSequence};
@@ -78,7 +78,7 @@ fn trace_prefill_range_finalize_checkpoint_with_roots(
         current_sha256.clone(),
     );
     activation_sequence.det_activations_sha256 = current_det_sha256.clone();
-    if crate::prefill_range::trace_checkpoints(
+    if crate::routines::prefill_range::trace_checkpoints(
         layer_idx,
         &activation_sequence,
         state.prefill_token_range_width,
@@ -95,7 +95,7 @@ fn trace_prefill_range_finalize_checkpoint_with_roots(
     let mut completed_layer_output_det_sha256s = state.completed_layer_output_det_sha256s.clone();
     completed_layer_output_det_sha256s.push(current_det_sha256.clone());
     let completed_layer_output = Some((current_sha256, current_det_sha256));
-    let reached = crate::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
+    let reached = crate::routines::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
         execution_mode: Some("deterministic"),
         layer_idx,
         current_activations: &activation_sequence,

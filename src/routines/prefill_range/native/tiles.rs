@@ -67,7 +67,7 @@ pub fn run_text_layers_prefill_with_cache_with_range_width(
                 crate::shared::api::input::InferenceExecutionMode::Fp32,
             )?;
         xs = layer_output.activations;
-        if crate::prefill_range::trace_checkpoints(
+        if crate::routines::prefill_range::trace_checkpoints(
             layer_idx,
             &ActivationSequence::from_values(
                 xs.clone(),
@@ -94,7 +94,7 @@ pub fn run_text_layers_prefill_with_cache_with_range_width(
             xs.clone(),
             crate::shared::numerics::transformer_kernels::build_activation_commitment(&xs),
         );
-        if crate::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
+        if crate::routines::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
             execution_mode: None,
             layer_idx,
             current_activations: &current_activations,

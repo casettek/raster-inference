@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 
 use super::types::*;
 use crate::dsl::prelude::auth_read;
-use crate::input_embedding::raster::RasterInputEmbeddingRefs;
+use crate::routines::input_embedding::raster::RasterInputEmbeddingRefs;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::merkle::merkle_root;
 use crate::shared::artifacts::raster_artifact_store::{

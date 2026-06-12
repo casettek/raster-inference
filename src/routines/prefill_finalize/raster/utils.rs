@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use crate::prefill_finalize::raster::{RasterPrefillFinalizeRefs, PREFILL_LOGITS_ARTIFACT_NAME};
+use crate::routines::prefill_finalize::raster::{RasterPrefillFinalizeRefs, PREFILL_LOGITS_ARTIFACT_NAME};
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
     ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerPrefillResult,
@@ -13,12 +13,12 @@ pub fn build_prefill_result_from_root_refs(
     roots: &RasterArtifactStoreRoots,
     refs: &RasterPrefillFinalizeRefs,
 ) -> Result<TransformerPrefillResult> {
-    let layer_refs = crate::prefill_range::raster::PrefillLayerOutputRefs {
+    let layer_refs = crate::routines::prefill_range::raster::PrefillLayerOutputRefs {
         final_hidden_states_ref: refs.final_hidden_states_ref.clone(),
         layer_caches: refs.layer_caches.clone(),
     };
     let (final_hidden_states, layer_caches) =
-        crate::prefill_range::materialize_prefill_layer_output_refs_from_roots_for_trace(
+        crate::routines::prefill_range::materialize_prefill_layer_output_refs_from_roots_for_trace(
             roots,
             &layer_refs,
         )?;
@@ -47,7 +47,7 @@ pub fn build_prefill_result(
 ) -> Result<TransformerPrefillResult> {
     // Delegates to the shared checkpoint/result builder so native and raster
     // prefill.finalize payloads stay in lockstep.
-    crate::prefill_finalize::native::build_prefill_result(
+    crate::routines::prefill_finalize::native::build_prefill_result(
         prompt_token_count,
         final_hidden_states,
         layer_caches,
@@ -88,10 +88,10 @@ fn materialize_prefill_logits_from_roots(
 
 pub(in super::super) fn validate_layer_cache_roots(
     roots: &RasterArtifactStoreRoots,
-    layer_caches: &[crate::prefill_range::raster::PrefillLayerCacheSlot],
+    layer_caches: &[crate::routines::prefill_range::raster::PrefillLayerCacheSlot],
 ) -> Result<()> {
     for cache in layer_caches {
-        if let crate::prefill_range::raster::PrefillLayerCacheSlot::Ref(cache_ref) = cache {
+        if let crate::routines::prefill_range::raster::PrefillLayerCacheSlot::Ref(cache_ref) = cache {
             ensure_artifact_root_present(roots, cache_ref.keys().det_commitment())?;
             ensure_artifact_root_present(roots, cache_ref.values().det_commitment())?;
         }

@@ -4,7 +4,7 @@ use tokenizers::Tokenizer;
 use crate::shared::api::input::{
     InferenceRequest, ModelSpec, PromptPreparationState, RasterPromptPreparationState,
 };
-use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
+use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::trace::{routine_scope, trace_event};
 
 use self::native::{

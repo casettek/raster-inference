@@ -20,7 +20,7 @@ use crate::shared::api::audit::{
     AuditOutcome, CheckpointDivergence, ClaimedTrace, ClaimedTraceEntry, DetourArtifact,
 };
 use crate::shared::api::input::{InferenceExecutionMode, InferenceRequest, ModelSpec};
-use crate::shared::model::gemma_tokenizer::AuthenticatedGemmaTokenizer;
+use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::Gemma4TransformerModel;
 
 /// Routines whose selective raster detour is implemented on the native path.

@@ -4,10 +4,10 @@ use super::{
     project_next_prefill_logit_chunk, RasterPrefillFinalizeInputRoots,
     NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
 };
-use crate::prefill_finalize::raster::auth_source::{
+use crate::routines::prefill_finalize::raster::auth_source::{
     AuthenticatedGemmaPrefillFinalizeSource, RasterPrefillFinalizeSource,
 };
-use crate::prefill_range::raster::PrefillLayerCacheSlot;
+use crate::routines::prefill_range::raster::PrefillLayerCacheSlot;
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -46,7 +46,7 @@ fn raster_finalize_matches_native_deterministic_for_untied_projection() {
 
     let raster = run_ref_backed_finalize(2, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
-    let native = crate::prefill_finalize::run(
+    let native = crate::routines::prefill_finalize::run(
         &[3, 4],
         &model,
         final_hidden_states,
@@ -87,7 +87,7 @@ fn ref_backed_finalize_matches_native_deterministic_for_untied_projection() {
 
     let raster = run_ref_backed_finalize(2, final_hidden_states_ref, vec![], &source, 1)
         .expect("ref-backed raster finalize should run");
-    let native = crate::prefill_finalize::run(
+    let native = crate::routines::prefill_finalize::run(
         &[3, 4],
         &model,
         final_hidden_states,
@@ -188,7 +188,7 @@ fn raster_finalize_matches_native_deterministic_for_tied_projection() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
-    let native = crate::prefill_finalize::run(
+    let native = crate::routines::prefill_finalize::run(
         &[9],
         &model,
         final_hidden_states,
@@ -217,7 +217,7 @@ fn ref_backed_finalize_matches_native_deterministic_for_tied_projection() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("ref-backed raster finalize should run");
-    let native = crate::prefill_finalize::run(
+    let native = crate::routines::prefill_finalize::run(
         &[9],
         &model,
         final_hidden_states,
@@ -246,7 +246,7 @@ fn raster_finalize_matches_native_deterministic_with_softcap() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 2)
         .expect("root-backed raster finalize should run");
-    let native = crate::prefill_finalize::run(
+    let native = crate::routines::prefill_finalize::run(
         &[1],
         &model,
         final_hidden_states,
@@ -296,7 +296,7 @@ fn ref_backed_finalize_matches_native_deterministic_with_softcap() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 2)
         .expect("ref-backed raster finalize should run");
-    let native = crate::prefill_finalize::run(
+    let native = crate::routines::prefill_finalize::run(
         &[1],
         &model,
         final_hidden_states,
@@ -511,7 +511,7 @@ fn raster_finalize_uses_internal_det_row_not_public_f32_view() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
-    let native = crate::prefill_finalize::run(
+    let native = crate::routines::prefill_finalize::run(
         &[1],
         &model,
         final_hidden_states,
@@ -623,12 +623,12 @@ fn native_prefill_layer_output_adapter_feeds_raster_finalize_detour() {
     );
 
     ArtifactIo::reset_store();
-    let (roots, layer_refs) = crate::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
+    let (roots, layer_refs) = crate::routines::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
         &final_hidden_states,
         std::slice::from_ref(&layer_cache),
     )
     .expect("native layer output should convert to raster refs");
-    let raster_output = crate::prefill_finalize::run_raster(
+    let raster_output = crate::routines::prefill_finalize::run_raster(
         roots,
         1,
         &source,
@@ -637,9 +637,9 @@ fn native_prefill_layer_output_adapter_feeds_raster_finalize_detour() {
         1,
     )
     .expect("raster finalize should run from adapted native refs");
-    let raster = crate::prefill_finalize::materialize_raster_output_refs_for_api(&raster_output)
+    let raster = crate::routines::prefill_finalize::materialize_raster_output_refs_for_api(&raster_output)
         .expect("raster finalize output should materialize");
-    let native = crate::prefill_finalize::run(
+    let native = crate::routines::prefill_finalize::run(
         &[1],
         &model,
         final_hidden_states,
@@ -661,7 +661,7 @@ fn native_prefill_layer_output_adapter_requires_deterministic_hidden_states() {
     );
 
     ArtifactIo::reset_store();
-    let error = crate::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
+    let error = crate::routines::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
         &final_hidden_states,
         &[],
     )
@@ -682,7 +682,7 @@ fn native_prefill_layer_output_adapter_requires_deterministic_cache_rows() {
     );
 
     ArtifactIo::reset_store();
-    let error = crate::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
+    let error = crate::routines::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
         &final_hidden_states,
         &[layer_cache],
     )
