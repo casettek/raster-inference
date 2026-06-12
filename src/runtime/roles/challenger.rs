@@ -15,9 +15,10 @@ use tokenizers::Tokenizer;
 
 use crate::runtime::checkpoints::{RasterDetourSpec, RoutineId};
 use crate::runtime::inference::{InferenceControls, InferenceRunOutcome};
+use crate::runtime::roles::{detour, ExecutionTuning};
 use crate::runtime::{sequence, trace};
 use crate::shared::api::audit::{
-    AuditOutcome, CheckpointDivergence, ClaimedTrace, ClaimedTraceEntry, DetourArtifact,
+    AuditOutcome, CheckpointDivergence, ClaimedTrace, ClaimedTraceEntry,
 };
 use crate::shared::api::input::{InferenceExecutionMode, InferenceRequest, ModelSpec};
 use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
@@ -59,17 +60,19 @@ pub fn audit(
     transformer_model: &Gemma4TransformerModel,
     raster_tokenizer_source: AuthenticatedGemmaTokenizer,
     claimed_trace: &[u8],
+    tuning: &ExecutionTuning,
 ) -> Result<AuditOutcome> {
     if request.execution_mode != InferenceExecutionMode::Deterministic {
         anyhow::bail!("challenger audit requires deterministic execution");
     }
     let claimed = ClaimedTrace::from_json_bytes(claimed_trace)?;
 
-    let replay_controls = InferenceControls {
+    let mut replay_controls = InferenceControls {
         commit_checkpoints: true,
         raster_tokenizer_source: Some(raster_tokenizer_source.clone()),
         ..Default::default()
     };
+    tuning.apply(&mut replay_controls);
     run_to_completion(
         request,
         model,
@@ -88,23 +91,17 @@ pub fn audit(
 
     let detour = detour_spec_for(&divergence)
         .map(|spec| {
-            let detour_controls = InferenceControls {
-                commit_checkpoints: true,
-                raster_detour: Some(spec),
-                raster_tokenizer_source: Some(raster_tokenizer_source.clone()),
-                ..Default::default()
-            };
-            run_to_completion(
+            let outcome = detour::run(
                 request,
                 model,
                 tokenizer,
                 transformer_model,
-                &detour_controls,
-                "challenger raster detour",
-            )?;
-            let trace_path = trace::completed_trace_path()
-                .context("challenger raster detour did not produce a trace artifact")?;
-            Ok::<_, anyhow::Error>(DetourArtifact { spec, trace_path })
+                raster_tokenizer_source.clone(),
+                spec,
+                tuning,
+            )
+            .context("challenger raster detour failed")?;
+            Ok::<_, anyhow::Error>(outcome.artifact)
         })
         .transpose()?;
 

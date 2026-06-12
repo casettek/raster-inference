@@ -65,7 +65,7 @@ Today the implemented serial path produces:
 - `src/runtime/trace.rs`: checkpoint emission, terminal-checkpoint tracking, and serialized trace artifact writing
 - `src/runtime/sequence.rs`: the phase-sequencing skeleton — the single place that knows the canonical routine order
 - `src/runtime/executors/`: the executor seam — `native.rs` (native deterministic/fp32 executor with selective raster detour hooks) and `raster.rs` (full root-backed raster tile executor)
-- `src/runtime/roles/`: protocol role entry points — `claimer.rs` (`claimer::run`) and `challenger.rs` (`challenger::audit`, replay/compare/detour)
+- `src/runtime/roles/`: protocol role entry points — `claimer.rs` (`claimer::run`), `challenger.rs` (`challenger::audit`, replay/compare/detour), and `detour.rs` (`detour::run`, the shared single-routine raster detour)
 - `src/runtime/inference.rs`: inference control/outcome types plus the deprecated legacy entry points (thin shims over `sequence::run`)
 - `src/runtime/pipeline.rs`: composed prefill/decode bundle helpers for tests, benches, and golden capture (not on the production path)
 - `src/routines/<routine>/{native,raster}/`: routine implementation details (tiles, types, utils, auth sources)
@@ -75,7 +75,7 @@ Today the implemented serial path produces:
 - `src/io.rs`: generic disk-loading helpers (chat templates, tokenizer files, safetensors/mmap infrastructure)
 - `src/dsl/`: raster tile DSL machinery
 - `src/lib.rs`: curated public API surface
-- `src/main.rs`: tiny CLI for local smoke tests
+- `src/main.rs`: clap-based protocol CLI (`claim` / `detour` / `audit`)
 - `tests/goldens/`: golden checkpoint trace artifacts (byte-identity contract; see `tests/golden_traces.rs`)
 - `assets/tiny-gemma-dev/`: checked-in hermetic test model bundle
 
@@ -96,62 +96,96 @@ isolation.
 For the working porting method and the first-batch tile plan, see
 `RASTER_INFERENCE_PORTING_GUIDE.md`.
 
-## CLI Smoke Test
+## CLI
 
-The current CLI expects local tokenizer and template artifacts plus a model path for either the default FP32 Gemma weights or the converted deterministic weight artifact:
+The CLI is a thin shell over the protocol role APIs (`claimer::run`, `challenger::audit`, `detour::run`) with one subcommand per protocol action. Every subcommand runs deterministic execution with checkpoint commitment on; the fp32 baseline is not reachable from the CLI. Run `raster-inference <subcommand> --help` for the full flag list.
 
-```bash
-cargo run -- \
-  google/gemma-4-test \
-  /path/to/tokenizer.json \
-  /path/to/chat_template.jinja \
-  /path/to/gemma-model \
-  "Hello from Raster"
-```
+### Common flags
 
-It runs the `input_embedding` prompt-preparation routine first, then immediately feeds the resulting prompt token IDs into the `transformer_state_transition` routines. For the default FP32 path it reads `model.language_model.embed_tokens.weight`, all Gemma text-layer weights, the final text norm, and the output projection path from the Gemma safetensors. It applies Gemma's embedding scale automatically, runs the full text prefill path, and produces final-position logits plus an explicit decode state with per-layer KV cache. The `output_decode` routine then performs deterministic greedy decode by selecting one token at a time, appending it to the explicit token sequence, and calling the incremental transformer decode-transition routine for the new token. This keeps the architecture simple while avoiding full-sequence replay on every generation step. `temperature`/`top_k`/`top_p` remain unsupported beyond accepting the current deterministic default configuration. The default model path can be:
+- `--model <dir>`: model directory, resolved by convention — it must contain `tokenizer.json`, `chat_template.jinja`, and `model.detwgt`. The model id defaults to the directory name (`--model-id` overrides).
+- The prompt is given as trailing arguments (joined with spaces) or via `--prompt-file <path>`.
+- `--max-new-tokens <N>` (default 16) bounds generation. Temperature is a fixed protocol constant (`protocol::SAMPLING_TEMPERATURE`), not a flag.
+- `--trace-dir <dir>`: where trace artifacts are written. Overrides the `RASTER_TRACE_DIR` env var; default `raster-traces/`.
+- `--config <file>`: execution tuning TOML (see below).
 
-- a Gemma model directory containing `model.safetensors.index.json`
-- a Gemma model directory containing a single `model.safetensors` or `consolidated.safetensors`
-- a direct path to a `.safetensors` file or `model.safetensors.index.json`
+Human-readable progress goes to stderr; stdout is a single machine-parseable JSON document.
 
-The deterministic comparison path is opt-in:
+### claim
+
+Runs one inference as the claimer and emits the checkpoint trace artifact (the protocol object committed on-chain):
 
 ```bash
-cargo run -- \
-  --commit-checkpoints \
-  --deterministic \
-  google/gemma-4-test \
-  /path/to/tokenizer.json \
-  /path/to/chat_template.jinja \
-  /path/to/converted-det-model \
-  "Hello from Raster"
+cargo run -- claim --model assets/tiny-gemma-dev "Hello from Raster"
 ```
 
-To stop after a specific checkpoint, pass `--terminal-checkpoint <checkpoint-id>`. For example, `--terminal-checkpoint prefill.finalize` stops after the prefill finalize checkpoint has been emitted. Add `:N` to stop after a later occurrence of a repeated checkpoint, such as `--terminal-checkpoint prefill.range_finalize:2` for the second finalized prefill layer.
+stdout: `{ "trace_path": ..., "state": <InferenceState> }`.
 
-The raster-authored path is opt-in while routines are ported one at a time:
+For debugging, `--stop-at <checkpoint-id[:occurrence]>` pauses the run after the named checkpoint (e.g. `--stop-at prefill.finalize`, or `--stop-at prefill.range_finalize:2` for the second finalized prefill layer); stdout is then the `PausedInferenceState` JSON, with `terminal_checkpoint_id` plus the completed outputs gathered so far.
+
+### detour
+
+Re-runs an inference native-deterministically with exactly one selected raster routine occurrence swapped in, producing the raster detour trace artifact used by the dispute path:
 
 ```bash
-cargo run -- \
-  --raster \
-  --prefill-token-range-width 100 \
-  --raster-projection-rows-per-tile 1 \
-  google/gemma-4-test \
-  /path/to/tokenizer.json \
-  /path/to/chat_template.jinja \
-  /path/to/converted-det-model \
-  "Hello from Raster"
+cargo run -- detour --model assets/tiny-gemma-dev --at prefill.range:2 "Hello from Raster"
 ```
 
-For now, `--raster` implies the deterministic model/runtime path and routes the implemented raster-authored routines through separate raster tile modules. Prompt preparation, prefill preparation/finalization work, prefill range checkpoints, and decode token selection use raster-authored tiles where available. Decode transition still uses the native deterministic path until it is separately converted. Use `--prefill-token-range-width` to bound how many prompt tokens each `prefill.range` checkpoint covers. Use `--raster-projection-rows-per-tile` to bound how many projection rows a raster projection tile reads at once; lower values reduce zkVM memory pressure, and the default is `1`.
+stdout: `{ "routine": ..., "occurrence": ..., "trace_path": ..., "state": <InferenceState> }`.
 
-When `--deterministic` is set, the model path must point to either:
+Add `--trace-tiles` to print verbose routine, progress, and individual tile execution logs to stderr.
 
-- a directory containing `config.json` and `model.detwgt`
-- a direct path to a `model.detwgt` file with a sibling `config.json`
+### audit
 
-For faster development runs, generate a tiny representative Gemma-style bundle:
+Replays a claimed trace as the challenger: re-runs the request natively, compares committed checkpoints positionally against the claimed artifact, and on divergence automatically performs the raster detour at the divergent routine occurrence (when the routine supports detours):
+
+```bash
+cargo run -- audit --model assets/tiny-gemma-dev --claimed raster-traces/trace-1234.json "Hello from Raster"
+```
+
+stdout is either:
+
+```json
+{ "result": "no_divergence" }
+```
+
+or
+
+```json
+{
+  "result": "divergence",
+  "divergence": { "entry_index": 3, "checkpoint_id": "prefill.range", "occurrence": 1, "claimed_commitment": "...", "replayed_commitment": "..." },
+  "detour": { "routine": "prefill.range", "occurrence": 1, "trace_path": "..." }
+}
+```
+
+`detour` is `null` for structural divergences (id-sequence or length mismatch) and for routines without an implemented detour (e.g. `prompt.prepare`).
+
+Exit codes are part of the scripting contract: `0` = no divergence, `2` = divergence found (report emitted), `1` = operational error. `--trace-tiles` is accepted here too.
+
+### Execution tuning config
+
+Raster tile sizing and range widths are not per-invocation flags; they live in a TOML file passed as `--config <path>`. Every key is optional — omitted keys (or omitting the file entirely) use the built-in library defaults:
+
+```toml
+[ranges]
+prefill_token_range_width = 8
+decode_layer_range_width = 4
+
+[tile_sizing]
+projection_rows_per_tile = 64
+attention_kv_rows_per_tile = 128
+sequence_rows_per_tile = 16
+head_rows_per_tile = 4
+tokenizer_bpe_pairs_per_tile = 1024
+tokenizer_bpe_pieces_per_tile = 512
+output_byte_flush_bytes_per_tile = 4096
+```
+
+Tuning is pure scheduling: committed checkpoint bytes are identical for every tuning, so traces produced with different configs still compare equal.
+
+### Dev model bundle
+
+For fast local runs, generate the tiny representative Gemma-style bundle:
 
 ```bash
 cargo run --bin tiny-gemma-dev -- --output-dir assets/tiny-gemma-dev --force
@@ -160,41 +194,30 @@ cargo run --bin tiny-gemma-dev -- --output-dir assets/tiny-gemma-dev --force
 The generated bundle includes `config.json`, `model.safetensors`, `model.detwgt`,
 `tokenizer.json`, and `chat_template.jinja`. It keeps the deterministic `Wgt`
 artifact format while shrinking the model to tiny PLE-enabled layers with a
-small Gemma-compatible BPE tokenizer.
+small Gemma-compatible BPE tokenizer. (`model.safetensors` is the fp32 baseline,
+used only by the library-level parity suites.)
 
-This Phase 1 deterministic path is a **converted-weight parity path** with a canonical-state runtime core. It requires `.detwgt` provenance, loads canonical `Wgt` bytes from `model.detwgt`, keeps deterministic KV cache rows and layer activations in canonical `Act` form across deterministic prefill/decode boundaries, and converts config-derived scalars once into canonical `Act`/`Acc` carriers. The existing `f32` fields remain compatibility views for public API and JSON consumers.
+### Deterministic path notes
+
+The deterministic path is a **converted-weight parity path** with a canonical-state runtime core. It requires `.detwgt` provenance, loads canonical `Wgt` bytes from `model.detwgt`, keeps deterministic KV cache rows and layer activations in canonical `Act` form across deterministic prefill/decode boundaries, and converts config-derived scalars once into canonical `Act`/`Acc` carriers. The existing `f32` fields remain compatibility views for public API and JSON consumers.
 
 Deterministic checkpoints may include optional `det_*_sha256` fields next to the compatibility hashes. Compatibility fields such as `activations_sha256`, `final_logits_sha256`, and serialized `layer_caches` still describe the public f32 views; `det_*` fields describe canonical fixed-point bytes and are omitted when deterministic internals are not present.
 
-The CLI prints the resulting `InferenceState` as formatted JSON with:
+The `state` JSON in `claim`/`detour` output includes:
 
 - `input_embedding.prompt_token_ids_sha256`: SHA-256 digest of the prompt token IDs
-- `input_embedding.embedded_prompt_activations_sha256`: SHA-256 digest of the embedding activations for those prompt token IDs
 - `transformer_state_transition.activation_states[0].activations_sha256`: SHA-256 digest of the final Gemma 4 prefill hidden states
 - `transformer_state_transition.prefill_logits.final_logits_sha256`: SHA-256 digest of the final-position logits
 - `output_decode.generated_text`: detokenized text for the generated tokens only
 - `output_decode.generated_token_ids_sha256`: SHA-256 digest of the generated token IDs
 - `output_decode.stop_reason`: currently `max_new_tokens`
 
-If you stop at a terminal checkpoint before the normal end of inference, the CLI prints a `PausedInferenceState` instead, with `terminal_checkpoint_id` plus the completed outputs gathered so far.
-
-Pass `--commit-checkpoints` to emit the checkpoint trace file at the end of the run. Leave it off to skip checkpoint commitment work entirely. Checkpoint hits and phase start/end logs still go to stderr even when checkpoint output is disabled. Per-token prefill checkpoints (`prefill.layer_token.*`) are logged live but omitted from the final checkpoint commitment bundle.
-
-```bash
-cargo run -- \
-  google/gemma-4-E4B-it \
-  assets/gemma-4-E4B-it/tokenizer.json \
-  assets/gemma-4-E4B-it/chat_template.jinja \
-  /path/to/gemma-4-model \
-  "Hello from Raster"
-```
-
 ## Comparison Workflow
 
-To validate a converted deterministic artifact against the current baseline:
+To validate a converted deterministic artifact against the current baseline (the fp32 path is no longer reachable from the CLI; use the library entry points, e.g. `sequence::run` with an fp32-mode request, as the parity suites do):
 
 1. Run the prompt once against the original FP32 model path.
-2. Run the same prompt again with `--deterministic` against the converted `model.detwgt` directory.
+2. Run the same prompt again in deterministic mode against the converted `model.detwgt` directory.
 3. Compare:
    - `output_decode.generated_text`
    - `output_decode.generated_token_ids_sha256`

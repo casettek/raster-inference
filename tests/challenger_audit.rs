@@ -38,7 +38,8 @@ use raster_inference::shared::model::gemma::tokenizer::AuthenticatedGemmaTokeniz
 use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
-    load_transformer_state_model_from_det_num_wgt_path, sequence, InferenceControls, InferenceExecutionMode,
+    load_transformer_state_model_from_det_num_wgt_path, sequence, ClaimerOptions,
+    ClaimerRunOutcome, ExecutionTuning, InferenceControls, InferenceExecutionMode,
     InferenceRequest, InferenceRunOutcome, ModelSpec, RasterDetourSpec, SamplingConfig,
     TextDecodingPolicy,
 };
@@ -134,8 +135,12 @@ fn run_claimer(fixture: &Fixture, request: &InferenceRequest) -> Vec<u8> {
         &fixture.tokenizer,
         &fixture.transformer_model,
         fixture.raster_tokenizer_source(),
+        &ClaimerOptions::default(),
     )
     .expect("claimer run should complete");
+    let ClaimerRunOutcome::Completed(outcome) = outcome else {
+        panic!("claimer run should complete rather than pause");
+    };
     fs::read(&outcome.trace_path).expect("claimer trace artifact should be readable")
 }
 
@@ -148,6 +153,7 @@ fn run_audit(fixture: &Fixture, request: &InferenceRequest, claimed_trace: &[u8]
         &fixture.transformer_model,
         fixture.raster_tokenizer_source(),
         claimed_trace,
+        &ExecutionTuning::default(),
     )
     .expect("challenger audit should complete")
 }

@@ -11,12 +11,15 @@ pub mod shared;
 // machinery reachable under its module path.
 // ---------------------------------------------------------------------------
 
-// Role entry points (claimer / challenger) and audit report types.
-pub use runtime::roles::claimer::ClaimerOutcome;
-pub use runtime::roles::{challenger, claimer};
+// Role entry points (claimer / challenger / detour) and audit report types.
+pub use runtime::roles::claimer::{ClaimerOptions, ClaimerOutcome, ClaimerRunOutcome};
+pub use runtime::roles::detour::DetourOutcome;
+pub use runtime::roles::{challenger, claimer, detour, ExecutionTuning};
 pub use shared::api::audit::{
     AuditOutcome, CheckpointDivergence, ClaimedTrace, ClaimedTraceEntry, DetourArtifact,
 };
+pub use shared::api::protocol;
+pub use shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 
 // Inference sequencing: request/outcome types and the sequence engine.
 pub use runtime::inference::{
