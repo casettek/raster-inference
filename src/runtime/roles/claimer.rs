@@ -3,16 +3,14 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use tokenizers::Tokenizer;
 
 use crate::runtime::inference::{
     InferenceControls, InferenceRunOutcome, InferenceState, PausedInferenceState,
 };
 use crate::runtime::roles::ExecutionTuning;
 use crate::runtime::{sequence, trace};
-use crate::shared::api::input::{InferenceRequest, ModelSpec};
-use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
-use crate::shared::model::transformer::Gemma4TransformerModel;
+use crate::shared::api::input::InferenceRequest;
+use crate::shared::model::runtime::LoadedModel;
 
 /// Result of a claimer run: the final inference state plus the serialized
 /// checkpoint trace artifact the claimer commits on-chain.
@@ -57,20 +55,17 @@ pub enum ClaimerRunOutcome {
 /// requests it; an unexpected pause is an error.
 pub fn run(
     request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &Tokenizer,
-    transformer_model: &Gemma4TransformerModel,
-    raster_tokenizer_source: AuthenticatedGemmaTokenizer,
+    model: &LoadedModel,
     options: &ClaimerOptions,
 ) -> Result<ClaimerRunOutcome> {
     let mut controls = InferenceControls {
         commit_checkpoints: true,
         terminal_checkpoint: options.terminal_checkpoint.clone(),
-        raster_tokenizer_source: Some(raster_tokenizer_source),
+        raster_tokenizer_enabled: true,
         ..Default::default()
     };
     options.tuning.apply(&mut controls);
-    match sequence::run(request, model, tokenizer, transformer_model, &controls)? {
+    match sequence::run(request, model, &controls)? {
         InferenceRunOutcome::Completed(state) => {
             let trace_path = trace::completed_trace_path()
                 .context("claimer run did not produce a serialized trace artifact")?;

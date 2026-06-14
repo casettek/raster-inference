@@ -19,7 +19,9 @@ pub use shared::api::audit::{
     AuditOutcome, CheckpointDivergence, ClaimedTrace, ClaimedTraceEntry, DetourArtifact,
 };
 pub use shared::api::protocol;
+pub use shared::model::gemma::adapter::GemmaModelBundle;
 pub use shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
+pub use shared::model::runtime::LoadedModel;
 
 // Inference sequencing: request/outcome types and the sequence engine.
 pub use runtime::inference::{
@@ -38,8 +40,8 @@ pub use runtime::trace;
 
 // Request/response API types.
 pub use shared::api::input::{
-    InferenceRequest, MessageRole, ModelSpec, PromptPreparationState,
-    RasterPromptPreparationState, SamplingConfig, TextDecodingPolicy, TextMessage,
+    InferenceRequest, MessageRole, ModelSpec, PromptPreparationState, RasterPromptPreparationState,
+    SamplingConfig, TextDecodingPolicy, TextMessage,
 };
 pub use shared::api::output::{DecodeState, OutputDecodeState, OutputDecodeStopReason};
 pub use shared::artifacts::integrity_mode::RasterIntegrityMode;

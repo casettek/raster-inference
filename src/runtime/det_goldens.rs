@@ -22,6 +22,8 @@ use crate::runtime::pipeline;
 use crate::shared::api::input::{
     InferenceRequest, ModelSpec, PromptPreparationState, SamplingConfig, TextDecodingPolicy,
 };
+use crate::shared::model::gemma::adapter::GemmaModelBundle;
+use crate::shared::model::runtime::LoadedModel;
 use crate::shared::model::transformer::Gemma4TransformerModel;
 use crate::shared::numerics::det_num::{encode_det_wgt_artifact, f32_to_wgt, DetWgtTensorSpec};
 use crate::shared::numerics::transformer_kernels::build_det_kv_cache_commitment;
@@ -75,6 +77,12 @@ fn run_fixture(name: &str, donor: bool) -> Value {
 fn capture_det(model: &Gemma4TransformerModel) -> Value {
     let tokenizer = test_tokenizer();
     let model_spec = test_model_spec();
+    let loaded_model = LoadedModel::Gemma(GemmaModelBundle::new(
+        model_spec.clone(),
+        tokenizer.clone(),
+        model.clone(),
+        None,
+    ));
     let prompt_preparation =
         crate::routines::prompt_prepare::run(&test_request(), &model_spec, &tokenizer)
             .expect("prompt preparation should succeed");
@@ -89,7 +97,7 @@ fn capture_det(model: &Gemma4TransformerModel) -> Value {
             prompt_token_ids: prompt_preparation.prompt_token_ids.clone(),
             prompt_token_ids_sha256: prompt_preparation.prompt_token_ids_sha256.clone(),
         },
-        model,
+        &loaded_model,
         &token_embeddings,
     )
     .expect("prefill should succeed");
@@ -108,11 +116,8 @@ fn capture_det(model: &Gemma4TransformerModel) -> Value {
         &prefill_logits.clone_internal(),
     )
     .expect("token selection should succeed");
-    let first_step_layers = capture_first_step_layers(
-        model,
-        prefill.transformer_decode_state.clone(),
-        first_token,
-    );
+    let first_step_layers =
+        capture_first_step_layers(model, prefill.transformer_decode_state.clone(), first_token);
 
     // Per-step decode capture (DECODE_TOKENS steps).
     let mut decode_steps = Vec::with_capacity(DECODE_TOKENS);
@@ -122,7 +127,7 @@ fn capture_det(model: &Gemma4TransformerModel) -> Value {
         let next_token =
             crate::routines::decode_select_token::native::select_next_token_internal(&logits)
                 .expect("token selection should succeed");
-        let step = pipeline::decode_step(decode_state, next_token, model)
+        let step = pipeline::decode_step(decode_state, next_token, &loaded_model)
             .expect("decode step should succeed");
         let step_capture = json!({
             "token": next_token,
@@ -138,9 +143,7 @@ fn capture_det(model: &Gemma4TransformerModel) -> Value {
     // End-to-end capture through the public entry point.
     let outcome = crate::runtime::sequence::run(
         &test_request(),
-        &test_model_spec(),
-        &tokenizer,
-        model,
+        &loaded_model,
         &crate::InferenceControls::default(),
     )
     .expect("end-to-end inference should succeed");

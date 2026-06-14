@@ -23,9 +23,8 @@
 
 use std::ops::ControlFlow;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::json;
-use tokenizers::Tokenizer;
 
 use crate::routines::input_embedding;
 use crate::runtime::checkpoints::{PhaseId, RoutineId};
@@ -35,18 +34,16 @@ use crate::runtime::inference::{
     PausedInferenceState,
 };
 use crate::runtime::trace;
-use crate::shared::api::input::{InferenceRequest, ModelSpec};
+use crate::shared::api::input::InferenceRequest;
 use crate::shared::artifacts::integrity_mode::current_raster_integrity_mode;
-use crate::shared::model::transformer::Gemma4TransformerModel;
+use crate::shared::model::runtime::LoadedModel;
 
 /// Runs one inference request through the canonical phase sequence under the
 /// given controls. This is the engine behind both the legacy
 /// `run_inference_with_controls` entry point and the role APIs.
 pub fn run(
     request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &Tokenizer,
-    transformer_model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     controls: &InferenceControls,
 ) -> Result<InferenceRunOutcome> {
     let terminal_checkpoint = controls.terminal_checkpoint_spec()?;
@@ -67,13 +64,13 @@ pub fn run(
                 None
             };
             trace::start_inference_trace(&json!({
-                "model_id": model.model_id,
+                "model_id": model.model_spec().model_id,
                 "execution_mode": "deterministic",
                 "det_num_spec_version": crate::shared::numerics::det_num::DET_NUM_SPEC_VERSION,
                 "model_provenance": "DetNumWgt",
                 "prompt_bytes_sha256": trace::sha256_hex(&request.prompt_bytes),
                 "max_new_tokens": request.sampling.max_new_tokens,
-                "transformer_layer_count": transformer_model.layers.len(),
+                "transformer_layer_count": model.transformer_layer_count(),
                 "terminal_checkpoint": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.checkpoint_id()),
                 "terminal_checkpoint_occurrence": terminal_checkpoint.as_ref().map(|checkpoint| checkpoint.occurrence()),
                 "commit_checkpoints": controls.commit_checkpoints,
@@ -110,7 +107,7 @@ pub fn run(
                         ),
                     }
                 } else {
-                    match native::run_prompt_prepare(request, model, tokenizer, controls)? {
+                    match native::run_prompt_prepare(request, model, controls)? {
                         ControlFlow::Break(outcome) => return Ok(outcome),
                         ControlFlow::Continue(prepared) => (
                             prepared.prompt_preparation,
@@ -124,7 +121,6 @@ pub fn run(
                 let (token_embeddings, raster_input_embedding_refs) = if policy.is_full_raster() {
                     let (token_embeddings, output) = raster::run_input_embedding_full(
                         model,
-                        transformer_model,
                         raster_prompt_preparation_for_embedding.as_ref(),
                         raster_prompt_preparation_roots_for_embedding.as_ref(),
                     )?;
@@ -132,7 +128,6 @@ pub fn run(
                 } else if policy.mode_for(RoutineId::InputEmbedding) == StepMode::Raster {
                     let (token_embeddings, output) = raster::run_input_embedding_detour(
                         model,
-                        transformer_model,
                         raster_prompt_preparation_for_embedding.as_ref(),
                         raster_prompt_preparation_roots_for_embedding.as_ref(),
                     )?;
@@ -141,7 +136,6 @@ pub fn run(
                     native::run_input_embedding(
                         &prompt_preparation.prompt_token_ids,
                         model,
-                        transformer_model,
                         raster_prompt_preparation_for_embedding.as_ref(),
                     )?
                 };
@@ -181,7 +175,6 @@ pub fn run(
                 let prefill = if policy.is_full_raster() {
                     match raster::run_prefill(
                         model,
-                        transformer_model,
                         controls,
                         raster_sizing_controls,
                         policy.detour_controller_mut(),
@@ -206,7 +199,6 @@ pub fn run(
                 } else {
                     match native::run_prefill(
                         model,
-                        transformer_model,
                         controls,
                         raster_sizing_controls,
                         policy.detour_controller_mut(),
@@ -242,14 +234,10 @@ pub fn run(
                 let output_decode = if let Some(raster_decode_state) =
                     raster_decode_state_for_output
                 {
-                    let tokenizer_source = controls.raster_tokenizer_source.as_ref().context(
-                        "raster tile inference requires an authenticated Gemma tokenizer",
-                    )?;
                     raster::run_output_decode(
                         raster_decode_state,
                         &request.sampling,
-                        tokenizer_source,
-                        transformer_model,
+                        model,
                         raster_sizing_controls.expect("raster sizing controls should be validated"),
                     )?
                 } else {
@@ -257,9 +245,7 @@ pub fn run(
                         &prompt_preparation.prompt_token_ids,
                         &prefill,
                         &request.sampling,
-                        tokenizer,
-                        controls.raster_tokenizer_source.as_ref(),
-                        transformer_model,
+                        model,
                         Some(policy.detour_controller_mut()),
                         raster_sizing_controls,
                     )?

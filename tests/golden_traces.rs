@@ -43,7 +43,9 @@ use std::{
 
 use raster_inference::shared::artifacts::artifact_io::ArtifactIo;
 use raster_inference::shared::artifacts::external_artifacts::reset_external_source_store;
+use raster_inference::shared::model::gemma::adapter::GemmaModelBundle;
 use raster_inference::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
+use raster_inference::shared::model::runtime::LoadedModel;
 use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
@@ -106,6 +108,15 @@ impl Fixture {
                 .expect("tiny-gemma-dev tokenizer spec should load"),
         )
     }
+
+    fn loaded_model(&self) -> LoadedModel {
+        LoadedModel::Gemma(GemmaModelBundle::new(
+            self.model_spec.clone(),
+            self.tokenizer.clone(),
+            self.transformer_model.clone(),
+            Some(self.raster_tokenizer_source()),
+        ))
+    }
 }
 
 fn tiny_gemma_dir() -> PathBuf {
@@ -149,14 +160,8 @@ fn run_and_capture_artifact(
     ArtifactIo::reset_store();
     reset_external_source_store();
 
-    let outcome = sequence::run(
-        request,
-        &fixture.model_spec,
-        &fixture.tokenizer,
-        &fixture.transformer_model,
-        controls,
-    )
-    .expect("inference should complete");
+    let outcome = sequence::run(request, &fixture.loaded_model(), controls)
+        .expect("inference should complete");
 
     let mut trace_files = fs::read_dir(&trace_dir)
         .expect("trace dir should be readable")
@@ -212,7 +217,7 @@ fn golden_native_det_full() {
         &request(LONG_PROMPT, 2),
         &InferenceControls {
             commit_checkpoints: true,
-            raster_tokenizer_source: Some(fixture.raster_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..Default::default()
         },
     );
@@ -230,7 +235,7 @@ fn golden_native_det_terminal() {
         &InferenceControls {
             commit_checkpoints: true,
             terminal_checkpoint: Some("prefill.finalize".to_string()),
-            raster_tokenizer_source: Some(fixture.raster_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..Default::default()
         },
     );
@@ -255,7 +260,7 @@ fn golden_detour_prefill_range() {
             raster_detour: Some(
                 RasterDetourSpec::parse("prefill.range").expect("detour spec should parse"),
             ),
-            raster_tokenizer_source: Some(fixture.raster_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..Default::default()
         },
     );
@@ -278,7 +283,7 @@ fn golden_raster_full() {
         &InferenceControls {
             commit_checkpoints: true,
             raster: true,
-            raster_tokenizer_source: Some(fixture.raster_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..Default::default()
         },
     );
@@ -302,7 +307,7 @@ fn golden_raster_terminal() {
             commit_checkpoints: true,
             terminal_checkpoint: Some("decode.transition_finalize".to_string()),
             raster: true,
-            raster_tokenizer_source: Some(fixture.raster_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..Default::default()
         },
     );

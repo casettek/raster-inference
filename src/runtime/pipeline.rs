@@ -9,13 +9,13 @@
 //! which the executors share.
 
 use anyhow::Result;
-use tokenizers::Tokenizer;
 
 use crate::shared::api::input::{PromptPreparationState, SamplingConfig};
 use crate::shared::api::output::OutputDecodeState;
+use crate::shared::model::runtime::LoadedModel;
 use crate::shared::model::transformer::{
-    ActivationSequence, Gemma4TransformerModel, TransformerDecodeState,
-    TransformerDecodeStepResult, TransformerPrefillResult, TransformerStateTransitionState,
+    ActivationSequence, TransformerDecodeState, TransformerDecodeStepResult,
+    TransformerPrefillResult, TransformerStateTransitionState,
 };
 use crate::trace::{trace_event, trace_scope};
 
@@ -41,7 +41,7 @@ pub fn validate_sampling_config(sampling: &SamplingConfig) -> Result<usize> {
 
 pub fn run_prefill_pass(
     prompt_preparation_state: &PromptPreparationState,
-    model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     token_embeddings: &ActivationSequence,
 ) -> Result<TransformerPrefillResult> {
     run_prefill_pass_for_token_ids(
@@ -53,41 +53,42 @@ pub fn run_prefill_pass(
 
 fn run_prefill_pass_for_token_ids(
     prompt_token_ids: &[u32],
-    model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     token_embeddings: &ActivationSequence,
 ) -> Result<TransformerPrefillResult> {
     let _trace = trace_scope("prefill.run");
     trace_event(format!(
         "prefill.summary tokens={} layers={}",
         prompt_token_ids.len(),
-        model.layers.len()
+        model.transformer_layer_count()
     ));
-    let ple_inputs =
-        crate::routines::prefill_prepare_aux::run(prompt_token_ids, model, token_embeddings)?;
+    let ple_inputs = crate::routines::prefill_prepare_aux::run(
+        prompt_token_ids,
+        model.transformer_model(),
+        token_embeddings,
+    )?;
     trace_event("prefill.layer_stack");
     let (final_hidden_states, layer_caches) = crate::routines::prefill_range::run_internal(
         token_embeddings.clone_internal(),
-        model,
+        model.transformer_model(),
         ple_inputs.as_ref(),
     )?;
-    crate::routines::prefill_finalize::run(prompt_token_ids, model, final_hidden_states, layer_caches)
+    crate::routines::prefill_finalize::run(
+        prompt_token_ids,
+        model.transformer_model(),
+        final_hidden_states,
+        layer_caches,
+    )
 }
 
-fn embed_token_ids(
-    token_ids: &[u32],
-    model: &Gemma4TransformerModel,
-) -> Result<ActivationSequence> {
-    if let Some(ref embedding_source) = model.embedding_source {
-        trace_event("prefill.embed_tokens");
-        crate::io::embed_input_tokens_from_gemma_source(token_ids, embedding_source)
-    } else {
-        anyhow::bail!("transformer state model is missing an embedding_source")
-    }
+fn embed_token_ids(token_ids: &[u32], model: &LoadedModel) -> Result<ActivationSequence> {
+    trace_event("prefill.embed_tokens");
+    model.embed_token_ids(token_ids)
 }
 
 pub fn run_transformer_state_transition_for_token_ids(
     token_ids: &[u32],
-    model: &Gemma4TransformerModel,
+    model: &LoadedModel,
 ) -> Result<TransformerStateTransitionState> {
     let _trace = trace_scope("prefill.from_token_ids");
     let token_embeddings = embed_token_ids(token_ids, model)?;
@@ -96,7 +97,7 @@ pub fn run_transformer_state_transition_for_token_ids(
 
 pub fn run_transformer_state_transition(
     prompt_preparation_state: &PromptPreparationState,
-    model: &Gemma4TransformerModel,
+    model: &LoadedModel,
 ) -> Result<TransformerStateTransitionState> {
     let _trace = trace_scope("prefill.from_input_embedding");
     run_transformer_state_transition_for_token_ids(
@@ -108,49 +109,46 @@ pub fn run_transformer_state_transition(
 pub fn decode_step(
     transformer_decode_state: TransformerDecodeState,
     next_token: u32,
-    model: &Gemma4TransformerModel,
+    model: &LoadedModel,
 ) -> Result<TransformerDecodeStepResult> {
     let _trace = trace_scope("decode.step");
     trace_event(format!(
         "decode.summary token={} position={} layers={}",
         next_token,
         transformer_decode_state.position,
-        model.layers.len()
+        model.transformer_layer_count()
     ));
     trace_event("decode.layer_stack");
     let mut range_state =
         crate::routines::decode_layer_range::native::deterministic_tiles::init_state(
             transformer_decode_state,
             next_token,
-            model,
+            model.transformer_model(),
         )?;
     while !range_state.is_complete() {
         let (next_range_state, _) =
             crate::routines::decode_layer_range::native::deterministic_tiles::run_range(
                 range_state,
-                model,
+                model.transformer_model(),
                 crate::InferenceControls::DEFAULT_DECODE_LAYER_RANGE_WIDTH,
             )?;
         range_state = next_range_state;
     }
     trace_event("decode.project_to_logits");
-    crate::routines::decode_transition_finalize::native::run(range_state, model)
+    crate::routines::decode_transition_finalize::native::run(range_state, model.transformer_model())
 }
 
 pub fn run_output_decode(
     prompt_token_ids: &[u32],
     initial_transformer_state: &TransformerPrefillResult,
     sampling: &SamplingConfig,
-    tokenizer: &Tokenizer,
-    transformer_model: &Gemma4TransformerModel,
+    model: &LoadedModel,
 ) -> Result<OutputDecodeState> {
     crate::runtime::executors::native::run_output_decode(
         prompt_token_ids,
         initial_transformer_state,
         sampling,
-        tokenizer,
-        None,
-        transformer_model,
+        model,
         None,
         None,
     )

@@ -4,16 +4,15 @@ use std::{env, fs};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use serde::Deserialize;
-use tokenizers::Tokenizer;
-
-use raster_inference::shared::model::gemma::transformer::Gemma4TransformerModel;
+use raster_inference::shared::model::gemma::adapter::GemmaModelBundle;
+use raster_inference::shared::model::runtime::LoadedModel;
 use raster_inference::{
     challenger, claimer, detour, load_chat_template, load_gemma_tokenizer_spec_from_path,
     load_tokenizer_from_path, load_transformer_state_model_from_det_num_wgt_path, protocol, trace,
     AuditOutcome, AuthenticatedGemmaTokenizer, ClaimerOptions, ClaimerRunOutcome, ExecutionTuning,
     InferenceRequest, ModelSpec, RasterDetourSpec, SamplingConfig, TextDecodingPolicy,
 };
+use serde::Deserialize;
 
 /// Exit code when `audit` finds a divergence (`0` = no divergence,
 /// `1` = operational error). Part of the scripting contract.
@@ -135,19 +134,12 @@ fn run() -> Result<ExitCode> {
 
 fn run_claim(args: ClaimArgs) -> Result<ExitCode> {
     let ctx = RunContext::prepare(&args.common)?;
-    eprintln!("claim: model {}", ctx.model.model_id);
+    eprintln!("claim: model {}", ctx.model.model_spec().model_id);
     let options = ClaimerOptions {
         terminal_checkpoint: args.stop_at,
         tuning: ctx.tuning.clone(),
     };
-    let outcome = claimer::run(
-        &ctx.request,
-        &ctx.model,
-        &ctx.tokenizer,
-        &ctx.transformer_model,
-        ctx.raster_tokenizer_source.clone(),
-        &options,
-    )?;
+    let outcome = claimer::run(&ctx.request, &ctx.model, &options)?;
     match outcome {
         ClaimerRunOutcome::Completed(outcome) => {
             eprintln!("claim: trace artifact {}", outcome.trace_path.display());
@@ -175,21 +167,11 @@ fn run_detour(args: DetourArgs) -> Result<ExitCode> {
     let ctx = RunContext::prepare(&args.common)?;
     eprintln!(
         "detour: model {}, raster routine {}:{}",
-        ctx.model.model_id,
+        ctx.model.model_spec().model_id,
         spec.routine_id(),
         spec.occurrence()
     );
-    let run = || {
-        detour::run(
-            &ctx.request,
-            &ctx.model,
-            &ctx.tokenizer,
-            &ctx.transformer_model,
-            ctx.raster_tokenizer_source.clone(),
-            spec,
-            &ctx.tuning,
-        )
-    };
+    let run = || detour::run(&ctx.request, &ctx.model, spec, &ctx.tuning);
     let outcome = if args.trace_tiles {
         trace::with_trace_logging_enabled(true, run)
     } else {
@@ -221,20 +203,10 @@ fn run_audit(args: AuditArgs) -> Result<ExitCode> {
     let ctx = RunContext::prepare(&args.common)?;
     eprintln!(
         "audit: model {}, claimed trace {}",
-        ctx.model.model_id,
+        ctx.model.model_spec().model_id,
         args.claimed.display()
     );
-    let run = || {
-        challenger::audit(
-            &ctx.request,
-            &ctx.model,
-            &ctx.tokenizer,
-            &ctx.transformer_model,
-            ctx.raster_tokenizer_source.clone(),
-            &claimed,
-            &ctx.tuning,
-        )
-    };
+    let run = || challenger::audit(&ctx.request, &ctx.model, &claimed, &ctx.tuning);
     let outcome = if args.trace_tiles {
         trace::with_trace_logging_enabled(true, run)
     } else {
@@ -286,10 +258,7 @@ fn run_audit(args: AuditArgs) -> Result<ExitCode> {
 /// Everything a role entry point needs, loaded once per invocation.
 struct RunContext {
     request: InferenceRequest,
-    model: ModelSpec,
-    tokenizer: Tokenizer,
-    transformer_model: Gemma4TransformerModel,
-    raster_tokenizer_source: AuthenticatedGemmaTokenizer,
+    model: LoadedModel,
     tuning: ExecutionTuning,
 }
 
@@ -310,7 +279,7 @@ impl RunContext {
         let transformer_model =
             load_transformer_state_model_from_det_num_wgt_path(&assets.weights_path)?;
 
-        let model = ModelSpec {
+        let model_spec = ModelSpec {
             model_id: assets.model_id,
             tokenizer_path: assets.tokenizer_path,
             chat_template,
@@ -332,10 +301,12 @@ impl RunContext {
         };
         Ok(Self {
             request,
-            model,
-            tokenizer,
-            transformer_model,
-            raster_tokenizer_source,
+            model: LoadedModel::Gemma(GemmaModelBundle::new(
+                model_spec,
+                tokenizer,
+                transformer_model,
+                Some(raster_tokenizer_source),
+            )),
             tuning,
         })
     }

@@ -10,16 +10,14 @@
 //! [`challenger::audit`]: crate::runtime::roles::challenger::audit
 
 use anyhow::{Context, Result};
-use tokenizers::Tokenizer;
 
 use crate::runtime::checkpoints::RasterDetourSpec;
 use crate::runtime::inference::{InferenceControls, InferenceRunOutcome, InferenceState};
 use crate::runtime::roles::ExecutionTuning;
 use crate::runtime::{sequence, trace};
 use crate::shared::api::audit::DetourArtifact;
-use crate::shared::api::input::{InferenceRequest, ModelSpec};
-use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
-use crate::shared::model::transformer::Gemma4TransformerModel;
+use crate::shared::api::input::InferenceRequest;
+use crate::shared::model::runtime::LoadedModel;
 
 /// Result of a detour run: the final inference state plus the raster detour
 /// trace artifact.
@@ -35,21 +33,18 @@ pub struct DetourOutcome {
 /// is on; the serialized trace is the dispute's detour artifact.
 pub fn run(
     request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &Tokenizer,
-    transformer_model: &Gemma4TransformerModel,
-    raster_tokenizer_source: AuthenticatedGemmaTokenizer,
+    model: &LoadedModel,
     spec: RasterDetourSpec,
     tuning: &ExecutionTuning,
 ) -> Result<DetourOutcome> {
     let mut controls = InferenceControls {
         commit_checkpoints: true,
         raster_detour: Some(spec),
-        raster_tokenizer_source: Some(raster_tokenizer_source),
+        raster_tokenizer_enabled: true,
         ..Default::default()
     };
     tuning.apply(&mut controls);
-    let state = match sequence::run(request, model, tokenizer, transformer_model, &controls)? {
+    let state = match sequence::run(request, model, &controls)? {
         InferenceRunOutcome::Completed(state) => state,
         InferenceRunOutcome::Paused(paused) => anyhow::bail!(
             "raster detour paused unexpectedly at checkpoint {}",
@@ -60,8 +55,8 @@ pub fn run(
             state.terminal_checkpoint_id
         ),
     };
-    let trace_path = trace::completed_trace_path()
-        .context("raster detour did not produce a trace artifact")?;
+    let trace_path =
+        trace::completed_trace_path().context("raster detour did not produce a trace artifact")?;
     Ok(DetourOutcome {
         state,
         artifact: DetourArtifact { spec, trace_path },

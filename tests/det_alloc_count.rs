@@ -15,15 +15,20 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use raster_inference::routines::input_embedding;
+use raster_inference::runtime::pipeline::{decode_step, run_prefill_pass};
+use raster_inference::shared::model::gemma::adapter::GemmaModelBundle;
+use raster_inference::shared::model::runtime::LoadedModel;
+use raster_inference::shared::model::transformer::{
+    Gemma4TransformerModel, TransformerDecodeState,
+};
 use raster_inference::shared::numerics::det_num::{
     encode_det_wgt_artifact, f32_to_wgt, DetWgtTensorSpec,
 };
-use raster_inference::routines::input_embedding;
-use raster_inference::runtime::pipeline::{decode_step, run_prefill_pass};
-use raster_inference::shared::model::transformer::{Gemma4TransformerModel, TransformerDecodeState};
 use raster_inference::{
-    load_transformer_state_model_from_det_num_wgt_path, PromptPreparationState,
+    load_transformer_state_model_from_det_num_wgt_path, ModelSpec, PromptPreparationState,
 };
+use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
 
 struct CountingAllocator;
 
@@ -110,13 +115,16 @@ fn det_prefill_allocations_scale_subquadratically() {
 }
 
 fn decode_step_allocations(model: &Gemma4TransformerModel, context_len: usize) -> u64 {
+    let loaded_model = runtime_model(model);
     let mut decode_state = prefill_decode_state(model, context_len);
     // Warm-up step (fills lazy weight caches and scratch capacities).
-    let step = decode_step(decode_state, 1, model).expect("warm-up decode step should succeed");
+    let step =
+        decode_step(decode_state, 1, &loaded_model).expect("warm-up decode step should succeed");
     decode_state = step.transformer_decode_state;
 
     let before = allocations();
-    let step = decode_step(decode_state, 2, model).expect("measured decode step should succeed");
+    let step =
+        decode_step(decode_state, 2, &loaded_model).expect("measured decode step should succeed");
     let after = allocations();
     drop(step);
     after - before
@@ -132,12 +140,39 @@ fn prefill_allocations(model: &Gemma4TransformerModel, seq_len: usize) -> u64 {
 }
 
 fn run_prefill(model: &Gemma4TransformerModel, seq_len: usize) -> TransformerDecodeState {
+    let loaded_model = runtime_model(model);
     let prompt_token_ids = token_ids(seq_len);
     let token_embeddings =
         input_embedding::run(&prompt_token_ids, model).expect("embedding should succeed");
-    run_prefill_pass(&prompt_preparation(&prompt_token_ids), model, &token_embeddings)
-        .expect("prefill should succeed")
-        .transformer_decode_state
+    run_prefill_pass(
+        &prompt_preparation(&prompt_token_ids),
+        &loaded_model,
+        &token_embeddings,
+    )
+    .expect("prefill should succeed")
+    .transformer_decode_state
+}
+
+fn runtime_model(model: &Gemma4TransformerModel) -> LoadedModel {
+    LoadedModel::Gemma(GemmaModelBundle::new(
+        ModelSpec {
+            model_id: "det-alloc-count".to_string(),
+            tokenizer_path: "tokenizer.json".into(),
+            chat_template: "{{ messages[0].content }}".to_string(),
+            bos_token: None,
+            eos_token: None,
+            unk_token: Some("<unk>".to_string()),
+        },
+        Tokenizer::new(
+            WordLevel::builder()
+                .vocab([("<unk>".to_string(), 0)].into_iter().collect())
+                .unk_token("<unk>".to_string())
+                .build()
+                .expect("dummy tokenizer should build"),
+        ),
+        model.clone(),
+        None,
+    ))
 }
 
 fn prefill_decode_state(

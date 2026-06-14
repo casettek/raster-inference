@@ -7,7 +7,6 @@ use crate::shared::api::input::{
     PromptPreparationState, RasterPromptPreparationState, SamplingConfig,
 };
 use crate::shared::api::output::OutputDecodeState;
-use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::transformer::TransformerStateTransitionState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,7 +37,7 @@ pub struct InferenceControls {
     pub terminal_checkpoint: Option<String>,
     pub raster: bool,
     pub raster_detour: Option<RasterDetourSpec>,
-    pub raster_tokenizer_source: Option<AuthenticatedGemmaTokenizer>,
+    pub raster_tokenizer_enabled: bool,
     pub raster_projection_rows_per_tile: Option<usize>,
     pub raster_attention_kv_rows_per_tile: Option<usize>,
     pub raster_sequence_rows_per_tile: Option<usize>,

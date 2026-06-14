@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::shared::api::input::TextMessage;
 
+pub mod adapter;
 pub mod io;
 pub mod tokenizer;
 pub mod transformer;

@@ -6,14 +6,16 @@ use serde_json::json;
 use tokenizers::Tokenizer;
 use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
+use raster_inference::shared::model::gemma::adapter::GemmaModelBundle;
 use raster_inference::shared::model::gemma::tokenizer::GemmaAddedToken;
 use raster_inference::shared::model::gemma::tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaBpeMerge, GemmaTokenizerSpec, GemmaVocabEntry,
 };
+use raster_inference::shared::model::runtime::LoadedModel;
 use raster_inference::shared::model::transformer::{
     DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4TransformerModel,
-    GemmaEmbeddingTensorSource, MatrixF32,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
+    MatrixF32,
 };
 use raster_inference::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
 use raster_inference::{
@@ -21,9 +23,9 @@ use raster_inference::{
     OutputDecodeStopReason, RasterDetourSpec, SamplingConfig, TextDecodingPolicy,
 };
 use std::sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    };
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 fn run_inference_with_controls(
     request: &InferenceRequest,
@@ -32,7 +34,33 @@ fn run_inference_with_controls(
     transformer_model: &Gemma4TransformerModel,
     controls: &InferenceControls,
 ) -> anyhow::Result<InferenceRunOutcome> {
-    raster_inference::sequence::run(request, model, tokenizer, transformer_model, controls)
+    let raster_tokenizer =
+        (controls.raster || controls.raster_tokenizer_enabled).then(test_gemma_tokenizer_source);
+    run_inference_with_controls_and_raster_tokenizer(
+        request,
+        model,
+        tokenizer,
+        transformer_model,
+        raster_tokenizer,
+        controls,
+    )
+}
+
+fn run_inference_with_controls_and_raster_tokenizer(
+    request: &InferenceRequest,
+    model: &ModelSpec,
+    tokenizer: &Tokenizer,
+    transformer_model: &Gemma4TransformerModel,
+    raster_tokenizer: Option<AuthenticatedGemmaTokenizer>,
+    controls: &InferenceControls,
+) -> anyhow::Result<InferenceRunOutcome> {
+    let loaded_model = LoadedModel::Gemma(GemmaModelBundle::new(
+        model.clone(),
+        tokenizer.clone(),
+        transformer_model.clone(),
+        raster_tokenizer,
+    ));
+    raster_inference::sequence::run(request, &loaded_model, controls)
 }
 
 fn run_inference(
@@ -649,7 +677,7 @@ fn run_inference_reports_unmatched_decode_select_token_detour() {
             raster_detour: Some(
                 RasterDetourSpec::parse("decode.select_token:2").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -677,7 +705,7 @@ fn run_inference_validates_sequence_sizing_for_decode_select_token_detour() {
                 RasterDetourSpec::parse("decode.select_token").expect("detour should parse"),
             ),
             raster_sequence_rows_per_tile: Some(0),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -772,7 +800,7 @@ fn run_inference_rejects_full_raster_with_raster_detour() {
             raster_detour: Some(
                 RasterDetourSpec::parse("prompt.prepare").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -874,7 +902,7 @@ fn run_inference_executes_input_embedding_raster_detour() {
             raster_detour: Some(
                 RasterDetourSpec::parse("input.embedding").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -942,7 +970,7 @@ fn run_inference_input_embedding_detour_can_pause_after_input_embedding() {
             raster_detour: Some(
                 RasterDetourSpec::parse("input.embedding").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -1224,6 +1252,7 @@ fn run_inference_executes_output_finalize_raster_detour() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
     let transformer_fixture = deterministic_no_ple_model_fixture();
+    let tokenizer_source = test_native_matching_gemma_tokenizer_source();
     let request = deterministic_prompt_request(1);
 
     raster_inference::shared::artifacts::artifact_io::ArtifactIo::reset_store();
@@ -1237,16 +1266,17 @@ fn run_inference_executes_output_finalize_raster_detour() {
     .expect("native deterministic inference should complete");
 
     raster_inference::shared::artifacts::artifact_io::ArtifactIo::reset_store();
-    let detour = run_inference_with_controls(
+    let detour = run_inference_with_controls_and_raster_tokenizer(
         &request,
         &model,
         &tokenizer,
         &transformer_fixture.model,
+        Some(tokenizer_source),
         &InferenceControls {
             raster_detour: Some(
                 RasterDetourSpec::parse("output.finalize").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_native_matching_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -1282,9 +1312,9 @@ fn run_inference_output_finalize_detour_requires_authenticated_tokenizer_source(
     )
     .expect_err("output finalize detour requires tokenizer source");
 
-    assert!(error.to_string().contains(
-        "selective raster output.finalize detour requires an authenticated Gemma tokenizer"
-    ));
+    assert!(error
+        .to_string()
+        .contains("selective raster output.finalize detour requires raster tokenizer capability"));
 }
 
 #[test]
@@ -1303,7 +1333,7 @@ fn run_inference_reports_unmatched_second_output_finalize_detour() {
             raster_detour: Some(
                 RasterDetourSpec::parse("output.finalize:2").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -1330,7 +1360,7 @@ fn run_inference_validates_output_byte_flush_sizing_for_output_finalize_detour()
             raster_detour: Some(
                 RasterDetourSpec::parse("output.finalize").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_output_byte_flush_bytes_per_tile: Some(0),
             ..InferenceControls::default()
         },
@@ -1363,7 +1393,7 @@ fn run_inference_output_finalize_detour_runs_in_unchecked_integrity_mode() {
                     raster_detour: Some(
                         RasterDetourSpec::parse("output.finalize").expect("detour should parse"),
                     ),
-                    raster_tokenizer_source: Some(test_native_matching_gemma_tokenizer_source()),
+                    raster_tokenizer_enabled: true,
                     ..InferenceControls::default()
                 },
             )
@@ -1399,9 +1429,9 @@ fn run_inference_input_embedding_detour_requires_prompt_artifact_roots() {
     )
     .expect_err("input embedding detour requires prompt artifact roots");
 
-    assert!(error.to_string().contains(
-        "selective raster input.embedding detour requires an authenticated Gemma tokenizer"
-    ));
+    assert!(error
+        .to_string()
+        .contains("selective raster input.embedding detour requires raster prompt preparation"));
 }
 
 #[test]
@@ -1420,7 +1450,7 @@ fn run_inference_reports_unmatched_second_input_embedding_detour() {
             raster_detour: Some(
                 RasterDetourSpec::parse("input.embedding:2").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -1473,7 +1503,7 @@ fn run_inference_reports_unmatched_second_prefill_prepare_aux_detour() {
             raster_detour: Some(
                 RasterDetourSpec::parse("prefill.prepare_aux:2").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..InferenceControls::default()
         },
     )
@@ -1500,7 +1530,7 @@ fn run_inference_validates_sequence_sizing_for_prefill_prepare_aux_detour() {
             raster_detour: Some(
                 RasterDetourSpec::parse("prefill.prepare_aux").expect("detour should parse"),
             ),
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_sequence_rows_per_tile: Some(0),
             ..InferenceControls::default()
         },
@@ -1691,7 +1721,7 @@ fn run_inference_decode_select_token_detour_runs_in_unchecked_integrity_mode() {
                             .expect("detour should parse"),
                     ),
                     raster_sequence_rows_per_tile: Some(1),
-                    raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+                    raster_tokenizer_enabled: true,
                     ..InferenceControls::default()
                 },
             )
@@ -1734,7 +1764,7 @@ fn run_inference_with_controls_pauses_after_prompt_prepare_checkpoint() {
             terminal_checkpoint: Some("prompt.prepare".to_string()),
             raster: false,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -1787,7 +1817,7 @@ fn deterministic_cpu_prompt_prepare_checkpoint_matches_raster_shape() {
             terminal_checkpoint: Some("prompt.prepare".to_string()),
             raster: false,
             raster_detour: None,
-            raster_tokenizer_source: Some(tokenizer_source.clone()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -1851,7 +1881,7 @@ fn run_inference_with_controls_raster_can_pause_after_input_embedding() {
             terminal_checkpoint: Some("input.embedding".to_string()),
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -1913,7 +1943,7 @@ fn run_inference_with_controls_raster_can_pause_after_prefill_prepare_aux() {
             terminal_checkpoint: Some("prefill.prepare_aux".to_string()),
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -1975,7 +2005,7 @@ fn run_inference_with_controls_raster_can_pause_after_prefill_layer() {
             terminal_checkpoint: Some("prefill.range_finalize".to_string()),
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: Some(2),
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2031,7 +2061,7 @@ fn run_inference_with_controls_pauses_after_second_prefill_layer_checkpoint() {
             terminal_checkpoint: Some("prefill.range_finalize:2".to_string()),
             raster: false,
             raster_detour: None,
-            raster_tokenizer_source: None,
+            raster_tokenizer_enabled: false,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2084,7 +2114,7 @@ fn run_inference_with_controls_raster_can_pause_after_prefill_finalize() {
             terminal_checkpoint: Some("prefill.finalize".to_string()),
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: Some(2),
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2142,7 +2172,7 @@ fn run_inference_with_controls_raster_runs_decode_select_token() {
             terminal_checkpoint: None,
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: Some(2),
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2204,7 +2234,7 @@ fn run_inference_with_controls_raster_can_pause_after_decode_transition() {
             terminal_checkpoint: Some("decode.transition_finalize".to_string()),
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: Some(2),
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2288,7 +2318,7 @@ fn run_inference_with_controls_raster_can_pause_after_output_finalize() {
             terminal_checkpoint: Some("output.finalize".to_string()),
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: Some(2),
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2343,7 +2373,7 @@ fn run_inference_with_controls_raster_rejects_non_deterministic_model() {
             terminal_checkpoint: None,
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2388,7 +2418,7 @@ fn run_inference_with_controls_raster_rejects_zero_projection_rows_per_tile() {
             terminal_checkpoint: None,
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: Some(0),
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2433,7 +2463,7 @@ fn run_inference_with_controls_raster_rejects_zero_attention_kv_rows_per_tile() 
             terminal_checkpoint: None,
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: Some(0),
             raster_sequence_rows_per_tile: None,
@@ -2478,7 +2508,7 @@ fn run_inference_with_controls_raster_rejects_zero_sequence_rows_per_tile() {
             terminal_checkpoint: None,
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: Some(0),
@@ -2523,7 +2553,7 @@ fn run_inference_with_controls_raster_rejects_zero_head_rows_per_tile() {
             terminal_checkpoint: None,
             raster: true,
             raster_detour: None,
-            raster_tokenizer_source: Some(test_gemma_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             raster_projection_rows_per_tile: None,
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,
@@ -2601,7 +2631,7 @@ fn run_inference_with_controls_pauses_after_prefill_finalize_checkpoint() {
             terminal_checkpoint: Some("prefill.finalize".to_string()),
             raster: false,
             raster_detour: None,
-            raster_tokenizer_source: None,
+            raster_tokenizer_enabled: false,
             raster_projection_rows_per_tile: Some(0),
             raster_attention_kv_rows_per_tile: None,
             raster_sequence_rows_per_tile: None,

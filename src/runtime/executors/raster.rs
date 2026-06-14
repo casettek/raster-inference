@@ -14,7 +14,9 @@ use std::ops::ControlFlow;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::routines::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
+use crate::routines::{
+    input_embedding, prefill_finalize, prefill_prepare_aux, prefill_range, prompt_prepare,
+};
 use crate::runtime::checkpoints::{PhaseId, RasterDetourController, RoutineId};
 use crate::runtime::inference::{
     InferenceControls, InferenceRunOutcome, RasterPromptPreparedState,
@@ -22,29 +24,23 @@ use crate::runtime::inference::{
 use crate::runtime::sequence::reached_terminal_checkpoint_id;
 use crate::runtime::trace;
 use crate::shared::api::input::{
-    InferenceRequest, ModelSpec, PromptPreparationState, RasterPromptPreparationState,
-    SamplingConfig,
+    InferenceRequest, PromptPreparationState, RasterPromptPreparationState, SamplingConfig,
 };
 use crate::shared::api::output::OutputDecodeState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     RasterArtifactStoreRoots, RasterTokenIdSequenceRef,
 };
-use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
+use crate::shared::model::runtime::LoadedModel;
 use crate::shared::model::transformer::{
-    ActivationSequence, Gemma4TransformerModel, InternalActivationSequence,
-    TransformerPrefillResult,
+    ActivationSequence, InternalActivationSequence, TransformerPrefillResult,
 };
 use crate::shared::raster_contracts::pipeline::RasterDecodeLoopState;
-use crate::shared::raster_contracts::prefill_ple::AuthenticatedGemmaPleSource;
 use crate::shared::tensors::raster_tensor_artifacts::{
     read_sequence_row_from_roots, RasterActivationSequenceRef, RasterSequenceRowRequest,
 };
 use crate::trace::{trace_event, trace_scope};
 use crate::RasterSizingControls;
-use crate::routines::{
-    input_embedding, prefill_finalize, prefill_prepare_aux, prefill_range, prompt_prepare,
-};
 
 /// Result of the raster prompt-prepare phase when the run continues.
 pub(crate) struct RasterPromptPrepared {
@@ -62,18 +58,21 @@ pub(crate) struct RasterPromptPrepared {
 /// tokenizer and commits artifact-root-form checkpoint payloads.
 pub(crate) fn run_prompt_prepare(
     request: &InferenceRequest,
-    model: &ModelSpec,
+    model: &LoadedModel,
     controls: &InferenceControls,
     raster_sizing_controls: Option<&RasterSizingControls>,
 ) -> Result<ControlFlow<InferenceRunOutcome, RasterPromptPrepared>> {
-    let tokenizer_source = controls
-        .raster_tokenizer_source
-        .as_ref()
-        .context("raster tile inference requires an authenticated Gemma tokenizer")?;
+    let tokenizer_source = model
+        .raster_tokenizer()
+        .context("raster tile inference requires raster tokenizer capability")?;
     let raster_sizing_controls =
         raster_sizing_controls.expect("raster sizing controls should be validated");
-    let raster_prompt_preparation =
-        prompt_prepare::run_raster(request, model, tokenizer_source, *raster_sizing_controls)?;
+    let raster_prompt_preparation = prompt_prepare::run_raster(
+        request,
+        model.model_spec(),
+        tokenizer_source,
+        *raster_sizing_controls,
+    )?;
     trace::trace_checkpoint(
         "prompt.prepare",
         &json!({
@@ -109,8 +108,7 @@ pub(crate) fn run_prompt_prepare(
 
 /// Raster `input.embedding` on the full-raster path.
 pub(crate) fn run_input_embedding_full(
-    model: &ModelSpec,
-    transformer_model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     raster_prompt_preparation: Option<&RasterPromptPreparationState>,
     raster_prompt_preparation_roots: Option<&RasterArtifactStoreRoots>,
 ) -> Result<(
@@ -124,7 +122,6 @@ pub(crate) fn run_input_embedding_full(
         .expect("raster prompt preparation roots should exist for raster prefill");
     run_input_embedding_from_prompt(
         model,
-        transformer_model,
         raster_prompt_preparation,
         raster_prompt_preparation_roots,
     )
@@ -132,41 +129,34 @@ pub(crate) fn run_input_embedding_full(
 
 /// Raster `input.embedding` as a selective detour from the native path.
 pub(crate) fn run_input_embedding_detour(
-    model: &ModelSpec,
-    transformer_model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     raster_prompt_preparation: Option<&RasterPromptPreparationState>,
     raster_prompt_preparation_roots: Option<&RasterArtifactStoreRoots>,
 ) -> Result<(
     ActivationSequence,
     input_embedding::raster::RasterInputEmbeddingOutput,
 )> {
-    let raster_prompt_preparation = raster_prompt_preparation.context(
-        "selective raster input.embedding detour requires an authenticated Gemma tokenizer",
-    )?;
+    let raster_prompt_preparation = raster_prompt_preparation
+        .context("selective raster input.embedding detour requires raster prompt preparation")?;
     let raster_prompt_preparation_roots = raster_prompt_preparation_roots
         .cloned()
         .context("selective raster input.embedding detour requires prompt artifact roots")?;
     run_input_embedding_from_prompt(
         model,
-        transformer_model,
         raster_prompt_preparation,
         raster_prompt_preparation_roots,
     )
 }
 
 fn run_input_embedding_from_prompt(
-    model: &ModelSpec,
-    transformer_model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     raster_prompt_preparation: &RasterPromptPreparationState,
     raster_prompt_preparation_roots: RasterArtifactStoreRoots,
 ) -> Result<(
     ActivationSequence,
     input_embedding::raster::RasterInputEmbeddingOutput,
 )> {
-    let embedding_source = AuthenticatedGemmaInputEmbeddingSource::from_model(
-        model.model_id.clone(),
-        transformer_model,
-    )?;
+    let embedding_source = model.input_embedding_source()?;
     let input_embedding_output = input_embedding::run_raster(
         raster_prompt_preparation_roots,
         raster_prompt_preparation,
@@ -191,8 +181,7 @@ pub(crate) struct RasterPrefill {
 /// checkpoint was reached inside the phase (after emitting `phase_paused`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_prefill(
-    model: &ModelSpec,
-    transformer_model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     controls: &InferenceControls,
     raster_sizing_controls: Option<RasterSizingControls>,
     raster_detour_controller: &mut RasterDetourController,
@@ -202,8 +191,7 @@ pub(crate) fn run_prefill(
 ) -> Result<ControlFlow<String, RasterPrefill>> {
     let raster_sizing = raster_sizing_controls.expect("raster sizing controls should be validated");
     raster_detour_controller.reject_if_selected_unsupported(RoutineId::PrefillPrepareAux)?;
-    let ple_source =
-        AuthenticatedGemmaPleSource::from_model(model.model_id.clone(), transformer_model)?;
+    let ple_source = model.prefill_ple_source()?;
     let input_embedding_output =
         raster_input_embedding_refs.expect("raster prefill requires raster input embedding refs");
     let ple_output = prefill_prepare_aux::run_raster(
@@ -217,11 +205,7 @@ pub(crate) fn run_prefill(
         trace::phase_paused(PhaseId::TransformerStateTransition);
         return Ok(ControlFlow::Break(terminal_checkpoint_id));
     }
-    let layer_source =
-        crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource::from_model(
-            model.model_id.clone(),
-            transformer_model,
-        )?;
+    let layer_source = model.prefill_layer_source()?;
     raster_detour_controller.reject_if_selected_unsupported(RoutineId::PrefillRangeFinalize)?;
     let (layer_roots, layer_refs) = prefill_range::run_raster(
         layer_roots,
@@ -234,11 +218,7 @@ pub(crate) fn run_prefill(
         trace::phase_paused(PhaseId::TransformerStateTransition);
         return Ok(ControlFlow::Break(terminal_checkpoint_id));
     }
-    let finalize_source =
-        crate::routines::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource::from_model(
-            model.model_id.clone(),
-            transformer_model,
-        )?;
+    let finalize_source = model.prefill_finalize_source()?;
     raster_detour_controller.reject_if_selected_unsupported(RoutineId::PrefillFinalize)?;
     let prefill_output = prefill_finalize::run_raster(
         layer_roots,
@@ -286,12 +266,14 @@ pub(crate) fn run_prefill(
 pub(crate) fn run_output_decode(
     initial_decode_state: RasterDecodeLoopState,
     sampling: &SamplingConfig,
-    raster_tokenizer: &AuthenticatedGemmaTokenizer,
-    transformer_model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     raster_sizing: RasterSizingControls,
 ) -> Result<OutputDecodeState> {
     let _trace = trace_scope("decode.run");
     let max_new_tokens = crate::runtime::pipeline::validate_sampling_config(sampling)?;
+    let raster_tokenizer = model
+        .raster_tokenizer()
+        .context("raster output decode requires raster tokenizer capability")?;
     let mut decode_transition_state_refs = Vec::new();
     let mut decode_state = initial_decode_state;
 
@@ -323,11 +305,12 @@ pub(crate) fn run_output_decode(
         }
 
         trace_event("decode.select_token");
-        let (selected_state, select_output) = crate::routines::decode_select_token::run_raster_with_sizing(
-            decode_state,
-            max_new_tokens,
-            raster_sizing,
-        )?;
+        let (selected_state, select_output) =
+            crate::routines::decode_select_token::run_raster_with_sizing(
+                decode_state,
+                max_new_tokens,
+                raster_sizing,
+            )?;
         let select_output = select_output.expect("stop condition should have returned earlier");
         crate::routines::decode_select_token::trace_raster_checkpoint_from_state(
             &selected_state,
@@ -336,18 +319,18 @@ pub(crate) fn run_output_decode(
         )?;
 
         trace_event("decode.step");
-        let source =
-            crate::routines::decode_layer_range::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource::from_model(
-                format!("decode.layer_range.position_{}", selected_state.position),
-                transformer_model,
-            )?;
+        let source = model.decode_layer_range_source(format!(
+            "decode.layer_range.position_{}",
+            selected_state.position
+        ))?;
         let selected_state_for_finalize = selected_state.clone();
-        let mut range_state = crate::routines::decode_layer_range::init_raster_state_from_decode_loop(
-            selected_state,
-            select_output.selected_token_ref,
-            &source,
-            raster_sizing,
-        )?;
+        let mut range_state =
+            crate::routines::decode_layer_range::init_raster_state_from_decode_loop(
+                selected_state,
+                select_output.selected_token_ref,
+                &source,
+                raster_sizing,
+            )?;
         while !range_state.is_complete() {
             range_state = crate::routines::decode_layer_range::run_raster(
                 range_state,
@@ -364,7 +347,9 @@ pub(crate) fn run_output_decode(
             decode_transition_state_refs
                 .push((decode_state.artifact_store_roots.clone(), activation_ref));
         }
-        crate::routines::decode_transition_finalize::finalize_raster_state_for_trace(&decode_state)?;
+        crate::routines::decode_transition_finalize::finalize_raster_state_for_trace(
+            &decode_state,
+        )?;
         if crate::trace::reached_terminal_checkpoint_id().is_some() {
             let materialized_transition_states = decode_transition_state_refs
                 .into_iter()
@@ -372,11 +357,21 @@ pub(crate) fn run_output_decode(
                     materialize_activation_sequence_from_ref(&roots, &activation_ref)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let mut output_decode_state = build_current_output_decode_state_from_raster_state(
-                &decode_state,
-                raster_tokenizer,
-                raster_sizing,
-            )?;
+            let generated_token_ids = match decode_state.generated_token_ids_ref.as_ref() {
+                Some(generated_token_ids_ref) => {
+                    crate::routines::output_finalize::raster::materialize_token_ids_from_roots(
+                        &decode_state.artifact_store_roots,
+                        generated_token_ids_ref,
+                    )?
+                }
+                None => Vec::new(),
+            };
+            let mut output_decode_state =
+                crate::routines::output_finalize::raster::run_with_byte_flush_bytes_per_tile(
+                    &generated_token_ids,
+                    raster_tokenizer,
+                    raster_sizing.output_byte_flush_bytes_per_tile,
+                )?;
             output_decode_state.decode_transition_states = materialized_transition_states;
             return Ok(output_decode_state);
         }
@@ -408,27 +403,6 @@ fn materialize_activation_sequence_from_ref(
             ),
         ),
     ))
-}
-
-fn build_current_output_decode_state_from_raster_state(
-    decode_state: &RasterDecodeLoopState,
-    raster_tokenizer: &AuthenticatedGemmaTokenizer,
-    raster_sizing: RasterSizingControls,
-) -> Result<OutputDecodeState> {
-    let generated_token_ids = match decode_state.generated_token_ids_ref.as_ref() {
-        Some(generated_token_ids_ref) => {
-            crate::routines::output_finalize::raster::materialize_token_ids_from_roots(
-                &decode_state.artifact_store_roots,
-                generated_token_ids_ref,
-            )?
-        }
-        None => Vec::new(),
-    };
-    crate::routines::output_finalize::raster::run_with_byte_flush_bytes_per_tile(
-        &generated_token_ids,
-        raster_tokenizer,
-        raster_sizing.output_byte_flush_bytes_per_tile,
-    )
 }
 
 fn prompt_preparation_from_raster_prompt(

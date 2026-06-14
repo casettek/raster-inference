@@ -19,6 +19,7 @@ the only family is Gemma:
 ```
 src/shared/model/gemma/
   mod.rs          Gemma4Prompt and module docs
+  adapter.rs      GemmaModelBundle and runtime-facing source builders
   transformer.rs  Gemma4TransformerModel, Gemma4LayerWeights, Gemma4Ple*, …
   tokenizer.rs    GemmaTokenizerSpec, AuthenticatedGemmaTokenizer, BPE state
   io.rs           safetensors / det-wgt Gemma weight loaders, tokenizer-spec
@@ -27,6 +28,8 @@ src/shared/model/gemma/
 
 Generic counterparts stay outside the family module:
 
+- `src/shared/model/runtime.rs` — `LoadedModel`, the narrow enum-backed
+  runtime boundary used by sequence, executors, roles, and pipeline helpers,
 - `src/shared/model/transformer.rs` — activation sequences, KV caches,
   det-num matrix storage, decode/prefill state types,
 - `src/io.rs` — chat-template/tokenizer-file loading, generic
@@ -36,7 +39,8 @@ Adding a new model family (qwen3.6, MoE variants — planned, not near-term)
 means adding `shared/model/<family>/`, **not** threading family types
 through `runtime/`, `shared/api/`, or `shared/artifacts/`. Multi-model
 *abstraction* (a model trait) is explicitly deferred; this rule is about
-containment only.
+containment only. Runtime code may depend on `LoadedModel`; it should not
+match on concrete model-family internals.
 
 ## Compatibility re-exports
 
@@ -51,23 +55,23 @@ and the crate-root flat re-exports have been removed):
 
 New code should import from the `shared::model::gemma::*` paths.
 
-## Audited exception list
+## Enforcement
 
-`grep -rl Gemma src/runtime src/shared/api src/shared/artifacts` is expected
-to return only the files below. Each reference is a *type-level use* of the
-Gemma model/tokenizer types in entry-point signatures or control fields —
-unavoidable until the deferred multi-model abstraction exists, because the
-runtime executes exactly one concrete model family today:
+`tests/model_family_containment.rs` scans the protected protocol/runtime
+surfaces and fails if model-family names leak back into them. The protected
+surface includes:
 
-| File | Reference | Justification |
-| --- | --- | --- |
-| `runtime/inference.rs` | `Gemma4TransformerModel` parameter; `InferenceControls.raster_tokenizer_source: Option<AuthenticatedGemmaTokenizer>` | legacy entry-point signature + tokenizer source control; abstraction deferred |
-| `runtime/sequence.rs` | `Gemma4TransformerModel` parameter | skeleton passes the model through to executors |
-| `runtime/executors/{native,raster}.rs` | `Gemma4TransformerModel`, `AuthenticatedGemma*Source` constructors | executors bind routine auth sources to the concrete model |
-| `runtime/pipeline.rs` | `Gemma4TransformerModel` parameters; Gemma model fixtures in tests | test/bench bundle API over the concrete model |
-| `runtime/roles/{claimer,challenger}.rs` | `Gemma4TransformerModel`, `AuthenticatedGemmaTokenizer` parameters | role entry points take the concrete model until abstraction lands |
-| `runtime/det_goldens.rs` (test-only) | `Gemma4TransformerModel` fixtures | golden-capture test helper |
+- `src/runtime/sequence.rs`,
+- `src/runtime/inference/mod.rs`,
+- `src/runtime/pipeline.rs`,
+- `src/runtime/executors/`,
+- `src/runtime/roles/`,
+- `src/runtime/checkpoints.rs`,
+- `src/runtime/trace.rs`,
+- `src/shared/api/`,
+- `src/shared/artifacts/`.
 
-`runtime/checkpoints.rs`, `runtime/trace.rs`, all of `shared/api/`, and all
-of `shared/artifacts/` are Gemma-free, including serialization: no
-checkpoint id, trace field, or artifact domain string names a model family.
+Test-only fixtures, `src/shared/model/gemma/`, and existing routine/auth-source
+internals may still name Gemma. The next cleanup workstream can rename or wrap
+authenticated routine sources; this containment layer only ensures runtime and
+protocol surfaces do not carry Gemma types or constructors.

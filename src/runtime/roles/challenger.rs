@@ -11,7 +11,6 @@
 //! `--raster-at` produces today. True mid-state resumption is deferred.
 
 use anyhow::{Context, Result};
-use tokenizers::Tokenizer;
 
 use crate::runtime::checkpoints::{RasterDetourSpec, RoutineId};
 use crate::runtime::inference::{InferenceControls, InferenceRunOutcome};
@@ -20,9 +19,8 @@ use crate::runtime::{sequence, trace};
 use crate::shared::api::audit::{
     AuditOutcome, CheckpointDivergence, ClaimedTrace, ClaimedTraceEntry,
 };
-use crate::shared::api::input::{InferenceRequest, ModelSpec};
-use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
-use crate::shared::model::transformer::Gemma4TransformerModel;
+use crate::shared::api::input::InferenceRequest;
+use crate::shared::model::runtime::LoadedModel;
 
 /// Routines whose selective raster detour is implemented on the native path.
 /// Divergences at other routines (`prompt.prepare`,
@@ -55,10 +53,7 @@ const DETOURABLE_ROUTINES: [RoutineId; 8] = [
 /// it.
 pub fn audit(
     request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &Tokenizer,
-    transformer_model: &Gemma4TransformerModel,
-    raster_tokenizer_source: AuthenticatedGemmaTokenizer,
+    model: &LoadedModel,
     claimed_trace: &[u8],
     tuning: &ExecutionTuning,
 ) -> Result<AuditOutcome> {
@@ -66,18 +61,11 @@ pub fn audit(
 
     let mut replay_controls = InferenceControls {
         commit_checkpoints: true,
-        raster_tokenizer_source: Some(raster_tokenizer_source.clone()),
+        raster_tokenizer_enabled: true,
         ..Default::default()
     };
     tuning.apply(&mut replay_controls);
-    run_to_completion(
-        request,
-        model,
-        tokenizer,
-        transformer_model,
-        &replay_controls,
-        "challenger replay",
-    )?;
+    run_to_completion(request, model, &replay_controls, "challenger replay")?;
     let replayed_payload = trace::completed_checkpoint_payload()
         .context("challenger replay did not produce a committed checkpoint payload")?;
     let replayed = ClaimedTrace::from_value(&replayed_payload)?;
@@ -88,16 +76,8 @@ pub fn audit(
 
     let detour = detour_spec_for(&divergence)
         .map(|spec| {
-            let outcome = detour::run(
-                request,
-                model,
-                tokenizer,
-                transformer_model,
-                raster_tokenizer_source.clone(),
-                spec,
-                tuning,
-            )
-            .context("challenger raster detour failed")?;
+            let outcome = detour::run(request, model, spec, tuning)
+                .context("challenger raster detour failed")?;
             Ok::<_, anyhow::Error>(outcome.artifact)
         })
         .transpose()?;
@@ -107,13 +87,11 @@ pub fn audit(
 
 fn run_to_completion(
     request: &InferenceRequest,
-    model: &ModelSpec,
-    tokenizer: &Tokenizer,
-    transformer_model: &Gemma4TransformerModel,
+    model: &LoadedModel,
     controls: &InferenceControls,
     description: &str,
 ) -> Result<()> {
-    match sequence::run(request, model, tokenizer, transformer_model, controls)? {
+    match sequence::run(request, model, controls)? {
         InferenceRunOutcome::Completed(_) => Ok(()),
         InferenceRunOutcome::Paused(paused) => anyhow::bail!(
             "{description} paused unexpectedly at checkpoint {}",

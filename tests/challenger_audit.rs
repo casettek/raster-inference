@@ -34,7 +34,9 @@ use raster_inference::runtime::roles::{challenger, claimer};
 use raster_inference::shared::api::audit::AuditOutcome;
 use raster_inference::shared::artifacts::artifact_io::ArtifactIo;
 use raster_inference::shared::artifacts::external_artifacts::reset_external_source_store;
+use raster_inference::shared::model::gemma::adapter::GemmaModelBundle;
 use raster_inference::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
+use raster_inference::shared::model::runtime::LoadedModel;
 use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
@@ -88,6 +90,15 @@ impl Fixture {
                 .expect("tiny-gemma-dev tokenizer spec should load"),
         )
     }
+
+    fn loaded_model(&self) -> LoadedModel {
+        LoadedModel::Gemma(GemmaModelBundle::new(
+            self.model_spec.clone(),
+            self.tokenizer.clone(),
+            self.transformer_model.clone(),
+            Some(self.raster_tokenizer_source()),
+        ))
+    }
 }
 
 fn tiny_gemma_dir() -> PathBuf {
@@ -127,15 +138,8 @@ fn fresh_run_env() -> PathBuf {
 
 fn run_claimer(fixture: &Fixture, request: &InferenceRequest) -> Vec<u8> {
     fresh_run_env();
-    let outcome = claimer::run(
-        request,
-        &fixture.model_spec,
-        &fixture.tokenizer,
-        &fixture.transformer_model,
-        fixture.raster_tokenizer_source(),
-        &ClaimerOptions::default(),
-    )
-    .expect("claimer run should complete");
+    let outcome = claimer::run(request, &fixture.loaded_model(), &ClaimerOptions::default())
+        .expect("claimer run should complete");
     let ClaimerRunOutcome::Completed(outcome) = outcome else {
         panic!("claimer run should complete rather than pause");
     };
@@ -146,10 +150,7 @@ fn run_audit(fixture: &Fixture, request: &InferenceRequest, claimed_trace: &[u8]
     fresh_run_env();
     challenger::audit(
         request,
-        &fixture.model_spec,
-        &fixture.tokenizer,
-        &fixture.transformer_model,
-        fixture.raster_tokenizer_source(),
+        &fixture.loaded_model(),
         claimed_trace,
         &ExecutionTuning::default(),
     )
@@ -162,13 +163,11 @@ fn run_reference_detour(fixture: &Fixture, request: &InferenceRequest, spec: &st
     let trace_dir = fresh_run_env();
     let outcome = sequence::run(
         request,
-        &fixture.model_spec,
-        &fixture.tokenizer,
-        &fixture.transformer_model,
+        &fixture.loaded_model(),
         &InferenceControls {
             commit_checkpoints: true,
             raster_detour: Some(RasterDetourSpec::parse(spec).expect("detour spec should parse")),
-            raster_tokenizer_source: Some(fixture.raster_tokenizer_source()),
+            raster_tokenizer_enabled: true,
             ..Default::default()
         },
     )
