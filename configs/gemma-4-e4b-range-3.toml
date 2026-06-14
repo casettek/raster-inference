@@ -1,0 +1,19 @@
+# Range-3 scheduling for ~/models/gemma-4-E4B-it (42 layers, hidden 2560).
+#
+# Usage:
+#   cargo run --release -- claim --model ~/models/gemma-4-E4B-it --config configs/gemma-4-e4b-range-3.toml "Hello from Raster"
+
+[ranges]
+prefill_token_range_width = 3
+decode_layer_range_width = 3
+
+[tile_sizing]
+# Conservative starting point for E4B; tune after measuring trace-tiles runtime.
+# projection_rows_per_tile=25 is the plan-doc suggestion for 1 MiB tile targets.
+projection_rows_per_tile = 25
+attention_kv_rows_per_tile = 128
+sequence_rows_per_tile = 16
+head_rows_per_tile = 4
+tokenizer_bpe_pairs_per_tile = 1024
+tokenizer_bpe_pieces_per_tile = 512
+output_byte_flush_bytes_per_tile = 4096

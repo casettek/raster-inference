@@ -1,0 +1,18 @@
+# Range-3 scheduling for assets/tiny-gemma-dev (4 layers).
+#
+# Usage:
+#   cargo run -- claim --model assets/tiny-gemma-dev --config configs/tiny-gemma-range-3.toml "hello raster prompt"
+
+[ranges]
+prefill_token_range_width = 3
+decode_layer_range_width = 3
+
+[tile_sizing]
+# Defaults are fine for the tiny fixture; these match README examples.
+projection_rows_per_tile = 64
+attention_kv_rows_per_tile = 128
+sequence_rows_per_tile = 16
+head_rows_per_tile = 4
+tokenizer_bpe_pairs_per_tile = 1024
+tokenizer_bpe_pieces_per_tile = 512
+output_byte_flush_bytes_per_tile = 4096
