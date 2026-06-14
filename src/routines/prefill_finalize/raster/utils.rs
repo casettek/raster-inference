@@ -1,6 +1,8 @@
 use anyhow::{bail, Result};
 
-use crate::routines::prefill_finalize::raster::{RasterPrefillFinalizeRefs, PREFILL_LOGITS_ARTIFACT_NAME};
+use crate::routines::prefill_finalize::raster::{
+    RasterPrefillFinalizeRefs, PREFILL_LOGITS_ARTIFACT_NAME,
+};
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
     ActivationSequence, InternalLogits, LayerKvCache, PrefillLogits, TransformerPrefillResult,
@@ -91,7 +93,8 @@ pub(in super::super) fn validate_layer_cache_roots(
     layer_caches: &[crate::routines::prefill_range::raster::PrefillLayerCacheSlot],
 ) -> Result<()> {
     for cache in layer_caches {
-        if let crate::routines::prefill_range::raster::PrefillLayerCacheSlot::Ref(cache_ref) = cache {
+        if let crate::routines::prefill_range::raster::PrefillLayerCacheSlot::Ref(cache_ref) = cache
+        {
             ensure_artifact_root_present(roots, cache_ref.keys().det_commitment())?;
             ensure_artifact_root_present(roots, cache_ref.values().det_commitment())?;
         }

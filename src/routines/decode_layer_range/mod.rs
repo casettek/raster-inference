@@ -24,12 +24,12 @@ use crate::RasterSizingControls;
 pub mod native;
 pub mod raster;
 
-use self::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource;
+use self::raster::auth_source::AuthenticatedDecoderDecodeLayerRangeSource;
 
 pub(crate) fn init_raster_state_from_decode_loop(
     decode_state: RasterDecodeLoopState,
     selected_token_ref: RasterSelectedTokenRef,
-    source: &AuthenticatedGemmaDecodeLayerRangeSource,
+    source: &AuthenticatedDecoderDecodeLayerRangeSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<raster::RasterDecodeLayerRangeState> {
     let source =
@@ -56,7 +56,7 @@ pub(crate) fn init_raster_state_from_decode_loop(
 
 pub fn run_raster(
     state: raster::RasterDecodeLayerRangeState,
-    source: &AuthenticatedGemmaDecodeLayerRangeSource,
+    source: &AuthenticatedDecoderDecodeLayerRangeSource,
     decode_layer_range_width: usize,
 ) -> Result<raster::RasterDecodeLayerRangeState> {
     let source =
@@ -66,7 +66,7 @@ pub fn run_raster(
 
 pub(crate) fn run_selected_raster_detour_from_native_boundary(
     state: DecodeLayerRangeState,
-    source: &AuthenticatedGemmaDecodeLayerRangeSource,
+    source: &AuthenticatedDecoderDecodeLayerRangeSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<DecodeLayerRangeState> {
     let source_for_mode =

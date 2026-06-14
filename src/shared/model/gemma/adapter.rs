@@ -1,17 +1,18 @@
 use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 
-use crate::routines::decode_layer_range::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource;
-use crate::routines::decode_transition_finalize::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource;
-use crate::routines::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
-use crate::routines::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource;
+use crate::routines::decode_layer_range::raster::auth_source::AuthenticatedDecoderDecodeLayerRangeSource;
+use crate::routines::decode_transition_finalize::raster::auth_source::AuthenticatedDecoderDecodeTransitionSource;
+use crate::routines::input_embedding::raster::auth_source::AuthenticatedDecoderEmbeddingSource;
+use crate::routines::prefill_finalize::raster::auth_source::AuthenticatedDecoderPrefillFinalizeSource;
 use crate::shared::api::input::ModelSpec;
 use crate::shared::model::gemma::io::embed_input_tokens_from_gemma_source;
+use crate::shared::model::gemma::sources;
 use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::gemma::transformer::Gemma4TransformerModel;
 use crate::shared::model::transformer::ActivationSequence;
-use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
-use crate::shared::raster_contracts::prefill_ple::AuthenticatedGemmaPleSource;
+use crate::shared::raster_contracts::prefill_layer::AuthenticatedDecoderPrefillLayerSource;
+use crate::shared::raster_contracts::prefill_ple::AuthenticatedDecoderPrefillPleSource;
 
 #[derive(Clone)]
 pub struct GemmaModelBundle {
@@ -67,47 +68,35 @@ impl GemmaModelBundle {
         embed_input_tokens_from_gemma_source(token_ids, embedding_source)
     }
 
-    pub(crate) fn input_embedding_source(&self) -> Result<AuthenticatedGemmaInputEmbeddingSource> {
-        AuthenticatedGemmaInputEmbeddingSource::from_model(
-            self.model_spec.model_id.clone(),
-            &self.transformer_model,
-        )
+    pub(crate) fn input_embedding_source(&self) -> Result<AuthenticatedDecoderEmbeddingSource> {
+        sources::input_embedding_source(self.model_spec.model_id.clone(), &self.transformer_model)
     }
 
-    pub(crate) fn prefill_ple_source(&self) -> Result<AuthenticatedGemmaPleSource> {
-        AuthenticatedGemmaPleSource::from_model(
-            self.model_spec.model_id.clone(),
-            &self.transformer_model,
-        )
+    pub(crate) fn prefill_ple_source(&self) -> Result<AuthenticatedDecoderPrefillPleSource> {
+        sources::prefill_ple_source(self.model_spec.model_id.clone(), &self.transformer_model)
     }
 
-    pub(crate) fn prefill_layer_source(&self) -> Result<AuthenticatedGemmaPrefillLayerSource> {
-        AuthenticatedGemmaPrefillLayerSource::from_model(
-            self.model_spec.model_id.clone(),
-            &self.transformer_model,
-        )
+    pub(crate) fn prefill_layer_source(&self) -> Result<AuthenticatedDecoderPrefillLayerSource> {
+        sources::prefill_layer_source(self.model_spec.model_id.clone(), &self.transformer_model)
     }
 
     pub(crate) fn prefill_finalize_source(
         &self,
-    ) -> Result<AuthenticatedGemmaPrefillFinalizeSource> {
-        AuthenticatedGemmaPrefillFinalizeSource::from_model(
-            self.model_spec.model_id.clone(),
-            &self.transformer_model,
-        )
+    ) -> Result<AuthenticatedDecoderPrefillFinalizeSource> {
+        sources::prefill_finalize_source(self.model_spec.model_id.clone(), &self.transformer_model)
     }
 
     pub(crate) fn decode_layer_range_source(
         &self,
         identifier: impl Into<String>,
-    ) -> Result<AuthenticatedGemmaDecodeLayerRangeSource> {
-        AuthenticatedGemmaDecodeLayerRangeSource::from_model(identifier, &self.transformer_model)
+    ) -> Result<AuthenticatedDecoderDecodeLayerRangeSource> {
+        sources::decode_layer_range_source(identifier, &self.transformer_model)
     }
 
     pub(crate) fn decode_transition_source(
         &self,
         identifier: impl Into<String>,
-    ) -> Result<AuthenticatedGemmaDecodeTransitionSource> {
-        AuthenticatedGemmaDecodeTransitionSource::from_model(identifier, &self.transformer_model)
+    ) -> Result<AuthenticatedDecoderDecodeTransitionSource> {
+        sources::decode_transition_source(identifier, &self.transformer_model)
     }
 }

@@ -16,5 +16,10 @@ pub(crate) fn run_range(
     model: &Gemma4TransformerModel,
     decode_layer_range_width: usize,
 ) -> Result<(DecodeLayerRangeState, bool)> {
-    super::tiles::run_range(state, model, decode_layer_range_width, Some("deterministic"))
+    super::tiles::run_range(
+        state,
+        model,
+        decode_layer_range_width,
+        Some("deterministic"),
+    )
 }

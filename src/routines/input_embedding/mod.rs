@@ -12,7 +12,7 @@ use crate::shared::model::transformer::{ActivationSequence, Gemma4TransformerMod
 pub mod native;
 pub mod raster;
 
-use self::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
+use self::raster::auth_source::AuthenticatedDecoderEmbeddingSource;
 
 pub fn run(prompt_token_ids: &[u32], model: &Gemma4TransformerModel) -> Result<ActivationSequence> {
     let _routine = crate::trace::routine_scope(RoutineId::InputEmbedding, "");
@@ -22,7 +22,7 @@ pub fn run(prompt_token_ids: &[u32], model: &Gemma4TransformerModel) -> Result<A
 pub fn run_raster(
     artifact_store_roots: RasterArtifactStoreRoots,
     prompt_preparation: &RasterPromptPreparationState,
-    embedding_source: &AuthenticatedGemmaInputEmbeddingSource,
+    embedding_source: &AuthenticatedDecoderEmbeddingSource,
 ) -> Result<raster::RasterInputEmbeddingOutput> {
     let _routine = crate::trace::routine_scope(
         RoutineId::InputEmbedding,

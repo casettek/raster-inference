@@ -25,12 +25,14 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
+use raster_inference::routines::input_embedding;
+use raster_inference::runtime::pipeline::{decode_step, run_prefill_pass};
+use raster_inference::shared::model::transformer::{
+    Gemma4TransformerModel, TransformerDecodeState,
+};
 use raster_inference::shared::numerics::det_num::{
     encode_det_wgt_artifact_with_widths, f32_to_wgt, DetWgtTensorSpec, DetWgtWidthPolicy,
 };
-use raster_inference::routines::input_embedding;
-use raster_inference::runtime::pipeline::{decode_step, run_prefill_pass};
-use raster_inference::shared::model::transformer::{Gemma4TransformerModel, TransformerDecodeState};
 use raster_inference::{
     load_transformer_state_model_from_det_num_wgt_path, PromptPreparationState,
 };
@@ -72,11 +74,15 @@ fn prefill_decode_state(
     context_len: usize,
 ) -> TransformerDecodeState {
     let prompt_token_ids = token_ids(context_len);
-    let token_embeddings = input_embedding::run(&prompt_token_ids, model)
-        .expect("bench embedding should succeed");
-    run_prefill_pass(&prompt_preparation(&prompt_token_ids), model, &token_embeddings)
-        .expect("bench prefill should succeed")
-        .transformer_decode_state
+    let token_embeddings =
+        input_embedding::run(&prompt_token_ids, model).expect("bench embedding should succeed");
+    run_prefill_pass(
+        &prompt_preparation(&prompt_token_ids),
+        model,
+        &token_embeddings,
+    )
+    .expect("bench prefill should succeed")
+    .transformer_decode_state
 }
 
 fn det_prefill(criterion: &mut Criterion) {
@@ -109,9 +115,7 @@ fn det_decode(criterion: &mut Criterion) {
         group.bench_function(format!("ctx_{context_len}"), |bencher| {
             bencher.iter_batched(
                 || decode_state.clone(),
-                |state| {
-                    decode_step(state, 1, &model).expect("bench decode step should succeed")
-                },
+                |state| decode_step(state, 1, &model).expect("bench decode step should succeed"),
                 BatchSize::LargeInput,
             )
         });

@@ -9,7 +9,7 @@ use crate::shared::model::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel,
 };
 use crate::shared::raster_contracts::prefill_ple::{
-    read_prefill_ple_input_manifest_from_roots, AuthenticatedGemmaPleSource,
+    read_prefill_ple_input_manifest_from_roots, AuthenticatedDecoderPrefillPleSource,
     GemmaPleMetadataRequest, RasterPrefillPleInputRefs,
 };
 use crate::RasterSizingControls;
@@ -37,7 +37,7 @@ pub fn run_with_input_embedding_checkpoint(
     token_embeddings: &ActivationSequence,
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &AuthenticatedDecoderPrefillPleSource,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let _routine = crate::trace::routine_scope(
         RoutineId::PrefillPrepareAux,
@@ -60,7 +60,7 @@ pub fn run_with_input_embedding_checkpoint(
 pub fn run_raster(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &AuthenticatedDecoderPrefillPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<raster::RasterPrefillPleOutput> {
     let _routine = crate::trace::routine_scope(RoutineId::PrefillPrepareAux, "mode=raster");
@@ -97,7 +97,7 @@ pub fn prefill_ple_input_refs_from_manifest(
 pub fn format_native_prefill_prepare_aux_as_raster_checkpoint_for_trace(
     mut artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &AuthenticatedDecoderPrefillPleSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<Option<RasterPrefillPleInputRefs>> {
     let metadata = ArtifactIo::auth_read(ple_source, GemmaPleMetadataRequest)?;

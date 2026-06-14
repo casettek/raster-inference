@@ -24,7 +24,7 @@ const INPUT_EMBEDDING_METADATA_REQUEST: &str = "gemma_input_embedding.metadata";
 const INPUT_EMBEDDING_ROW_REQUEST: &str = "gemma_input_embedding.row";
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AuthenticatedGemmaInputEmbeddingSource {
+pub struct AuthenticatedDecoderEmbeddingSource {
     identifier: String,
     vocab_size: usize,
     hidden_size: usize,
@@ -35,18 +35,18 @@ pub struct AuthenticatedGemmaInputEmbeddingSource {
 pub enum RasterInputEmbeddingSource<'a> {
     Committed {
         source: CommittedExternalSource,
-        _marker: PhantomData<&'a AuthenticatedGemmaInputEmbeddingSource>,
+        _marker: PhantomData<&'a AuthenticatedDecoderEmbeddingSource>,
     },
     #[cfg(feature = "unchecked-raster-integrity")]
     DirectUnchecked {
-        source: &'a AuthenticatedGemmaInputEmbeddingSource,
+        source: &'a AuthenticatedDecoderEmbeddingSource,
         root: String,
     },
 }
 
 impl<'a> RasterInputEmbeddingSource<'a> {
     pub fn for_current_integrity_mode(
-        source: &'a AuthenticatedGemmaInputEmbeddingSource,
+        source: &'a AuthenticatedDecoderEmbeddingSource,
     ) -> Result<Self> {
         #[cfg(feature = "unchecked-raster-integrity")]
         if raster_integrity_is_unchecked() {
@@ -96,7 +96,7 @@ pub struct GemmaInputEmbeddingRowRequest {
     pub token_id: u32,
 }
 
-impl AuthenticatedGemmaInputEmbeddingSource {
+impl AuthenticatedDecoderEmbeddingSource {
     pub fn from_model(
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
@@ -204,7 +204,7 @@ impl AuthenticatedGemmaInputEmbeddingSource {
     }
 }
 
-impl AuthRead<GemmaInputEmbeddingMetadataRequest> for AuthenticatedGemmaInputEmbeddingSource {
+impl AuthRead<GemmaInputEmbeddingMetadataRequest> for AuthenticatedDecoderEmbeddingSource {
     type Output = GemmaInputEmbeddingMetadata;
 
     fn auth_read(&self, _request: GemmaInputEmbeddingMetadataRequest) -> Result<Self::Output> {
@@ -224,7 +224,7 @@ impl AuthRead<GemmaInputEmbeddingMetadataRequest> for RasterInputEmbeddingSource
     }
 }
 
-impl AuthRead<GemmaInputEmbeddingRowRequest> for AuthenticatedGemmaInputEmbeddingSource {
+impl AuthRead<GemmaInputEmbeddingRowRequest> for AuthenticatedDecoderEmbeddingSource {
     type Output = Vec<Act>;
 
     fn auth_read(&self, request: GemmaInputEmbeddingRowRequest) -> Result<Self::Output> {

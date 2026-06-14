@@ -5,7 +5,7 @@ use super::{
     NORMALIZED_FINAL_POSITION_ARTIFACT_NAME,
 };
 use crate::routines::prefill_finalize::raster::auth_source::{
-    AuthenticatedGemmaPrefillFinalizeSource, RasterPrefillFinalizeSource,
+    AuthenticatedDecoderPrefillFinalizeSource, RasterPrefillFinalizeSource,
 };
 use crate::routines::prefill_range::raster::PrefillLayerCacheSlot;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn raster_finalize_matches_native_deterministic_for_untied_projection() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states = activation_sequence(vec![
         vec![Act::from_num(0.25), Act::from_num(0.5)],
@@ -45,13 +45,9 @@ fn raster_finalize_matches_native_deterministic_for_untied_projection() {
 
     let raster = run_ref_backed_finalize(2, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
-    let native = crate::routines::prefill_finalize::run(
-        &[3, 4],
-        &model,
-        final_hidden_states,
-        vec![],
-    )
-    .expect("native finalize should run");
+    let native =
+        crate::routines::prefill_finalize::run(&[3, 4], &model, final_hidden_states, vec![])
+            .expect("native finalize should run");
 
     assert_eq!(
         raster.transformer_state.prefill_logits.logits,
@@ -74,7 +70,7 @@ fn raster_finalize_matches_native_deterministic_for_untied_projection() {
 #[test]
 fn ref_backed_finalize_matches_native_deterministic_for_untied_projection() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states = activation_sequence(vec![
         vec![Act::from_num(0.25), Act::from_num(0.5)],
@@ -85,13 +81,9 @@ fn ref_backed_finalize_matches_native_deterministic_for_untied_projection() {
 
     let raster = run_ref_backed_finalize(2, final_hidden_states_ref, vec![], &source, 1)
         .expect("ref-backed raster finalize should run");
-    let native = crate::routines::prefill_finalize::run(
-        &[3, 4],
-        &model,
-        final_hidden_states,
-        vec![],
-    )
-    .expect("native finalize should run");
+    let native =
+        crate::routines::prefill_finalize::run(&[3, 4], &model, final_hidden_states, vec![])
+            .expect("native finalize should run");
 
     assert_eq!(
         raster.transformer_state.prefill_logits,
@@ -104,7 +96,7 @@ fn ref_backed_finalize_matches_native_deterministic_for_untied_projection() {
 #[test]
 fn finalize_projection_state_serializes_builder_not_logits() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let raster_source =
         RasterPrefillFinalizeSource::for_current_integrity_mode(&source).expect("raster source");
@@ -138,7 +130,7 @@ fn finalize_projection_state_serializes_builder_not_logits() {
 #[test]
 fn in_progress_projection_state_serializes_refs_not_payloads() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("in-progress", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("in-progress", &model)
         .expect("source should build");
     let raster_source =
         RasterPrefillFinalizeSource::for_current_integrity_mode(&source).expect("raster source");
@@ -176,7 +168,7 @@ fn in_progress_projection_state_serializes_refs_not_payloads() {
 #[test]
 fn raster_finalize_matches_native_deterministic_for_tied_projection() {
     let (_path, model) = tied_model().expect("tied fixture should build");
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("tied", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("tied", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(0.5), Act::from_num(-0.25)]]);
@@ -185,13 +177,8 @@ fn raster_finalize_matches_native_deterministic_for_tied_projection() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
-    let native = crate::routines::prefill_finalize::run(
-        &[9],
-        &model,
-        final_hidden_states,
-        vec![],
-    )
-    .expect("native finalize should run");
+    let native = crate::routines::prefill_finalize::run(&[9], &model, final_hidden_states, vec![])
+        .expect("native finalize should run");
 
     assert_eq!(
         raster.transformer_state.prefill_logits.logits,
@@ -204,7 +191,7 @@ fn raster_finalize_matches_native_deterministic_for_tied_projection() {
 #[test]
 fn ref_backed_finalize_matches_native_deterministic_for_tied_projection() {
     let (_path, model) = tied_model().expect("tied fixture should build");
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("tied", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("tied", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(0.5), Act::from_num(-0.25)]]);
@@ -213,13 +200,8 @@ fn ref_backed_finalize_matches_native_deterministic_for_tied_projection() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("ref-backed raster finalize should run");
-    let native = crate::routines::prefill_finalize::run(
-        &[9],
-        &model,
-        final_hidden_states,
-        vec![],
-    )
-    .expect("native finalize should run");
+    let native = crate::routines::prefill_finalize::run(&[9], &model, final_hidden_states, vec![])
+        .expect("native finalize should run");
 
     assert_eq!(
         raster.transformer_state.prefill_logits,
@@ -232,7 +214,7 @@ fn ref_backed_finalize_matches_native_deterministic_for_tied_projection() {
 #[test]
 fn raster_finalize_matches_native_deterministic_with_softcap() {
     let model = untied_model(true);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("softcap", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("softcap", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
@@ -241,13 +223,8 @@ fn raster_finalize_matches_native_deterministic_with_softcap() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 2)
         .expect("root-backed raster finalize should run");
-    let native = crate::routines::prefill_finalize::run(
-        &[1],
-        &model,
-        final_hidden_states,
-        vec![],
-    )
-    .expect("native finalize should run");
+    let native = crate::routines::prefill_finalize::run(&[1], &model, final_hidden_states, vec![])
+        .expect("native finalize should run");
 
     assert_eq!(
         raster.transformer_state.prefill_logits.logits,
@@ -258,7 +235,7 @@ fn raster_finalize_matches_native_deterministic_with_softcap() {
 #[test]
 fn raster_finalize_projection_chunk_sizes_do_not_change_result() {
     let model = untied_model(true);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("chunks", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("chunks", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
@@ -281,7 +258,7 @@ fn raster_finalize_projection_chunk_sizes_do_not_change_result() {
 #[test]
 fn ref_backed_finalize_matches_native_deterministic_with_softcap() {
     let model = untied_model(true);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("softcap", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("softcap", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.5)]]);
@@ -290,13 +267,8 @@ fn ref_backed_finalize_matches_native_deterministic_with_softcap() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 2)
         .expect("ref-backed raster finalize should run");
-    let native = crate::routines::prefill_finalize::run(
-        &[1],
-        &model,
-        final_hidden_states,
-        vec![],
-    )
-    .expect("native finalize should run");
+    let native = crate::routines::prefill_finalize::run(&[1], &model, final_hidden_states, vec![])
+        .expect("native finalize should run");
 
     assert_eq!(
         raster.transformer_state.prefill_logits,
@@ -307,7 +279,7 @@ fn ref_backed_finalize_matches_native_deterministic_with_softcap() {
 #[test]
 fn raster_finalize_rejects_zero_projection_rows_per_tile() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
@@ -323,7 +295,7 @@ fn raster_finalize_rejects_zero_projection_rows_per_tile() {
 #[test]
 fn ref_backed_finalize_fails_closed_for_missing_sequence_ref() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
@@ -346,7 +318,7 @@ fn ref_backed_finalize_fails_closed_for_missing_sequence_ref() {
 #[test]
 fn ref_backed_finalize_reports_width_mismatch() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states = activation_sequence(vec![vec![
         Act::from_num(1.0),
@@ -365,7 +337,7 @@ fn ref_backed_finalize_reports_width_mismatch() {
 #[test]
 fn ref_backed_finalize_fails_closed_for_bad_source_root() {
     let model = untied_model(false);
-    let _source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let _source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
@@ -392,7 +364,7 @@ fn ref_backed_finalize_fails_closed_for_bad_source_root() {
 #[test]
 fn ref_backed_finalize_fails_closed_for_missing_cache_roots() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
@@ -426,7 +398,7 @@ fn ref_backed_finalize_fails_closed_for_missing_cache_roots() {
 #[test]
 fn prefill_finalize_roots_aware_mutation_rejects_stale_builder_root() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("stale", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("stale", &model)
         .expect("source should build");
     let raster_source =
         RasterPrefillFinalizeSource::for_current_integrity_mode(&source).expect("raster source");
@@ -463,7 +435,7 @@ fn prefill_finalize_roots_aware_mutation_rejects_stale_builder_root() {
 #[test]
 fn finalize_refs_rejects_overadvanced_projection_cursor() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("overadvanced", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("overadvanced", &model)
         .expect("source should build");
     let raster_source =
         RasterPrefillFinalizeSource::for_current_integrity_mode(&source).expect("raster source");
@@ -494,7 +466,7 @@ fn finalize_refs_rejects_overadvanced_projection_cursor() {
 #[test]
 fn raster_finalize_uses_internal_det_row_not_public_f32_view() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let mut final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
@@ -504,13 +476,8 @@ fn raster_finalize_uses_internal_det_row_not_public_f32_view() {
 
     let raster = run_ref_backed_finalize(1, final_hidden_states_ref, vec![], &source, 1)
         .expect("root-backed raster finalize should run");
-    let native = crate::routines::prefill_finalize::run(
-        &[1],
-        &model,
-        final_hidden_states,
-        vec![],
-    )
-    .expect("native finalize should run");
+    let native = crate::routines::prefill_finalize::run(&[1], &model, final_hidden_states, vec![])
+        .expect("native finalize should run");
 
     assert_eq!(
         raster.transformer_state.prefill_logits.logits,
@@ -521,7 +488,7 @@ fn raster_finalize_uses_internal_det_row_not_public_f32_view() {
 #[test]
 fn raster_finalize_preserves_layer_caches_in_decode_state() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
@@ -562,7 +529,7 @@ fn raster_finalize_preserves_layer_caches_in_decode_state() {
 #[test]
 fn ref_backed_finalize_materializes_public_activation_and_layer_cache() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
@@ -605,7 +572,7 @@ fn ref_backed_finalize_materializes_public_activation_and_layer_cache() {
 #[test]
 fn native_prefill_layer_output_adapter_feeds_raster_finalize_detour() {
     let model = untied_model(false);
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("detour", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("detour", &model)
         .expect("source should build");
     let final_hidden_states =
         activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
@@ -615,11 +582,12 @@ fn native_prefill_layer_output_adapter_feeds_raster_finalize_detour() {
     );
 
     ArtifactIo::reset_store();
-    let (roots, layer_refs) = crate::routines::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
-        &final_hidden_states,
-        std::slice::from_ref(&layer_cache),
-    )
-    .expect("native layer output should convert to raster refs");
+    let (roots, layer_refs) =
+        crate::routines::prefill_finalize::insert_prefill_layer_output_refs_for_detour(
+            &final_hidden_states,
+            std::slice::from_ref(&layer_cache),
+        )
+        .expect("native layer output should convert to raster refs");
     let raster_output = crate::routines::prefill_finalize::run_raster(
         roots,
         1,
@@ -629,8 +597,9 @@ fn native_prefill_layer_output_adapter_feeds_raster_finalize_detour() {
         1,
     )
     .expect("raster finalize should run from adapted native refs");
-    let raster = crate::routines::prefill_finalize::materialize_raster_output_refs_for_api(&raster_output)
-        .expect("raster finalize output should materialize");
+    let raster =
+        crate::routines::prefill_finalize::materialize_raster_output_refs_for_api(&raster_output)
+            .expect("raster finalize output should materialize");
     let native = crate::routines::prefill_finalize::run(
         &[1],
         &model,
@@ -724,7 +693,7 @@ fn run_ref_backed_finalize(
     prompt_token_count: usize,
     final_hidden_states_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
     layer_caches: Vec<PrefillLayerCacheSlot>,
-    source: &AuthenticatedGemmaPrefillFinalizeSource,
+    source: &AuthenticatedDecoderPrefillFinalizeSource,
     projection_rows_per_tile: usize,
 ) -> Result<crate::shared::model::transformer::TransformerPrefillResult> {
     run_ref_backed_finalize_with_roots(
@@ -742,7 +711,7 @@ fn run_ref_backed_finalize_with_roots(
     prompt_token_count: usize,
     final_hidden_states_ref: crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef,
     layer_caches: Vec<PrefillLayerCacheSlot>,
-    source: &AuthenticatedGemmaPrefillFinalizeSource,
+    source: &AuthenticatedDecoderPrefillFinalizeSource,
     projection_rows_per_tile: usize,
 ) -> Result<crate::shared::model::transformer::TransformerPrefillResult> {
     let source_ref = source.committed_source_ref()?;

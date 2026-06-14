@@ -29,9 +29,8 @@ pub fn run(
         model.final_logit_softcapping,
         model.final_logit_softcapping_det,
     )?;
-    let det_final_logits_sha256 = Some(
-        crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&logits),
-    );
+    let det_final_logits_sha256 =
+        Some(crate::shared::numerics::transformer_kernels::build_det_vector_commitment(&logits));
     let prefill_logits = crate::shared::model::transformer::PrefillLogits::from_det_internal(
         crate::shared::model::transformer::InternalLogits::from_det_values_only(logits),
         det_final_logits_sha256,

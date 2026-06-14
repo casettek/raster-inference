@@ -12,7 +12,7 @@ use crate::shared::artifacts::raster_artifact_store::{
 };
 use crate::shared::model::transformer::{ActivationSequence, InternalActivationSequence};
 use crate::shared::raster_contracts::prefill_ple::{
-    AuthenticatedGemmaPleSource, GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest,
+    AuthenticatedDecoderPrefillPleSource, GemmaPleLayerMetadataRequest, GemmaPleMetadataRequest,
     RasterPrefillPleSource,
 };
 use crate::shared::raster_kernels::transformer::{
@@ -266,7 +266,7 @@ pub(in super::super) fn token_ids_root<'a>(
 pub fn prepare_raster_prefill_ple_input_roots(
     token_ids: &[u32],
     input_activations: &ActivationSequence,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &AuthenticatedDecoderPrefillPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
     let ple_source = RasterPrefillPleSource::for_current_integrity_mode(ple_source)?;
@@ -370,7 +370,7 @@ fn prepare_raster_prefill_ple_input_roots_with_source(
 pub fn prepare_raster_prefill_ple_input_roots_from_embedding_refs(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &AuthenticatedDecoderPrefillPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, RasterPrefillPleInputRoots)> {
     let ple_source = RasterPrefillPleSource::for_current_integrity_mode(ple_source)?;
@@ -467,7 +467,7 @@ fn prepare_raster_prefill_ple_input_roots_from_embedding_refs_with_source(
 pub fn run(
     token_ids: &[u32],
     input_activations: &ActivationSequence,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &AuthenticatedDecoderPrefillPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
     let ple_source = RasterPrefillPleSource::for_current_integrity_mode(ple_source)?;
@@ -483,7 +483,7 @@ pub fn run(
 pub fn run_with_input_embedding_refs(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
-    ple_source: &AuthenticatedGemmaPleSource,
+    ple_source: &AuthenticatedDecoderPrefillPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<RasterPrefillPleOutput> {
     let ple_source = RasterPrefillPleSource::for_current_integrity_mode(ple_source)?;

@@ -6,7 +6,7 @@ use crate::shared::model::transformer::{
     ActivationSequence, Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence,
     LayerKvCache,
 };
-use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
+use crate::shared::raster_contracts::prefill_layer::AuthenticatedDecoderPrefillLayerSource;
 use crate::RasterSizingControls;
 use anyhow::{bail, Result};
 use serde_json::json;
@@ -72,7 +72,7 @@ pub(crate) fn trace_checkpoints(
 
 #[derive(Clone, Copy)]
 pub(crate) struct PrefillLayerRasterDetour<'a> {
-    pub(crate) layer_source: &'a AuthenticatedGemmaPrefillLayerSource,
+    pub(crate) layer_source: &'a AuthenticatedDecoderPrefillLayerSource,
     pub(crate) raster_sizing: RasterSizingControls,
 }
 
@@ -129,7 +129,7 @@ pub fn materialize_prefill_layer_output_refs_from_roots_for_trace(
 pub fn run_raster(
     artifact_store_roots: RasterArtifactStoreRoots,
     input_embedding_refs: &RasterInputEmbeddingRefs,
-    layer_source: &AuthenticatedGemmaPrefillLayerSource,
+    layer_source: &AuthenticatedDecoderPrefillLayerSource,
     ple_input_manifest_root: Option<&str>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(RasterArtifactStoreRoots, raster::PrefillLayerOutputRefs)> {

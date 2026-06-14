@@ -10,7 +10,7 @@ use crate::shared::tensors::raster_tensor_artifacts::RasterActivationSequenceRef
 pub mod native;
 pub mod raster;
 
-use self::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource;
+use self::raster::auth_source::AuthenticatedDecoderPrefillFinalizeSource;
 
 pub fn run(
     prompt_token_ids: &[u32],
@@ -29,7 +29,7 @@ pub fn run(
 pub(crate) fn materialize_raster_input_roots_for_api(
     artifact_store_roots: RasterArtifactStoreRoots,
     prompt_token_count: usize,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
+    finalize_source: &AuthenticatedDecoderPrefillFinalizeSource,
     final_hidden_states_ref: RasterActivationSequenceRef,
     layer_caches: Vec<crate::routines::prefill_range::raster::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
@@ -48,7 +48,7 @@ pub(crate) fn materialize_raster_input_roots_for_api(
 pub fn run_raster(
     artifact_store_roots: RasterArtifactStoreRoots,
     prompt_token_count: usize,
-    finalize_source: &AuthenticatedGemmaPrefillFinalizeSource,
+    finalize_source: &AuthenticatedDecoderPrefillFinalizeSource,
     final_hidden_states_ref: RasterActivationSequenceRef,
     layer_caches: Vec<crate::routines::prefill_range::raster::PrefillLayerCacheSlot>,
     projection_rows_per_tile: usize,
@@ -75,20 +75,18 @@ pub fn run_raster(
 }
 
 pub(crate) fn run_selected_raster_detour_from_native_boundary(
-    model_id: impl Into<String>,
-    model: &Gemma4TransformerModel,
+    finalize_source: &AuthenticatedDecoderPrefillFinalizeSource,
     prompt_token_count: usize,
     final_hidden_states: ActivationSequence,
     layer_caches: Vec<LayerKvCache>,
     projection_rows_per_tile: usize,
 ) -> Result<TransformerPrefillResult> {
-    let finalize_source = AuthenticatedGemmaPrefillFinalizeSource::from_model(model_id, model)?;
     let (artifact_store_roots, layer_refs) =
         insert_prefill_layer_output_refs_for_detour(&final_hidden_states, &layer_caches)?;
     let output = run_raster(
         artifact_store_roots,
         prompt_token_count,
-        &finalize_source,
+        finalize_source,
         layer_refs.final_hidden_states_ref,
         layer_refs.layer_caches,
         projection_rows_per_tile,

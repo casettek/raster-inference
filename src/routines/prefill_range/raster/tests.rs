@@ -8,12 +8,12 @@ use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactStoreRoots;
 use crate::shared::model::transformer::{
     ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleLayerWeights,
-    Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence, MatrixF32,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleLayerWeights, Gemma4PrefillPleInputs,
+    Gemma4TransformerModel, InternalActivationSequence, MatrixF32,
 };
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_contracts::prefill_layer::{
-    AuthenticatedGemmaPrefillLayerSource, GemmaPrefillLayerSourceMetadataRequest,
+    AuthenticatedDecoderPrefillLayerSource, GemmaPrefillLayerSourceMetadataRequest,
 };
 use crate::shared::raster_contracts::prefill_ple::store_prefill_ple_input_manifest_with_roots;
 use crate::shared::raster_kernels::transformer::RasterActivationSequence;
@@ -454,7 +454,7 @@ fn zero_length_self_cache_materializes_as_empty_slot() {
     model.layers[0].attention_kind = Gemma4AttentionKind::Sliding;
     model.layers[0].sliding_window = Some(1);
     model.layers[0].cache_sliding_window = Some(0);
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     let raster = run_roots_path_with_optional_ple(&input, &source, None, raster_sizing(1))
@@ -473,7 +473,7 @@ fn empty_donor_cache_fails_closed() {
     chained_layer.kv_shared_layer_index = Some(1);
     model.layers.push(shared_layer);
     model.layers.push(chained_layer);
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
@@ -517,7 +517,7 @@ fn multi_head_sliding_attention_matches_deterministic_prefill_layer() {
 fn non_prior_donor_cache_fails_closed() {
     let (_path, mut model) = no_ple_model();
     model.layers[0].kv_shared_layer_index = Some(0);
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
@@ -545,7 +545,7 @@ fn nonzero_mlp_and_layer_scalar_match_deterministic_prefill_layer() {
 #[test]
 fn chunked_projection_matches_deterministic_prefill_layer() {
     let (_path, model) = nonzero_model(false, true);
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let rows = vec![
         vec![Act::from_num(1.0), Act::from_num(-0.5)],
@@ -627,7 +627,7 @@ fn ple_input_width_can_differ_from_hidden_size() {
 #[test]
 fn ple_layer_missing_input_fails_closed() {
     let (_path, model) = nonzero_model(true, false);
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
@@ -642,7 +642,7 @@ fn ple_layer_missing_input_fails_closed() {
 #[test]
 fn ple_input_on_non_ple_layer_fails_closed() {
     let (_path, model) = no_ple_model();
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     let ple_inputs = ple_inputs(vec![vec![Act::from_num(0.5), Act::from_num(0.25)]]);
@@ -659,7 +659,7 @@ fn ple_input_on_non_ple_layer_fails_closed() {
 #[test]
 fn ple_input_shape_mismatch_fails_closed() {
     let (_path, model) = nonzero_model(true, false);
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
     let ple_inputs = ple_inputs(vec![vec![
@@ -698,7 +698,7 @@ fn zero_layer_source_fails_closed() {
         rms_norm_eps: 0.0,
         rms_norm_eps_det: Some(Acc::from_num(0.0)),
     };
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("empty", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("empty", &model)
         .expect("source should build");
     let input = activation_sequence(vec![vec![Act::from_num(1.0), Act::from_num(0.0)]]);
 
@@ -713,7 +713,7 @@ fn zero_layer_source_fails_closed() {
 #[test]
 fn empty_activation_sequence_fails_closed() {
     let (_path, model) = no_ple_model();
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let input = activation_sequence(Vec::new());
 
@@ -728,7 +728,7 @@ fn empty_activation_sequence_fails_closed() {
 #[test]
 fn non_deterministic_activation_input_fails_closed() {
     let (_path, model) = no_ple_model();
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", &model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", &model)
         .expect("source should build");
     let input = ActivationSequence::from_values(
         vec![vec![1.0, 0.0]],
@@ -761,7 +761,7 @@ fn assert_raster_matches_deterministic_with_ple(
     ActivationSequence,
     Vec<crate::shared::model::transformer::LayerKvCache>,
 ) {
-    let source = AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer", model)
+    let source = AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer", model)
         .expect("source should build");
     let input_internal = InternalActivationSequence::from_det_values(rows);
     let input = activation_sequence_from_internal(input_internal.clone());
@@ -793,7 +793,7 @@ fn assert_raster_matches_deterministic_with_ple(
 
 fn run_roots_path_with_optional_ple(
     input: &ActivationSequence,
-    source: &AuthenticatedGemmaPrefillLayerSource,
+    source: &AuthenticatedDecoderPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
     raster_sizing: RasterSizingControls,
 ) -> Result<(
@@ -831,7 +831,7 @@ fn run_roots_path_with_optional_ple(
 
 fn store_materialized_ple_inputs_with_roots(
     artifact_store_roots: RasterArtifactStoreRoots,
-    source: &AuthenticatedGemmaPrefillLayerSource,
+    source: &AuthenticatedDecoderPrefillLayerSource,
     ple_inputs: Option<&Gemma4PrefillPleInputs>,
 ) -> Result<(RasterArtifactStoreRoots, Option<String>)> {
     let Some(ple_inputs) = ple_inputs else {

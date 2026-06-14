@@ -2,10 +2,12 @@ use anyhow::Result;
 use raster_inference::io::parse_gemma_tokenizer_spec_bytes;
 use raster_inference::load_gemma_tokenizer_spec_from_path;
 use raster_inference::routines::output_finalize::raster::detokenize_output_tokens;
-use raster_inference::routines::prompt_prepare::raster::{tokenize_prompt, tokenize_prompt_with_controls};
+use raster_inference::routines::prompt_prepare::raster::{
+    tokenize_prompt, tokenize_prompt_with_controls,
+};
 use raster_inference::shared::artifacts::raster_artifact_store::{self, RasterTokenIdSequenceRef};
-use raster_inference::shared::model::gemma::tokenizer::GemmaDecoderMetadataRequest;
 use raster_inference::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
+use raster_inference::shared::model::gemma::tokenizer::GemmaDecoderMetadataRequest;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 

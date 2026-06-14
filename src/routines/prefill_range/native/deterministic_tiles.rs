@@ -95,15 +95,16 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
                 )
             })?;
             let xs_internal = internal_sequence_from_slab(&xs);
-            let output = crate::routines::prefill_range::run_selected_raster_detour_from_native_boundary(
-                &xs_internal,
-                layer_idx,
-                &layer_caches,
-                &completed_layer_output_sha256s,
-                &completed_layer_output_det_sha256s,
-                ple_inputs,
-                detour,
-            )?;
+            let output =
+                crate::routines::prefill_range::run_selected_raster_detour_from_native_boundary(
+                    &xs_internal,
+                    layer_idx,
+                    &layer_caches,
+                    &completed_layer_output_sha256s,
+                    &completed_layer_output_det_sha256s,
+                    ple_inputs,
+                    detour,
+                )?;
             xs = slab_from_internal_sequence(&output.final_hidden_states.clone_internal())?;
             layer_caches = output.layer_caches;
             completed_layer_output_sha256s = output.completed_layer_output_sha256s;
@@ -157,14 +158,18 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
         )? {
             break;
         }
-        if crate::routines::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
-            execution_mode: Some("deterministic"),
-            layer_idx,
-            current_activations: &current_activations,
-            layer_caches: &layer_caches,
-            completed_layer_output_sha256s: completed_layer_output_sha256s.clone(),
-            completed_layer_output_det_sha256s: Some(completed_layer_output_det_sha256s.clone()),
-        }) {
+        if crate::routines::prefill_range_finalize::trace_checkpoint(
+            PrefillRangeFinalizeCheckpoint {
+                execution_mode: Some("deterministic"),
+                layer_idx,
+                current_activations: &current_activations,
+                layer_caches: &layer_caches,
+                completed_layer_output_sha256s: completed_layer_output_sha256s.clone(),
+                completed_layer_output_det_sha256s: Some(
+                    completed_layer_output_det_sha256s.clone(),
+                ),
+            },
+        ) {
             break;
         }
         let mut reached_terminal_checkpoint = false;

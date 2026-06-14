@@ -49,10 +49,8 @@ fn config_tile_sizing_takes_effect() {
         "[tile_sizing]\nprojection_rows_per_tile = 1\n",
         "single-row",
     );
-    let multi_row_chunks = run_detour_with_config(
-        "[tile_sizing]\nprojection_rows_per_tile = 2\n",
-        "multi-row",
-    );
+    let multi_row_chunks =
+        run_detour_with_config("[tile_sizing]\nprojection_rows_per_tile = 2\n", "multi-row");
 
     let tile_invocations = |result: &Value| {
         result["state"]["raster_tile_invocations"]

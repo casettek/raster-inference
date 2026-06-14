@@ -4,12 +4,12 @@ use std::collections::VecDeque;
 
 use anyhow::{anyhow, bail, Result};
 
+use crate::dsl::prelude::auth_read;
 use crate::routines::decode_layer_range::raster::auth_source::{
     GemmaDecodeLayerMatrixRowRequest, GemmaDecodeLayerMetadata,
     GemmaDecodePleModelProjectionRowRequest, GemmaDecodeProjectionRowRequest,
     RasterDecodeLayerRangeSource,
 };
-use crate::dsl::prelude::auth_read;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
     activation_row_leaf, token_id_leaf, RasterActivationSequenceArtifactRef, RasterArtifactId,

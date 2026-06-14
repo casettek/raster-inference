@@ -215,9 +215,9 @@ pub(crate) fn run_prefill(
     let prefill = if raster_detour_controller.should_detour(RoutineId::PrefillFinalize) {
         let raster_sizing =
             raster_sizing_controls.expect("raster sizing controls should be validated");
+        let finalize_source = model.prefill_finalize_source()?;
         prefill_finalize::run_selected_raster_detour_from_native_boundary(
-            model.model_spec().model_id.clone(),
-            model.transformer_model(),
+            &finalize_source,
             prompt_token_ids.len(),
             final_hidden_states,
             layer_caches,

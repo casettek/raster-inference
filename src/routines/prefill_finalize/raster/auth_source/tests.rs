@@ -1,5 +1,5 @@
 use super::{
-    AuthenticatedGemmaPrefillFinalizeSource, GemmaPrefillFinalizeMetadataRequest,
+    AuthenticatedDecoderPrefillFinalizeSource, GemmaPrefillFinalizeMetadataRequest,
     GemmaPrefillFinalizeNormWeightsRequest, GemmaPrefillFinalizeProjectionKind,
     GemmaPrefillFinalizeProjectionRowRequest, GemmaPrefillFinalizeScalarsRequest,
 };
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn untied_source_reads_metadata_scalars_norm_and_projection_rows() {
     let model = untied_model();
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("finalize", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("finalize", &model)
         .expect("source should build");
 
     let metadata = crate::auth_read!(&source, GemmaPrefillFinalizeMetadataRequest)
@@ -51,7 +51,7 @@ fn untied_source_reads_metadata_scalars_norm_and_projection_rows() {
 #[test]
 fn committed_source_root_reads_metadata_scalars_norm_and_projection_rows() {
     let model = untied_model();
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("committed", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("committed", &model)
         .expect("source should build");
     let committed = source.committed_source().expect("source should commit");
     let root = committed.root().to_string();
@@ -83,14 +83,14 @@ fn committed_source_root_reads_metadata_scalars_norm_and_projection_rows() {
 
 #[test]
 fn committed_source_rejects_same_id_with_different_data() {
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("conflict", &untied_model())
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("conflict", &untied_model())
         .expect("source should build");
     source
         .committed_source_ref()
         .expect("first source should commit");
     let mut model = untied_model();
     model.final_norm_weight_det = Some(vec![Wgt::from_num(2.0), Wgt::from_num(0.5)]);
-    let conflicting = AuthenticatedGemmaPrefillFinalizeSource::from_model("conflict", &model)
+    let conflicting = AuthenticatedDecoderPrefillFinalizeSource::from_model("conflict", &model)
         .expect("conflicting source should build");
 
     assert!(conflicting.committed_source_ref().is_err());
@@ -99,7 +99,7 @@ fn committed_source_rejects_same_id_with_different_data() {
 #[test]
 fn tied_source_reads_embedding_rows_as_projection_rows() {
     let (_path, model) = tied_model().expect("tied model fixture should build");
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("tied", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("tied", &model)
         .expect("source should build");
 
     let metadata = crate::auth_read!(&source, GemmaPrefillFinalizeMetadataRequest)
@@ -137,7 +137,7 @@ fn tied_source_honors_nonzero_embedding_data_offset() {
         Gemma4LogitsProjection::TiedEmbedding(matrix_f32(2, 2)),
         Some(embedding_source),
     );
-    let source = AuthenticatedGemmaPrefillFinalizeSource::from_model("offset", &model)
+    let source = AuthenticatedDecoderPrefillFinalizeSource::from_model("offset", &model)
         .expect("source should build");
 
     let row = crate::auth_read!(
@@ -156,7 +156,7 @@ fn construction_rejects_missing_softcap_scalar() {
     model.final_logit_softcapping = Some(1.0);
     model.final_logit_softcapping_det = None;
 
-    let error = AuthenticatedGemmaPrefillFinalizeSource::from_model("softcap", &model)
+    let error = AuthenticatedDecoderPrefillFinalizeSource::from_model("softcap", &model)
         .expect_err("missing softcap scalar should fail");
 
     assert!(error.to_string().contains("canonical final logit softcap"));
@@ -170,7 +170,7 @@ fn construction_rejects_missing_projection_backing() {
         det_weight: None,
     };
 
-    let error = AuthenticatedGemmaPrefillFinalizeSource::from_model("projection", &model)
+    let error = AuthenticatedDecoderPrefillFinalizeSource::from_model("projection", &model)
         .expect_err("missing projection should fail");
 
     assert!(error.to_string().contains("canonical lm_head det_weight"));

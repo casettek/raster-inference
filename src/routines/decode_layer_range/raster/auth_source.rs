@@ -13,14 +13,14 @@ use crate::shared::artifacts::external_artifacts::{
 use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
 use crate::shared::model::transformer::{
     DetNumMatrix, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
-    Gemma4PleMatrixSource, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleMatrixSource,
+    Gemma4TransformerModel, GemmaEmbeddingTensorSource,
 };
 use crate::shared::numerics::det_num::{scale_act, Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_tensor_slice_row_wgts;
 
 #[derive(Debug, Clone)]
-pub struct AuthenticatedGemmaDecodeLayerRangeSource {
+pub struct AuthenticatedDecoderDecodeLayerRangeSource {
     identifier: String,
     metadata: GemmaDecodeLayerRangeMetadata,
     embedding: DetNumTensorSliceSource,
@@ -38,18 +38,18 @@ pub struct AuthenticatedGemmaDecodeLayerRangeSource {
 pub enum RasterDecodeLayerRangeSource<'a> {
     Committed {
         source: CommittedExternalSource,
-        _marker: PhantomData<&'a AuthenticatedGemmaDecodeLayerRangeSource>,
+        _marker: PhantomData<&'a AuthenticatedDecoderDecodeLayerRangeSource>,
     },
     #[cfg(feature = "unchecked-raster-integrity")]
     DirectUnchecked {
-        source: &'a AuthenticatedGemmaDecodeLayerRangeSource,
+        source: &'a AuthenticatedDecoderDecodeLayerRangeSource,
         root: String,
     },
 }
 
 impl<'a> RasterDecodeLayerRangeSource<'a> {
     pub fn for_current_integrity_mode(
-        source: &'a AuthenticatedGemmaDecodeLayerRangeSource,
+        source: &'a AuthenticatedDecoderDecodeLayerRangeSource,
     ) -> Result<Self> {
         #[cfg(feature = "unchecked-raster-integrity")]
         if raster_integrity_is_unchecked() {
@@ -333,7 +333,7 @@ pub enum GemmaDecodeLayerNormKind {
     PlePostInput,
 }
 
-impl AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthenticatedDecoderDecodeLayerRangeSource {
     pub fn from_model(
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
@@ -713,7 +713,7 @@ impl AuthenticatedGemmaDecodeLayerRangeSource {
     }
 }
 
-impl AuthRead<GemmaDecodeLayerRangeMetadataRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeLayerRangeMetadataRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = GemmaDecodeLayerRangeMetadata;
 
     fn auth_read(&self, request: GemmaDecodeLayerRangeMetadataRequest) -> Result<Self::Output> {
@@ -733,7 +733,7 @@ impl AuthRead<GemmaDecodeLayerRangeMetadataRequest> for RasterDecodeLayerRangeSo
     }
 }
 
-impl AuthRead<GemmaDecodeEmbeddingRowRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeEmbeddingRowRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = Vec<Act>;
 
     fn auth_read(&self, request: GemmaDecodeEmbeddingRowRequest) -> Result<Self::Output> {
@@ -753,7 +753,7 @@ impl AuthRead<GemmaDecodeEmbeddingRowRequest> for RasterDecodeLayerRangeSource<'
     }
 }
 
-impl AuthRead<GemmaDecodeLayerMetadataRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeLayerMetadataRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = GemmaDecodeLayerMetadata;
 
     fn auth_read(&self, request: GemmaDecodeLayerMetadataRequest) -> Result<Self::Output> {
@@ -783,7 +783,7 @@ impl AuthRead<GemmaDecodeLayerMetadataRequest> for RasterDecodeLayerRangeSource<
     }
 }
 
-impl AuthRead<GemmaDecodeLayerScalarsRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeLayerScalarsRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = GemmaDecodeLayerScalars;
 
     fn auth_read(&self, request: GemmaDecodeLayerScalarsRequest) -> Result<Self::Output> {
@@ -803,7 +803,7 @@ impl AuthRead<GemmaDecodeLayerScalarsRequest> for RasterDecodeLayerRangeSource<'
     }
 }
 
-impl AuthRead<GemmaDecodeLayerMatrixRowRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeLayerMatrixRowRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaDecodeLayerMatrixRowRequest) -> Result<Self::Output> {
@@ -823,7 +823,7 @@ impl AuthRead<GemmaDecodeLayerMatrixRowRequest> for RasterDecodeLayerRangeSource
     }
 }
 
-impl AuthRead<GemmaDecodeLayerNormWeightsRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeLayerNormWeightsRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaDecodeLayerNormWeightsRequest) -> Result<Self::Output> {
@@ -843,7 +843,9 @@ impl AuthRead<GemmaDecodeLayerNormWeightsRequest> for RasterDecodeLayerRangeSour
     }
 }
 
-impl AuthRead<GemmaDecodePleTokenEmbeddingRowRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodePleTokenEmbeddingRowRequest>
+    for AuthenticatedDecoderDecodeLayerRangeSource
+{
     type Output = Vec<Act>;
 
     fn auth_read(&self, request: GemmaDecodePleTokenEmbeddingRowRequest) -> Result<Self::Output> {
@@ -864,7 +866,7 @@ impl AuthRead<GemmaDecodePleTokenEmbeddingRowRequest> for RasterDecodeLayerRange
 }
 
 impl AuthRead<GemmaDecodePleModelProjectionRowRequest>
-    for AuthenticatedGemmaDecodeLayerRangeSource
+    for AuthenticatedDecoderDecodeLayerRangeSource
 {
     type Output = Vec<Wgt>;
 
@@ -886,7 +888,7 @@ impl AuthRead<GemmaDecodePleModelProjectionRowRequest> for RasterDecodeLayerRang
 }
 
 impl AuthRead<GemmaDecodePleProjectionNormWeightsRequest>
-    for AuthenticatedGemmaDecodeLayerRangeSource
+    for AuthenticatedDecoderDecodeLayerRangeSource
 {
     type Output = Vec<Wgt>;
 
@@ -916,7 +918,7 @@ impl AuthRead<GemmaDecodePleProjectionNormWeightsRequest> for RasterDecodeLayerR
     }
 }
 
-impl AuthRead<GemmaDecodePleScalarsRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodePleScalarsRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = GemmaDecodePleScalars;
 
     fn auth_read(&self, request: GemmaDecodePleScalarsRequest) -> Result<Self::Output> {
@@ -939,7 +941,7 @@ impl AuthRead<GemmaDecodePleScalarsRequest> for RasterDecodeLayerRangeSource<'_>
     }
 }
 
-impl AuthRead<GemmaDecodeFinalNormWeightsRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeFinalNormWeightsRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaDecodeFinalNormWeightsRequest) -> Result<Self::Output> {
@@ -962,7 +964,7 @@ impl AuthRead<GemmaDecodeFinalNormWeightsRequest> for RasterDecodeLayerRangeSour
     }
 }
 
-impl AuthRead<GemmaDecodeFinalScalarsRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeFinalScalarsRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = GemmaDecodeFinalScalars;
 
     fn auth_read(&self, request: GemmaDecodeFinalScalarsRequest) -> Result<Self::Output> {
@@ -985,7 +987,7 @@ impl AuthRead<GemmaDecodeFinalScalarsRequest> for RasterDecodeLayerRangeSource<'
     }
 }
 
-impl AuthRead<GemmaDecodeProjectionRowRequest> for AuthenticatedGemmaDecodeLayerRangeSource {
+impl AuthRead<GemmaDecodeProjectionRowRequest> for AuthenticatedDecoderDecodeLayerRangeSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaDecodeProjectionRowRequest) -> Result<Self::Output> {

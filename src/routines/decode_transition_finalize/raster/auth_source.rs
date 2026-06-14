@@ -1,6 +1,6 @@
 pub use crate::routines::decode_layer_range::raster::auth_source::*;
 
-pub type AuthenticatedGemmaDecodeTransitionSource =
-    crate::routines::decode_layer_range::raster::auth_source::AuthenticatedGemmaDecodeLayerRangeSource;
+pub type AuthenticatedDecoderDecodeTransitionSource =
+    crate::routines::decode_layer_range::raster::auth_source::AuthenticatedDecoderDecodeLayerRangeSource;
 pub type RasterDecodeTransitionSource<'a> =
     crate::routines::decode_layer_range::raster::auth_source::RasterDecodeLayerRangeSource<'a>;

@@ -12,6 +12,7 @@ use crate::shared::api::input::TextMessage;
 
 pub mod adapter;
 pub mod io;
+pub mod sources;
 pub mod tokenizer;
 pub mod transformer;
 

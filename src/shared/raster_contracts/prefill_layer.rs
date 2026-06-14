@@ -18,7 +18,7 @@ use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
 
 #[derive(Debug, Clone)]
-pub struct AuthenticatedGemmaPrefillLayerSource {
+pub struct AuthenticatedDecoderPrefillLayerSource {
     identifier: String,
     layers: Vec<GemmaPrefillLayerMetadata>,
     backing_layers: Vec<GemmaPrefillLayerBacking>,
@@ -28,18 +28,18 @@ pub struct AuthenticatedGemmaPrefillLayerSource {
 pub enum RasterPrefillLayerSource<'a> {
     Committed {
         source: CommittedExternalSource,
-        _marker: PhantomData<&'a AuthenticatedGemmaPrefillLayerSource>,
+        _marker: PhantomData<&'a AuthenticatedDecoderPrefillLayerSource>,
     },
     #[cfg(feature = "unchecked-raster-integrity")]
     DirectUnchecked {
-        source: &'a AuthenticatedGemmaPrefillLayerSource,
+        source: &'a AuthenticatedDecoderPrefillLayerSource,
         root: String,
     },
 }
 
 impl<'a> RasterPrefillLayerSource<'a> {
     pub fn for_current_integrity_mode(
-        source: &'a AuthenticatedGemmaPrefillLayerSource,
+        source: &'a AuthenticatedDecoderPrefillLayerSource,
     ) -> Result<Self> {
         #[cfg(feature = "unchecked-raster-integrity")]
         if raster_integrity_is_unchecked() {
@@ -231,7 +231,7 @@ pub enum GemmaPrefillLayerNormKind {
     PlePostInput,
 }
 
-impl AuthenticatedGemmaPrefillLayerSource {
+impl AuthenticatedDecoderPrefillLayerSource {
     pub fn from_model(
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
@@ -412,7 +412,7 @@ impl AuthenticatedGemmaPrefillLayerSource {
     }
 }
 
-impl AuthRead<GemmaPrefillLayerSourceMetadataRequest> for AuthenticatedGemmaPrefillLayerSource {
+impl AuthRead<GemmaPrefillLayerSourceMetadataRequest> for AuthenticatedDecoderPrefillLayerSource {
     type Output = GemmaPrefillLayerSourceMetadata;
 
     fn auth_read(&self, request: GemmaPrefillLayerSourceMetadataRequest) -> Result<Self::Output> {
@@ -432,7 +432,7 @@ impl AuthRead<GemmaPrefillLayerSourceMetadataRequest> for RasterPrefillLayerSour
     }
 }
 
-impl AuthRead<GemmaPrefillLayerMetadataRequest> for AuthenticatedGemmaPrefillLayerSource {
+impl AuthRead<GemmaPrefillLayerMetadataRequest> for AuthenticatedDecoderPrefillLayerSource {
     type Output = GemmaPrefillLayerMetadata;
 
     fn auth_read(&self, request: GemmaPrefillLayerMetadataRequest) -> Result<Self::Output> {
@@ -463,7 +463,7 @@ impl AuthRead<GemmaPrefillLayerMetadataRequest> for RasterPrefillLayerSource<'_>
     }
 }
 
-impl AuthRead<GemmaPrefillLayerScalarsRequest> for AuthenticatedGemmaPrefillLayerSource {
+impl AuthRead<GemmaPrefillLayerScalarsRequest> for AuthenticatedDecoderPrefillLayerSource {
     type Output = GemmaPrefillLayerScalars;
 
     fn auth_read(&self, request: GemmaPrefillLayerScalarsRequest) -> Result<Self::Output> {
@@ -484,7 +484,7 @@ impl AuthRead<GemmaPrefillLayerScalarsRequest> for RasterPrefillLayerSource<'_> 
     }
 }
 
-impl AuthRead<GemmaPrefillLayerMatrixRowRequest> for AuthenticatedGemmaPrefillLayerSource {
+impl AuthRead<GemmaPrefillLayerMatrixRowRequest> for AuthenticatedDecoderPrefillLayerSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPrefillLayerMatrixRowRequest) -> Result<Self::Output> {
@@ -508,7 +508,7 @@ impl AuthRead<GemmaPrefillLayerMatrixRowRequest> for RasterPrefillLayerSource<'_
     }
 }
 
-impl AuthRead<GemmaPrefillLayerNormWeightsRequest> for AuthenticatedGemmaPrefillLayerSource {
+impl AuthRead<GemmaPrefillLayerNormWeightsRequest> for AuthenticatedDecoderPrefillLayerSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPrefillLayerNormWeightsRequest) -> Result<Self::Output> {
@@ -980,7 +980,7 @@ fn matrix_row_wgts(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthenticatedGemmaPrefillLayerSource, GemmaPrefillAttentionKind,
+        AuthenticatedDecoderPrefillLayerSource, GemmaPrefillAttentionKind,
         GemmaPrefillLayerMatrixKind, GemmaPrefillLayerMatrixRowRequest,
         GemmaPrefillLayerMetadataRequest, GemmaPrefillLayerNormKind,
         GemmaPrefillLayerNormWeightsRequest, GemmaPrefillLayerScalarsRequest,
@@ -999,7 +999,7 @@ mod tests {
     fn canonical_model_reads_source_and_layer_metadata() {
         let (_path, model) = canonical_model(true, false);
         let source =
-            AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer-fixture", &model)
+            AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer-fixture", &model)
                 .expect("source should build");
 
         let metadata = crate::auth_read!(&source, GemmaPrefillLayerSourceMetadataRequest)
@@ -1027,7 +1027,7 @@ mod tests {
     fn canonical_model_reads_matrix_rows() {
         let (_path, model) = canonical_model(true, false);
         let source =
-            AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer-fixture", &model)
+            AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer-fixture", &model)
                 .expect("source should build");
 
         let row = crate::auth_read!(
@@ -1047,7 +1047,7 @@ mod tests {
     fn canonical_model_reads_norm_weights_and_scalars() {
         let (_path, model) = canonical_model(true, false);
         let source =
-            AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer-fixture", &model)
+            AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer-fixture", &model)
                 .expect("source should build");
 
         let q_norm = crate::auth_read!(
@@ -1080,7 +1080,7 @@ mod tests {
     #[test]
     fn source_without_ple_reports_absence_and_rejects_ple_reads() {
         let (_path, model) = canonical_model(false, false);
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("no-ple", &model)
+        let source = AuthenticatedDecoderPrefillLayerSource::from_model("no-ple", &model)
             .expect("source should build");
 
         let layer = crate::auth_read!(&source, GemmaPrefillLayerMetadataRequest { layer_idx: 0 })
@@ -1114,7 +1114,7 @@ mod tests {
     #[test]
     fn source_allows_missing_v_proj_when_k_equals_v_is_enabled() {
         let (_path, model) = canonical_model(false, true);
-        let source = AuthenticatedGemmaPrefillLayerSource::from_model("k-eq-v", &model)
+        let source = AuthenticatedDecoderPrefillLayerSource::from_model("k-eq-v", &model)
             .expect("source should build");
 
         let layer = crate::auth_read!(&source, GemmaPrefillLayerMetadataRequest { layer_idx: 0 })
@@ -1138,7 +1138,7 @@ mod tests {
     fn invalid_layer_index_fails_with_clear_layer_count() {
         let (_path, model) = canonical_model(false, false);
         let source =
-            AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer-fixture", &model)
+            AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer-fixture", &model)
                 .expect("source should build");
 
         let error = crate::auth_read!(&source, GemmaPrefillLayerMetadataRequest { layer_idx: 1 })
@@ -1151,7 +1151,7 @@ mod tests {
     fn invalid_matrix_row_fails_with_clear_row_count() {
         let (_path, model) = canonical_model(false, false);
         let source =
-            AuthenticatedGemmaPrefillLayerSource::from_model("prefill-layer-fixture", &model)
+            AuthenticatedDecoderPrefillLayerSource::from_model("prefill-layer-fixture", &model)
                 .expect("source should build");
 
         let error = crate::auth_read!(
@@ -1178,7 +1178,7 @@ mod tests {
             values: vec![1.0, 0.0, 0.0, 1.0],
         });
 
-        let error = AuthenticatedGemmaPrefillLayerSource::from_model("non-canonical", &model)
+        let error = AuthenticatedDecoderPrefillLayerSource::from_model("non-canonical", &model)
             .expect_err("non-canonical matrix should fail");
 
         assert!(error.to_string().contains(".detwgt q_proj source"));
@@ -1190,7 +1190,7 @@ mod tests {
         model.layers[0].v_proj = None;
         model.layers[0].attention_k_eq_v = false;
 
-        let error = AuthenticatedGemmaPrefillLayerSource::from_model("missing-v", &model)
+        let error = AuthenticatedDecoderPrefillLayerSource::from_model("missing-v", &model)
             .expect_err("missing v_proj should fail");
 
         assert!(error

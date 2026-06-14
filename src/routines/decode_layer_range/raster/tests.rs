@@ -4,7 +4,7 @@ use super::{
     RasterDecodeLayerRangeInputRefs, RasterDecodeLayerRangeInputRoots,
 };
 use crate::routines::decode_layer_range::raster::auth_source::{
-    AuthenticatedGemmaDecodeLayerRangeSource, RasterDecodeLayerRangeSource,
+    AuthenticatedDecoderDecodeLayerRangeSource, RasterDecodeLayerRangeSource,
 };
 use crate::shared::api::input::InferenceExecutionMode;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 fn raster_source(
-    source: &AuthenticatedGemmaDecodeLayerRangeSource,
+    source: &AuthenticatedDecoderDecodeLayerRangeSource,
 ) -> RasterDecodeLayerRangeSource<'_> {
     RasterDecodeLayerRangeSource::for_current_integrity_mode(source)
         .expect("source should prepare for raster reads")
@@ -85,7 +85,7 @@ fn decode_layer_range_tiles_rs_contains_only_authored_functions() {
 #[test]
 fn raster_decode_layer_range_matches_deterministic_no_ple() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
@@ -111,7 +111,7 @@ fn raster_decode_layer_range_matches_deterministic_no_ple() {
 #[test]
 fn root_backed_main_reads_selected_token_ref() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
@@ -150,7 +150,7 @@ fn root_backed_main_reads_selected_token_ref() {
 #[test]
 fn root_backed_main_rejects_mismatched_committed_source_root() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let (roots, selected_token_ref) =
@@ -178,7 +178,7 @@ fn root_backed_main_rejects_mismatched_committed_source_root() {
 #[test]
 fn root_backed_state_main_returns_refs_without_materialized_transition_result() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
@@ -277,7 +277,7 @@ fn root_backed_state_main_returns_refs_without_materialized_transition_result() 
 #[test]
 fn root_backed_state_main_rejects_mismatched_committed_source_root() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
@@ -321,7 +321,7 @@ fn root_backed_state_main_rejects_mismatched_committed_source_root() {
 #[test]
 fn root_backed_main_rejects_missing_selected_token_root() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let (_roots, selected_token_ref) =
@@ -346,7 +346,7 @@ fn root_backed_main_rejects_missing_selected_token_root() {
 #[test]
 fn raster_decode_layer_range_matches_across_projection_and_attention_chunks() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(3);
@@ -378,7 +378,7 @@ fn raster_decode_layer_range_matches_across_projection_and_attention_chunks() {
 #[test]
 fn raster_decode_rejects_zero_sizing_controls() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let decode_state = decode_state_with_cache(1);
@@ -409,7 +409,7 @@ fn raster_decode_rejects_zero_sizing_controls() {
 #[test]
 fn raster_decode_layer_range_matches_sliding_cache_window() {
     let (_path, model) = no_ple_model(true);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
 
@@ -471,7 +471,7 @@ fn raster_decode_layer_range_matches_deterministic_with_donor_cache() {
 #[test]
 fn raster_decode_rejects_f32_only_cache() {
     let (_path, model) = no_ple_model(false);
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let decode_state = TransformerDecodeState {
@@ -494,7 +494,7 @@ fn decode_source_rejects_non_deterministic_model() {
     let (_path, mut model) = no_ple_model(false);
     model.provenance = Gemma4ModelProvenance::Fp32;
 
-    let error = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", &model)
+    let error = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", &model)
         .expect_err("fp32 model should fail");
 
     assert!(error.to_string().contains(".detwgt artifact"));
@@ -504,7 +504,7 @@ fn assert_raster_matches_deterministic(
     model: &Gemma4TransformerModel,
     decode_state: TransformerDecodeState,
 ) {
-    let source = AuthenticatedGemmaDecodeLayerRangeSource::from_model("decode", model)
+    let source = AuthenticatedDecoderDecodeLayerRangeSource::from_model("decode", model)
         .expect("source should build");
     let committed_source = raster_source(&source);
     let raster = run(

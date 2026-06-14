@@ -10,9 +10,8 @@ use crate::shared::model::transformer::{
 use crate::shared::numerics::det_num::{
     act_to_f32, act_to_le_bytes, add_sat, attention_score as det_attention_score,
     attention_softmax as det_attention_softmax,
-    attention_weighted_sum as det_attention_weighted_sum,
-    gelu_pytorch_tanh_act, mac_bits, mul_sat, requantize, rms_norm as det_rms_norm,
-    rope_rotate_pairs as det_rope_rotate_pairs, scale_act,
+    attention_weighted_sum as det_attention_weighted_sum, gelu_pytorch_tanh_act, mac_bits, mul_sat,
+    requantize, rms_norm as det_rms_norm, rope_rotate_pairs as det_rope_rotate_pairs, scale_act,
     value_rms_norm as det_value_rms_norm, Acc, Act, Wgt,
 };
 
@@ -608,9 +607,15 @@ fn run_attention_for_layer_decode(
                 layer.cache_sliding_window,
             )
         }
-        Gemma4AttentionKind::Full => {
-            run_causal_attention_decode_buffer(input, layer, cache, donor_cache, position, None, None)
-        }
+        Gemma4AttentionKind::Full => run_causal_attention_decode_buffer(
+            input,
+            layer,
+            cache,
+            donor_cache,
+            position,
+            None,
+            None,
+        ),
     }
 }
 

@@ -3,14 +3,14 @@ use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::RasterArtifactId;
 use crate::shared::model::transformer::{
     ActivationSequence, DetNumTensorSliceSource, Gemma4AttentionKind, Gemma4LayerMatrixSource,
-    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights,
-    Gemma4PleLayerWeights, Gemma4PrefillPleInputs, Gemma4TransformerModel,
-    InternalActivationSequence, MatrixF32,
+    Gemma4LayerWeights, Gemma4LogitsProjection, Gemma4PleGlobalWeights, Gemma4PleLayerWeights,
+    Gemma4PrefillPleInputs, Gemma4TransformerModel, InternalActivationSequence, MatrixF32,
 };
 use crate::shared::numerics::det_num::act_to_f32;
 use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
 use crate::shared::raster_contracts::prefill_ple::{
-    AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleScalars, RasterPrefillPleSource,
+    AuthenticatedDecoderPrefillPleSource, GemmaPleLayerConfig, GemmaPleScalars,
+    RasterPrefillPleSource,
 };
 use crate::RasterSizingControls;
 use anyhow::{Context, Result};
@@ -208,7 +208,7 @@ fn scaled_token_embedding_rows_advance_one_recursive_step_at_a_time() {
 
 #[test]
 fn no_ple_globals_return_none_without_requiring_deterministic_inputs() {
-    let source = AuthenticatedGemmaPleSource::no_ple(
+    let source = AuthenticatedDecoderPrefillPleSource::no_ple(
         "no-ple",
         vec![GemmaPleLayerConfig {
             has_ple: false,
@@ -243,7 +243,7 @@ fn prefill_prepare_aux_roots_can_be_built_from_input_embedding_refs() {
         prompt_token_count: token_ids_ref.token_count(),
         embedded_prompt_activations_ref: activations_ref.clone(),
     };
-    let ple_source = AuthenticatedGemmaPleSource::from_canonical_parts(
+    let ple_source = AuthenticatedDecoderPrefillPleSource::from_canonical_parts(
         "ple-fixture",
         vec![GemmaPleLayerConfig {
             has_ple: true,
@@ -282,7 +282,7 @@ fn prefill_prepare_aux_roots_can_be_built_from_input_embedding_refs() {
 
 #[test]
 fn no_ple_globals_match_native_none_output() {
-    let source = AuthenticatedGemmaPleSource::no_ple(
+    let source = AuthenticatedDecoderPrefillPleSource::no_ple(
         "no-ple",
         vec![GemmaPleLayerConfig {
             has_ple: false,
@@ -480,9 +480,11 @@ fn prefill_ple_state_serializes_refs_not_activation_rows() {
     .expect("read manifest")
     .expect("PLE refs");
     let finalized =
-        crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(&refs))
-            .expect("materialize refs")
-            .expect("PLE inputs");
+        crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(
+            &refs,
+        ))
+        .expect("materialize refs")
+        .expect("PLE inputs");
     let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
     assert_eq!(finalized.per_layer_inputs, native.per_layer_inputs);
 }
@@ -548,7 +550,7 @@ fn prefill_ple_state_rejects_mismatched_committed_source_root() {
         raster_sizing_with_projection_rows(1),
     )
     .expect("prepare input roots");
-    let other_source = AuthenticatedGemmaPleSource::no_ple(
+    let other_source = AuthenticatedDecoderPrefillPleSource::no_ple(
         "other-ple-source",
         vec![GemmaPleLayerConfig {
             has_ple: false,
@@ -595,9 +597,11 @@ fn prefill_ple_ref_manifest_serializes_refs_not_activation_rows() {
     assert!(!encoded.contains("act_bits"));
 
     let materialized =
-        crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(&refs))
-            .expect("materialize refs")
-            .expect("PLE inputs");
+        crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(Some(
+            &refs,
+        ))
+        .expect("materialize refs")
+        .expect("PLE inputs");
     let native = native_prefill_ple_inputs(&fixture, &token_ids, &input);
     assert_eq!(materialized.per_layer_inputs, native.per_layer_inputs);
 }
@@ -748,7 +752,7 @@ fn token_and_activation_count_mismatch_fails_clearly() {
 
 #[test]
 fn source_construction_reports_token_embedding_layer_mismatch() {
-    let error = AuthenticatedGemmaPleSource::from_canonical_parts(
+    let error = AuthenticatedDecoderPrefillPleSource::from_canonical_parts(
         "bad-token-layers",
         vec![
             GemmaPleLayerConfig {
@@ -774,7 +778,7 @@ fn source_construction_reports_token_embedding_layer_mismatch() {
 
 #[test]
 fn source_construction_reports_model_projection_layer_mismatch() {
-    let error = AuthenticatedGemmaPleSource::from_canonical_parts(
+    let error = AuthenticatedDecoderPrefillPleSource::from_canonical_parts(
         "bad-projection-layers",
         vec![
             GemmaPleLayerConfig {
@@ -820,7 +824,7 @@ fn unsupported_fp32_only_ple_source_fails_closed() {
         1.0,
     );
 
-    let error = AuthenticatedGemmaPleSource::from_ple_global(
+    let error = AuthenticatedDecoderPrefillPleSource::from_ple_global(
         "fp32-ple",
         vec![GemmaPleLayerConfig {
             has_ple: true,
@@ -835,7 +839,7 @@ fn unsupported_fp32_only_ple_source_fails_closed() {
 }
 
 struct PleFixture {
-    source: AuthenticatedGemmaPleSource,
+    source: AuthenticatedDecoderPrefillPleSource,
     native_ple_global: Gemma4PleGlobalWeights,
     layers: Vec<Gemma4LayerWeights>,
     _weights_file: PathBuf,
@@ -885,7 +889,7 @@ impl PleFixture {
                 hidden_width,
             })
             .collect::<Vec<_>>();
-        let source = AuthenticatedGemmaPleSource::from_canonical_parts(
+        let source = AuthenticatedDecoderPrefillPleSource::from_canonical_parts(
             "ple-raster-fixture",
             layer_configs,
             token_embeddings.clone(),
@@ -936,7 +940,7 @@ fn compare_raster_and_native(
 fn run_materialized(
     token_ids: &[u32],
     input: &ActivationSequence,
-    source: &AuthenticatedGemmaPleSource,
+    source: &AuthenticatedDecoderPrefillPleSource,
     projection_rows_per_tile: usize,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     run_materialized_with_sizing(
@@ -950,7 +954,7 @@ fn run_materialized(
 fn run_materialized_with_sizing(
     token_ids: &[u32],
     input: &ActivationSequence,
-    source: &AuthenticatedGemmaPleSource,
+    source: &AuthenticatedDecoderPrefillPleSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<Option<Gemma4PrefillPleInputs>> {
     let (artifact_store_roots, manifest_root) = run(token_ids, input, source, raster_sizing)?;
@@ -958,7 +962,9 @@ fn run_materialized_with_sizing(
         artifact_store_roots,
         manifest_root.as_deref(),
     )?;
-    crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(refs.as_ref())
+    crate::routines::prefill_prepare_aux::materialize_prefill_ple_input_refs_for_trace(
+        refs.as_ref(),
+    )
 }
 
 fn native_prefill_ple_inputs(

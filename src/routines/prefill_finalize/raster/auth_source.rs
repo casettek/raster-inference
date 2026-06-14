@@ -25,7 +25,7 @@ const PREFILL_FINALIZE_SCALARS_REQUEST: &str = "gemma_prefill_finalize.scalars";
 const PREFILL_FINALIZE_PROJECTION_ROW_REQUEST: &str = "gemma_prefill_finalize.projection_row";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthenticatedGemmaPrefillFinalizeSource {
+pub struct AuthenticatedDecoderPrefillFinalizeSource {
     identifier: String,
     metadata: GemmaPrefillFinalizeMetadata,
     final_norm_weights: Vec<Wgt>,
@@ -37,18 +37,18 @@ pub struct AuthenticatedGemmaPrefillFinalizeSource {
 pub enum RasterPrefillFinalizeSource<'a> {
     Committed {
         source: CommittedExternalSource,
-        _marker: PhantomData<&'a AuthenticatedGemmaPrefillFinalizeSource>,
+        _marker: PhantomData<&'a AuthenticatedDecoderPrefillFinalizeSource>,
     },
     #[cfg(feature = "unchecked-raster-integrity")]
     DirectUnchecked {
-        source: &'a AuthenticatedGemmaPrefillFinalizeSource,
+        source: &'a AuthenticatedDecoderPrefillFinalizeSource,
         root: String,
     },
 }
 
 impl<'a> RasterPrefillFinalizeSource<'a> {
     pub fn for_current_integrity_mode(
-        source: &'a AuthenticatedGemmaPrefillFinalizeSource,
+        source: &'a AuthenticatedDecoderPrefillFinalizeSource,
     ) -> Result<Self> {
         #[cfg(feature = "unchecked-raster-integrity")]
         if raster_integrity_is_unchecked() {
@@ -130,7 +130,7 @@ pub struct GemmaPrefillFinalizeProjectionRowRequest {
     pub row_idx: usize,
 }
 
-impl AuthenticatedGemmaPrefillFinalizeSource {
+impl AuthenticatedDecoderPrefillFinalizeSource {
     pub fn from_model(
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
@@ -225,7 +225,7 @@ impl AuthenticatedGemmaPrefillFinalizeSource {
     }
 }
 
-impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for AuthenticatedGemmaPrefillFinalizeSource {
+impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for AuthenticatedDecoderPrefillFinalizeSource {
     type Output = GemmaPrefillFinalizeMetadata;
 
     fn auth_read(&self, _request: GemmaPrefillFinalizeMetadataRequest) -> Result<Self::Output> {
@@ -245,7 +245,9 @@ impl AuthRead<GemmaPrefillFinalizeMetadataRequest> for RasterPrefillFinalizeSour
     }
 }
 
-impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for AuthenticatedGemmaPrefillFinalizeSource {
+impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest>
+    for AuthenticatedDecoderPrefillFinalizeSource
+{
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, _request: GemmaPrefillFinalizeNormWeightsRequest) -> Result<Self::Output> {
@@ -265,7 +267,7 @@ impl AuthRead<GemmaPrefillFinalizeNormWeightsRequest> for RasterPrefillFinalizeS
     }
 }
 
-impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for AuthenticatedGemmaPrefillFinalizeSource {
+impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for AuthenticatedDecoderPrefillFinalizeSource {
     type Output = GemmaPrefillFinalizeScalars;
 
     fn auth_read(&self, _request: GemmaPrefillFinalizeScalarsRequest) -> Result<Self::Output> {
@@ -286,7 +288,7 @@ impl AuthRead<GemmaPrefillFinalizeScalarsRequest> for RasterPrefillFinalizeSourc
 }
 
 impl AuthRead<GemmaPrefillFinalizeProjectionRowRequest>
-    for AuthenticatedGemmaPrefillFinalizeSource
+    for AuthenticatedDecoderPrefillFinalizeSource
 {
     type Output = Vec<Wgt>;
 

@@ -6,11 +6,11 @@ use super::{
 };
 use crate::io::decode_matrix_slice;
 use crate::shared::model::transformer::DetNumTensorSliceSource;
+use crate::shared::model::transformer::Gemma4LogitsProjection;
 use crate::shared::numerics::det_num::{
     f32_to_wgt, wgt_to_le_bytes, Act, DetWgtElementWidth, DetWgtTensorSpec, DET_NUM_SPEC_VERSION,
     DET_WGT_ARTIFACT_FORMAT_VERSION, DET_WGT_ARTIFACT_MAGIC,
 };
-use crate::shared::model::transformer::Gemma4LogitsProjection;
 use memmap2::Mmap;
 use safetensors::tensor::{serialize_to_file, TensorView};
 use std::{

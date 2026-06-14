@@ -9,12 +9,12 @@ use crate::RasterSizingControls;
 pub mod native;
 pub mod raster;
 
-use self::raster::auth_source::AuthenticatedGemmaDecodeTransitionSource;
+use self::raster::auth_source::AuthenticatedDecoderDecodeTransitionSource;
 
 pub fn run_raster(
     prior_decode_state: crate::shared::raster_contracts::pipeline::RasterDecodeLoopState,
     completed_range_state: raster::RasterDecodeTransitionFinalizeInput,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
+    source: &AuthenticatedDecoderDecodeTransitionSource,
 ) -> Result<crate::shared::raster_contracts::pipeline::RasterDecodeLoopState> {
     let source =
         raster::auth_source::RasterDecodeTransitionSource::for_current_integrity_mode(source)?;
@@ -24,7 +24,7 @@ pub fn run_raster(
 pub(crate) fn run_selected_raster_detour_from_native_boundary(
     decode_state: &DecodeState,
     completed_range_state: crate::routines::decode_layer_range::DecodeLayerRangeState,
-    source: &AuthenticatedGemmaDecodeTransitionSource,
+    source: &AuthenticatedDecoderDecodeTransitionSource,
     raster_sizing: RasterSizingControls,
 ) -> Result<TransformerDecodeStepResult> {
     let source_prefix = format!(
@@ -36,10 +36,11 @@ pub(crate) fn run_selected_raster_detour_from_native_boundary(
             decode_state,
             &source_prefix,
         )?;
-    let completed_range_state = crate::routines::decode_layer_range::raster_state_from_native_state(
-        completed_range_state,
-        raster_sizing,
-    )?;
+    let completed_range_state =
+        crate::routines::decode_layer_range::raster_state_from_native_state(
+            completed_range_state,
+            raster_sizing,
+        )?;
     let raster_state = run_raster(prior_raster_state, completed_range_state, source)?;
     let activation_ref = raster_state.activation_state_ref.as_ref().ok_or_else(|| {
         anyhow::anyhow!("decode transition finalize detour requires activation state ref")

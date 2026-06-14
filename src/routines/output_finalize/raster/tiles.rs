@@ -77,10 +77,11 @@ pub fn run_with_byte_flush_bytes_per_tile(
         &refs.artifact_store_roots,
         &refs.refs.generated_token_ids_ref,
     )?;
-    let generated_text = crate::routines::output_finalize::raster::auth_source::materialize_text_from_roots(
-        &refs.artifact_store_roots,
-        &refs.refs.generated_text_ref,
-    )?;
+    let generated_text =
+        crate::routines::output_finalize::raster::auth_source::materialize_text_from_roots(
+            &refs.artifact_store_roots,
+            &refs.refs.generated_text_ref,
+        )?;
     Ok(call_tile!(
         finalize_output_decode,
         generated_token_ids,

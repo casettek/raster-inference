@@ -9,7 +9,7 @@ use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::White
 use crate::routines::decode_select_token::run as run_decode_select_token;
 use crate::routines::decode_transition_finalize::trace_checkpoint as finalize_decode_transition;
 use crate::routines::output_finalize::run as run_output_finalize;
-use crate::routines::prefill_finalize::raster::auth_source::AuthenticatedGemmaPrefillFinalizeSource;
+use crate::routines::prefill_finalize::raster::auth_source::AuthenticatedDecoderPrefillFinalizeSource;
 use crate::routines::prefill_finalize::run as run_prefill_finalize;
 use crate::routines::prefill_prepare_aux::run as run_prefill_prepare_aux;
 use crate::routines::prompt_prepare::run as run_prompt_prepare;
@@ -29,7 +29,7 @@ use crate::shared::model::transformer::{
     Gemma4PleLayerWeights, Gemma4TransformerModel, MatrixF32,
 };
 use crate::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
-use crate::shared::raster_contracts::prefill_layer::AuthenticatedGemmaPrefillLayerSource;
+use crate::shared::raster_contracts::prefill_layer::AuthenticatedDecoderPrefillLayerSource;
 use crate::shared::raster_kernels::transformer::RasterActivationSequence;
 use crate::shared::tensors::raster_tensor_artifacts::insert_activation_sequence_artifact_ref;
 use crate::{
@@ -1483,7 +1483,7 @@ fn deterministic_cpu_prefill_layer_checkpoint_commitment_matches_raster() {
         prompt_token_count: input_ref.row_count(),
         embedded_prompt_activations_ref: input_ref,
     };
-    let layer_source = AuthenticatedGemmaPrefillLayerSource::from_model(
+    let layer_source = AuthenticatedDecoderPrefillLayerSource::from_model(
         "prefill-layer",
         &transformer_fixture.model,
     )
@@ -1573,12 +1573,12 @@ fn deterministic_cpu_prefill_finalize_checkpoint_commitment_matches_raster() {
         prompt_token_count: input_ref.row_count(),
         embedded_prompt_activations_ref: input_ref,
     };
-    let layer_source = AuthenticatedGemmaPrefillLayerSource::from_model(
+    let layer_source = AuthenticatedDecoderPrefillLayerSource::from_model(
         "prefill-finalize-layer",
         &transformer_fixture.model,
     )
     .expect("prefill layer source");
-    let finalize_source = AuthenticatedGemmaPrefillFinalizeSource::from_model(
+    let finalize_source = AuthenticatedDecoderPrefillFinalizeSource::from_model(
         "prefill-finalize",
         &transformer_fixture.model,
     )

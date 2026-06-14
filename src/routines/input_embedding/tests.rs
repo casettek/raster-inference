@@ -1,5 +1,5 @@
 use super::{materialize_input_embedding_refs_for_trace, run_raster};
-use crate::routines::input_embedding::raster::auth_source::AuthenticatedGemmaInputEmbeddingSource;
+use crate::routines::input_embedding::raster::auth_source::AuthenticatedDecoderEmbeddingSource;
 use crate::shared::api::input::RasterPromptPreparationState;
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{
@@ -138,8 +138,8 @@ fn prompt_preparation_for_token_ids(
     }
 }
 
-fn embedding_source_fixture() -> AuthenticatedGemmaInputEmbeddingSource {
-    AuthenticatedGemmaInputEmbeddingSource::from_canonical_rows(
+fn embedding_source_fixture() -> AuthenticatedDecoderEmbeddingSource {
+    AuthenticatedDecoderEmbeddingSource::from_canonical_rows(
         "embedding-fixture",
         vec![
             vec![Act::from_num(1.0), Act::from_num(2.0)],

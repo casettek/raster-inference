@@ -22,7 +22,7 @@ use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
 
 #[derive(Debug, Clone)]
-pub struct AuthenticatedGemmaPleSource {
+pub struct AuthenticatedDecoderPrefillPleSource {
     identifier: String,
     layers: Vec<GemmaPleLayerMetadata>,
     projection_norm_weights: Option<Vec<Wgt>>,
@@ -34,17 +34,19 @@ pub struct AuthenticatedGemmaPleSource {
 pub enum RasterPrefillPleSource<'a> {
     Committed {
         source: CommittedExternalSource,
-        _marker: PhantomData<&'a AuthenticatedGemmaPleSource>,
+        _marker: PhantomData<&'a AuthenticatedDecoderPrefillPleSource>,
     },
     #[cfg(feature = "unchecked-raster-integrity")]
     DirectUnchecked {
-        source: &'a AuthenticatedGemmaPleSource,
+        source: &'a AuthenticatedDecoderPrefillPleSource,
         root: String,
     },
 }
 
 impl<'a> RasterPrefillPleSource<'a> {
-    pub fn for_current_integrity_mode(source: &'a AuthenticatedGemmaPleSource) -> Result<Self> {
+    pub fn for_current_integrity_mode(
+        source: &'a AuthenticatedDecoderPrefillPleSource,
+    ) -> Result<Self> {
         #[cfg(feature = "unchecked-raster-integrity")]
         if raster_integrity_is_unchecked() {
             return Ok(Self::DirectUnchecked {
@@ -397,7 +399,7 @@ pub struct GemmaPleProjectionNormWeightsRequest;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmaPleScalarsRequest;
 
-impl AuthenticatedGemmaPleSource {
+impl AuthenticatedDecoderPrefillPleSource {
     pub fn from_model(
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
@@ -722,7 +724,7 @@ impl AuthenticatedGemmaPleSource {
     }
 }
 
-impl AuthRead<GemmaPleMetadataRequest> for AuthenticatedGemmaPleSource {
+impl AuthRead<GemmaPleMetadataRequest> for AuthenticatedDecoderPrefillPleSource {
     type Output = GemmaPleMetadata;
 
     fn auth_read(&self, request: GemmaPleMetadataRequest) -> Result<Self::Output> {
@@ -742,7 +744,7 @@ impl AuthRead<GemmaPleMetadataRequest> for RasterPrefillPleSource<'_> {
     }
 }
 
-impl AuthRead<GemmaPleLayerMetadataRequest> for AuthenticatedGemmaPleSource {
+impl AuthRead<GemmaPleLayerMetadataRequest> for AuthenticatedDecoderPrefillPleSource {
     type Output = GemmaPleLayerMetadata;
 
     fn auth_read(&self, request: GemmaPleLayerMetadataRequest) -> Result<Self::Output> {
@@ -779,7 +781,7 @@ impl AuthRead<GemmaPleLayerMetadataRequest> for RasterPrefillPleSource<'_> {
     }
 }
 
-impl AuthRead<GemmaPleTokenEmbeddingRowRequest> for AuthenticatedGemmaPleSource {
+impl AuthRead<GemmaPleTokenEmbeddingRowRequest> for AuthenticatedDecoderPrefillPleSource {
     type Output = Vec<Act>;
 
     fn auth_read(&self, request: GemmaPleTokenEmbeddingRowRequest) -> Result<Self::Output> {
@@ -800,7 +802,7 @@ impl AuthRead<GemmaPleTokenEmbeddingRowRequest> for RasterPrefillPleSource<'_> {
     }
 }
 
-impl AuthRead<GemmaPleModelProjectionRowRequest> for AuthenticatedGemmaPleSource {
+impl AuthRead<GemmaPleModelProjectionRowRequest> for AuthenticatedDecoderPrefillPleSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPleModelProjectionRowRequest) -> Result<Self::Output> {
@@ -821,7 +823,7 @@ impl AuthRead<GemmaPleModelProjectionRowRequest> for RasterPrefillPleSource<'_> 
     }
 }
 
-impl AuthRead<GemmaPleProjectionNormWeightsRequest> for AuthenticatedGemmaPleSource {
+impl AuthRead<GemmaPleProjectionNormWeightsRequest> for AuthenticatedDecoderPrefillPleSource {
     type Output = Vec<Wgt>;
 
     fn auth_read(&self, request: GemmaPleProjectionNormWeightsRequest) -> Result<Self::Output> {
@@ -845,7 +847,7 @@ impl AuthRead<GemmaPleProjectionNormWeightsRequest> for RasterPrefillPleSource<'
     }
 }
 
-impl AuthRead<GemmaPleScalarsRequest> for AuthenticatedGemmaPleSource {
+impl AuthRead<GemmaPleScalarsRequest> for AuthenticatedDecoderPrefillPleSource {
     type Output = GemmaPleScalars;
 
     fn auth_read(&self, request: GemmaPleScalarsRequest) -> Result<Self::Output> {
@@ -1201,7 +1203,7 @@ fn rectangular_width<T>(matrix: &[Vec<T>], label: &str, layer_idx: usize) -> Res
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthenticatedGemmaPleSource, GemmaPleLayerConfig, GemmaPleLayerMetadataRequest,
+        AuthenticatedDecoderPrefillPleSource, GemmaPleLayerConfig, GemmaPleLayerMetadataRequest,
         GemmaPleMetadataRequest, GemmaPleModelProjectionRowRequest,
         GemmaPleProjectionNormWeightsRequest, GemmaPleScalars, GemmaPleScalarsRequest,
         GemmaPleTokenEmbeddingRowRequest,
@@ -1340,7 +1342,7 @@ mod tests {
             1.0,
             Act::from_num(1.0),
         );
-        let source = AuthenticatedGemmaPleSource::from_ple_global(
+        let source = AuthenticatedDecoderPrefillPleSource::from_ple_global(
             "det-source-ple",
             vec![GemmaPleLayerConfig {
                 has_ple: true,
@@ -1389,7 +1391,7 @@ mod tests {
 
     #[test]
     fn source_with_no_ple_reports_no_ple_state() {
-        let source = AuthenticatedGemmaPleSource::no_ple(
+        let source = AuthenticatedDecoderPrefillPleSource::no_ple(
             "no-ple",
             vec![GemmaPleLayerConfig {
                 has_ple: false,
@@ -1427,7 +1429,7 @@ mod tests {
 
     #[test]
     fn construction_rejects_ple_layers_without_global_weights() {
-        let error = AuthenticatedGemmaPleSource::no_ple(
+        let error = AuthenticatedDecoderPrefillPleSource::no_ple(
             "bad-no-ple",
             vec![GemmaPleLayerConfig {
                 has_ple: true,
@@ -1460,7 +1462,7 @@ mod tests {
             1.0,
         );
 
-        let error = AuthenticatedGemmaPleSource::from_ple_global(
+        let error = AuthenticatedDecoderPrefillPleSource::from_ple_global(
             "non-canonical-ple",
             vec![GemmaPleLayerConfig {
                 has_ple: true,
@@ -1476,7 +1478,7 @@ mod tests {
 
     #[test]
     fn construction_rejects_layer_count_mismatch() {
-        let error = AuthenticatedGemmaPleSource::from_canonical_parts(
+        let error = AuthenticatedDecoderPrefillPleSource::from_canonical_parts(
             "bad-shape",
             vec![
                 GemmaPleLayerConfig {
@@ -1503,8 +1505,8 @@ mod tests {
             .contains("token embedding slice count mismatch: 1 vs 2"));
     }
 
-    fn canonical_source() -> AuthenticatedGemmaPleSource {
-        AuthenticatedGemmaPleSource::from_canonical_parts(
+    fn canonical_source() -> AuthenticatedDecoderPrefillPleSource {
+        AuthenticatedDecoderPrefillPleSource::from_canonical_parts(
             "ple-fixture",
             vec![GemmaPleLayerConfig {
                 has_ple: true,

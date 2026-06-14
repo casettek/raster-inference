@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 
+use crate::dsl::prelude::{
+    auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
+};
 use crate::routines::decode_layer_range::raster::auth_source::{
     GemmaDecodeAttentionKind, GemmaDecodeEmbeddingRowRequest, GemmaDecodeFinalNormWeightsRequest,
     GemmaDecodeFinalScalarsRequest, GemmaDecodeLayerMatrixKind, GemmaDecodeLayerMetadata,
@@ -7,9 +10,6 @@ use crate::routines::decode_layer_range::raster::auth_source::{
     GemmaDecodeLayerRangeMetadataRequest, GemmaDecodeLayerScalarsRequest,
     GemmaDecodePleProjectionNormWeightsRequest, GemmaDecodePleScalarsRequest,
     GemmaDecodePleTokenEmbeddingRowRequest, RasterDecodeLayerRangeSource,
-};
-use crate::dsl::prelude::{
-    auth_read, call_recur_seq, call_recur_tile, call_seq, call_tile, sequence, tile,
 };
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::artifacts::raster_artifact_store::{

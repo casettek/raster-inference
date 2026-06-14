@@ -95,14 +95,15 @@ fn trace_prefill_range_finalize_checkpoint_with_roots(
     let mut completed_layer_output_det_sha256s = state.completed_layer_output_det_sha256s.clone();
     completed_layer_output_det_sha256s.push(current_det_sha256.clone());
     let completed_layer_output = Some((current_sha256, current_det_sha256));
-    let reached = crate::routines::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
-        execution_mode: Some("deterministic"),
-        layer_idx,
-        current_activations: &activation_sequence,
-        layer_caches: &layer_caches,
-        completed_layer_output_sha256s,
-        completed_layer_output_det_sha256s: Some(completed_layer_output_det_sha256s),
-    });
+    let reached =
+        crate::routines::prefill_range_finalize::trace_checkpoint(PrefillRangeFinalizeCheckpoint {
+            execution_mode: Some("deterministic"),
+            layer_idx,
+            current_activations: &activation_sequence,
+            layer_caches: &layer_caches,
+            completed_layer_output_sha256s,
+            completed_layer_output_det_sha256s: Some(completed_layer_output_det_sha256s),
+        });
     if reached {
         return Ok(completed_layer_output);
     }
