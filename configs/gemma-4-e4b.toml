@@ -4,8 +4,8 @@
 #   cargo run --release -- claim --model ~/models/gemma-4-E4B-it --config configs/gemma-4-e4b-range-3.toml "Hello from Raster"
 
 [ranges]
-prefill_token_range_width = 3
-decode_layer_range_width = 3
+prefill_token_range_width = 100
+decode_layer_range_width = 100
 
 [tile_sizing]
 # Conservative starting point for E4B; tune after measuring trace-tiles runtime.
