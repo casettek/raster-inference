@@ -86,6 +86,38 @@ fn authenticated_source_construction_stays_at_model_family_boundary() {
     );
 }
 
+#[test]
+fn common_model_views_do_not_construct_authenticated_sources() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+
+    collect_rust_files(&root.join("src/shared/model/common"), &mut files);
+
+    let mut violations = Vec::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(&root)
+            .expect("file should be under crate root");
+        let text = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", relative.display()));
+        for needle in [
+            "AuthenticatedDecoder",
+            "::from_model(",
+            "::from_decoder_view(",
+        ] {
+            if text.contains(needle) {
+                violations.push(format!("{} contains `{needle}`", relative.display()));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "common decoder views must not construct authenticated sources:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) {
     if path.is_file() {
         if path.extension().is_some_and(|extension| extension == "rs") {

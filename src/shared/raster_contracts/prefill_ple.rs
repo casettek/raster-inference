@@ -15,6 +15,7 @@ use crate::shared::artifacts::raster_artifact_store::{
     RasterActivationSequenceArtifactRef, RasterArtifactId, RasterArtifactMetadata,
     RasterArtifactStoreRoots,
 };
+use crate::shared::model::common::{DecoderModelView, ModelFamily};
 use crate::shared::model::transformer::{
     Gemma4PleGlobalWeights, Gemma4PleMatrixSource, Gemma4TransformerModel,
 };
@@ -404,7 +405,22 @@ impl AuthenticatedDecoderPrefillPleSource {
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
     ) -> Result<Self> {
-        let layers = model
+        Self::from_decoder_view(
+            identifier,
+            &model.decoder_view(),
+            model.ple_global.clone(),
+            model.rms_norm_eps_det,
+        )
+    }
+
+    pub fn from_decoder_view(
+        identifier: impl Into<String>,
+        view: &DecoderModelView<'_>,
+        ple_global: Option<Gemma4PleGlobalWeights>,
+        rms_norm_eps_det: Option<Acc>,
+    ) -> Result<Self> {
+        ensure_gemma_view(view)?;
+        let layers = view
             .layers
             .iter()
             .map(|layer| GemmaPleLayerConfig {
@@ -412,12 +428,7 @@ impl AuthenticatedDecoderPrefillPleSource {
                 hidden_width: layer.hidden_size,
             })
             .collect();
-        Self::from_ple_global(
-            identifier,
-            layers,
-            model.ple_global.clone(),
-            model.rms_norm_eps_det,
-        )
+        Self::from_ple_global(identifier, layers, ple_global, rms_norm_eps_det)
     }
 
     pub fn from_ple_global(
@@ -985,6 +996,13 @@ fn validate_identifier(identifier: String) -> Result<String> {
         bail!("Gemma PLE source identifier must not be empty");
     }
     Ok(identifier)
+}
+
+fn ensure_gemma_view(view: &DecoderModelView<'_>) -> Result<()> {
+    if view.spec.family != ModelFamily::Gemma {
+        bail!("Gemma PLE source requires a Gemma decoder view");
+    }
+    Ok(())
 }
 
 fn ensure_model_backing_is_canonical(ple_global: &Gemma4PleGlobalWeights) -> Result<()> {

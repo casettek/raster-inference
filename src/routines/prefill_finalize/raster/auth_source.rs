@@ -9,9 +9,8 @@ use crate::shared::artifacts::external_artifacts::{
 };
 #[cfg(feature = "unchecked-raster-integrity")]
 use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
-use crate::shared::model::transformer::{
-    DetNumMatrix, Gemma4LogitsProjection, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
-};
+use crate::shared::model::common::{DecoderModelView, ModelFamily, ProjectionKind};
+use crate::shared::model::transformer::{DetNumMatrix, DetNumValues, Gemma4TransformerModel};
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
 use anyhow::{anyhow, bail, Result};
@@ -135,13 +134,21 @@ impl AuthenticatedDecoderPrefillFinalizeSource {
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
     ) -> Result<Self> {
+        Self::from_decoder_view(identifier, &model.decoder_view())
+    }
+
+    pub fn from_decoder_view(
+        identifier: impl Into<String>,
+        view: &DecoderModelView<'_>,
+    ) -> Result<Self> {
+        ensure_gemma_view(view)?;
         let identifier = validate_identifier(identifier.into())?;
-        let final_norm_weights = canonical_final_norm_weights(&model.final_norm_weight_det)?;
-        let rms_norm_eps = model.rms_norm_eps_det.ok_or_else(|| {
+        let final_norm_weights = canonical_final_norm_weights(&view.final_norm.det_weights)?;
+        let rms_norm_eps = view.rms_norm_eps.ok_or_else(|| {
             anyhow!("deterministic raster prefill finalize requires canonical RMSNorm epsilon")
         })?;
-        let final_logit_softcapping = if model.final_logit_softcapping.is_some() {
-            Some(model.final_logit_softcapping_det.ok_or_else(|| {
+        let final_logit_softcapping = if view.has_final_logit_softcapping {
+            Some(view.final_logit_softcapping.ok_or_else(|| {
                 anyhow!(
                     "deterministic raster prefill finalize requires canonical final logit softcap"
                 )
@@ -151,7 +158,7 @@ impl AuthenticatedDecoderPrefillFinalizeSource {
         };
 
         let (projection_kind, projection_rows, projection_cols, projection) =
-            canonical_projection_backing(model)?;
+            canonical_projection_backing(view)?;
         let hidden_width = final_norm_weights.len();
         if projection_cols != hidden_width {
             bail!(
@@ -424,8 +431,15 @@ fn validate_identifier(identifier: String) -> Result<String> {
     Ok(identifier)
 }
 
-fn canonical_final_norm_weights(weights: &Option<Vec<Wgt>>) -> Result<Vec<Wgt>> {
-    let weights = weights.clone().ok_or_else(|| {
+fn ensure_gemma_view(view: &DecoderModelView<'_>) -> Result<()> {
+    if view.spec.family != ModelFamily::Gemma {
+        bail!("Gemma prefill finalize source requires a Gemma decoder view");
+    }
+    Ok(())
+}
+
+fn canonical_final_norm_weights(weights: &Option<&[Wgt]>) -> Result<Vec<Wgt>> {
+    let weights = weights.map(<[Wgt]>::to_vec).ok_or_else(|| {
         anyhow!("deterministic raster prefill finalize requires canonical final norm weights")
     })?;
     if weights.is_empty() {
@@ -435,18 +449,22 @@ fn canonical_final_norm_weights(weights: &Option<Vec<Wgt>>) -> Result<Vec<Wgt>> 
 }
 
 fn canonical_projection_backing(
-    model: &Gemma4TransformerModel,
+    view: &DecoderModelView<'_>,
 ) -> Result<(
     GemmaPrefillFinalizeProjectionKind,
     usize,
     usize,
     GemmaPrefillFinalizeProjectionBacking,
 )> {
-    match &model.logits_projection {
-        Gemma4LogitsProjection::UntiedLmHead {
-            det_weight: Some(det_weight),
-            ..
-        } => {
+    match view.lm_head.kind {
+        ProjectionKind::UntiedLmHead => {
+            let Some(crate::shared::model::common::WeightMatrixView::DetNumMatrix(det_weight)) =
+                view.lm_head.weights
+            else {
+                bail!(
+                    "deterministic raster prefill finalize requires canonical lm_head det_weight"
+                );
+            };
             validate_det_matrix_shape(det_weight, "lm_head")?;
             Ok((
                 GemmaPrefillFinalizeProjectionKind::UntiedLmHead,
@@ -455,28 +473,15 @@ fn canonical_projection_backing(
                 GemmaPrefillFinalizeProjectionBacking::Matrix(det_weight.clone()),
             ))
         }
-        Gemma4LogitsProjection::UntiedLmHead {
-            det_weight: None, ..
-        } => bail!("deterministic raster prefill finalize requires canonical lm_head det_weight"),
-        Gemma4LogitsProjection::TiedEmbedding(_) => {
-            let matrix = match model.embedding_source.as_ref() {
-                Some(GemmaEmbeddingTensorSource::Deterministic { .. }) => {
-                    crate::io::materialize_det_num_embedding_matrix(
-                        model
-                            .embedding_source
-                            .as_ref()
-                            .expect("embedding source should exist"),
-                    )?
-                    .ok_or_else(|| {
-                        anyhow!("deterministic raster tied embedding logits require canonical embedding matrix")
-                    })?
-                }
-                Some(_) | None => {
-                    bail!(
-                        "deterministic raster tied embedding logits require a .detwgt embedding source"
-                    )
-                }
+        ProjectionKind::TiedEmbedding => {
+            let Some(crate::shared::model::common::WeightMatrixView::DetNumSlice(source)) =
+                view.embeddings.weights
+            else {
+                bail!(
+                    "deterministic raster tied embedding logits require a .detwgt embedding source"
+                );
             };
+            let matrix = materialize_det_num_slice_matrix(source, "tied embedding")?;
             validate_det_matrix_shape(&matrix, "tied embedding")?;
             Ok((
                 GemmaPrefillFinalizeProjectionKind::TiedEmbedding,
@@ -486,6 +491,30 @@ fn canonical_projection_backing(
             ))
         }
     }
+}
+
+fn materialize_det_num_slice_matrix(
+    source: &crate::shared::model::transformer::DetNumTensorSliceSource,
+    label: &str,
+) -> Result<Arc<DetNumMatrix>> {
+    if source.row_count == 0 || source.col_count == 0 {
+        bail!("Gemma prefill finalize {label} matrix must have non-zero shape");
+    }
+    let mut values = Vec::with_capacity(source.row_count * source.col_count);
+    for row_idx in 0..source.row_count {
+        values.extend(
+            crate::shared::raster_kernels::transformer::det_num_tensor_slice_row_wgts(
+                source, row_idx, label,
+            )?
+            .into_iter()
+            .map(|value| value.to_bits()),
+        );
+    }
+    Ok(Arc::new(DetNumMatrix {
+        rows: source.row_count,
+        cols: source.col_count,
+        values: DetNumValues::Owned(values),
+    }))
 }
 
 fn validate_det_matrix_shape(matrix: &DetNumMatrix, label: &str) -> Result<()> {

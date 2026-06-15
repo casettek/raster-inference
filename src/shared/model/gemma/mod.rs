@@ -15,6 +15,7 @@ pub mod io;
 pub mod sources;
 pub mod tokenizer;
 pub mod transformer;
+pub mod view;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Gemma4Prompt {

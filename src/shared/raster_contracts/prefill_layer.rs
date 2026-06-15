@@ -11,9 +11,10 @@ use crate::shared::artifacts::external_artifacts::{
 };
 #[cfg(feature = "unchecked-raster-integrity")]
 use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
-use crate::shared::model::transformer::{
-    Gemma4AttentionKind, Gemma4LayerMatrixSource, Gemma4LayerWeights, Gemma4TransformerModel,
+use crate::shared::model::common::{
+    DecoderLayerView, DecoderModelView, FfnKind, ModelFamily, WeightMatrixView,
 };
+use crate::shared::model::transformer::{Gemma4LayerMatrixSource, Gemma4TransformerModel};
 use crate::shared::numerics::det_num::{Acc, Act, Wgt};
 use crate::shared::raster_kernels::transformer::det_num_matrix_row_wgts;
 
@@ -236,11 +237,19 @@ impl AuthenticatedDecoderPrefillLayerSource {
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
     ) -> Result<Self> {
+        Self::from_decoder_view(identifier, &model.decoder_view())
+    }
+
+    pub fn from_decoder_view(
+        identifier: impl Into<String>,
+        view: &DecoderModelView<'_>,
+    ) -> Result<Self> {
+        ensure_gemma_view(view)?;
         let identifier = validate_identifier(identifier.into())?;
-        let mut layers = Vec::with_capacity(model.layers.len());
-        let mut backing_layers = Vec::with_capacity(model.layers.len());
-        for (layer_idx, layer) in model.layers.iter().enumerate() {
-            let (metadata, backing) = build_layer(layer_idx, layer)?;
+        let mut layers = Vec::with_capacity(view.layers.len());
+        let mut backing_layers = Vec::with_capacity(view.layers.len());
+        for layer in &view.layers {
+            let (metadata, backing) = build_layer(layer)?;
             layers.push(metadata);
             backing_layers.push(backing);
         }
@@ -677,11 +686,11 @@ impl GemmaPrefillLayerBacking {
     }
 }
 
-impl From<Gemma4AttentionKind> for GemmaPrefillAttentionKind {
-    fn from(value: Gemma4AttentionKind) -> Self {
+impl From<crate::shared::model::common::AttentionKind> for GemmaPrefillAttentionKind {
+    fn from(value: crate::shared::model::common::AttentionKind) -> Self {
         match value {
-            Gemma4AttentionKind::Sliding => Self::Sliding,
-            Gemma4AttentionKind::Full => Self::Full,
+            crate::shared::model::common::AttentionKind::Sliding => Self::Sliding,
+            crate::shared::model::common::AttentionKind::Full => Self::Full,
         }
     }
 }
@@ -772,64 +781,90 @@ fn validate_identifier(identifier: String) -> Result<String> {
     Ok(identifier)
 }
 
+fn ensure_gemma_view(view: &DecoderModelView<'_>) -> Result<()> {
+    if view.spec.family != ModelFamily::Gemma {
+        bail!("Gemma prefill layer source requires a Gemma decoder view");
+    }
+    Ok(())
+}
+
 fn build_layer(
-    layer_idx: usize,
-    layer: &Gemma4LayerWeights,
+    layer: &DecoderLayerView<'_>,
 ) -> Result<(GemmaPrefillLayerMetadata, GemmaPrefillLayerBacking)> {
-    if layer.v_proj.is_none() && !layer.attention_k_eq_v {
+    let layer_idx = layer.layer_idx;
+    if layer.attention.v_proj.is_none() && !layer.attention.attention_k_eq_v {
         bail!("Gemma prefill layer {layer_idx} is missing v_proj without attention_k_eq_v enabled");
     }
 
-    let q_proj_shape = canonical_matrix_shape(layer_idx, "q_proj", &layer.q_proj)?;
-    let k_proj_shape = canonical_matrix_shape(layer_idx, "k_proj", &layer.k_proj)?;
+    let q_proj_shape = canonical_matrix_shape(layer_idx, "q_proj", layer.attention.q_proj)?;
+    let k_proj_shape = canonical_matrix_shape(layer_idx, "k_proj", layer.attention.k_proj)?;
     let v_proj_shape = layer
+        .attention
         .v_proj
-        .as_ref()
         .map(|source| canonical_matrix_shape(layer_idx, "v_proj", source))
         .transpose()?;
-    let o_proj_shape = canonical_matrix_shape(layer_idx, "o_proj", &layer.o_proj)?;
-    let gate_proj_shape = canonical_matrix_shape(layer_idx, "gate_proj", &layer.gate_proj)?;
-    let up_proj_shape = canonical_matrix_shape(layer_idx, "up_proj", &layer.up_proj)?;
-    let down_proj_shape = canonical_matrix_shape(layer_idx, "down_proj", &layer.down_proj)?;
+    let o_proj_shape = canonical_matrix_shape(layer_idx, "o_proj", layer.attention.o_proj)?;
+    let FfnKind::Dense(ffn) = layer.ffn else {
+        bail!("Gemma prefill layer {layer_idx} requires dense FFN");
+    };
+    let gate_proj_shape = canonical_matrix_shape(layer_idx, "gate_proj", ffn.gate_proj)?;
+    let up_proj_shape = canonical_matrix_shape(layer_idx, "up_proj", ffn.up_proj)?;
+    let down_proj_shape = canonical_matrix_shape(layer_idx, "down_proj", ffn.down_proj)?;
 
-    let q_norm = canonical_norm_weights(layer_idx, "q_norm_weight", &layer.q_norm_weight_det)?;
-    let k_norm = canonical_norm_weights(layer_idx, "k_norm_weight", &layer.k_norm_weight_det)?;
+    let q_norm = canonical_norm_weights(
+        layer_idx,
+        "q_norm_weight",
+        layer.attention.q_norm.det_weights,
+    )?;
+    let k_norm = canonical_norm_weights(
+        layer_idx,
+        "k_norm_weight",
+        layer.attention.k_norm.det_weights,
+    )?;
     let input_layernorm = canonical_norm_weights(
         layer_idx,
         "input_layernorm_weight",
-        &layer.input_layernorm_weight_det,
+        layer.input_norm.det_weights,
     )?;
     let post_attention_layernorm = canonical_norm_weights(
         layer_idx,
         "post_attention_layernorm_weight",
-        &layer.post_attention_layernorm_weight_det,
+        layer.post_attention_norm.det_weights,
     )?;
     let pre_feedforward_layernorm = canonical_norm_weights(
         layer_idx,
         "pre_feedforward_layernorm_weight",
-        &layer.pre_feedforward_layernorm_weight_det,
+        layer.pre_feedforward_norm.det_weights,
     )?;
     let post_feedforward_layernorm = canonical_norm_weights(
         layer_idx,
         "post_feedforward_layernorm_weight",
-        &layer.post_feedforward_layernorm_weight_det,
+        layer.post_feedforward_norm.det_weights,
     )?;
 
     let (ple_matrices, ple_input_gate_shape, ple_layer_projection_shape, ple_post_input_norm) =
-        if let Some(ple) = &layer.ple {
+        if let Some(ple) = layer.ple {
             let input_gate_shape =
-                canonical_matrix_shape(layer_idx, "PLE input_gate", &ple.input_gate)?;
+                canonical_matrix_shape(layer_idx, "PLE input_gate", ple.input_gate)?;
             let layer_projection_shape =
-                canonical_matrix_shape(layer_idx, "PLE layer_projection", &ple.layer_projection)?;
+                canonical_matrix_shape(layer_idx, "PLE layer_projection", ple.layer_projection)?;
             let post_input_norm = canonical_norm_weights(
                 layer_idx,
                 "PLE post_input_norm_weight",
-                &ple.post_input_norm_weight_det,
+                ple.post_input_norm.det_weights,
             )?;
             (
                 Some(GemmaPrefillPleLayerMatrices {
-                    input_gate: ple.input_gate.clone(),
-                    layer_projection: ple.layer_projection.clone(),
+                    input_gate: canonical_matrix_source(
+                        layer_idx,
+                        "PLE input_gate",
+                        ple.input_gate,
+                    )?,
+                    layer_projection: canonical_matrix_source(
+                        layer_idx,
+                        "PLE layer_projection",
+                        ple.layer_projection,
+                    )?,
                 }),
                 Some(input_gate_shape),
                 Some(layer_projection_shape),
@@ -842,18 +877,18 @@ fn build_layer(
     let scalars = canonical_layer_scalars(layer_idx, layer)?;
     let metadata = GemmaPrefillLayerMetadata {
         layer_idx,
-        attention_kind: layer.attention_kind.into(),
+        attention_kind: layer.attention.kind.into(),
         hidden_size: layer.hidden_size,
-        num_heads: layer.num_heads,
-        num_kv_heads: layer.num_kv_heads,
-        head_dim: layer.head_dim,
-        sliding_window: layer.sliding_window,
-        cache_sliding_window: layer.cache_sliding_window,
-        partial_rotary_dim: layer.partial_rotary_dim,
-        rope_freq_base_dim: layer.rope_freq_base_dim,
-        kv_shared_layer_index: layer.kv_shared_layer_index,
-        attention_k_eq_v: layer.attention_k_eq_v,
-        has_v_proj: layer.v_proj.is_some(),
+        num_heads: layer.attention.num_heads,
+        num_kv_heads: layer.attention.num_kv_heads,
+        head_dim: layer.attention.head_dim,
+        sliding_window: layer.attention.sliding_window,
+        cache_sliding_window: layer.attention.cache_sliding_window,
+        partial_rotary_dim: layer.attention.rope.partial_rotary_dim,
+        rope_freq_base_dim: layer.attention.rope.freq_base_dim,
+        kv_shared_layer_index: layer.attention.kv_shared_layer_index,
+        attention_k_eq_v: layer.attention.attention_k_eq_v,
+        has_v_proj: layer.attention.v_proj.is_some(),
         has_ple: layer.ple.is_some(),
         has_layer_scalar: scalars.layer_scalar.is_some(),
         q_proj_shape,
@@ -875,13 +910,17 @@ fn build_layer(
     };
     let backing = GemmaPrefillLayerBacking {
         matrices: GemmaPrefillLayerMatrices {
-            q_proj: layer.q_proj.clone(),
-            k_proj: layer.k_proj.clone(),
-            v_proj: layer.v_proj.clone(),
-            o_proj: layer.o_proj.clone(),
-            gate_proj: layer.gate_proj.clone(),
-            up_proj: layer.up_proj.clone(),
-            down_proj: layer.down_proj.clone(),
+            q_proj: canonical_matrix_source(layer_idx, "q_proj", layer.attention.q_proj)?,
+            k_proj: canonical_matrix_source(layer_idx, "k_proj", layer.attention.k_proj)?,
+            v_proj: layer
+                .attention
+                .v_proj
+                .map(|source| canonical_matrix_source(layer_idx, "v_proj", source))
+                .transpose()?,
+            o_proj: canonical_matrix_source(layer_idx, "o_proj", layer.attention.o_proj)?,
+            gate_proj: canonical_matrix_source(layer_idx, "gate_proj", ffn.gate_proj)?,
+            up_proj: canonical_matrix_source(layer_idx, "up_proj", ffn.up_proj)?,
+            down_proj: canonical_matrix_source(layer_idx, "down_proj", ffn.down_proj)?,
             ple: ple_matrices,
         },
         norms: GemmaPrefillLayerNorms {
@@ -902,9 +941,9 @@ fn build_layer(
 fn canonical_matrix_shape(
     layer_idx: usize,
     label: &str,
-    source: &Gemma4LayerMatrixSource,
+    source: WeightMatrixView<'_>,
 ) -> Result<GemmaPrefillMatrixShape> {
-    let Gemma4LayerMatrixSource::DetNumLazy { source, .. } = source else {
+    let Some(source) = source.det_num_slice() else {
         bail!(
             "deterministic raster prefill layer source requires .detwgt {label} source at layer {layer_idx}"
         );
@@ -918,12 +957,25 @@ fn canonical_matrix_shape(
     })
 }
 
+fn canonical_matrix_source(
+    layer_idx: usize,
+    label: &str,
+    source: WeightMatrixView<'_>,
+) -> Result<Gemma4LayerMatrixSource> {
+    let Some(source) = source.det_num_slice() else {
+        bail!(
+            "deterministic raster prefill layer source requires .detwgt {label} source at layer {layer_idx}"
+        );
+    };
+    Ok(Gemma4LayerMatrixSource::from_det_num_source(source.clone()))
+}
+
 fn canonical_norm_weights(
     layer_idx: usize,
     label: &str,
-    weights: &Option<Vec<Wgt>>,
+    weights: Option<&[Wgt]>,
 ) -> Result<Vec<Wgt>> {
-    let weights = weights.clone().ok_or_else(|| {
+    let weights = weights.map(<[Wgt]>::to_vec).ok_or_else(|| {
         anyhow!("deterministic raster prefill layer {layer_idx} requires canonical {label}")
     })?;
     if weights.is_empty() {
@@ -934,20 +986,20 @@ fn canonical_norm_weights(
 
 fn canonical_layer_scalars(
     layer_idx: usize,
-    layer: &Gemma4LayerWeights,
+    layer: &DecoderLayerView<'_>,
 ) -> Result<GemmaPrefillLayerScalars> {
-    let rms_norm_eps = layer.rms_norm_eps_det.ok_or_else(|| {
+    let rms_norm_eps = layer.rms_norm_eps.ok_or_else(|| {
         anyhow!("deterministic raster prefill layer {layer_idx} requires canonical RMSNorm epsilon")
     })?;
-    let rope_base = if layer.partial_rotary_dim == 0 {
-        layer.rope_base_det
+    let rope_base = if layer.attention.rope.partial_rotary_dim == 0 {
+        layer.rope_base
     } else {
-        Some(layer.rope_base_det.ok_or_else(|| {
+        Some(layer.rope_base.ok_or_else(|| {
             anyhow!("deterministic raster prefill layer {layer_idx} requires canonical RoPE base")
         })?)
     };
-    let layer_scalar = if layer.layer_scalar.is_some() {
-        Some(layer.layer_scalar_det.ok_or_else(|| {
+    let layer_scalar = if layer.has_layer_scalar {
+        Some(layer.layer_scalar.ok_or_else(|| {
             anyhow!(
                 "deterministic raster prefill layer {layer_idx} requires canonical layer scalar"
             )

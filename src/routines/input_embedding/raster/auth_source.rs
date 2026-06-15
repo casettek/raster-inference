@@ -11,9 +11,8 @@ use crate::shared::artifacts::external_artifacts::{
 };
 #[cfg(feature = "unchecked-raster-integrity")]
 use crate::shared::artifacts::integrity_mode::raster_integrity_is_unchecked;
-use crate::shared::model::transformer::{
-    DetNumTensorSliceSource, Gemma4TransformerModel, GemmaEmbeddingTensorSource,
-};
+use crate::shared::model::common::{DecoderModelView, ModelFamily, WeightMatrixView};
+use crate::shared::model::transformer::{DetNumTensorSliceSource, Gemma4TransformerModel};
 use crate::shared::numerics::det_num::{scale_act, Act};
 use crate::shared::raster_kernels::transformer::det_num_tensor_slice_row_wgts;
 
@@ -101,14 +100,21 @@ impl AuthenticatedDecoderEmbeddingSource {
         identifier: impl Into<String>,
         model: &Gemma4TransformerModel,
     ) -> Result<Self> {
-        let (source, scale) = match model.embedding_source.as_ref() {
-            Some(GemmaEmbeddingTensorSource::Deterministic { source, scale, .. }) => {
-                (source.clone(), Act::from_num(*scale))
-            }
+        Self::from_decoder_view(identifier, &model.decoder_view())
+    }
+
+    pub fn from_decoder_view(
+        identifier: impl Into<String>,
+        view: &DecoderModelView<'_>,
+    ) -> Result<Self> {
+        ensure_gemma_view(view)?;
+        let source = match view.embeddings.weights {
+            Some(WeightMatrixView::DetNumSlice(source)) => source.clone(),
             Some(_) | None => {
                 bail!("deterministic raster input embedding requires a .detwgt embedding source")
             }
         };
+        let scale = Act::from_num(view.embeddings.scale);
         validate_full_embedding_source(&source)?;
 
         Ok(Self {
@@ -202,6 +208,13 @@ impl AuthenticatedDecoderEmbeddingSource {
         }
         Ok(entries)
     }
+}
+
+fn ensure_gemma_view(view: &DecoderModelView<'_>) -> Result<()> {
+    if view.spec.family != ModelFamily::Gemma {
+        bail!("Gemma input embedding source requires a Gemma decoder view");
+    }
+    Ok(())
 }
 
 impl AuthRead<GemmaInputEmbeddingMetadataRequest> for AuthenticatedDecoderEmbeddingSource {

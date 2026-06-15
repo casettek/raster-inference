@@ -6,6 +6,7 @@ use crate::routines::decode_transition_finalize::raster::auth_source::Authentica
 use crate::routines::input_embedding::raster::auth_source::AuthenticatedDecoderEmbeddingSource;
 use crate::routines::prefill_finalize::raster::auth_source::AuthenticatedDecoderPrefillFinalizeSource;
 use crate::shared::api::input::ModelSpec;
+use crate::shared::model::common::{ArchitectureSpec, DecoderModelView};
 use crate::shared::model::gemma::adapter::GemmaModelBundle;
 use crate::shared::model::gemma::tokenizer::AuthenticatedGemmaTokenizer;
 use crate::shared::model::gemma::transformer::Gemma4TransformerModel;
@@ -32,8 +33,18 @@ impl LoadedModel {
     }
 
     pub fn transformer_layer_count(&self) -> usize {
+        self.architecture_spec().num_layers
+    }
+
+    pub fn architecture_spec(&self) -> ArchitectureSpec {
         match self {
-            Self::Gemma(model) => model.transformer_layer_count(),
+            Self::Gemma(model) => model.architecture_spec(),
+        }
+    }
+
+    pub fn decoder_view(&self) -> DecoderModelView<'_> {
+        match self {
+            Self::Gemma(model) => model.decoder_view(),
         }
     }
 
