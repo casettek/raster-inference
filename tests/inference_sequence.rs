@@ -20,7 +20,7 @@ use raster_inference::shared::model::transformer::{
 use raster_inference::shared::numerics::det_num::{f32_to_acc, Act, Wgt};
 use raster_inference::{
     InferenceControls, InferenceRequest, InferenceRunOutcome, InferenceState, ModelSpec,
-    OutputDecodeStopReason, RasterDetourSpec, SamplingConfig, TextDecodingPolicy,
+    OutputDecodeStopReason, RasterDetourSpec, RoutineId, SamplingConfig, TextDecodingPolicy,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -809,6 +809,95 @@ fn run_inference_rejects_full_raster_with_raster_detour() {
     assert!(error
         .to_string()
         .contains("--raster and selective raster detour cannot be used together"));
+}
+
+#[test]
+fn run_inference_rejects_raster_core_detour_for_every_routine() {
+    let tokenizer = test_tokenizer();
+    let model = test_model_spec();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
+    let request = InferenceRequest {
+        prompt_bytes: b"prompt".to_vec(),
+        text_decoding_policy: TextDecodingPolicy::Utf8,
+        add_generation_prompt: false,
+        add_special_tokens: false,
+        sampling: SamplingConfig {
+            // At least one decode iteration so every decode-loop decision
+            // point (select_token, layer_range, transition_finalize,
+            // output.finalize) is reached.
+            max_new_tokens: Some(1),
+            temperature: Some(1.0),
+            top_k: None,
+            top_p: None,
+        },
+    };
+
+    for routine_id in RoutineId::ALL {
+        raster_inference::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+        let error = run_inference_with_controls(
+            &request,
+            &model,
+            &tokenizer,
+            &transformer_fixture.model,
+            &InferenceControls {
+                raster_detour: Some(
+                    RasterDetourSpec::parse_raster_core(routine_id.as_str())
+                        .expect("raster-core spec should parse"),
+                ),
+                ..InferenceControls::default()
+            },
+        )
+        .expect_err("raster-core detour should be rejected as unimplemented");
+
+        let expected = format!(
+            "selective raster-core detour for {} is not implemented yet",
+            routine_id.as_str()
+        );
+        assert!(
+            error.to_string().contains(&expected),
+            "unexpected error for {}: {error:#}",
+            routine_id.as_str()
+        );
+    }
+}
+
+#[test]
+fn run_inference_reports_unreached_raster_core_detour_target() {
+    let tokenizer = test_tokenizer();
+    let model = test_model_spec();
+    let transformer_fixture = deterministic_no_ple_model_fixture();
+    let request = InferenceRequest {
+        prompt_bytes: b"prompt".to_vec(),
+        text_decoding_policy: TextDecodingPolicy::Utf8,
+        add_generation_prompt: false,
+        add_special_tokens: false,
+        sampling: SamplingConfig {
+            max_new_tokens: Some(0),
+            temperature: Some(1.0),
+            top_k: None,
+            top_p: None,
+        },
+    };
+
+    raster_inference::shared::artifacts::artifact_io::ArtifactIo::reset_store();
+    let error = run_inference_with_controls(
+        &request,
+        &model,
+        &tokenizer,
+        &transformer_fixture.model,
+        &InferenceControls {
+            raster_detour: Some(
+                RasterDetourSpec::parse_raster_core("prefill.range:7")
+                    .expect("raster-core spec should parse"),
+            ),
+            ..InferenceControls::default()
+        },
+    )
+    .expect_err("unreached raster-core target should fail");
+
+    assert!(error
+        .to_string()
+        .contains("selective raster-core detour target prefill.range:7 was not reached"));
 }
 
 #[test]

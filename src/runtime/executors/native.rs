@@ -20,7 +20,7 @@ use tokenizers::Tokenizer;
 use crate::routines::{
     input_embedding, prefill_finalize, prefill_prepare_aux, prefill_range, prompt_prepare,
 };
-use crate::runtime::checkpoints::{PhaseId, RasterDetourController, RoutineId};
+use crate::runtime::checkpoints::{DetourBackend, PhaseId, RasterDetourController, RoutineId};
 use crate::runtime::inference::{
     InferenceControls, InferenceRunOutcome, RasterPromptPreparedState,
 };
@@ -147,7 +147,7 @@ pub(crate) fn run_prefill(
     raster_input_embedding_refs: Option<&input_embedding::raster::RasterInputEmbeddingOutput>,
 ) -> Result<ControlFlow<String, TransformerPrefillResult>> {
     let detour_prefill_prepare_aux =
-        raster_detour_controller.should_detour(RoutineId::PrefillPrepareAux);
+        raster_detour_controller.should_detour_sim(RoutineId::PrefillPrepareAux)?;
     let ple_inputs = if detour_prefill_prepare_aux {
         let input_embedding_output = raster_input_embedding_refs.context(
             "selective raster prefill.prepare_aux detour requires input embedding raster refs",
@@ -180,8 +180,9 @@ pub(crate) fn run_prefill(
     }
     let prefill_layer_source = if raster_detour_controller
         .selected_spec()
-        .is_some_and(|spec| spec.routine_id() == RoutineId::PrefillRange)
-    {
+        .is_some_and(|spec| {
+            spec.routine_id() == RoutineId::PrefillRange && spec.backend() == DetourBackend::Sim
+        }) {
         Some(model.prefill_layer_source()?)
     } else {
         None
@@ -212,7 +213,13 @@ pub(crate) fn run_prefill(
         trace::phase_paused(PhaseId::TransformerStateTransition);
         return Ok(ControlFlow::Break(terminal_checkpoint_id));
     }
-    let prefill = if raster_detour_controller.should_detour(RoutineId::PrefillFinalize) {
+    // `prefill.range_finalize` has no sim detour call site on the native
+    // path; this raster-core-only decision point makes a selected
+    // raster-core occurrence fail cleanly as unimplemented (WS0). Sim specs
+    // are unaffected.
+    raster_detour_controller
+        .reject_if_selected_unsupported_raster_core(RoutineId::PrefillRangeFinalize)?;
+    let prefill = if raster_detour_controller.should_detour_sim(RoutineId::PrefillFinalize)? {
         let raster_sizing =
             raster_sizing_controls.expect("raster sizing controls should be validated");
         let finalize_source = model.prefill_finalize_source()?;
@@ -275,9 +282,10 @@ pub(crate) fn run_output_decode(
         )
         .is_some()
         {
-            let detour_finalize_output = detour_controller
-                .as_deref_mut()
-                .is_some_and(|controller| controller.should_detour(RoutineId::FinalizeOutput));
+            let detour_finalize_output = match detour_controller.as_deref_mut() {
+                Some(controller) => controller.should_detour_sim(RoutineId::FinalizeOutput)?,
+                None => false,
+            };
             trace_event("output.detokenize");
             let mut output_decode_state = if detour_finalize_output {
                 let raster_sizing = raster_sizing.context(
@@ -298,9 +306,10 @@ pub(crate) fn run_output_decode(
             return Ok(output_decode_state);
         }
 
-        let detour_select_token = detour_controller
-            .as_deref_mut()
-            .is_some_and(|controller| controller.should_detour(RoutineId::SelectOutputToken));
+        let detour_select_token = match detour_controller.as_deref_mut() {
+            Some(controller) => controller.should_detour_sim(RoutineId::SelectOutputToken)?,
+            None => false,
+        };
         trace_event("decode.select_token");
         let next_token = if detour_select_token {
             let raster_sizing = raster_sizing.context(
@@ -329,9 +338,10 @@ pub(crate) fn run_output_decode(
                 model.transformer_model(),
             )?;
         while !range_state.is_complete() {
-            let detour_decode_layer_range = detour_controller
-                .as_deref_mut()
-                .is_some_and(|controller| controller.should_detour(RoutineId::DecodeLayerRange));
+            let detour_decode_layer_range = match detour_controller.as_deref_mut() {
+                Some(controller) => controller.should_detour_sim(RoutineId::DecodeLayerRange)?,
+                None => false,
+            };
             if detour_decode_layer_range {
                 let raster_sizing = raster_sizing.context(
                     "selective raster decode.layer_range detour requires raster sizing controls",
@@ -356,10 +366,12 @@ pub(crate) fn run_output_decode(
                 range_state = next_range_state;
             }
         }
-        let detour_decode_transition_finalize =
-            detour_controller.as_deref_mut().is_some_and(|controller| {
-                controller.should_detour(RoutineId::DecodeTransitionFinalize)
-            });
+        let detour_decode_transition_finalize = match detour_controller.as_deref_mut() {
+            Some(controller) => {
+                controller.should_detour_sim(RoutineId::DecodeTransitionFinalize)?
+            }
+            None => false,
+        };
         let decode_transition = if detour_decode_transition_finalize {
             let raster_sizing = raster_sizing.context(
                 "selective raster decode.transition_finalize detour requires raster sizing controls",

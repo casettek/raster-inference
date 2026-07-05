@@ -180,15 +180,6 @@ fn run_detour(args: DetourArgs) -> Result<ExitCode> {
         (None, Some(at)) => RasterDetourSpec::parse_raster_core(at)?,
         _ => unreachable!("clap enforces exactly one of --at and --raster-core-at"),
     };
-    // Interim guard until the raster-core backend is threaded through the
-    // detour controller: reject before execution with the same wording the
-    // controller will use.
-    if spec.backend() == DetourBackend::RasterCore {
-        anyhow::bail!(
-            "selective raster-core detour for {} is not implemented yet",
-            spec
-        );
-    }
     let ctx = RunContext::prepare(&args.common)?;
     eprintln!(
         "detour: model {}, {} routine {}:{}",

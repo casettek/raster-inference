@@ -229,6 +229,10 @@ impl RasterDetourController {
         self.spec
     }
 
+    pub fn selected_backend(&self) -> Option<DetourBackend> {
+        self.spec.map(|spec| spec.backend())
+    }
+
     pub fn should_detour(&mut self, routine_id: RoutineId) -> bool {
         let Some(spec) = self.spec else {
             return false;
@@ -246,10 +250,38 @@ impl RasterDetourController {
         matched
     }
 
+    /// Counts an occurrence of `routine_id` and decides the *sim* detour for
+    /// it. Occurrence matching is shared with every backend via
+    /// [`should_detour`]; when the matched spec targets the raster-core
+    /// backend this errors as unimplemented instead (WS0: no routine has a
+    /// raster-core implementation yet).
+    ///
+    /// [`should_detour`]: Self::should_detour
+    pub fn should_detour_sim(&mut self, routine_id: RoutineId) -> anyhow::Result<bool> {
+        if !self.should_detour(routine_id) {
+            return Ok(false);
+        }
+        let spec = self
+            .spec
+            .expect("matched raster detour controller should carry a spec");
+        match spec.backend() {
+            DetourBackend::Sim => Ok(true),
+            DetourBackend::RasterCore => Err(unimplemented_detour_error(spec)),
+        }
+    }
+
     pub fn ensure_matched_if_active(&self) -> anyhow::Result<()> {
         if let Some(spec) = self.spec {
             if !self.matched {
-                anyhow::bail!("selective raster detour target {} was not reached", spec);
+                match spec.backend() {
+                    DetourBackend::Sim => {
+                        anyhow::bail!("selective raster detour target {} was not reached", spec)
+                    }
+                    DetourBackend::RasterCore => anyhow::bail!(
+                        "selective raster-core detour target {} was not reached",
+                        spec
+                    ),
+                }
             }
         }
         Ok(())
@@ -260,12 +292,40 @@ impl RasterDetourController {
             let spec = self
                 .spec
                 .expect("active raster detour controller should carry a spec");
-            anyhow::bail!(
-                "selective raster detour for {} is not implemented yet",
-                spec
-            );
+            return Err(unimplemented_detour_error(spec));
         }
         Ok(())
+    }
+
+    /// Raster-core-only decision point for routines that have no sim detour
+    /// call site (e.g. `prefill.range_finalize`). Sim specs are untouched so
+    /// their behavior at these routines stays exactly as before (the target
+    /// is reported as "not reached" at the end of the run).
+    pub fn reject_if_selected_unsupported_raster_core(
+        &mut self,
+        routine_id: RoutineId,
+    ) -> anyhow::Result<()> {
+        if self.selected_backend() != Some(DetourBackend::RasterCore) {
+            return Ok(());
+        }
+        self.reject_if_selected_unsupported(routine_id)
+    }
+}
+
+/// The clean "not implemented yet" error for a selected detour occurrence,
+/// worded per backend (frozen terminology: `raster-core`).
+pub(crate) fn unimplemented_detour_error(spec: RasterDetourSpec) -> anyhow::Error {
+    match spec.backend() {
+        DetourBackend::Sim => {
+            anyhow::anyhow!(
+                "selective raster detour for {} is not implemented yet",
+                spec
+            )
+        }
+        DetourBackend::RasterCore => anyhow::anyhow!(
+            "selective raster-core detour for {} is not implemented yet",
+            spec
+        ),
     }
 }
 

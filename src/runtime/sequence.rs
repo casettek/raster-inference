@@ -125,19 +125,25 @@ pub fn run(
                         raster_prompt_preparation_roots_for_embedding.as_ref(),
                     )?;
                     (token_embeddings, Some(output))
-                } else if policy.mode_for(RoutineId::InputEmbedding) == StepMode::Raster {
-                    let (token_embeddings, output) = raster::run_input_embedding_detour(
-                        model,
-                        raster_prompt_preparation_for_embedding.as_ref(),
-                        raster_prompt_preparation_roots_for_embedding.as_ref(),
-                    )?;
-                    (token_embeddings, Some(output))
                 } else {
-                    native::run_input_embedding(
-                        &prompt_preparation.prompt_token_ids,
-                        model,
-                        raster_prompt_preparation_for_embedding.as_ref(),
-                    )?
+                    match policy.mode_for(RoutineId::InputEmbedding) {
+                        StepMode::Raster => {
+                            let (token_embeddings, output) = raster::run_input_embedding_detour(
+                                model,
+                                raster_prompt_preparation_for_embedding.as_ref(),
+                                raster_prompt_preparation_roots_for_embedding.as_ref(),
+                            )?;
+                            (token_embeddings, Some(output))
+                        }
+                        StepMode::RasterCore => {
+                            return Err(policy.raster_core_unimplemented_error());
+                        }
+                        StepMode::Native => native::run_input_embedding(
+                            &prompt_preparation.prompt_token_ids,
+                            model,
+                            raster_prompt_preparation_for_embedding.as_ref(),
+                        )?,
+                    }
                 };
                 let input_embedding = InputEmbeddingState {
                     prompt_preparation: prompt_preparation.clone(),

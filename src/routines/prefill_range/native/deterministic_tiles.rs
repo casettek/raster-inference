@@ -85,9 +85,10 @@ pub(crate) fn run_text_layers_prefill_with_cache_internal_and_detour(
     let mut completed_layer_output_sha256s: Vec<String> = Vec::new();
     let mut completed_layer_output_det_sha256s = Vec::with_capacity(model.layers.len());
     for (layer_idx, layer) in model.layers.iter().enumerate() {
-        let selected_for_raster = detour_controller
-            .as_deref_mut()
-            .is_some_and(|controller| controller.should_detour(RoutineId::PrefillRange));
+        let selected_for_raster = match detour_controller.as_deref_mut() {
+            Some(controller) => controller.should_detour_sim(RoutineId::PrefillRange)?,
+            None => false,
+        };
         if selected_for_raster {
             let detour = raster_detour.ok_or_else(|| {
                 anyhow!(

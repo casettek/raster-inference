@@ -16,7 +16,9 @@ pub(crate) mod raster;
 
 use anyhow::Result;
 
-use crate::runtime::checkpoints::{RasterDetourController, RasterDetourSpec, RoutineId};
+use crate::runtime::checkpoints::{
+    DetourBackend, RasterDetourController, RasterDetourSpec, RoutineId,
+};
 use crate::runtime::inference::InferenceControls;
 
 /// Which executor a routine step is dispatched to.
@@ -24,6 +26,10 @@ use crate::runtime::inference::InferenceControls;
 pub(crate) enum StepMode {
     Native,
     Raster,
+    /// Real-toolchain (`raster-core`) execution. WS0: selected occurrences
+    /// error as unimplemented at their decision points; execution lands with
+    /// WS3+ per-routine migration.
+    RasterCore,
 }
 
 /// Per-(routine, occurrence) executor selection.
@@ -68,10 +74,27 @@ impl ExecutionPolicy {
             return StepMode::Raster;
         }
         if self.controller.should_detour(routine) {
-            StepMode::Raster
+            match self
+                .controller
+                .selected_backend()
+                .expect("matched detour controller should carry a spec")
+            {
+                DetourBackend::Sim => StepMode::Raster,
+                DetourBackend::RasterCore => StepMode::RasterCore,
+            }
         } else {
             StepMode::Native
         }
+    }
+
+    /// The clean unimplemented error for the currently selected raster-core
+    /// detour target (used by call sites that observe [`StepMode::RasterCore`]).
+    pub fn raster_core_unimplemented_error(&self) -> anyhow::Error {
+        let spec = self
+            .controller
+            .selected_spec()
+            .expect("raster-core step mode requires an active detour spec");
+        crate::runtime::checkpoints::unimplemented_detour_error(spec)
     }
 
     /// Counts an occurrence of `routine` and errors if the detour selected
