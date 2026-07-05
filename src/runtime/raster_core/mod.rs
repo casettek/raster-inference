@@ -1,0 +1,216 @@
+//! Host-side scaffolding for raster-core (real toolchain) detour execution.
+//!
+//! WS0 scope: run-directory conventions and the `cargo raster run` subprocess
+//! wrapper only — no routine executes on this path yet. The execution shape
+//! (subprocess-first, per the migration ADR) is:
+//!
+//! 1. The detour stages committed inputs into a fresh run directory
+//!    (`input.json` + `input_manifest.json`, tokenizer-PoC idiom: logical
+//!    input name → file binding, and logical input name → commitment).
+//! 2. The host invokes `cargo raster run --backend native --input ...
+//!    --input-manifest ... --commit ...` inside the routine's program crate
+//!    (`crates/raster-programs/<routine>/`).
+//! 3. Outputs and the commit artifact are ingested back into native state
+//!    (WS2 scope).
+//!
+//! Nothing in this module touches committed checkpoint payloads; raster-core
+//! details (run directories, commit artifacts, backend labels) never enter
+//! checkpoint schemas.
+//!
+//! Known upstream gap (recorded in the migration ADR): `cargo raster run`
+//! prints a failed guest process's exit status but still exits `0`, so the
+//! wrapper's exit-status check is not sufficient to detect guest failure.
+//! Ingestion (WS2+) must validate the produced artifacts instead of trusting
+//! the CLI exit code.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result};
+
+use crate::runtime::checkpoints::RoutineId;
+
+/// File name for the private input bindings inside a run directory.
+pub const INPUT_FILE_NAME: &str = "input.json";
+/// File name for the public input commitments inside a run directory.
+pub const INPUT_MANIFEST_FILE_NAME: &str = "input_manifest.json";
+/// File name for the trace commitment artifact produced by `--commit`.
+pub const COMMIT_FILE_NAME: &str = "commit.bin";
+
+/// A fresh, uniquely named run directory for one raster-core routine
+/// invocation, holding the staged inputs and the commit artifact.
+///
+/// The directory is *not* deleted on drop: run directories are debugging
+/// evidence for parity failures, and callers that want cleanup do it
+/// explicitly once ingestion has succeeded.
+#[derive(Debug)]
+pub struct RasterCoreRunDir {
+    root: PathBuf,
+}
+
+impl RasterCoreRunDir {
+    /// Creates a unique run directory for the given routine occurrence under
+    /// the system temp dir.
+    pub fn create(routine_id: RoutineId, occurrence: usize) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "raster-core-{}-{}-{}-{}",
+            routine_id.as_str().replace('.', "_"),
+            occurrence,
+            std::process::id(),
+            nonce,
+        ));
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create raster-core run dir {}", root.display()))?;
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn input_path(&self) -> PathBuf {
+        self.root.join(INPUT_FILE_NAME)
+    }
+
+    pub fn input_manifest_path(&self) -> PathBuf {
+        self.root.join(INPUT_MANIFEST_FILE_NAME)
+    }
+
+    pub fn commit_path(&self) -> PathBuf {
+        self.root.join(COMMIT_FILE_NAME)
+    }
+}
+
+/// Output of one `cargo raster run` invocation.
+#[derive(Debug)]
+pub struct CargoRasterRunOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Subprocess wrapper for the real toolchain's `cargo raster run`.
+///
+/// Invokes the `cargo-raster` binary directly (with the `raster` subcommand
+/// prefix cargo would normally supply) so execution does not depend on cargo
+/// subcommand resolution.
+#[derive(Debug)]
+pub struct CargoRasterRunner {
+    program: OsString,
+}
+
+impl Default for CargoRasterRunner {
+    fn default() -> Self {
+        Self {
+            program: OsString::from("cargo-raster"),
+        }
+    }
+}
+
+impl CargoRasterRunner {
+    /// Overrides the `cargo-raster` program path (tests, hermetic setups).
+    pub fn with_program(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+        }
+    }
+
+    /// Runs `cargo raster run --backend native` for the program crate at
+    /// `program_crate_dir` against the staged inputs in `run_dir`, writing
+    /// the trace commitment to the run directory's commit path.
+    pub fn run(
+        &self,
+        program_crate_dir: &Path,
+        run_dir: &RasterCoreRunDir,
+    ) -> Result<CargoRasterRunOutput> {
+        let output = Command::new(&self.program)
+            .arg("raster")
+            .arg("run")
+            .arg("--backend")
+            .arg("native")
+            .arg("--input")
+            .arg(run_dir.input_path())
+            .arg("--input-manifest")
+            .arg(run_dir.input_manifest_path())
+            .arg("--commit")
+            .arg(run_dir.commit_path())
+            .current_dir(program_crate_dir)
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow::anyhow!(
+                        "cargo-raster was not found on PATH; install the raster toolchain CLI \
+                         (cargo install --path <raster checkout>/crates/raster-cli) to run \
+                         raster-core detours"
+                    )
+                } else {
+                    anyhow::Error::new(error).context(format!(
+                        "failed to launch cargo-raster for program crate {}",
+                        program_crate_dir.display()
+                    ))
+                }
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !output.status.success() {
+            anyhow::bail!(
+                "cargo raster run failed with {} for program crate {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                program_crate_dir.display(),
+                stdout,
+                stderr,
+            );
+        }
+        Ok(CargoRasterRunOutput { stdout, stderr })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CargoRasterRunner, RasterCoreRunDir};
+    use crate::runtime::checkpoints::RoutineId;
+
+    #[test]
+    fn run_dir_uses_committed_input_conventions() {
+        let run_dir = RasterCoreRunDir::create(RoutineId::PromptPrepare, 2)
+            .expect("run dir should be created");
+        assert!(run_dir.root().is_dir());
+        assert!(run_dir.input_path().ends_with("input.json"));
+        assert!(run_dir
+            .input_manifest_path()
+            .ends_with("input_manifest.json"));
+        assert!(run_dir.commit_path().ends_with("commit.bin"));
+
+        let second = RasterCoreRunDir::create(RoutineId::PromptPrepare, 2)
+            .expect("second run dir should be created");
+        assert_ne!(
+            run_dir.root(),
+            second.root(),
+            "run directories must be unique per invocation"
+        );
+
+        std::fs::remove_dir_all(run_dir.root()).ok();
+        std::fs::remove_dir_all(second.root()).ok();
+    }
+
+    #[test]
+    fn missing_cargo_raster_binary_errors_clearly() {
+        let run_dir = RasterCoreRunDir::create(RoutineId::PrefillRange, 1)
+            .expect("run dir should be created");
+        let runner = CargoRasterRunner::with_program("cargo-raster-definitely-not-installed");
+        let error = runner
+            .run(run_dir.root(), &run_dir)
+            .expect_err("missing cargo-raster should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cargo-raster was not found on PATH"),
+            "unexpected error: {error:#}"
+        );
+        std::fs::remove_dir_all(run_dir.root()).ok();
+    }
+}
