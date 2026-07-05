@@ -10,6 +10,16 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Single source of truth for the pinned `raster` toolchain revision.
+  # The workspace consumes `raster` as a path dependency at ../raster (see
+  # [workspace.dependencies] in Cargo.toml); CI materializes that sibling
+  # checkout at this rev. Bumping the pin is a deliberate, ADR-noted act —
+  # see the migration ADR in docs/plans/ for the bump procedure.
+  RASTER_PIN: 536214533f06381a913e5873772e283025ebe061
+
+defaults:
+  run:
+    working-directory: raster-inference
 
 jobs:
   lint:
@@ -17,12 +27,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: raster-inference
+      - uses: actions/checkout@v4
+        with:
+          repository: casettek/raster
+          ref: ${{ env.RASTER_PIN }}
+          path: raster
+          token: ${{ secrets.RASTER_CHECKOUT_TOKEN || github.token }}
       # Toolchain version and components come from rust-toolchain.toml
       # (pinned to match the `raster` workspace).
       - uses: dtolnay/rust-toolchain@1.91.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: raster-inference
       - name: rustfmt
         run: cargo fmt --check
       # Report-only until the existing lint debt is cleared; promoting this
@@ -38,18 +58,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: raster-inference
+      - uses: actions/checkout@v4
+        with:
+          repository: casettek/raster
+          ref: ${{ env.RASTER_PIN }}
+          path: raster
+          token: ${{ secrets.RASTER_CHECKOUT_TOKEN || github.token }}
       - uses: dtolnay/rust-toolchain@1.91.1
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: raster-inference
       - name: cargo test
         run: cargo test
+      # WS0 exit criterion: the placeholder program crate builds against the
+      # pinned real `raster` dependency, including its no_std surface.
+      - name: program crates build against pinned raster
+        run: cargo build -p raster-program-prompt-prepare
+      - name: program crates no_std surface check
+        run: cargo check -p raster-program-prompt-prepare --no-default-features
 
   parity-gate:
     name: Determinism parity gate (release)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: raster-inference
+      - uses: actions/checkout@v4
+        with:
+          repository: casettek/raster
+          ref: ${{ env.RASTER_PIN }}
+          path: raster
+          token: ${{ secrets.RASTER_CHECKOUT_TOKEN || github.token }}
       - uses: dtolnay/rust-toolchain@1.91.1
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: raster-inference
       # Runs all four parity test categories, including the full-raster
       # Verified-mode leg that is ignored in debug builds (see
       # tests/e2e_checkpoint_parity.rs and docs/parity-gate.md).

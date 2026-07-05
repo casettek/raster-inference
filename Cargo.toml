@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dsl-macros"]
+members = ["crates/dsl-macros", "crates/raster-programs/*"]
 
 [workspace.dependencies]
 # Real raster toolchain, consumed only by program crates under

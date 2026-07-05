@@ -1,0 +1,24 @@
+# WS0 placeholder program crate for the `prompt.prepare` routine.
+#
+# Program crates under crates/raster-programs/ hold real raster tiles and
+# sequences (charter invariant 6: real raster never enters the main crate).
+# This crate is currently a compiling shell proving that the workspace, the
+# pinned `raster` dependency, the no_std lib surface, and the 1.91.1 toolchain
+# build together. Real prompt.prepare tiles land in WS3.
+[package]
+name = "raster-program-prompt-prepare"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "raster-program-prompt-prepare"
+path = "src/main.rs"
+required-features = ["std"]
+
+[features]
+default = ["std"]
+std = ["raster/std"]
+
+[dependencies]
+raster = { workspace = true }
+serde = { workspace = true }
