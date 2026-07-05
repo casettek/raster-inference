@@ -33,8 +33,8 @@ pub use runtime::sequence;
 // Checkpoint taxonomy and trace artifact layer.
 pub use runtime::checkpoints;
 pub use runtime::checkpoints::{
-    classify_checkpoint, CheckpointTaxonomy, PhaseId, RasterDetourController, RasterDetourSpec,
-    RoutineId,
+    classify_checkpoint, CheckpointTaxonomy, DetourBackend, PhaseId, RasterDetourController,
+    RasterDetourSpec, RoutineId,
 };
 pub use runtime::trace;
 

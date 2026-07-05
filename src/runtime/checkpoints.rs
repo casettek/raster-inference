@@ -109,14 +109,44 @@ impl fmt::Display for RoutineId {
     }
 }
 
+/// Which raster backend a detour spec targets.
+///
+/// The sim backend is the in-repo DSL path (`src/dsl/` + per-routine
+/// `raster/` modules); the raster-core backend is the real `raster`
+/// toolchain path (program crates under `crates/raster-programs/`). The
+/// backend never enters committed checkpoint payloads — committed
+/// checkpoints represent logical inference state, not execution backend.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DetourBackend {
+    #[default]
+    Sim,
+    RasterCore,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RasterDetourSpec {
     routine_id: RoutineId,
     occurrence: usize,
+    #[serde(default)]
+    backend: DetourBackend,
 }
 
 impl RasterDetourSpec {
+    /// Parses a sim-backend detour spec (`detour --at` semantics).
     pub fn parse(value: &str) -> anyhow::Result<Self> {
+        Self::parse_with_backend(value, DetourBackend::Sim)
+    }
+
+    /// Parses a raster-core-backend detour spec (`detour --raster-core-at`
+    /// semantics). Identical `routine-id[:occurrence]` grammar as [`parse`].
+    ///
+    /// [`parse`]: Self::parse
+    pub fn parse_raster_core(value: &str) -> anyhow::Result<Self> {
+        Self::parse_with_backend(value, DetourBackend::RasterCore)
+    }
+
+    fn parse_with_backend(value: &str, backend: DetourBackend) -> anyhow::Result<Self> {
         let (routine_id, occurrence) = match value.rsplit_once(':') {
             Some((routine_id, occurrence)) => {
                 if routine_id.is_empty() {
@@ -140,6 +170,7 @@ impl RasterDetourSpec {
         Ok(Self {
             routine_id: routine_id.parse()?,
             occurrence,
+            backend,
         })
     }
 
@@ -149,6 +180,10 @@ impl RasterDetourSpec {
 
     pub fn occurrence(self) -> usize {
         self.occurrence
+    }
+
+    pub fn backend(self) -> DetourBackend {
+        self.backend
     }
 }
 
@@ -301,8 +336,8 @@ pub fn classify_checkpoint(checkpoint_name: &str) -> Option<CheckpointTaxonomy> 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_checkpoint, CheckpointTaxonomy, PhaseId, RasterDetourController, RasterDetourSpec,
-        RoutineId,
+        classify_checkpoint, CheckpointTaxonomy, DetourBackend, PhaseId, RasterDetourController,
+        RasterDetourSpec, RoutineId,
     };
 
     #[test]
@@ -425,6 +460,48 @@ mod tests {
         assert_eq!(spec.routine_id(), RoutineId::PrefillRange);
         assert_eq!(spec.occurrence(), 2);
         assert_eq!(spec.to_string(), "prefill.range:2");
+    }
+
+    #[test]
+    fn raster_detour_spec_parse_defaults_to_sim_backend() {
+        let spec = RasterDetourSpec::parse("prefill.range:2").expect("spec should parse");
+        assert_eq!(spec.backend(), DetourBackend::Sim);
+    }
+
+    #[test]
+    fn raster_core_detour_spec_parses_every_routine_id() {
+        for routine_id in RoutineId::ALL {
+            let spec = RasterDetourSpec::parse_raster_core(routine_id.as_str())
+                .expect("raster-core spec should parse for every routine id");
+            assert_eq!(spec.routine_id(), routine_id);
+            assert_eq!(spec.occurrence(), 1);
+            assert_eq!(spec.backend(), DetourBackend::RasterCore);
+        }
+    }
+
+    #[test]
+    fn raster_core_detour_spec_parses_occurrence_suffix() {
+        let spec =
+            RasterDetourSpec::parse_raster_core("prefill.range:3").expect("spec should parse");
+        assert_eq!(spec.routine_id(), RoutineId::PrefillRange);
+        assert_eq!(spec.occurrence(), 3);
+        assert_eq!(spec.backend(), DetourBackend::RasterCore);
+        assert_eq!(spec.to_string(), "prefill.range:3");
+    }
+
+    #[test]
+    fn raster_core_detour_spec_rejects_unknown_routine_and_bad_occurrence() {
+        let unknown = RasterDetourSpec::parse_raster_core("not.a_routine")
+            .expect_err("unknown routine id should fail");
+        assert!(unknown.to_string().contains("unknown routine id"));
+
+        let zero = RasterDetourSpec::parse_raster_core("prefill.range:0")
+            .expect_err("zero occurrence should fail");
+        assert!(zero.to_string().contains("greater than zero"));
+
+        let non_numeric = RasterDetourSpec::parse_raster_core("prefill.range:abc")
+            .expect_err("non-numeric occurrence should fail");
+        assert!(non_numeric.to_string().contains("positive integer"));
     }
 
     #[test]

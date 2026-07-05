@@ -9,8 +9,9 @@ use raster_inference::shared::model::runtime::LoadedModel;
 use raster_inference::{
     challenger, claimer, detour, load_chat_template, load_gemma_tokenizer_spec_from_path,
     load_tokenizer_from_path, load_transformer_state_model_from_det_num_wgt_path, protocol, trace,
-    AuditOutcome, AuthenticatedGemmaTokenizer, ClaimerOptions, ClaimerRunOutcome, ExecutionTuning,
-    InferenceRequest, ModelSpec, RasterDetourSpec, SamplingConfig, TextDecodingPolicy,
+    AuditOutcome, AuthenticatedGemmaTokenizer, ClaimerOptions, ClaimerRunOutcome, DetourBackend,
+    ExecutionTuning, InferenceRequest, ModelSpec, RasterDetourSpec, SamplingConfig,
+    TextDecodingPolicy,
 };
 use serde::Deserialize;
 
@@ -88,10 +89,21 @@ struct DetourArgs {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// Routine occurrence to execute at raster (tile) level, e.g.
-    /// prefill.range:2
+    /// Routine occurrence to execute at raster (tile) level on the sim DSL
+    /// backend, e.g. prefill.range:2
+    #[arg(
+        long,
+        value_name = "ROUTINE[:OCC]",
+        required_unless_present = "raster_core_at",
+        conflicts_with = "raster_core_at"
+    )]
+    at: Option<String>,
+
+    /// Routine occurrence to execute on the real raster toolchain
+    /// (raster-core) backend, e.g. prompt.prepare or prefill.range:2.
+    /// Mutually exclusive with --at.
     #[arg(long, value_name = "ROUTINE[:OCC]")]
-    at: String,
+    raster_core_at: Option<String>,
 
     /// Print verbose routine and tile execution logs to stderr
     #[arg(long)]
@@ -163,11 +175,28 @@ fn run_claim(args: ClaimArgs) -> Result<ExitCode> {
 }
 
 fn run_detour(args: DetourArgs) -> Result<ExitCode> {
-    let spec = RasterDetourSpec::parse(&args.at)?;
+    let spec = match (&args.at, &args.raster_core_at) {
+        (Some(at), None) => RasterDetourSpec::parse(at)?,
+        (None, Some(at)) => RasterDetourSpec::parse_raster_core(at)?,
+        _ => unreachable!("clap enforces exactly one of --at and --raster-core-at"),
+    };
+    // Interim guard until the raster-core backend is threaded through the
+    // detour controller: reject before execution with the same wording the
+    // controller will use.
+    if spec.backend() == DetourBackend::RasterCore {
+        anyhow::bail!(
+            "selective raster-core detour for {} is not implemented yet",
+            spec
+        );
+    }
     let ctx = RunContext::prepare(&args.common)?;
     eprintln!(
-        "detour: model {}, raster routine {}:{}",
+        "detour: model {}, {} routine {}:{}",
         ctx.model.model_spec().model_id,
+        match spec.backend() {
+            DetourBackend::Sim => "raster",
+            DetourBackend::RasterCore => "raster-core",
+        },
         spec.routine_id(),
         spec.occurrence()
     );
@@ -560,8 +589,73 @@ mod tests {
         let Command::Detour(args) = cli.command else {
             panic!("expected detour subcommand");
         };
-        assert_eq!(args.at, "prefill.range:2");
+        assert_eq!(args.at.as_deref(), Some("prefill.range:2"));
+        assert!(args.raster_core_at.is_none());
         assert!(args.trace_tiles);
+    }
+
+    #[test]
+    fn detour_parses_raster_core_at() {
+        let cli = parse(&[
+            "raster-inference",
+            "detour",
+            "--model",
+            "assets/tiny-gemma-dev",
+            "--raster-core-at",
+            "prefill.range:2",
+            "hello",
+        ]);
+        let Command::Detour(args) = cli.command else {
+            panic!("expected detour subcommand");
+        };
+        assert_eq!(args.raster_core_at.as_deref(), Some("prefill.range:2"));
+        assert!(args.at.is_none());
+    }
+
+    #[test]
+    fn detour_parses_raster_core_at_equals_form() {
+        let cli = parse(&[
+            "raster-inference",
+            "detour",
+            "--model",
+            "assets/tiny-gemma-dev",
+            "--raster-core-at=prompt.prepare",
+            "hello",
+        ]);
+        let Command::Detour(args) = cli.command else {
+            panic!("expected detour subcommand");
+        };
+        assert_eq!(args.raster_core_at.as_deref(), Some("prompt.prepare"));
+    }
+
+    #[test]
+    fn detour_rejects_at_combined_with_raster_core_at() {
+        let error = Cli::try_parse_from([
+            "raster-inference",
+            "detour",
+            "--model",
+            "assets/tiny-gemma-dev",
+            "--at",
+            "prefill.range",
+            "--raster-core-at",
+            "prefill.range",
+            "hello",
+        ])
+        .expect_err("--at and --raster-core-at should conflict");
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn detour_requires_a_target_flag() {
+        let error = Cli::try_parse_from([
+            "raster-inference",
+            "detour",
+            "--model",
+            "assets/tiny-gemma-dev",
+            "hello",
+        ])
+        .expect_err("detour without a target should fail");
+        assert!(error.to_string().contains("--at"));
     }
 
     #[test]
