@@ -1,3 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/dsl-macros"]
+
+[workspace.dependencies]
+# Real raster toolchain, consumed only by program crates under
+# crates/raster-programs/ (never by the main crate — see charter invariant 6).
+# Local builds use the sibling checkout; CI checks it out at the pinned rev
+# declared as RASTER_PIN in .github/workflows/ci.yml. The pin-bump procedure
+# is documented in the migration ADR.
+raster = { path = "../raster/crates/raster", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
 [package]
 name = "raster-inference"
 version = "0.1.0"
