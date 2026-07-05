@@ -14,6 +14,7 @@ use crate::RasterSizingControls;
 
 pub mod native;
 pub mod raster;
+pub mod raster_core;
 
 pub fn run(decode_state: DecodeState, tokenizer: &Tokenizer) -> Result<OutputDecodeState> {
     let _routine = crate::trace::routine_scope(

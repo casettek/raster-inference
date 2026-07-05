@@ -11,6 +11,7 @@ use crate::shared::model::transformer::{ActivationSequence, Gemma4TransformerMod
 
 pub mod native;
 pub mod raster;
+pub mod raster_core;
 
 use self::raster::auth_source::AuthenticatedDecoderEmbeddingSource;
 

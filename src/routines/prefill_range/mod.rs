@@ -20,6 +20,7 @@ use self::raster::utils::{
 
 pub mod native;
 pub mod raster;
+pub mod raster_core;
 
 pub(crate) fn range_bounds(
     token_count: usize,

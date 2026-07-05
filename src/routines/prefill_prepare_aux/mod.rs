@@ -16,6 +16,7 @@ use crate::RasterSizingControls;
 
 pub mod native;
 pub mod raster;
+pub mod raster_core;
 
 pub fn run(
     prompt_token_ids: &[u32],

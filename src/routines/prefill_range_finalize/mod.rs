@@ -4,6 +4,7 @@ use crate::runtime::checkpoints::RoutineId;
 use crate::shared::model::transformer::{ActivationSequence, LayerKvCache};
 
 pub mod raster;
+pub mod raster_core;
 
 pub(crate) struct PrefillRangeFinalizeCheckpoint<'a> {
     pub execution_mode: Option<&'a str>,

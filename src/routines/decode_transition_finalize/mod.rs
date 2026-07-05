@@ -8,6 +8,7 @@ use crate::RasterSizingControls;
 
 pub mod native;
 pub mod raster;
+pub mod raster_core;
 
 use self::raster::auth_source::AuthenticatedDecoderDecodeTransitionSource;
 
