@@ -1,0 +1,6 @@
+# Pinned to match the `raster` toolchain workspace (see
+# docs/plans/ws0-implementation-plan.md). Bumps are deliberate, ADR-noted acts;
+# the parity gate is the acceptance test for any bump.
+[toolchain]
+channel = "1.91.1"
+components = ["rustfmt", "clippy"]

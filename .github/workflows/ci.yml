@@ -17,7 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain version and components come from rust-toolchain.toml
+      # (pinned to match the `raster` workspace).
+      - uses: dtolnay/rust-toolchain@1.91.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -36,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.1
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
         run: cargo test
@@ -46,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.1
       - uses: Swatinem/rust-cache@v2
       # Runs all four parity test categories, including the full-raster
       # Verified-mode leg that is ignored in debug builds (see
