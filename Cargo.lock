@@ -2708,6 +2708,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "raster-program-gemma-externals"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "raster",
+ "raster-program-support",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "raster-program-prompt-prepare"
 version = "0.1.0"
 dependencies = [

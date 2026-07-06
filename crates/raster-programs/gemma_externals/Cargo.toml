@@ -1,0 +1,44 @@
+# Gemma committed-external schemas and encoder (WS2).
+#
+# NOT a routine. Holds the Selectable schema for the Gemma tokenizer
+# committed external (WS1 catalog rows C13/C22) — shared by the
+# `prompt.prepare` and `output.finalize` routines' program crates in WS3 —
+# and the offline encoder that raster-encodes a HuggingFace tokenizer.json
+# into a content-addressed cache (`.rastered` + `.rindex`, mmap staging).
+#
+# Schema provenance: the raster-tokenizer PoC's `GemmaTokenizer` shape, the
+# authoring idiom the WS1 catalog verified end-to-end. Accepted risk (WS2
+# ruling, docs/plans/ws2-staging.md): prompt.prepare's WS3 Phase A plan may
+# revise this schema; revisions re-run this crate's determinism tests and
+# the tokenizer-external round trip.
+[package]
+name = "raster-program-gemma-externals"
+version = "0.1.0"
+edition = "2021"
+default-run = "raster-program-gemma-externals"
+
+# Smoke program: binds the tokenizer external and selects through the
+# schema, proving the encoded artifact is loadable end-to-end. Driven by
+# tests/raster_core_gemma_tokenizer_external.rs in the main crate.
+[[bin]]
+name = "raster-program-gemma-externals"
+path = "src/main.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "encode"
+path = "bin/encode.rs"
+required-features = ["encode"]
+
+[features]
+default = ["std"]
+std = ["raster/std", "dep:raster-program-support"]
+encode = ["std", "dep:serde_json", "dep:sha2", "dep:anyhow"]
+
+[dependencies]
+raster = { workspace = true }
+serde = { workspace = true }
+raster-program-support = { path = "../_support", optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+anyhow = { version = "1", optional = true }

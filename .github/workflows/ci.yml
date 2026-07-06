@@ -112,6 +112,10 @@ jobs:
         run: cargo build -p raster-program-roundtrip --features encode
       - name: round-trip fixture no_std surface check
         run: cargo check -p raster-program-roundtrip --no-default-features
+      - name: gemma externals crate builds against pinned raster
+        run: cargo build -p raster-program-gemma-externals --features encode
+      - name: gemma externals crate no_std surface check
+        run: cargo check -p raster-program-gemma-externals --no-default-features
 
   parity-gate:
     name: Determinism parity gate (release)
