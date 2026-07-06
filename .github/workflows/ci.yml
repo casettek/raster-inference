@@ -87,10 +87,11 @@ jobs:
         run: cargo test
         env:
           REQUIRE_CARGO_RASTER: "1"
-      # WS0 exit criterion: the placeholder program crate builds against the
-      # pinned real `raster` dependency, including its no_std surface.
-      - name: program crates build against pinned raster
-        run: cargo build -p raster-program-prompt-prepare
+      # WS3: the prompt.prepare program crate (real routine tiles) builds
+      # and tests against the pinned real `raster` dependency, including its
+      # no_std surface.
+      - name: prompt.prepare program crate tests
+        run: cargo test -p raster-program-prompt-prepare
       - name: program crates no_std surface check
         run: cargo check -p raster-program-prompt-prepare --no-default-features
       # WS1: the probe crate (not a routine; see

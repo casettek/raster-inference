@@ -344,3 +344,66 @@ Added coverage:
 - `crates/raster-programs/gemma_externals/` — tokenizer schema + encoder
 - `crates/raster-programs/_roundtrip/` — output-file idiom
 - `raster-tokenizer` — authoring idiom only
+
+---
+
+## Port notes (Phase B outcome, 2026-07-06)
+
+Landed as planned; the deviation register above (D1–D9) is the final list —
+no additional deviations were needed during implementation. Catalog
+amendments A1/A2 were folded into WS1 rows C2/C4/C7 with a dated §9 entry.
+The tokenizer external schema shipped unrevised (WS2 §7 accepted-risk clause
+not triggered; §11 note added).
+
+**Verification results:**
+
+- Program crate: 26 unit tests green; builds under the pinned toolchain
+  including the `--no-default-features` no_std surface (CI-checked, plus a
+  `cargo test -p raster-program-prompt-prepare` CI step).
+- Dev run (`tests/raster_core_prompt_prepare_detour.rs`, CI-gated with
+  `REQUIRE_CARGO_RASTER=1`): full native vs raster-core detour at
+  `prompt.prepare:1` on tiny-gemma-dev — committed checkpoint traces
+  identical (11 committed checkpoints, `SHORT_PROMPT` with 2 decode steps),
+  final inference states equal. Staged-input commitments (tokenizer raster
+  root, `initial_pieces`/`bpe_config` sha256) are captured on the run result
+  by `StagedInputs::write` → `ingest` (exit criterion 3).
+- Full suite + parity gate + goldens green at every commit; goldens
+  byte-identical to baseline (never regenerated).
+
+**Things the next routine's port should know:**
+
+1. **A1/A2 shape rules dominate the tile map.** Decide early which loop
+   state seeds from a literal vs which context rides `args`; fallibility
+   lives only in plain tiles, so plan one "surface deferred errors" tile per
+   loop chain (here: `finalize_tokenize_prompt`).
+2. **`call!` marker resolution needs glob imports** of every module that
+   defines a called tile/sequence (`use crate::<mod>::*;`) — same
+   convention as the probe crate; named imports fail to resolve the hidden
+   `__RasterTileCallBinding_*` types.
+3. **Reused bindings must be cloned.** `call_recur!`'s `args = (…)` moves
+   its bindings; `round.clone()` / `iteration.clone()` where a context
+   feeds both the loop and the follow-up tile.
+4. **Tile fns need an active sequence scope even when driven natively** —
+   unit tests wrap direct tile calls in
+   `raster::__private::SequenceScopeGuard::enter(…)`.
+5. **The unimplemented-detour reject test** in `tests/inference_sequence.rs`
+   now skips migrated routines
+   (`run_inference_rejects_raster_core_detours_for_unmigrated_routines`);
+   each WS3 port adds its routine to that skip in the same change that wires
+   its decision point.
+6. **Program-crate run artifacts need a crate-local `.gitignore`**
+   (`/target`) before the first `cargo raster run` — the root `.gitignore`
+   only covers the workspace `target/`.
+7. **Encoder-cache helper:** `output.finalize` consumes the same tokenizer
+   external; lift `encode_tokenizer_external_cached` from this routine's
+   `raster_core/mod.rs` into `src/runtime/raster_core/` when that port
+   starts (WS2 §11 note).
+
+**WS4 handoff.** `prompt.prepare` is ready for the parity-leg flip: append
+`("prompt.prepare", 1)` to `ENABLED_ROUTINES` in
+`tests/raster_core_detour_parity.rs`. The dev-run comparison the harness
+should absorb is `tests/raster_core_prompt_prepare_detour.rs` — it already
+mirrors the harness's trace-capture and identity-assertion helpers
+(divergence named by checkpoint id + occurrence) and adds final-output
+equality; once the harness leg is on, the standalone test can be folded in
+or retired at WS4's discretion.

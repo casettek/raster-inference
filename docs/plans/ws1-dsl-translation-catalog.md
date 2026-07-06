@@ -91,7 +91,7 @@ loops) and `src/dsl/runtime.rs` (invocation counting, `External<T>`). The
 | Real-raster mapping | `#[tile(kind = recur)]` with `input: RecurInput<T>` first param, then optional `RecurState<S>` / `RecurOutput<Schema>`, returning the matching mode's type or `RecurControl<…>` — **plus a structural rewrite** from condition-driven to list-driven iteration (H2) |
 | Status | verified (mapping); the *rewrite obligation* is recorded as gap G1 |
 | Evidence | P1 (run R1: `scan_max` 8 iterations over the full list, `sum_with_break` stopped after 3 of 8 via `Break`, `until_done_bounded` converged after 5 of 8); `raster/crates/raster/tests/recur_draft.rs` |
-| Porting rule | Rewrite each sim recur tile as `#[tile(kind = recur)]`: the sim's loop-carried state struct becomes `RecurState<S>`; the sim's `done` boolean becomes `RecurControl::Break`/`Continue` (or plain return = implicit Continue); the iteration source becomes an explicit `AuthRef<Vec<T>>` list (see G1 for constructing the bound). Do **not** use `#[tile(recur)]` — key/value form only. |
+| Porting rule | Rewrite each sim recur tile as `#[tile(kind = recur)]`: the sim's loop-carried state struct becomes `RecurState<S>`; the sim's `done` boolean becomes `RecurControl::Break`/`Continue` (or plain return = implicit Continue); the iteration source becomes an explicit `AuthRef<Vec<T>>` list (see G1 for constructing the bound). Do **not** use `#[tile(recur)]` — key/value form only. **Recur tiles are infallible** (WS3 finding A1, 2026-07-06): `ProtocolReturnKind` has no fallible recur variants and the shape validators reject `Result` returns (compile-fail `recur_tile_invalid_return.rs`). Sim fallible recur tiles defer in-loop guard errors through a state `error: Option<String>` field, surfaced as the terminal `Err` by the first fallible plain tile after the loop (H4 preserved: deterministic message, committed outcome). |
 | Notes | Real recur tiles cannot be invoked with `call!` for looping — `call!` on a recur tile is a single invocation. The spelling difference sim `kind = recursive` vs real `kind = recur` is intentional; catalog treats them as the same author intent. |
 
 ### C3. `#[sequence]`
@@ -117,7 +117,7 @@ loops) and `src/dsl/runtime.rs` (invocation counting, `External<T>`). The
 | Real-raster mapping | `#[sequence(kind = recur)]` with `RecurSequenceInput<T>` / `RecurSequenceState<S>` / `RecurSequenceOutput<Schema>` params, driven by `call_recur_seq!(sequence = …, input = …, …)` |
 | Status | verified (mapping); rewrite obligation shared with G1 |
 | Evidence | P1 (run R1: `per_item_pipeline` recur sequence orchestrated tiles per item, state threaded); `raster/crates/raster/tests/recur_draft.rs:304-415` |
-| Porting rule | The sim's `(bool, State)` continuation becomes a real recur sequence over an explicit list. **Constraint (real):** recur sequences have no `RecurControl` — they always run all items (`run_recur_sequence_list*`, `raster/crates/raster/src/input.rs:2045-2193`) and `RecurSequenceInput`/`State`/`Output` are opaque inside the sequence body (values only touchable in tiles). Early termination must therefore live inside the per-item tiles (no-op remaining iterations), or the loop must be restructured as a recur *tile*. See G1. |
+| Porting rule | The sim's `(bool, State)` continuation becomes a real recur sequence over an explicit list. **Constraint (real):** recur sequences have no `RecurControl` — they always run all items (`run_recur_sequence_list*`, `raster/crates/raster/src/input.rs:2045-2193`) and `RecurSequenceInput`/`State`/`Output` are opaque inside the sequence body (values only touchable in tiles). Early termination must therefore live inside the per-item tiles (no-op remaining iterations), or the loop must be restructured as a recur *tile*. See G1. **Recur sequence bodies are also infallible** (A1): the return must be the threaded state/output handle, so `?` is unavailable — errors thread through state like recur tiles. **Body idiom** (A2, first exercised by the prompt.prepare port): pass the opaque state into tiles as an ordinary argument (`RecurSequenceState<T>: IntoAuthValue<T>`, `input.rs:1501`); the final tile's `AuthRef` return re-enters the threaded state (`From<AuthRef<T>> for RecurSequenceState<T>`, `input.rs:1516`). |
 | Notes | The four sim sites are layer/PLE/BPE loops. Layer loops have static bounds (layer_count) → list of layer indices. The BPE loop's bound is data-dependent (see G1). |
 
 ### C5. `call_tile!`
@@ -156,7 +156,7 @@ loops) and `src/dsl/runtime.rs` (invocation counting, `External<T>`). The
 | Real-raster mapping | `call_recur!(tile = …, input = <list>, state = <initial>, args = (context…,))` — state-only recur mode |
 | Status | verified (mechanics); rewrite obligation G1 |
 | Evidence | P1 (run R1: state threading across iterations, Break honored, state materialized after loop); `recur_draft.rs` `count_seen_until_limit` |
-| Porting rule | Sim initial state expr → `state = <expr>` (struct literal allowed). Trailing context args → `args = (…,)` with **owned** values (clone or re-`select!`; borrowed `&T` context is G3/H3). Supply `input =` an explicit list that bounds the iteration (G1). Sim `done` → `RecurControl::Break(state)` at the equivalent point; otherwise `Continue(state)`. |
+| Porting rule | Sim initial state expr → `state = <expr>` (struct literal allowed). Trailing context args → `args = (…,)` with **owned** values (clone or re-`select!`; borrowed `&T` context is G3/H3). Supply `input =` an explicit list that bounds the iteration (G1). Sim `done` → `RecurControl::Break(state)` at the equivalent point; otherwise `Continue(state)`. **Initial state must be a plain value** (WS3 finding A2, 2026-07-06): the generated drivers take `state: impl Into<RecurState<S>>` and only `From<T>` exists (`input.rs:374`) — a tile-produced `AuthRef<S>` cannot seed a loop. Seed from a literal (first-iteration init inside the tile where state derives from staged inputs) and move heavy read-only context to `args = (…)`, which materialize once per recur site. |
 | Notes | Sim loops carry rich state structs (cursors + roots + config). These stay as the `RecurState<S>` type; per-iteration chunk indices can come from the input list instead of a cursor field where natural. |
 
 ### C8. `call_recur_tile!` — pair-state form
@@ -535,7 +535,7 @@ still `mapped-unverified` or gapped for that routine.
 
 | Routine id | WS3-ready? | Blocking rows / conditions |
 |---|---|---|
-| `prompt.prepare` | **conditionally** | G1 restructuring ruling for the BPE merge loop (C9) — restructure approved in §6/G1; C13 data layout (tokenizer external) is WS2 work with a proven idiom (raster-tokenizer). No unverified *mechanism* blocks it. |
+| `prompt.prepare` | **ported (WS3, 2026-07-06)** | Port landed per `src/routines/prompt_prepare/raster_core/PORT_PLAN.md`; dev-run trace identity verified (`tests/raster_core_prompt_prepare_detour.rs`). Findings A1/A2 folded into C2/C4/C7. |
 | `input.embedding` | conditionally | C22 (weights external staging, WS2); C15/C16 rewrite is mechanical. Pair-state recur (C8) fold rule applies. |
 | `prefill.prepare_aux` | conditionally | C30 (kernel helpers split), C22 (PLE source staging, WS2) |
 | `prefill.range` | conditionally | C30 (largest kernel surface), C27 (chunk-shape decisions), C29 (crate pairing with `prefill.range_finalize`) |
@@ -720,6 +720,19 @@ Staged inputs and run artifacts are gitignored within the probe crate.
   evidence; C33 (CFS source-layout constraint) added from a Phase B discovery;
   G1 resolution (bounded-list restructuring) approved as the catalog ruling
   for until-done loops.
+- **2026-07-06** — WS3 `prompt.prepare` port landed (first WS3 routine; plan
+  and deviation register: `src/routines/prompt_prepare/raster_core/PORT_PLAN.md`).
+  Two authoring constraints confirmed from the pinned `raster` source and
+  folded into rows C2/C4/C7 in place: **A1** — recur tiles and recur
+  sequences are infallible (`raster-macros` `ProtocolReturnKind` has no
+  fallible recur variants); in-loop guard errors defer through a state
+  `error` field and surface at the next fallible plain tile. **A2** — recur
+  initial state must be a plain value (drivers take
+  `impl Into<RecurState<S>>`, only `From<T>` exists); conversely
+  `RecurSequenceState<T>: IntoAuthValue<T>` makes the opaque threaded state
+  a legal tile argument and `From<AuthRef<T>>` lets a tile's return re-enter
+  it — the recur-sequence body idiom. §5 readiness row updated; G1's
+  canonical case (the BPE merge loop) is now port-proven.
 - **2026-07-06** — WS2 landed (`docs/plans/ws2-staging.md`); the rows that
   deferred to "WS2 scope" now have concrete owners. C13/C22 (per-source data
   layout, borrowed-source staging): `StagedInputs` +

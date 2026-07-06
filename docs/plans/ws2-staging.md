@@ -153,7 +153,7 @@ Committed-external encoders that **exist now**:
 
 | External | Crate | Consuming routines |
 |---|---|---|
-| Gemma tokenizer (`GemmaTokenizer` schema: metadata, decoder metadata, sorted token/merge lookups, dense id table, special tokens) | `crates/raster-programs/gemma_externals/` | `prompt.prepare`, `output.finalize` |
+| Gemma tokenizer (`GemmaTokenizer` schema: metadata, decoder metadata, sorted token/merge lookups, dense id table, special tokens) | `crates/raster-programs/gemma_externals/` | `prompt.prepare` (WS3-consumed, schema unrevised), `output.finalize` |
 
 Schema provenance: the raster-tokenizer PoC shape, the idiom WS1 verified
 for exactly this data (C13). **Accepted risk (WS2 ruling):** `prompt.prepare`'s
@@ -227,6 +227,16 @@ never happen silently there (`.github/workflows/ci.yml`).
 
 ## 11. Amendment log
 
+- **2026-07-06** — WS3 `prompt.prepare` landed as the first consumer of this
+  surface. The §7 accepted-risk clause was not triggered: the tokenizer
+  schema shipped unrevised. One convention addition: the routine's host
+  adapter resolves the tokenizer cache entry on demand — content-addressed
+  hit check first (§3 cache convention), `cargo run`-subprocess encoder on a
+  miss — with the cache root defaulting to
+  `$TMPDIR/raster-inference-gemma-external-cache` and overridable via
+  `RASTER_CORE_EXTERNAL_CACHE` (`src/routines/prompt_prepare/raster_core/`).
+  When `output.finalize`'s WS3 port needs the same entry, lift the helper
+  into `src/runtime/raster_core/` rather than duplicating it.
 - **2026-07-06** — Initial version: staging builder, runner hardening,
   ingestion + `RasterCoreError`, `raster-program-support`, round-trip
   fixture + CI gating, Gemma tokenizer committed external. Discovery
