@@ -23,6 +23,8 @@
 //! Ingestion (WS2+) must validate the produced artifacts instead of trusting
 //! the CLI exit code.
 
+pub mod staging;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +39,17 @@ pub const INPUT_FILE_NAME: &str = "input.json";
 pub const INPUT_MANIFEST_FILE_NAME: &str = "input_manifest.json";
 /// File name for the trace commitment artifact produced by `--commit`.
 pub const COMMIT_FILE_NAME: &str = "commit.bin";
+/// File name for the program's materialized output value (WS2 convention:
+/// the program writes `postcard(Result<T, String>)` here — see
+/// [`OUTPUT_PATH_ENV`]).
+pub const OUTPUT_FILE_NAME: &str = "output.bin";
+/// Environment variable through which the host hands the guest program its
+/// output-file path. `cargo raster run` has no result channel of its own
+/// (values live only in the raster-formatted trace, which the main crate
+/// cannot decode without a `raster` dependency), so the program's
+/// `#[sequence] fn main()` materializes its result and writes it to this
+/// path via the `raster-program-support` helper.
+pub const OUTPUT_PATH_ENV: &str = "RASTER_CORE_OUTPUT_PATH";
 
 /// A fresh, uniquely named run directory for one raster-core routine
 /// invocation, holding the staged inputs and the commit artifact.
@@ -82,6 +95,10 @@ impl RasterCoreRunDir {
 
     pub fn commit_path(&self) -> PathBuf {
         self.root.join(COMMIT_FILE_NAME)
+    }
+
+    pub fn output_path(&self) -> PathBuf {
+        self.root.join(OUTPUT_FILE_NAME)
     }
 }
 
@@ -184,6 +201,7 @@ mod tests {
             .input_manifest_path()
             .ends_with("input_manifest.json"));
         assert!(run_dir.commit_path().ends_with("commit.bin"));
+        assert!(run_dir.output_path().ends_with("output.bin"));
 
         let second = RasterCoreRunDir::create(RoutineId::PromptPrepare, 2)
             .expect("second run dir should be created");
