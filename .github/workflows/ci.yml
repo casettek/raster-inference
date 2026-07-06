@@ -78,6 +78,14 @@ jobs:
         run: cargo build -p raster-program-prompt-prepare
       - name: program crates no_std surface check
         run: cargo check -p raster-program-prompt-prepare --no-default-features
+      # WS1: the probe crate (not a routine; see
+      # docs/plans/ws1-dsl-translation-catalog.md §7) follows the same
+      # program-crate conventions. Probe *runs* are manual and documented in
+      # the catalog; CI only builds the crate.
+      - name: probe crate builds against pinned raster
+        run: cargo build -p raster-ws1-probes
+      - name: probe crate no_std surface check
+        run: cargo check -p raster-ws1-probes --no-default-features
 
   parity-gate:
     name: Determinism parity gate (release)

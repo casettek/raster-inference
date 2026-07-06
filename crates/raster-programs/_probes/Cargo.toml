@@ -1,0 +1,35 @@
+# WS1 probe program crate.
+#
+# NOT a routine. Each probe is a minimal tile/sequence exercising exactly one
+# translation-catalog mapping (docs/plans/ws1-dsl-translation-catalog.md, §7),
+# executed via `cargo raster run` against staged inputs. This crate appears in
+# no routine host, guard-test list, or parity-harness enumeration; it exists
+# only as re-runnable evidence for catalog rows.
+[package]
+name = "raster-ws1-probes"
+version = "0.1.0"
+edition = "2021"
+default-run = "raster-ws1-probes"
+
+[[bin]]
+name = "raster-ws1-probes"
+path = "src/main.rs"
+required-features = ["std"]
+
+# Host-side input staging (writes input.json / input_manifest.json and the
+# committed payload files). Mirrors the tokenizer-PoC `encode_tokenizer` idiom.
+[[bin]]
+name = "stage"
+path = "bin/stage.rs"
+required-features = ["stage"]
+
+[features]
+default = ["std"]
+std = ["raster/std"]
+stage = ["std", "dep:serde_json", "dep:sha2"]
+
+[dependencies]
+raster = { workspace = true }
+serde = { workspace = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
