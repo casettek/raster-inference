@@ -2724,6 +2724,8 @@ name = "raster-program-prompt-prepare"
 version = "0.1.0"
 dependencies = [
  "raster",
+ "raster-program-gemma-externals",
+ "raster-program-support",
  "serde",
 ]
 

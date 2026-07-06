@@ -6,7 +6,7 @@
 //! WS2/WS3 scope.
 
 use raster::prelude::*;
-use raster_program_prompt_prepare::*;
+use raster_program_prompt_prepare::placeholder::*;
 
 #[sequence]
 fn main() {

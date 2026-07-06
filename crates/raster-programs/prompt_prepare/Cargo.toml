@@ -1,10 +1,10 @@
-# WS0 placeholder program crate for the `prompt.prepare` routine.
+# Program crate for the `prompt.prepare` routine (WS3).
 #
 # Program crates under crates/raster-programs/ hold real raster tiles and
 # sequences (charter invariant 6: real raster never enters the main crate).
-# This crate is currently a compiling shell proving that the workspace, the
-# pinned `raster` dependency, the no_std lib surface, and the 1.91.1 toolchain
-# build together. Real prompt.prepare tiles land in WS3.
+# The sim path (src/routines/prompt_prepare/raster/) is the logical
+# specification; the port plan lives at
+# src/routines/prompt_prepare/raster_core/PORT_PLAN.md.
 [package]
 name = "raster-program-prompt-prepare"
 version = "0.1.0"
@@ -17,8 +17,16 @@ required-features = ["std"]
 
 [features]
 default = ["std"]
-std = ["raster/std"]
+std = [
+    "raster/std",
+    "raster-program-gemma-externals/std",
+    "dep:raster-program-support",
+]
 
 [dependencies]
 raster = { workspace = true }
 serde = { workspace = true }
+# Selectable schema types for the Gemma tokenizer committed external (WS2).
+raster-program-gemma-externals = { path = "../gemma_externals", default-features = false }
+# Output-file convention (WS2 §4), host boundary only.
+raster-program-support = { path = "../_support", optional = true }

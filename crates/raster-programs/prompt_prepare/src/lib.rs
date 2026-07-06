@@ -1,11 +1,13 @@
-//! WS0 placeholder library for the `prompt.prepare` program crate.
+//! Real-raster program for the `prompt.prepare` routine (WS3).
 //!
-//! Tiles authored here follow the real-raster constraints (no_std + alloc,
-//! free functions, serde-compatible types, `raster::exec::Result<T>` String
-//! errors). The placeholder tile below exists only to prove the build; the
-//! real `prompt.prepare` tile set is WS3 scope, re-expressed from the sim
-//! path (`src/routines/prompt_prepare/raster/`), which remains the logical
-//! specification.
+//! Ported from the sim specification (`src/routines/prompt_prepare/raster/`
+//! in the main crate) per the port plan
+//! (`src/routines/prompt_prepare/raster_core/PORT_PLAN.md`). Tiles follow
+//! the real-raster constraints: no_std + alloc, free functions,
+//! serde-compatible owned types, `raster::exec::Result<T>` String errors.
+//!
+//! Layout constraint (WS1 catalog C33): tiles and sequences live one module
+//! per file; this root only declares modules.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -14,14 +16,6 @@ extern crate std;
 
 extern crate alloc;
 
-use alloc::string::String;
-use raster::prelude::*;
-
-/// WS0 placeholder tile; replaced by the real prompt.prepare tiles in WS3.
-#[tile]
-pub fn placeholder_echo_prompt(prompt: String) -> Result<String> {
-    if prompt.is_empty() {
-        return Err(String::from("prompt must not be empty"));
-    }
-    Ok(prompt)
-}
+pub mod budgets;
+pub mod placeholder;
+pub mod types;
