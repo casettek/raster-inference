@@ -103,10 +103,27 @@ impl RasterCoreRunDir {
 }
 
 /// Output of one `cargo raster run` invocation.
+///
+/// `run_artifacts_dir` and `trace_path` are parsed from the CLI's stdout
+/// banner (`Run artifacts dir: …` / `Trace path: …`) — the only mechanism
+/// the CLI offers for discovering which `target/raster/runs/<run-id>/`
+/// directory an invocation created. `None` when the banner was absent
+/// (e.g. the CLI failed before creating run artifacts).
 #[derive(Debug)]
 pub struct CargoRasterRunOutput {
     pub stdout: String,
     pub stderr: String,
+    pub run_artifacts_dir: Option<PathBuf>,
+    pub trace_path: Option<PathBuf>,
+}
+
+/// Extracts the path following `prefix` on any stdout line.
+fn parse_stdout_path(stdout: &str, prefix: &str) -> Option<PathBuf> {
+    stdout.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix(prefix)
+            .map(|rest| PathBuf::from(rest.trim()))
+    })
 }
 
 /// Subprocess wrapper for the real toolchain's `cargo raster run`.
@@ -138,6 +155,12 @@ impl CargoRasterRunner {
     /// Runs `cargo raster run --backend native` for the program crate at
     /// `program_crate_dir` against the staged inputs in `run_dir`, writing
     /// the trace commitment to the run directory's commit path.
+    ///
+    /// The trace is always requested as ndjson (`--trace-format json`) so
+    /// ingestion can validate run structure with plain `serde_json` — the
+    /// binary trace format is raster-internal postcard the main crate must
+    /// not depend on. The guest program inherits [`OUTPUT_PATH_ENV`] pointing
+    /// at the run directory's output path.
     pub fn run(
         &self,
         program_crate_dir: &Path,
@@ -154,6 +177,9 @@ impl CargoRasterRunner {
             .arg(run_dir.input_manifest_path())
             .arg("--commit")
             .arg(run_dir.commit_path())
+            .arg("--trace-format")
+            .arg("json")
+            .env(OUTPUT_PATH_ENV, run_dir.output_path())
             .current_dir(program_crate_dir)
             .output()
             .map_err(|error| {
@@ -182,7 +208,14 @@ impl CargoRasterRunner {
                 stderr,
             );
         }
-        Ok(CargoRasterRunOutput { stdout, stderr })
+        let run_artifacts_dir = parse_stdout_path(&stdout, "Run artifacts dir:");
+        let trace_path = parse_stdout_path(&stdout, "Trace path:");
+        Ok(CargoRasterRunOutput {
+            stdout,
+            stderr,
+            run_artifacts_dir,
+            trace_path,
+        })
     }
 }
 
@@ -213,6 +246,24 @@ mod tests {
 
         std::fs::remove_dir_all(run_dir.root()).ok();
         std::fs::remove_dir_all(second.root()).ok();
+    }
+
+    #[test]
+    fn run_banner_paths_are_parsed_from_stdout() {
+        let stdout = "Raster Run\n  Project: fixture\n  Run ID: 001-pid1-000001\n  \
+                      Run artifacts dir: /tmp/target/raster/runs/001\n  \
+                      Trace path: /tmp/target/raster/runs/001/trace.ndjson\n";
+        assert_eq!(
+            super::parse_stdout_path(stdout, "Run artifacts dir:"),
+            Some(std::path::PathBuf::from("/tmp/target/raster/runs/001"))
+        );
+        assert_eq!(
+            super::parse_stdout_path(stdout, "Trace path:"),
+            Some(std::path::PathBuf::from(
+                "/tmp/target/raster/runs/001/trace.ndjson"
+            ))
+        );
+        assert_eq!(super::parse_stdout_path(stdout, "Commit path:"), None);
     }
 
     #[test]
