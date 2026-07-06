@@ -70,8 +70,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: raster-inference
+      # WS2: the staging round-trip test drives `cargo raster run` and is
+      # mandatory in CI (REQUIRE_CARGO_RASTER below prevents a silent skip).
+      # The CLI binary is cached keyed on the pinned raster rev; a pin bump
+      # rebuilds it.
+      - name: cache cargo-raster CLI
+        id: cache-cargo-raster
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-raster
+          key: cargo-raster-${{ env.RASTER_PIN }}-1.91.1
+      - name: install cargo-raster from the pinned checkout
+        if: steps.cache-cargo-raster.outputs.cache-hit != 'true'
+        run: cargo install --path ../raster/crates/raster-cli --locked
       - name: cargo test
         run: cargo test
+        env:
+          REQUIRE_CARGO_RASTER: "1"
       # WS0 exit criterion: the placeholder program crate builds against the
       # pinned real `raster` dependency, including its no_std surface.
       - name: program crates build against pinned raster
@@ -86,6 +101,17 @@ jobs:
         run: cargo build -p raster-ws1-probes
       - name: probe crate no_std surface check
         run: cargo check -p raster-ws1-probes --no-default-features
+      # WS2 crates: the output-helper lib (with its unit tests), the
+      # round-trip fixture, and their no_std surfaces
+      # (docs/plans/ws2-staging.md).
+      - name: support crate tests
+        run: cargo test -p raster-program-support
+      - name: support crate no_std surface check
+        run: cargo check -p raster-program-support --no-default-features
+      - name: round-trip fixture builds against pinned raster
+        run: cargo build -p raster-program-roundtrip --features encode
+      - name: round-trip fixture no_std surface check
+        run: cargo check -p raster-program-roundtrip --no-default-features
 
   parity-gate:
     name: Determinism parity gate (release)

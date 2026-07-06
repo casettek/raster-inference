@@ -110,10 +110,19 @@ impl RasterCoreRunDir {
 /// the CLI offers for discovering which `target/raster/runs/<run-id>/`
 /// directory an invocation created. `None` when the banner was absent
 /// (e.g. the CLI failed before creating run artifacts).
+///
+/// `cli_success` records the CLI's exit status for debugging only — it is
+/// meaningless for run-outcome decisions in *both* directions: the CLI
+/// exits `0` when the guest program fails (ADR gap G4), and it can exit
+/// non-zero for failures that ingestion must still classify (e.g. the CLI
+/// panics building a trace commitment after a guest integrity rejection
+/// leaves the trace shorter than the verification window). Ingestion
+/// validates the produced artifacts instead.
 #[derive(Debug)]
 pub struct CargoRasterRunOutput {
     pub stdout: String,
     pub stderr: String,
+    pub cli_success: bool,
     pub run_artifacts_dir: Option<PathBuf>,
     pub trace_path: Option<PathBuf>,
 }
@@ -200,20 +209,25 @@ impl CargoRasterRunner {
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if !output.status.success() {
-            anyhow::bail!(
-                "cargo raster run failed with {} for program crate {}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                program_crate_dir.display(),
-                stdout,
-                stderr,
-            );
-        }
-        let run_artifacts_dir = parse_stdout_path(&stdout, "Run artifacts dir:");
-        let trace_path = parse_stdout_path(&stdout, "Trace path:");
+        // A non-zero CLI exit is *not* an error here: run-outcome
+        // classification belongs to ingestion, which validates artifacts
+        // (see `CargoRasterRunOutput::cli_success`).
+        // Banner paths are printed relative to the CLI's working directory
+        // (the program crate); resolve them so callers can read them from
+        // any cwd.
+        let resolve = |path: PathBuf| {
+            if path.is_absolute() {
+                path
+            } else {
+                program_crate_dir.join(path)
+            }
+        };
+        let run_artifacts_dir = parse_stdout_path(&stdout, "Run artifacts dir:").map(resolve);
+        let trace_path = parse_stdout_path(&stdout, "Trace path:").map(resolve);
         Ok(CargoRasterRunOutput {
             stdout,
             stderr,
+            cli_success: output.status.success(),
             run_artifacts_dir,
             trace_path,
         })

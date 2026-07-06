@@ -1,0 +1,35 @@
+# WS2 staging round-trip fixture program crate.
+#
+# NOT a routine. A minimal real-raster program exercising the full WS2 loop —
+# stage committed inputs (one postcard external, one raster-encoded external),
+# run via `cargo raster run`, hand the materialized result back through the
+# output-file convention — driven end-to-end by
+# tests/raster_core_staging_roundtrip.rs in the main crate. It appears in no
+# routine host, guard-test list, or parity-harness enumeration.
+[package]
+name = "raster-program-roundtrip"
+version = "0.1.0"
+edition = "2021"
+default-run = "raster-program-roundtrip"
+
+[[bin]]
+name = "raster-program-roundtrip"
+path = "src/main.rs"
+required-features = ["std"]
+
+# Offline encoder for the raster-encoded external (tokenizer-PoC idiom):
+# writes config.rastered + config.rindex and prints the root commitment.
+[[bin]]
+name = "encode"
+path = "bin/encode.rs"
+required-features = ["encode"]
+
+[features]
+default = ["std"]
+std = ["raster/std", "dep:raster-program-support"]
+encode = ["std"]
+
+[dependencies]
+raster = { workspace = true }
+serde = { workspace = true }
+raster-program-support = { path = "../_support", optional = true }

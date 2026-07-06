@@ -52,6 +52,11 @@ toml = "1.1.2"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# WS2 round-trip test only: asserts the host and program halves of the
+# output-file convention agree on the env var. Carries no `raster`
+# dependency (charter invariant 6 concerns the real toolchain, which never
+# enters the main crate's dependency graph).
+raster-program-support = { path = "crates/raster-programs/_support" }
 
 [[bench]]
 name = "det_inference"

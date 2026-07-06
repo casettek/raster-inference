@@ -234,6 +234,7 @@ mod tests {
             CargoRasterRunOutput {
                 stdout: stdout.to_string(),
                 stderr: stderr.to_string(),
+                cli_success: true,
                 run_artifacts_dir: Some(self.run_dir.root().to_path_buf()),
                 trace_path: Some(self.trace_path.clone()),
             }

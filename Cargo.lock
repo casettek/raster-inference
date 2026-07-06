@@ -2687,6 +2687,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "postcard",
+ "raster-program-support",
  "rayon",
  "safetensors",
  "serde",
@@ -2711,6 +2712,15 @@ name = "raster-program-prompt-prepare"
 version = "0.1.0"
 dependencies = [
  "raster",
+ "serde",
+]
+
+[[package]]
+name = "raster-program-roundtrip"
+version = "0.1.0"
+dependencies = [
+ "raster",
+ "raster-program-support",
  "serde",
 ]
 
