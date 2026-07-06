@@ -720,3 +720,20 @@ Staged inputs and run artifacts are gitignored within the probe crate.
   evidence; C33 (CFS source-layout constraint) added from a Phase B discovery;
   G1 resolution (bounded-list restructuring) approved as the catalog ruling
   for until-done loops.
+- **2026-07-06** — WS2 landed (`docs/plans/ws2-staging.md`); the rows that
+  deferred to "WS2 scope" now have concrete owners. C13/C22 (per-source data
+  layout, borrowed-source staging): `StagedInputs` +
+  `crates/raster-programs/gemma_externals/` (tokenizer schema/encoder built;
+  weight-family externals deferred to their routines' WS3 plans per the WS2
+  encoder scope split). C18 (host-side staging of native values):
+  `StagedInputs::add_postcard`/`add_raster_encoded`. C19 (roots into
+  payloads → post-run commitment extraction): `ingest` captures the input
+  commitment map and the commit-artifact fingerprint; the WS5 payload
+  contract remains pending as recorded. C23 (H4 error contract): realized as
+  `RasterCoreError { Infrastructure, Terminal, Verification }` with
+  test-asserted classification, including the ruling that an undecodable
+  staged input is infrastructure. C25 (zero-arg `main` + staged inputs):
+  the output-file half of the interface is the `raster-program-support`
+  convention. G4 re-confirmed and extended: the CLI can also exit non-zero
+  (trace-commitment panic on guest integrity rejection), so exit status is
+  unusable in both directions; ingestion validates artifacts.
