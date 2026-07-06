@@ -87,13 +87,14 @@ impl ExecutionPolicy {
         }
     }
 
-    /// The clean unimplemented error for the currently selected raster-core
-    /// detour target (used by call sites that observe [`StepMode::RasterCore`]).
-    pub fn raster_core_unimplemented_error(&self) -> anyhow::Error {
+    /// The clean unimplemented error for the currently selected detour
+    /// target, worded per backend (used by call sites that observe a
+    /// [`StepMode`] with no implementation on the current path).
+    pub fn selected_detour_unimplemented_error(&self) -> anyhow::Error {
         let spec = self
             .controller
             .selected_spec()
-            .expect("raster-core step mode requires an active detour spec");
+            .expect("unimplemented detour step modes require an active detour spec");
         crate::runtime::checkpoints::unimplemented_detour_error(spec)
     }
 

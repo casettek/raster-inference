@@ -52,14 +52,37 @@ pub(crate) struct NativePromptPrepared {
 
 /// Native `prompt.prepare`, including the deterministic CPU checkpoint
 /// emission used to anchor raster detours of later routines.
+///
+/// With `raster_core_detour` set, the prompt preparation state is computed
+/// by the routine's raster-core host adapter (real toolchain) instead of
+/// `prompt_prepare::run`; everything downstream — including the checkpoint
+/// formatter and the committed value-form payload — is shared with the
+/// native leg, which is the backend-invariance rule made mechanical (the
+/// detour cannot commit a payload native would not).
 pub(crate) fn run_prompt_prepare(
     request: &InferenceRequest,
     model: &LoadedModel,
     controls: &InferenceControls,
+    raster_core_detour: bool,
+    raster_sizing_controls: Option<&RasterSizingControls>,
 ) -> Result<ControlFlow<InferenceRunOutcome, NativePromptPrepared>> {
     let model_spec = model.model_spec();
     let tokenizer = model.tokenizer();
-    let prompt_preparation = prompt_prepare::run(request, model_spec, tokenizer)?;
+    let prompt_preparation = if raster_core_detour {
+        let tokenizer_source = model.raster_tokenizer().context(
+            "selective raster-core prompt.prepare detour requires raster tokenizer capability",
+        )?;
+        let raster_sizing =
+            raster_sizing_controls.expect("raster sizing controls should be validated");
+        prompt_prepare::raster_core::run_raster_core(
+            request,
+            model_spec,
+            tokenizer_source,
+            raster_sizing,
+        )?
+    } else {
+        prompt_prepare::run(request, model_spec, tokenizer)?
+    };
     let mut raster_checkpoint_roots = None;
     let mut raster_checkpoint_state = None;
     if controls.raster_tokenizer_enabled {

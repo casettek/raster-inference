@@ -87,7 +87,6 @@ pub fn run(
 
             let result = (|| {
                 // --- prompt.prepare ---
-                policy.reject_if_selected_unsupported(RoutineId::PromptPrepare)?;
                 let (
                     prompt_preparation,
                     raster_prompt_preparation_for_embedding,
@@ -107,7 +106,23 @@ pub fn run(
                         ),
                     }
                 } else {
-                    match native::run_prompt_prepare(request, model, controls)? {
+                    let raster_core_detour = match policy.mode_for(RoutineId::PromptPrepare) {
+                        // No sim detour call site exists for prompt.prepare
+                        // (pre-WS3 behavior preserved: a selected sim spec
+                        // fails as unimplemented at this decision point).
+                        StepMode::Raster => {
+                            return Err(policy.selected_detour_unimplemented_error())
+                        }
+                        StepMode::RasterCore => true,
+                        StepMode::Native => false,
+                    };
+                    match native::run_prompt_prepare(
+                        request,
+                        model,
+                        controls,
+                        raster_core_detour,
+                        raster_sizing_controls.as_ref(),
+                    )? {
                         ControlFlow::Break(outcome) => return Ok(outcome),
                         ControlFlow::Continue(prepared) => (
                             prepared.prompt_preparation,
@@ -136,7 +151,7 @@ pub fn run(
                             (token_embeddings, Some(output))
                         }
                         StepMode::RasterCore => {
-                            return Err(policy.raster_core_unimplemented_error());
+                            return Err(policy.selected_detour_unimplemented_error());
                         }
                         StepMode::Native => native::run_input_embedding(
                             &prompt_preparation.prompt_token_ids,

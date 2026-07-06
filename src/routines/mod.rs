@@ -84,7 +84,7 @@ mod tests {
     /// host must expose exactly one `pub fn run_raster_core(` entrypoint in
     /// its `raster_core/` module; an unmigrated host must expose none. Flip a
     /// routine into this list in the same change that lands its migration.
-    const RASTER_CORE_MIGRATED: &[&str] = &[];
+    const RASTER_CORE_MIGRATED: &[&str] = &["prompt_prepare"];
 
     #[test]
     fn raster_hosts_expose_one_public_run_raster_entrypoint() {

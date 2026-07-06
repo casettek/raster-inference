@@ -812,7 +812,7 @@ fn run_inference_rejects_full_raster_with_raster_detour() {
 }
 
 #[test]
-fn run_inference_rejects_raster_core_detour_for_every_routine() {
+fn run_inference_rejects_raster_core_detours_for_unmigrated_routines() {
     let tokenizer = test_tokenizer();
     let model = test_model_spec();
     let transformer_fixture = deterministic_no_ple_model_fixture();
@@ -833,6 +833,12 @@ fn run_inference_rejects_raster_core_detour_for_every_routine() {
     };
 
     for routine_id in RoutineId::ALL {
+        // Migrated routines (WS3) dispatch to their raster-core host
+        // adapters instead of rejecting; their detour behavior is covered
+        // by the per-routine dev-run verification tests.
+        if routine_id == RoutineId::PromptPrepare {
+            continue;
+        }
         raster_inference::shared::artifacts::artifact_io::ArtifactIo::reset_store();
         let error = run_inference_with_controls(
             &request,
