@@ -2715,6 +2715,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "raster-program-support"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "raster-prover"
 version = "0.1.0"
 dependencies = [

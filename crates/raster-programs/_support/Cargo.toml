@@ -1,0 +1,20 @@
+# Shared host-boundary support for raster-core program crates.
+#
+# NOT a routine. Provides the WS2 output-file convention: a program's
+# `#[sequence] fn main()` materializes its result and hands it back to the
+# raster-inference host through the path in RASTER_CORE_OUTPUT_PATH (see
+# src/runtime/raster_core/ in the main crate, and docs/plans/ws2-staging.md).
+# The lib keeps an empty no_std surface under --no-default-features so
+# program-crate guest builds are unaffected.
+[package]
+name = "raster-program-support"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = ["postcard/use-std"]
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
