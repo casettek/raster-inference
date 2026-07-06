@@ -16,6 +16,9 @@ extern crate std;
 
 extern crate alloc;
 
+pub mod bpe_apply;
+pub mod bpe_round;
+pub mod bpe_scan;
 pub mod budgets;
 pub mod placeholder;
 pub mod types;
