@@ -259,7 +259,7 @@ visible in checkpoint payloads.
 | Real-raster mapping | Committed **external input** + `select!`: the source's entry set (request-key → payload, cf. `committed_source_entries()`, `tokenizer.rs:431-478`) becomes a committed external (rastered file + manifest sha256/commitment); each `auth_read(source, request)` becomes `select!(Output, external.entry[key-path])` or a tile-internal lookup on a selected sub-structure |
 | Status | mapped-unverified → **verified for the mechanism** (external + select with commitment verification, P3); per-source data layout is WS2 scope |
 | Evidence | P3 (run R1 + tamper run R2: byte-flipped external rejected); `raster-tokenizer` PoC (`src/tokenizer.rs` lookup tiles over selected `Vec<GemmaTokenIdEntry>`) |
-| Porting rule | Each authenticated source becomes one committed external with a `Selectable` schema. Point lookups (token id by string, merge by pair) that sim served via hashed request keys become either (a) `select!` by index after a tile computes the index (binary search over a sorted entry list — the tokenizer-PoC idiom), or (b) whole-substructure selection + in-tile scan for small tables (metadata, scalars). The choice is per-source and belongs to the routine's WS3 plan; the catalog constraint is only that every read is commitment-checked (external selection proof) — never ambient. **Model-scoped data placement (2026-07-06 amendment, from the prompt.prepare storage refactor; refined the same day by the trace-slimming refactor):** model-scoped tables enter tiles *only* as pre-chunked lists consumed via **recur sequences** — the external stores `Vec<Vec<Entry>>` (encode-time chunk width), the loop is a `#[sequence(kind = recur)]` over the chunk list, and each iteration passes the opaque item handle plus the threaded state into one plain per-chunk tile, which receives the chunk as an external-selection binding (materialized only at tile execution; ~100B commitment + selector in the trace). Big tables must never ride recur `args` or loop state (the generated recur drivers materialize `args` inside the per-iteration closure), and chunk loops must not be recur *tiles* (their drivers trace each iteration's materialized input and args inline — gap G7). Idiom (a)'s whole-table selection is thereby restricted to prompt/request-scoped data; point lookups over chunked tables are linear chunk scans that no-op after resolution (recur sequences cannot `Break` — G1's bounded full pass is the accepted cost, G7's upstream request would restore `Break`). |
+| Porting rule | Each authenticated source becomes one committed external with a `Selectable` schema. Point lookups (token id by string, merge by pair) that sim served via hashed request keys become either (a) `select!` by index after a tile computes the index (binary search over a sorted entry list — the tokenizer-PoC idiom), or (b) whole-substructure selection + in-tile scan for small tables (metadata, scalars). The choice is per-source and belongs to the routine's WS3 plan; the catalog constraint is only that every read is commitment-checked (external selection proof) — never ambient. **Model-scoped data placement (2026-07-06 amendment, from the prompt.prepare storage refactor; refined the same day by the trace-slimming refactor):** model-scoped tables enter tiles *only* as pre-chunked lists consumed via **recur sequences** — the external stores `Vec<Vec<Entry>>` (encode-time chunk width), the loop is a `#[sequence(kind = recur)]` over the chunk list, and each iteration passes the opaque item handle plus the threaded state into one plain per-chunk tile, which receives the chunk as an external-selection binding (materialized only at tile execution; ~100B commitment + selector in the trace). Big tables must never ride recur `args` or loop state (the generated recur drivers materialize `args` inside the per-iteration closure), and chunk loops must not be recur *tiles* (their drivers trace each iteration's materialized input and args inline — gap G7). Idiom (a)'s whole-table selection is thereby restricted to prompt/request-scoped data; point lookups over chunked tables are linear chunk scans that no-op after resolution (recur sequences cannot `Break` — G1's bounded full pass is the accepted cost, G7's upstream request would restore `Break`). **Prompt-scoped data placement (2026-07-07 amendment, from the prompt.prepare storage-resident refactor):** prompt-derived collections follow the same storage discipline — see the §9 entry for the seven-rule statement (staged externals / drafts / tile-output store; authenticated reads only; the single characterized loop-state exception). |
 | Notes | The `raster-tokenizer` PoC demonstrates idiom (a) end-to-end for exactly the Gemma tokenizer data. WS2 owns producing the committed files; the in-tile residue is `select!` + lookup tiles. Chunked-input evidence: `prompt_prepare` storage + trace-slimming refactors (schema v2 round-trip through the real toolchain; test-only probe module `crates/raster-programs/prompt_prepare/src/chunk_probes.rs` for nested `Vec<Vec<T>>` selection, chunked recur `Break`, recur-sequence chunk-handle + state into one tile, and nested recur sequences). See also G6 (select-by-computed-index would upgrade the linear chunk scan to a point read — an optimization, never a blocker) and G7. |
 
 ### C14. `impl AuthRead<…> for str` (root-string sources)
@@ -820,3 +820,39 @@ Staged inputs and run artifacts are gitignored within the probe crate.
   convention. G4 re-confirmed and extended: the CLI can also exit non-zero
   (trace-commitment panic on guest integrity rejection), so exit status is
   unusable in both directions; ingestion validates artifacts.
+- **2026-07-07** — `prompt.prepare` storage-resident refactor (PORT_PLAN
+  deviations D15–D17; D6 re-founded on probe-P1 findings). The C13 rule
+  gains its prompt-scoped counterpart: the following seven rules are the
+  **general tile-to-tile rule for prompt-scoped data**, with
+  `raster-tokenizer` commit `86be87b` (large collections do not ride
+  recur-tile args; pre-expanded probes + `args = ()`) and the sim path's
+  builder/root ownership model (pieces behind artifact roots, per-leaf
+  reads, builder appends) as the twin references. (1) No prompt-derived
+  collection ever accumulates in recur state — no growing `Vec` in
+  `RecurState` or `RecurSequenceState` at any nesting level; loops that
+  produce collections write them through `RecurOutput` drafts, and only
+  draft ops cross the ABI. (2) No prompt-derived collection rides context
+  structs or args into per-chunk or per-item tiles, except as a
+  selection-bound `AuthRef` arg on a *plain* tile called from a
+  recur-sequence body (an authenticated read, traced as a binding) —
+  never in recur-*tile* input items or args (G7: those trace inline per
+  iteration); recur-tile loops carry scalars only. (3) Loops that consume
+  collections take them as recur input lists (one item per iteration, as
+  a selection handle) or as rule-2 selection-bound args on plain tiles.
+  (4) A loop-carried collection threading recur-sequence state is
+  storage-backed between iterations at the pinned rev (tile-output store
+  + authenticated resolve) but traced inline per iteration — a
+  characterized, per-case documented exception (PORT_PLAN D6), not a
+  license. (5) Model-scoped tables keep the 2026-07-06 rule unchanged:
+  chunked committed-external recur-sequence inputs, one chunk per tile
+  execution, never whole in any tile's args or state. (6) Ordered
+  program outputs materialize once, in the terminal fallible tile at the
+  program boundary. (7) Inefficiency is accepted — full no-op passes
+  under G1, per-item iteration, repeated authenticated reads of the same
+  prompt-scoped value; simplicity and verifiability win, and algorithmic
+  semantics are never changed to optimize. Evidence: probes P1–P4 in
+  `crates/raster-programs/prompt_prepare/src/chunk_probes.rs` (re-runnable),
+  the structural guards in `.../guards.rs` (source-scan + trace-shape),
+  and the routine's dev-run trace-identity gate. G6 stands as the named
+  unlock for keyed lookups over prompt-scoped sets (PORT_PLAN D17); G7
+  unchanged.

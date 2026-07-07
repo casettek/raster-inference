@@ -321,17 +321,20 @@ Added coverage:
 | D3 | Until-done BPE round loop → bounded round list (`initial_piece_count − 1`) with no-op continuation after convergence | G1 approved ruling; recur sequences cannot `Break` (C4) |
 | D4 | Fallible recur tiles → infallible recur tiles with deferred `error: Option<String>` state fields, surfaced by the next fallible plain tile | A1: recur returns cannot be `Result` at the pinned rev; H4 preserved (terminal `Err` still committed, deterministic message) |
 | D5 | `tokenize_bpe_state` sequence not ported | test-only entry; program tests drive the parameterized routine sequence natively (C25 idiom) |
-| D6 | Builder/read ladder (`bpe-pieces-N` artifacts, token-ids builder) → pieces and ids carried inline in loop state/args | C15/C16 note: the sim's pair of (small state + store artifacts) collapses to state once roots dissolve; every value still rides the trace (state serialized per iteration, args materialized per site). `Draft` reserved for select-from-finalized needs, which this routine no longer has — its sole output is the materialized token-id vector. Trace-size cost noted for WS8 (`[MEASUREMENT-PENDING]`) |
+| D6 | **Re-founded by the storage-resident refactor (2026-07-07; original rationale superseded by D15/D16).** The single surviving inline crossing is the loop-carried pieces in `GemmaBpeLoopState` — retained because the pinned rev's recur-sequence state threading is **storage-backed between iterations**: the round-finalize tile's returned state persists in internal storage via the tile-output store (`bind_infallible_call` → `store_execution_output_value`, `raster/src/lib.rs:393-409`) and re-enters the threaded state through an authenticated resolve (`From<AuthRef<T>> for RecurSequenceState<T>` → `resolve_internal_value`, which validates the coordinates lookup, stored-vs-reference commitment equality, and a recomputed integrity commitment over the stored bytes — `raster-runtime/src/internal_storage.rs:350-414`; tampered commitments are rejected). Measured trace form at the boundary (probe P1, `chunk_probes.rs`): the driver holds the resolved state in memory across the iteration boundary and each iteration's `RecurSequenceStart` records it as `FnInputValue::Inline` — full postcard bytes, no binding metadata (`raster-macros/src/lib.rs:550-559`) — so per-iteration record size scales linearly with the carried pieces (a 64×32-byte seed inflates the state record to ≥2,048 bytes; asserted by `p1_state_traces_inline_per_iteration_and_scales_with_pieces`). The same inline form covers the state's entry into the round's first tile (`open_round`), since `RecurSequenceState<T>: IntoAuthValue<T>` produces an inline auth value. This is a documented, justified exception on the trace-form side, not a waiver of storage residency; every other pieces crossing moved to drafts, selections, and bindings (D15/D16) |
 | D6a | `finalize_bpe_tokenize_prompt` folded into `init_token_id_finalization` | the sim tile was a trivial state-to-output cast whose output type dissolves with D6 |
 | D7 | `auth_read(tokenizer, …Request)` → in-tile binary search over selected `token_lookup` / `merge_lookup` | **superseded by D10/D11** (storage refactor): whole-table selection dragged the model-scoped tables through recur `args`, re-materializing ~262k entries per chunk iteration |
 | D7b | Merged token taken from the scan candidate instead of a separate `GemmaBpeMergedTokenRequest` read | **superseded by D11** (the merged token now comes from the winning `GemmaBpeMerge` rule itself) |
 | D8 | `finalize_raster_prompt_preparation` not ported | its output is the checkpoint payload, which is host-side by the backend-invariance rule (§4); the native formatter emits it on both legs |
-| D9 | New `build_chunk_budgets` tile (no sim analogue) | G1 bound-list obligation + hoisted zero-width guards (sim's per-tile `bail!`s), kept fallible in one place. Storage refactor: only `rounds` and `apply_chunks` remain — the chunked model tables and the final pieces list are their own bounded recur inputs |
+| D9 | New `build_chunk_budgets` tile (no sim analogue) | G1 bound-list obligation + hoisted zero-width guards (sim's per-tile `bail!`s), kept fallible in one place. Storage refactor: only `rounds` and `apply_chunks` remain — the chunked model tables and the final pieces list are their own bounded recur inputs. **Storage-resident refactor (2026-07-07):** only `rounds` remains and the tile is infallible — the apply loop recurs over the round's own pieces, so the per-tile widths, `BpeConfig`, the `bpe_config` staged input, and the zero-width guards (with their sim-parity messages) are deleted end to end; the piece count comes from the new one-shot `count_pieces` authenticated read of the staged `BpePieces` external |
 | D10 | **Chunked-external idiom (storage refactor, supersedes D7's data placement).** Model-scoped tables enter tiles *only* as pre-chunked committed-external recur input lists: `token_lookup_chunks` / `merge_chunks` (`Vec<Vec<Entry>>`, encode-time width 1024), one chunk (~30–50KB) per tile execution — never materialized tile `args`, never loop state | ZKVM sizing for real Gemma: the generated recur drivers materialize `args` inside the per-iteration closure, so any table in `args` re-enters the tile ABI/trace on every iteration. Recur *input* items are per-iteration selections instead. WS1 C13/C22 amended with this rule. **Loop mechanism superseded by D13** (recur-tile inputs still traced inline per iteration; chunk loops became recur sequences) — the chunked-external schema and the "never args/state" rule stand |
 | D11 | **Priority-order scan (supersedes D7/D7b).** Per round, the scan recurs over `merge_chunks` in priority order; the first rule with an adjacent-pair occurrence in the round's pieces wins (lowest `merge_index` globally, leftmost pair) and breaks. The pair-keyed `merge_lookup` table is deleted from the external schema | equivalent to the sim's min-rank/earliest-pair selection (unit-proven against the sim fixture cases); dissolves the only consumer of `merge_lookup`, halving the external's derived data. A converged round pays one full table pass; the `complete` flag makes later rounds break on the first chunk |
 | D12 | **Draft-accumulated token ids (amends D6).** Token-id resolution is a nested loop — outer recur *sequence* over the final pieces (its own natural bound), inner recur *tile* over `token_lookup_chunks` (`Break` on match or past the sorted position) — with ids/misses accumulated in a `TokenIdsBundle` draft output, not loop state | **superseded by D14** (trace-slimming refactor): the recur-*tile* inner loop still inlined each vocab chunk per iteration (G7), and the per-piece nesting paid `pieces × chunks` iterations. D6's original rationale stands; the mechanism moved |
 | D13 | **Chunk loops are recur sequences (trace-slimming refactor, supersedes D10's recur-tile inputs).** Model-scoped chunk loops are `#[sequence(kind = recur)]` over the chunked table; each iteration passes the opaque item handle (`RecurSequenceInput<Vec<Entry>>`) plus the threaded state into one plain tile, so the chunk crosses the tile ABI as an external-selection binding (~100B commitment + selector) and materializes only at tile execution | recur-*tile* drivers trace each iteration's materialized input *and* re-materialized `args` inline (`RecurTileIterationExec` — gap G7): 86KB merge chunks / 34–50KB vocab chunks per iteration, 94% of the real-model trace. Plain-tile `AuthRef` args already trace as bindings; recur-sequence item handles are selection `AuthRef`s — combining the two is the fix. Cost: no `Break` in recur sequences (G1), so every round pays a full no-op pass after the winner (accepted; WS8 chunk-width retuning + the G7 upstream request are the mitigations) |
-| D14 | **Inverted single vocab pass (supersedes D12).** One recur sequence over `token_lookup_chunks`; per chunk, `resolve_pieces_in_vocab_chunk` binary-searches every still-unresolved piece against the chunk, filling a per-piece slot vector (`GemmaTokenResolutionState { initialized, resolved: Vec<Option<u32>> }` — prompt-scoped, seeds from a literal per A2, sizes itself from the context on the first iteration; no-ops once all pieces resolve). The per-piece machinery (`resolve_piece_token_ids`, `open_piece_lookup`, `lookup_piece_token_id`, `record_piece_token_id`, `TokenIdsBundle`, `GemmaVocabLookupState`) is deleted; `GemmaTokenIdContext` is no longer `Selectable` (nothing selects its pieces) and its deferred error reverts to `Option<String>` | one full pass over the vocab chunks for the whole prompt (256 iterations) replaces `pieces × chunks` nested iterations, and every chunk crosses as a selection binding (D13 rule). `finalize_tokenize_prompt` surfaces the first unresolved slot with the sim's exact missing-vocab message via `ctx.pieces[i]` (H4/A1 preserved) |
+| D14 | **Inverted single vocab pass (supersedes D12).** One recur sequence over `token_lookup_chunks`; per chunk, `resolve_pieces_in_vocab_chunk` binary-searches every still-unresolved piece against the chunk, filling a per-piece slot vector (`GemmaTokenResolutionState { initialized, resolved: Vec<Option<u32>> }` — prompt-scoped, seeds from a literal per A2, sizes itself from the context on the first iteration; no-ops once all pieces resolve). The per-piece machinery (`resolve_piece_token_ids`, `open_piece_lookup`, `lookup_piece_token_id`, `record_piece_token_id`, `TokenIdsBundle`, `GemmaVocabLookupState`) is deleted; `GemmaTokenIdContext` is no longer `Selectable` (nothing selects its pieces) and its deferred error reverts to `Option<String>` | one full pass over the vocab chunks for the whole prompt (256 iterations) replaces `pieces × chunks` nested iterations, and every chunk crosses as a selection binding (D13 rule). `finalize_tokenize_prompt` surfaces the first unresolved slot with the sim's exact missing-vocab message via `ctx.pieces[i]` (H4/A1 preserved). **State mechanism superseded by D16** (append-only draft; single-pass orientation stands) |
+| D15 | **Draft-accumulated round pieces (storage-resident refactor, supersedes the apply legs of D6/D9).** Each round's next pieces accumulate in a fresh `RecurOutput<BpePieces>` draft — the real-raster form of the sim's `bpe-pieces-{N+1}` builder — through a recur *sequence* over the round's own pieces (a `select!` projection of `open_round`'s output; not a recur tile — P4/G7). The per-iteration plain tile (`apply_one_piece`) threads cursor-only state `{skip_next, emitted}` plus the draft through a single `(RecurState<S>, RecurOutput<O>)` return; the piece arrives through the input handle, the decision scalars (`GemmaBpeApplyDecision { skip, merge_piece_idx, merged }`) as an internal binding. `open_round` republishes the round's pieces behind the selectable `BpePieces` root (the deferred error flattens to `(has_error, error)` scalars — `Option` has no `Selectable` schema, G3); `finalize_round` reconstructs the `Option<String>` convention, keeps the sim's range and count checks with their exact messages (H4), and carries the incoming pieces forward unchanged on skip/no-selection rounds — never the empty draft. The pieces-carrying `GemmaBpeRoundContext`/`GemmaBpeMergeDecision`/`GemmaBpeIterationContext`/`GemmaBpeApplyState` structs are deleted; `apply_chunks` and the per-tile widths die with them | the storage-residency invariant: prompt-derived collections persist in raster storage (staged external, tile-output store, finalized drafts) and cross the tile ABI only as authenticated reads — draft ops, input-handle selections, `select!` projections, selection-bound args — with the single P1-characterized loop-state exception (D6). Probe P2 pinned the exact driver surface (fresh draft created and finalized inside a recur-sequence body iteration over a `select!` projection input list; finalized ref consumed via `select!` and as a binding arg; re-entry into the outer threaded state) |
+| D16 | **Append-only token-id matches (supersedes D14's state mechanism, keeps its single-pass orientation).** The vocab pass is an output-only recur sequence appending `TokenIdMatch { piece_idx, token_id }` entries into a `RecurOutput<TokenIdMatches>` draft per chunk — no threaded resolution state. `init_token_id_finalization` becomes the first fallible plain tile after the BPE loop (A1): it surfaces the deferred loop error and republishes the final pieces behind the selectable `BpePieces` root; the per-chunk tile takes the chunk via the input handle, the final pieces as a selection-bound arg (repeated authenticated reads accepted — inefficiency over cleverness), and the draft. The terminal `finalize_tokenize_prompt(matches, final_pieces)` materializes both at the program boundary (the only place ordered token ids materialize for the host), orders by `piece_idx`, errors on conflicting duplicate matches (defensive — the sorted vocab resolves each piece in exactly one chunk; new deterministic message `token-id finalization found conflicting ids for piece {idx}`) and on the first unresolved piece with the sim's exact missing-vocab message. `GemmaTokenIdContext` and `GemmaTokenResolutionState` dissolve; the structurally unreachable `token-id finalization stopped at piece …` completion check dies with them | no prompt-derived collection threads through recur state in the token phase; the matches persist in the draft (internal storage) and the ids materialize once. The deferred BPE-loop error now surfaces *before* the vocab pass instead of after it — identical committed `Err` string, program-internal trace order differs (behavioral gate unaffected) |
+| D17 | **Whole-pairs authenticated read in the scan (permitted rule-2 crossing).** `build_pairs` derives the round's adjacent-pair list (`GemmaBpeAdjacentPairs`) as its own internal ref from the `select!`-ed round pieces; the per-chunk scan tile takes it as a selection-bound arg and materializes the full prompt-scoped pair set at execution, matching rules by leftmost occurrence in the pair list (D11's priority orientation stands). A separate tile rather than a fold into `open_round`: keeps the opened round free of derived data and each tile at one job | gap **G6** (computed-key selection) is the named unlock for the sim's keyed-lookup orientation — with it, the scan could select individual pairs by computed index instead of materializing the set; until then the whole-pairs binding read is the pinned-rev shape (an authenticated read, traced as a binding, prompt-bounded) |
 
 ## Measurements
 
@@ -550,3 +553,185 @@ per-iteration inputs/args in the trace) filed with the upstream request
 "trace recur-tile inputs as selection bindings"; G6 unchanged. WS2
 untouched (no schema/encoder change; cache kind stays
 `gemma-tokenizer-v2`).
+
+---
+
+## Storage-resident refactor (2026-07-07)
+
+Third restructuring pass (stage stays WS3; pinned rev unchanged — the
+program adapts to it). The trace-slimming refactor moved model-scoped
+chunks and cross-tile contexts to bindings, but prompt-derived collections
+still accumulated in recur state (`GemmaBpeApplyState.output`,
+`GemmaTokenResolutionState.resolved`) and rode context structs into
+per-chunk/per-item tiles (`GemmaBpeRoundContext.pieces`,
+`GemmaBpeMergeDecision.pieces`, `GemmaBpeIterationContext.pieces`,
+`GemmaTokenIdContext.pieces`). This refactor ports the sim's ownership
+model — pieces behind artifact roots, per-leaf reads, builder appends —
+onto real raster storage. Deviations D15–D17 (register above) supersede
+the apply/token legs of D6/D9/D14; D6 is re-founded on the probe-P1
+findings. Behavior is unchanged; the dev-run trace-identity gate
+(`tests/raster_core_prompt_prepare_detour.rs`) stayed green at every
+commit, as did the full suite and the no_std surface.
+
+**The invariant this refactor enforces:** prompt-derived data persists in
+raster storage across every tile boundary and every recur iteration —
+staged committed externals, and internal storage populated by tile outputs
+and finalized `RecurOutput` drafts. Tiles materialize prompt data only
+through authenticated reads: committed-external selections, input-handle
+selections, `select!` projections, and selection-bound `AuthRef` args on
+plain tiles called from recur-sequence bodies. No prompt-derived
+collection accumulates in recur state (the P1-characterized loop-carried
+pieces are the single documented exception — storage-backed between
+iterations, inline in the per-round trace records); none rides context
+structs or args into per-chunk/per-item tiles; recur-*tile* loops carry
+scalars only (G7) — this program now contains none. Inefficiency is
+accepted: full no-op passes under G1, per-item iteration, and repeated
+authenticated reads of the same prompt-scoped value are all fine;
+simplicity and verifiability win.
+
+**Probe findings (Step 0, `chunk_probes.rs` P1–P4; all green before the
+phases were rewritten, none contradicting the design):**
+
+- **P1 — round-boundary characterization** (the D6 re-founding; findings
+  quoted in the register): (a) a body tile's returned state persists in
+  internal storage at the tile's output coordinates
+  (`bind_infallible_call` → `store_execution_output_value`); resolving the
+  returned `InternalRef` yields the stored state
+  (`p1_tile_output_persists_in_internal_storage_and_resolve_validates`).
+  (b) The re-entry resolve (`From<AuthRef<T>> for RecurSequenceState<T>`
+  → `resolve_internal_value`) validates the coordinates lookup, the
+  stored-vs-reference commitment, and a recomputed integrity commitment;
+  a tampered commitment fails with `Internal store commitment mismatch at
+  coordinates …`. (c) Each iteration's `RecurSequenceStart` records the
+  threaded state as `FnInputValue::Inline` — full postcard, no binding
+  metadata — with per-iteration size scaling linearly in the carried
+  collection (64×32-byte seed ⇒ ≥2,048-byte state record); between
+  iterations the driver holds the resolved value in memory.
+- **P2 — fresh draft inside a body iteration:** a `RecurOutput` draft
+  created (`output = new!(…)`) and finalized inside a recur-sequence body
+  iteration works at the pinned rev, with the input list a `select!`
+  projection of a previous tile's internal output, one plain tile
+  threading cursor + draft via a `(RecurState<S>, RecurOutput<O>)`
+  return, and the finalized `AuthRef` consumed in the same body via
+  `select!` and as a follow-up tile's selection-bound arg before
+  re-entering the outer threaded state. Draft payloads never ride the
+  trace: iteration records carry a `DraftReplayHandle` (anchor + root)
+  and the finalized value reaches consumers as `InternalBinding`.
+- **P3 — selection-bound `Vec` args** on plain tiles in recur-sequence
+  bodies trace as `InternalBinding` on both the iteration record and the
+  tile record, and the tile materializes the full value at execution.
+- **P4 — recur-tile tracing scope (G7's exact boundary):** recur-*tile*
+  iteration records (`RecurTileIterationExec`) carry the input item, the
+  state, and the args **inline** — full postcard payloads per iteration —
+  which is why recur-tile loops carry scalars only and this program's
+  last recur tile (the apply chunk loop) became a recur sequence.
+
+**Tile-map delta** (rows follow the §1 table; unchanged rows omitted):
+
+| # | Previous construct | Storage-resident construct | Catalog rows | Deviations |
+|---|---|---|---|---|
+| T-count | — (new) | `count_pieces(pieces: BpePieces) -> PieceCount` — one-shot authenticated read of the staged external; no staged count (an unchecked staged count is an integrity hole, a checked one is redundant) | C13, C11 | staging delta |
+| T-budget | `build_chunk_budgets(initial_pieces, config) -> Result<ChunkBudgets>` | `build_chunk_budgets(piece_count: u32) -> ChunkBudgets { rounds }` — infallible; zero-width guards died with the widths | C1, G1 | D9 |
+| S-round | `merge_bpe_round(input, state, initial_pieces: Vec<String>, config, merge_chunks, apply_chunks)` | `merge_bpe_round(input, state, staged_pieces: BpePieces, merge_chunks)` — body: open → select pieces/skip → pairs → scan → decision → per-piece draft apply → finalize | C4/C9, G1, A2 | D15 |
+| T-open | `init_bpe_merge_scan(state, initial_pieces) -> GemmaBpeRoundContext` (pieces inline in the context) | `open_round(state, staged: BpePieces) -> GemmaBpeOpenedRound` — round scalars + pieces behind the selectable root; error flattened to `(has_error, error)` (G3) | C11, A2, G3 | D15 |
+| T-pairs | — (scan windowed over inline pieces) | `build_pairs(pieces: BpePieces) -> GemmaBpeAdjacentPairs` — the round's pair list as its own internal ref | C11 | D17 |
+| T-scan | `scan_one_merge_chunk(state, chunk, round /* pieces inline */)` | `scan_one_merge_chunk(state, chunk, skip: bool, pairs: GemmaBpeAdjacentPairs)` — whole-pairs selection-bound read (rule-2 permitted; G6 the named unlock); D11 priority orientation stands | C13/C22, D13 | D17 |
+| T-decide | `finalize_bpe_merge_scan(scan, round) -> GemmaBpeMergeDecision` (pieces inline) | `finalize_bpe_merge_scan(scan, skip) -> GemmaBpeApplyDecision` — scalars only | C1 | D15 |
+| T-apply | `apply_bpe_merge_chunk_or_complete` (recur *tile*; pieces accumulated in `GemmaBpeApplyState.output`) | `apply_one_piece(state: GemmaBpeApplyCursor, piece /* input handle */, output: Draft<BpePieces>, decision)` in recur sequence `apply_round_pieces` over the `select!`-ed round pieces; fresh draft per round, finalized at inner loop end | C4/C9, C16, G1, G7/P4 | D15 |
+| T-close | `finalize_bpe_merge_iteration(apply, iteration)` | `finalize_round(applied: BpePieces, decision, opened) -> GemmaBpeLoopState` — range/count checks verbatim; skip/no-selection rounds carry the incoming pieces forward, never the empty draft | A1, C23/H4 | D15 |
+| T-init-ids | `init_token_id_finalization(loop_state, initial_pieces) -> GemmaTokenIdContext` | `init_token_id_finalization(loop_state, staged: BpePieces) -> Result<BpePieces>` — fallible (A1 surfacing point); zero-round fallback to the staged pieces preserved | A1, C23 | D16 |
+| T-resolve | `resolve_pieces_in_vocab_chunk(state, chunk, ctx)` + threaded slot vector | `resolve_pieces_in_vocab_chunk(chunk /* input handle */, final_pieces: BpePieces /* binding */, output: Draft<TokenIdMatches>)` — append-only, full pass per chunk | C13/C22, C16, D13 | D16 |
+| T-final | `finalize_tokenize_prompt(resolution, ctx)` | `finalize_tokenize_prompt(matches: TokenIdMatches, final_pieces: BpePieces) -> Result<PromptTokenization>` — materializes both at the program boundary, orders by `piece_idx`, duplicate/out-of-range guards + the sim's exact missing-vocab message | C23/H4 | D16 |
+| S-main | binds `bpe_config`; `initial_pieces` as bare `Vec<String>` | binds `external!(BpePieces, "initial_pieces")`; `bpe_config` binding deleted | C25 | staging delta |
+
+**Types delta:** added `BpePieces { pieces }` (the selectable root and
+draft schema for all prompt-scoped pieces), `TokenIdMatch` /
+`TokenIdMatches` (append-only token-id draft), `PieceCount`,
+`GemmaBpeOpenedRound`, `GemmaBpeAdjacentPair(s)`, `GemmaBpeApplyDecision`
+(scalars), `GemmaBpeApplyCursor` (cursor-only). Changed:
+`GemmaBpeLoopState` gains `piece_count` (mirrors sim `GemmaBpeState`) and
+keeps `pieces` as the sole loop-carried collection; `ChunkBudgets` shrinks
+to `{ rounds }`. Deleted: `BpeConfig`, `GemmaBpeRoundContext`,
+`GemmaBpeMergeDecision`, `GemmaBpeIterationContext`, `GemmaBpeApplyState`,
+`GemmaTokenIdContext`, `GemmaTokenResolutionState`. Error convention
+unchanged (deferred `Option<String>` under A1; deterministic messages;
+H4 parity where messages survive — the zero-width guard messages died
+with their guards, and `token-id finalization stopped at piece …` became
+structurally unreachable and was deleted with its test).
+
+**Collections, where they live, and how they cross the ABI:**
+
+| Collection | Lives in | Crosses the ABI as |
+|---|---|---|
+| staged initial pieces | committed external `BpePieces` | `ExternalBinding` args (`count_pieces`, `open_round`, `init_token_id_finalization`) |
+| round pieces | internal storage (`open_round` output ref; finalized `RecurOutput<BpePieces>` drafts) | `select!` projections (skip scalar, apply input list), selection-bound args (`build_pairs`, `finalize_round`), draft push ops |
+| loop-carried pieces (`GemmaBpeLoopState.pieces`) | tile-output internal store, authenticated-resolved at each boundary | inline state at the P1-characterized boundary — the single documented exception (D6) |
+| adjacent pairs | internal storage (`build_pairs` output) | selection-bound arg on `scan_one_merge_chunk` (D17) |
+| `merge_chunks` / `token_lookup_chunks` | committed external (unchanged) | recur-sequence input selection handles, one chunk per tile execution (D13) |
+| round ordinals | internal storage (`build_chunk_budgets` output) | recur input selection handles |
+| token-id matches | `RecurOutput<TokenIdMatches>` draft → internal storage | draft push ops; finalized ref as a binding to the finalizer |
+| ordered token ids | materialized once in `finalize_tokenize_prompt` | terminal fallible tile output → `output.bin` |
+
+**Staging and host-adapter delta:** `initial_pieces` stages as the
+`BpePieces` root — postcard byte layout unchanged (a single-field postcard
+struct is unframed; asserted host-side by
+`staged_pieces_keep_the_bare_vec_byte_layout`), so the staged commitment
+is identical. `StagedBpeConfig` and the `bpe_config` staged input are
+deleted; `run_raster_core` drops its unused sizing-controls parameter
+(`RasterSizingControls` itself is untouched — the frozen sim path consumes
+it). WS2 §11 note appended.
+
+**Structural guards** (`crates/raster-programs/prompt_prepare/src/guards.rs`,
+test-only):
+
+- Source-scan guard: the program's recur state types are pinned to
+  `{GemmaBpeLoopState, GemmaBpeScanState, GemmaBpeApplyCursor}`;
+  `GemmaBpeLoopState.pieces` is asserted to be the *only* collection field
+  among them, and the per-item decision structs
+  (`GemmaBpeApplyDecision`, `GemmaBpeScanCandidate`) are asserted to carry
+  no pieces field and no collection.
+- Trace-shape assertion: a native routine run over sentinel pieces
+  verifies prompt-derived collections appear inline **only** in the
+  P1-characterized records (`merge_bpe_round` iteration state,
+  `open_round`'s state input) and that zero `RecurTileIterationExec`
+  events exist; everywhere else the sentinels cross as bindings, draft
+  ops, or the staged external. (Observed corollary: because the loop
+  state seeds uninitialized per A2 and round 1 resolves the staged
+  external, a one-round prompt never carries pieces inline at all.)
+- Functional matrix: empty prompt, single piece / zero-round fallback,
+  byte fallback, and the missing-piece error live in `routine.rs`;
+  duplicate-conflict and out-of-range matches in `token_ids.rs`; no-merge
+  multi-piece, repeated pieces, several rounds, and merge/vocab matches at
+  chunk boundaries in `guards.rs`.
+
+**Measurements (real Gemma `~/models/gemma-4-E4B-it`, prompt "Hello from
+Raster", 36 initial pieces → 35 rounds, manual
+`detour --raster-core-at prompt.prepare --max-new-tokens 1`, warm
+tokenizer cache; trace analyzed by streaming `trace.ndjson`):**
+
+| | trace-slimming baseline (2026-07-06) | storage-resident (2026-07-07) |
+|---|---|---|
+| trace events | 53,907 | 56,033 (18,616 `RecurSequenceStart`/`End` pairs, 18,725 `TileExec`, 72 recur-sequence sites) |
+| `RecurTileIterationExec` events | present (apply chunk loop) | **0** — the program contains no recur tiles |
+| largest inline value in any event's input | 102B (apply-phase cursors) | **99B** — the `merge_bpe_round` threaded-state record, i.e. the P1 boundary itself is now the largest inline crossing |
+| input values traced as bindings | contexts as `InternalBinding`, chunks as `ExternalBinding` | 18,080 `ExternalBinding` + 109,528 `InternalBinding` input values (pieces, pairs, decisions, finalized drafts); 95,240 inline values (cursors, flags, markers, replay handles, the P1 state) |
+| raw `trace.ndjson` | 1.93GB | 1.8GB |
+| program wall time | ≈ 1 min | ≈ 107s (run-dir creation → last trace write; includes `cargo raster run` overhead) |
+
+The iteration-count structure is unchanged in kind (G1 full passes:
+35 rounds × 503 merge chunks = 17,605 scan iterations + one 256-chunk
+vocab pass + 35 round iterations); the apply phase accounts for the
+remaining 720 iterations — one per round piece instead of one per
+width-64 chunk, the accepted per-item cost — and the draft/binding forms
+replace the inline collections everywhere outside the P1 boundary.
+
+**Acceptance record:** model tables remain chunked committed-external
+recur-sequence inputs; initial pieces enter once as the staged `BpePieces`
+external; each round's pieces are produced through
+`RecurOutput<BpePieces>` and persist in internal storage; all pieces
+consumption is through authenticated reads with the single P1 crossing
+documented; no recur state accumulates a prompt-derived collection and no
+context struct carries one into a loop; token resolution is append-only
+with ids materialized once in the terminal finalizer; structural guards
+in place; trace-identity gate, goldens, full suite, and the no_std surface
+green at every commit.

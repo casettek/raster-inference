@@ -232,6 +232,21 @@ never happen silently there (`.github/workflows/ci.yml`).
 
 ## 11. Amendment log
 
+- **2026-07-07** — `prompt.prepare` staged-input set revised by the
+  storage-resident refactor (PORT_PLAN deviations D15–D17). The
+  `initial_pieces` postcard input is now the program crate's selectable
+  root `BpePieces { pieces: Vec<String> }` rather than the bare
+  `Vec<String>`; the postcard byte layout — and therefore the staged
+  commitment — is unchanged (a single-field postcard struct is an
+  unframed field sequence; asserted host-side by
+  `staged_pieces_keep_the_bare_vec_byte_layout`). The host mirror is
+  `StagedBpePieces` (WS2 §9.6 layout contract). The `bpe_config` staged
+  input is **deleted**: the apply loop recurs over the round's own
+  pieces, so no per-tile widths remain, and the piece count is derived
+  in-program by a one-shot authenticated read of the staged external
+  (a staged count would be either unchecked — an integrity hole — or
+  redundant). The tokenizer external schema is untouched (cache kind
+  stays `gemma-tokenizer-v2`).
 - **2026-07-06** — Tokenizer external schema revised to **v2** by the
   `prompt.prepare` storage refactor — the first exercise of the §7
   accepted-risk clause. `token_lookup` → `token_lookup_chunks` and
