@@ -18,7 +18,6 @@
 //! payloads are host-side), and the test-only `tokenize_bpe_state` entry
 //! (D5 — this sequence is the natively drivable entry).
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use raster::prelude::*;
 use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry};
@@ -29,9 +28,7 @@ use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry};
 use crate::bpe_round::*;
 use crate::budgets::*;
 use crate::token_ids::*;
-use crate::types::{
-    BpeConfig, BpePieces, GemmaBpeLoopState, GemmaTokenResolutionState, PromptTokenization,
-};
+use crate::types::{BpeConfig, BpePieces, GemmaBpeLoopState, PromptTokenization, TokenIdMatches};
 
 /// Staged pieces + chunked tokenizer tables → prompt token ids.
 ///
@@ -58,15 +55,14 @@ pub fn tokenize_prompt_pieces(
         args = (initial_pieces.clone(), merge_chunks)
     );
 
-    let staged_pieces = select!(Vec<String>, initial_pieces.pieces);
-    let token_ctx = call!(init_token_id_finalization, bpe_state, staged_pieces);
-    let resolution = call_recur_seq!(
-        sequence = resolve_vocab_chunk,
+    let final_pieces = call!(init_token_id_finalization, bpe_state, initial_pieces)?;
+    let matches = call_recur_seq!(
+        sequence = resolve_vocab_chunks,
         input = token_lookup_chunks,
-        state = GemmaTokenResolutionState::initial(),
-        args = (token_ctx.clone(),)
+        output = new!(TokenIdMatches),
+        args = (final_pieces.clone(),)
     );
-    let tokenization = call!(finalize_tokenize_prompt, resolution, token_ctx)?;
+    let tokenization = call!(finalize_tokenize_prompt, matches, final_pieces)?;
     Ok(tokenization)
 }
 

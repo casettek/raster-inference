@@ -247,39 +247,6 @@ impl GemmaBpeApplyCursor {
     }
 }
 
-/// Read-only context of the token-id resolution loop, produced by
-/// `init_token_id_finalization` from the finished BPE loop state (sim
-/// `GemmaBpeOutput` + builder start, with the builder dissolved — D6/D6a).
-/// Prompt-scoped: rides the vocab pass as a small `args` context (nothing
-/// selects out of it anymore — D14).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GemmaTokenIdContext {
-    pub pieces: Vec<String>,
-    pub piece_count: u32,
-    /// Deferred BPE-loop error (A1); surfaced as the terminal `Err` by
-    /// `finalize_tokenize_prompt`.
-    pub error: Option<String>,
-}
-
-/// Loop-carried state of the inverted vocab pass (D14): one slot per final
-/// piece, filled as the single pass over `token_lookup_chunks` encounters
-/// each piece's sorted position. Prompt-scoped; seeds from a literal (A2)
-/// and sizes itself from the context on the first executed iteration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GemmaTokenResolutionState {
-    pub initialized: bool,
-    pub resolved: Vec<Option<u32>>,
-}
-
-impl GemmaTokenResolutionState {
-    pub fn initial() -> Self {
-        Self {
-            initialized: false,
-            resolved: Vec::new(),
-        }
-    }
-}
-
 /// The program's output value (sim `RasterTokenizationResult` in value form:
 /// the ids themselves, not a store root). Written to `output.bin` as
 /// `postcard(Result<PromptTokenization, String>)`; the host decodes it with
