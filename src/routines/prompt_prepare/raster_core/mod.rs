@@ -8,7 +8,8 @@
 //!    render → normalize → split → initial BPE pieces) and its outputs are
 //!    staged as committed inputs: the raster-encoded Gemma tokenizer
 //!    external (content-addressed cache, `gemma_externals` encoder) plus
-//!    postcard `initial_pieces` and `bpe_config`.
+//!    postcard `initial_pieces` (the selectable `BpePieces` root) and
+//!    `bpe_config`.
 //! 2. `cargo raster run` executes the routine's program crate against the
 //!    committed inputs, producing `output.bin` and `commit.bin`.
 //! 3. Ingestion validates the artifacts (never the CLI exit code) and
@@ -51,6 +52,15 @@ use super::raster::utils::{
 struct StagedBpeConfig {
     bpe_pairs_per_tile: u32,
     bpe_pieces_per_tile: u32,
+}
+
+/// Field-order mirror of the program crate's staged `BpePieces` (WS2 §9.6).
+/// A single-field postcard struct encodes identically to the bare
+/// `Vec<String>` it wraps (`staged_pieces_keep_the_bare_vec_byte_layout`),
+/// so the selectable-root shape costs nothing at the staging boundary.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct StagedBpePieces {
+    pieces: Vec<String>,
 }
 
 impl StagedBpeConfig {
@@ -121,7 +131,12 @@ pub fn run_raster_core(
         &tokenizer_external.index_path,
         &tokenizer_external.root_commitment,
     )?;
-    staged.add_postcard("initial_pieces", &initial_pieces)?;
+    staged.add_postcard(
+        "initial_pieces",
+        &StagedBpePieces {
+            pieces: initial_pieces,
+        },
+    )?;
     staged.add_postcard("bpe_config", &bpe_config)?;
     let input_commitments = staged
         .write(&run_dir)
@@ -285,6 +300,20 @@ mod tests {
         let error = StagedBpeConfig::from_sizing(&sizing(usize::MAX, 1))
             .expect_err("usize::MAX cannot stage as u32");
         assert!(error.to_string().contains("exceeds the staged u32 width"));
+    }
+
+    #[test]
+    fn staged_pieces_keep_the_bare_vec_byte_layout() {
+        // WS2 §9.6 layout contract: wrapping the staged pieces in the
+        // selectable `BpePieces` root must not change the postcard bytes
+        // (postcard structs are unframed field sequences).
+        let pieces = vec!["a".to_string(), "▁b".to_string(), String::new()];
+        let wrapped = postcard::to_allocvec(&StagedBpePieces {
+            pieces: pieces.clone(),
+        })
+        .expect("encode wrapped");
+        let bare = postcard::to_allocvec(&pieces).expect("encode bare");
+        assert_eq!(wrapped, bare);
     }
 
     #[test]

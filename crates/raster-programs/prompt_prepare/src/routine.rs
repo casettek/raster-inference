@@ -29,28 +29,38 @@ use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry};
 use crate::bpe_round::*;
 use crate::budgets::*;
 use crate::token_ids::*;
-use crate::types::{BpeConfig, GemmaBpeLoopState, GemmaTokenResolutionState, PromptTokenization};
+use crate::types::{
+    BpeConfig, BpePieces, GemmaBpeLoopState, GemmaTokenResolutionState, PromptTokenization,
+};
 
 /// Staged pieces + chunked tokenizer tables → prompt token ids.
+///
+/// The staged pieces arrive as the selectable `BpePieces` root and stay an
+/// `AuthRef` throughout: the count is a one-shot authenticated read
+/// (`count_pieces`), and the loops receive the pieces as selection-bound
+/// args materialized only at tile execution.
 #[sequence]
 pub fn tokenize_prompt_pieces(
-    initial_pieces: Vec<String>,
+    initial_pieces: BpePieces,
     config: BpeConfig,
     token_lookup_chunks: Vec<Vec<GemmaTokenIdEntry>>,
     merge_chunks: Vec<Vec<GemmaBpeMerge>>,
 ) -> Result<PromptTokenization> {
-    let budgets = call!(build_chunk_budgets, initial_pieces.clone(), config.clone())?;
+    let count = call!(count_pieces, initial_pieces.clone());
+    let piece_count = select!(u32, count.piece_count);
+    let budgets = call!(build_chunk_budgets, piece_count, config.clone())?;
     let rounds = select!(Vec<u32>, budgets.clone().rounds);
     let apply_chunks = select!(Vec<u32>, budgets.apply_chunks);
 
+    let staged_pieces = select!(Vec<String>, initial_pieces.clone().pieces);
     let bpe_state = call_recur_seq!(
         sequence = merge_bpe_round,
         input = rounds,
         state = GemmaBpeLoopState::initial(),
-        args = (initial_pieces.clone(), config, merge_chunks, apply_chunks)
+        args = (staged_pieces.clone(), config, merge_chunks, apply_chunks)
     );
 
-    let token_ctx = call!(init_token_id_finalization, bpe_state, initial_pieces);
+    let token_ctx = call!(init_token_id_finalization, bpe_state, staged_pieces);
     let resolution = call_recur_seq!(
         sequence = resolve_vocab_chunk,
         input = token_lookup_chunks,
@@ -132,10 +142,10 @@ mod tests {
         }
     }
 
-    /// Drives the routine natively. The chunked tables are stored as
-    /// internal values first: recur input lists must be selectable
-    /// external/internal sources, exactly like the selections `main` makes
-    /// from the tokenizer external.
+    /// Drives the routine natively. The staged pieces and chunked tables
+    /// are stored as internal values first: recur input lists and `select!`
+    /// roots must be selectable external/internal sources, exactly like the
+    /// bindings `main` makes from the committed externals.
     fn tokenize_chunked(
         pieces: Vec<&str>,
         config: BpeConfig,
@@ -143,16 +153,20 @@ mod tests {
     ) -> core::result::Result<PromptTokenization, String> {
         let _guard =
             raster::__private::SequenceScopeGuard::enter("prompt_prepare_routine_tests");
+        let staged_pieces = raster::store_internal_value(&BpePieces {
+            pieces: pieces
+                .into_iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        })
+        .expect("store staged pieces");
         let vocab = raster::store_internal_value(&token_lookup_chunks(table_width))
             .expect("store vocab chunks");
         let merges =
             raster::store_internal_value(&merge_chunks(table_width)).expect("store merge chunks");
         materialize_auth_result::<PromptTokenization, _>(
             __raster_sequence_auth_tokenize_prompt_pieces(
-                pieces
-                    .into_iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>(),
+                internal!(BpePieces, staged_pieces),
                 config,
                 internal!(Vec<Vec<GemmaTokenIdEntry>>, vocab),
                 internal!(Vec<Vec<GemmaBpeMerge>>, merges),
