@@ -35,6 +35,47 @@ pub struct BpeConfig {
     pub bpe_pieces_per_tile: u32,
 }
 
+/// Prompt-scoped pieces behind a selectable root (the storage-resident
+/// refactor's `BpePieces`): the staged `initial_pieces` external, every
+/// round's `open_round` output, and every round's finalized
+/// `RecurOutput<BpePieces>` draft all carry pieces in this shape, so tiles
+/// consume them only through authenticated reads — `select!` projections,
+/// input-handle selections, and selection-bound args. Postcard encodes a
+/// single-field struct identically to the bare `Vec<String>`, so staging
+/// keeps its byte layout (WS2 §9.6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct BpePieces {
+    pub pieces: Vec<String>,
+}
+
+/// One resolved vocab match of the append-only token-id pass: the piece's
+/// position in the final pieces and its resolved id. Appended by
+/// `resolve_pieces_in_vocab_chunk` into the `RecurOutput<TokenIdMatches>`
+/// draft; ordered by `piece_idx` in the terminal finalizer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct TokenIdMatch {
+    pub piece_idx: u32,
+    pub token_id: u32,
+}
+
+/// Draft-accumulated matches of the token-id phase (supersedes the
+/// threaded `GemmaTokenResolutionState` slot vector): append-only, no
+/// threaded resolution state; the ordered ids materialize once, in
+/// `finalize_tokenize_prompt`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct TokenIdMatches {
+    pub matches: Vec<TokenIdMatch>,
+}
+
+/// Output of the one-shot `count_pieces` tile: the staged pieces count,
+/// derived in-program through an authenticated read of the `initial_pieces`
+/// external (a staged count would be either unchecked — an integrity hole —
+/// or redundant).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct PieceCount {
+    pub piece_count: u32,
+}
+
 /// Bounded iteration lists for every recur loop in the program (gap G1:
 /// real recur is list-driven; every sim until-done loop has a derivable
 /// bound at loop start). Derived in-program by `build_chunk_budgets`.
