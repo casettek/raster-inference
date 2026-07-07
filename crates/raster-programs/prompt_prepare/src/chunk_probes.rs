@@ -18,6 +18,36 @@
 //! 4. That recur sequence nested **inside** another recur-sequence
 //!    iteration (the shape of the BPE round loop around the scan).
 //!
+//! Extended for the storage-resident refactor (plan
+//! `prompt.prepare storage-resident refactor`), probes P1–P4:
+//!
+//! P1. Round-boundary characterization: a recur sequence threading a
+//!     `Vec<String>`-carrying state. Establishes (a) the body tile's
+//!     returned state persists in internal storage via the tile-output
+//!     store (`bind_infallible_call` → `store_execution_output_value`);
+//!     (b) the driver's re-entry resolve (`From<AuthRef<T>> for
+//!     `RecurSequenceState<T>` → `resolve_internal_value`) validates a
+//!     coordinates lookup, commitment equality, and a recomputed integrity
+//!     commitment; (c) the trace records the state **inline** (full
+//!     postcard bytes) in every iteration's `RecurSequenceStart` record —
+//!     O(iterations × state bytes) scaling. These findings are the
+//!     pinned-rev justification for keeping the loop-carried pieces in
+//!     `GemmaBpeLoopState` (invariant rule 4, deviation D6 re-founding).
+//! P2. A fresh `RecurOutput` draft created (`output = new!(…)`) and
+//!     finalized inside a recur-sequence body iteration; input list from a
+//!     `select!` projection of a previous tile's internal output; the
+//!     per-item plain tile returns `(RecurState<S>, RecurOutput<O>)`
+//!     (cursor + draft through one tile); the finalized `AuthRef` consumed
+//!     in the same body via `select!` and as a follow-up plain tile's
+//!     selection-bound arg; the follow-up tile's return re-entering the
+//!     outer threaded state. The exact shape of the rewritten apply loop.
+//! P3. A `Vec` selection-bound arg on a plain tile called from a
+//!     recur-sequence body traces as a binding, never inline; the tile
+//!     materializes the full value at execution.
+//! P4. Recur-*tile* drivers trace the input item, the state, and the args
+//!     inline per iteration (`RecurTileIterationExec`) — gap G7's exact
+//!     boundary; recur-tile loops carry scalars only.
+//!
 //! Test-only module: these tiles are evidence, not program surface.
 
 use alloc::string::String;
@@ -233,6 +263,316 @@ pub fn probe_nested_recur_seq(
     )
 }
 
+// --- Storage-resident refactor probes (P1–P4) ---
+
+/// P1 state: the minimal loop-carried collection shape (`GemmaBpeLoopState`
+/// analog): a `Vec<String>` threaded through recur-sequence state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeRoundPieces {
+    pub round: u32,
+    pub pieces: Vec<String>,
+}
+
+/// P1 body tile: returns the next loop state. Its `call!` return is an
+/// `AuthRef` backed by the tile-output internal store
+/// (`bind_infallible_call` → `store_execution_output_value`); the sequence
+/// re-enters threaded state through `From<AuthRef<T>> for
+/// RecurSequenceState<T>` → `resolve_internal_value`.
+#[tile]
+pub fn probe_advance_round_pieces(state: ProbeRoundPieces, appended: String) -> ProbeRoundPieces {
+    let mut state = state;
+    let round = state.round;
+    state.pieces.push(alloc::format!("{appended}{round}"));
+    state.round += 1;
+    state
+}
+
+/// P1 loop: one plain tile per iteration, the tile's `AuthRef` return
+/// re-entering the threaded state (the exact `merge_bpe_round` boundary).
+#[sequence(kind = recur)]
+pub fn probe_round_boundary_seq(
+    input: RecurSequenceInput<u32>,
+    state: RecurSequenceState<ProbeRoundPieces>,
+    appended: String,
+) -> RecurSequenceState<ProbeRoundPieces> {
+    let _round_ordinal = &input;
+    call!(probe_advance_round_pieces, state, appended)
+}
+
+/// P1 seed builder — recur loop seeds must be plain literals (A2), so the
+/// drivers construct them in place; `width` scales the carried collection
+/// for the size-characterization leg.
+pub fn probe_p1_seed(piece_count: usize, piece_width: usize) -> ProbeRoundPieces {
+    ProbeRoundPieces {
+        round: 0,
+        pieces: (0..piece_count)
+            .map(|idx| alloc::format!("{idx:0>piece_width$}"))
+            .collect(),
+    }
+}
+
+/// P1 driver: a tiny seed, growing by one piece per round.
+#[sequence]
+pub fn probe_round_boundary(rounds: Vec<u32>, appended: String) -> ProbeRoundPieces {
+    call_recur_seq!(
+        sequence = probe_round_boundary_seq,
+        input = rounds,
+        state = probe_p1_seed(1, 1),
+        args = (appended,)
+    )
+}
+
+/// P1 driver, large-collection leg: 64 pieces of 32 bytes in the seed.
+#[sequence]
+pub fn probe_round_boundary_big(rounds: Vec<u32>, appended: String) -> ProbeRoundPieces {
+    call_recur_seq!(
+        sequence = probe_round_boundary_seq,
+        input = rounds,
+        state = probe_p1_seed(64, 32),
+        args = (appended,)
+    )
+}
+
+/// P1 storage leg: expose the body tile's output `InternalRef` so the test
+/// can resolve it against internal storage and characterize what the
+/// resolve validates.
+#[sequence]
+pub fn probe_tile_output_reference(seed: ProbeRoundPieces, appended: String) -> InternalRef {
+    call!(probe_advance_round_pieces, seed, appended)
+        .reference()
+        .clone()
+}
+
+/// P2 select-root: the `open_round` analog — one Selectable output carrying
+/// the round scalars and the round's pieces behind an internal ref, so the
+/// pieces are consumed only through `select!` projections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct ProbeOpenedRound {
+    pub round: u32,
+    pub pieces: ProbePieces,
+}
+
+/// P2 pieces wrapper: `Selectable` for `select!` roots and the draft schema
+/// for `RecurOutput<ProbePieces>` (the `BpePieces` analog).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct ProbePieces {
+    pub pieces: Vec<String>,
+}
+
+/// P2 cursor-only inner-loop state (the `GemmaBpeApplyCursor` analog).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeApplyCursor {
+    pub skip_next: bool,
+    pub emitted: u32,
+}
+
+/// P2 open tile: materializes the loop state once per round and republishes
+/// the pieces behind a selectable internal ref.
+#[tile]
+pub fn probe_open_apply_round(state: ProbeRoundPieces) -> ProbeOpenedRound {
+    ProbeOpenedRound {
+        round: state.round,
+        pieces: ProbePieces {
+            pieces: state.pieces,
+        },
+    }
+}
+
+/// P2 per-piece tile: cursor state + the piece via the input handle + the
+/// `RecurOutput` draft + decision scalars, returning both threads through
+/// one tile (the `apply_one_piece` shape). Merges at index 0 for the
+/// fixture: push `merged`, swallow the right-hand piece via `skip_next`,
+/// copy everything else.
+#[tile]
+pub fn probe_apply_one_piece(
+    state: ProbeApplyCursor,
+    piece: String,
+    output: Draft<ProbePieces>,
+    merged: String,
+) -> (RecurState<ProbeApplyCursor>, RecurOutput<ProbePieces>) {
+    let mut state = state;
+    let mut output = output;
+    if state.skip_next {
+        state.skip_next = false;
+        return (RecurState::new(state), output);
+    }
+    if state.emitted == 0 {
+        output.pieces().push(merged);
+        state.skip_next = true;
+    } else {
+        output.pieces().push(piece);
+    }
+    state.emitted += 1;
+    (RecurState::new(state), output)
+}
+
+/// P2 inner loop: a state+output recur sequence over a `select!` projection
+/// of a previous tile's internal output; the draft is created fresh
+/// (`output = new!(…)`) per outer iteration and finalized at inner loop end.
+#[sequence(kind = recur)]
+pub fn probe_apply_pieces_seq(
+    input: RecurSequenceInput<String>,
+    state: RecurSequenceState<ProbeApplyCursor>,
+    output: RecurSequenceOutput<ProbePieces>,
+    merged: String,
+) -> (
+    RecurSequenceState<ProbeApplyCursor>,
+    RecurSequenceOutput<ProbePieces>,
+) {
+    let (cursor, output) = call!(probe_apply_one_piece, state, input, output, merged);
+    let cursor: RecurSequenceState<ProbeApplyCursor> = cursor.into_inner().into();
+    let output: RecurSequenceOutput<ProbePieces> = output.into();
+    (cursor, output)
+}
+
+/// P2 finalize tile: consumes the finalized draft whole (selection-bound
+/// arg), plus a `select!` projection out of it, and returns the next outer
+/// loop state (re-entering the threaded state).
+#[tile]
+pub fn probe_finalize_apply_round(
+    applied: ProbePieces,
+    first: String,
+    round: u32,
+) -> ProbeRoundPieces {
+    let mut pieces = applied.pieces;
+    pieces.push(first);
+    ProbeRoundPieces {
+        round: round + 1,
+        pieces,
+    }
+}
+
+/// P2 outer round body: open → select pieces → inner draft loop → consume
+/// the finalized `AuthRef` via `select!` and as a plain tile's arg →
+/// re-enter the threaded state through the finalize tile.
+#[sequence(kind = recur)]
+pub fn probe_apply_round_seq(
+    input: RecurSequenceInput<u32>,
+    state: RecurSequenceState<ProbeRoundPieces>,
+    merged: String,
+) -> RecurSequenceState<ProbeRoundPieces> {
+    let _round_ordinal = &input;
+    let opened = call!(probe_open_apply_round, state);
+    let items = select!(Vec<String>, opened.clone().pieces.pieces);
+    let round_no = select!(u32, opened.round);
+    let applied = call_recur_seq!(
+        sequence = probe_apply_pieces_seq,
+        input = items,
+        state = ProbeApplyCursor {
+            skip_next: false,
+            emitted: 0,
+        },
+        output = new!(ProbePieces),
+        args = (merged,)
+    );
+    let first = select!(String, applied.clone().pieces[0]);
+    call!(probe_finalize_apply_round, applied, first, round_no)
+}
+
+/// P2 driver: outer recur sequence over a bounded round list, seeded from
+/// a plain literal (A2) — pieces `[a, b, c]`, round 0.
+#[sequence]
+pub fn probe_apply_rounds(rounds: Vec<u32>, merged: String) -> ProbeRoundPieces {
+    call_recur_seq!(
+        sequence = probe_apply_round_seq,
+        input = rounds,
+        state = ProbeRoundPieces {
+            round: 0,
+            pieces: alloc::vec![
+                String::from("a"),
+                String::from("b"),
+                String::from("c"),
+            ],
+        },
+        args = (merged,)
+    )
+}
+
+/// P3 loop state: counts how many input items appear in the selection-bound
+/// haystack arg (proving the tile materialized the full `Vec`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeVecArgState {
+    pub seen: u32,
+    pub hits: u32,
+}
+
+/// P3 plain tile with a `Vec` arg, called from a recur-sequence body.
+#[tile]
+pub fn probe_note_haystack(
+    state: ProbeVecArgState,
+    item: String,
+    haystack: Vec<String>,
+) -> ProbeVecArgState {
+    let mut state = state;
+    state.seen += 1;
+    if haystack.contains(&item) {
+        state.hits += 1;
+    }
+    state
+}
+
+/// P3 loop: the haystack rides `args` as an `AuthRef` and must trace as a
+/// binding on every iteration and on the plain tile's own record.
+#[sequence(kind = recur)]
+pub fn probe_vec_arg_seq(
+    input: RecurSequenceInput<String>,
+    state: RecurSequenceState<ProbeVecArgState>,
+    haystack: Vec<String>,
+) -> RecurSequenceState<ProbeVecArgState> {
+    call!(probe_note_haystack, state, input, haystack)
+}
+
+/// P3 driver: both the item list and the haystack arrive as internal
+/// bindings (the test stores them and passes `internal!` refs).
+#[sequence]
+pub fn probe_vec_arg(items: Vec<String>, haystack: Vec<String>) -> ProbeVecArgState {
+    call_recur_seq!(
+        sequence = probe_vec_arg_seq,
+        input = items,
+        state = ProbeVecArgState { seen: 0, hits: 0 },
+        args = (haystack,)
+    )
+}
+
+/// P4 recur-tile state carrying a collection (deliberately — the probe
+/// characterizes what the recur-tile driver traces inline per iteration).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeInlineState {
+    pub log: Vec<String>,
+}
+
+/// P4 recur tile: chunked input item, collection-carrying state, and a
+/// `Vec` arg — the driver materializes and traces all three inline per
+/// iteration (`RecurTileIterationExec`, gap G7).
+#[tile(kind = recur)]
+pub fn probe_inline_recur(
+    input: RecurInput<Vec<String>>,
+    state: RecurState<ProbeInlineState>,
+    extra: Vec<String>,
+) -> RecurState<ProbeInlineState> {
+    let mut state = state;
+    let chunk = input.into_value();
+    state.log.push(alloc::format!(
+        "{}+{}",
+        chunk.join(""),
+        extra.join("")
+    ));
+    state
+}
+
+/// P4 driver: even though the chunk list and the extra arg arrive as
+/// internal bindings, the recur-tile driver materializes and traces them
+/// inline per iteration.
+#[sequence]
+pub fn probe_inline_recur_tile(chunks: Vec<Vec<String>>, extra: Vec<String>) -> ProbeInlineState {
+    call_recur!(
+        tile = probe_inline_recur,
+        input = chunks,
+        state = ProbeInlineState { log: Vec::new() },
+        args = (extra,)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::ToString;
@@ -350,6 +690,418 @@ mod tests {
         });
         assert!(!state.found);
         assert_eq!(state.visited_chunks, 3);
+    }
+
+    // --- Trace capture for the storage-resident refactor probes (the
+    // `raster` repo's own `recur_draft.rs` capture pattern). ---
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, Once};
+    use std::thread::ThreadId;
+
+    use raster::core::draft::DraftReplayHandle;
+    use raster::core::trace::{FnInputValue, TraceEvent};
+    use raster_runtime::Publisher;
+    use serde::Deserialize;
+
+    static TRACE_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    static TRACE_INIT: Once = Once::new();
+    static TRACE_EVENTS: Mutex<Vec<TraceEvent>> = Mutex::new(Vec::new());
+    static TRACE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+    static TRACE_CAPTURE_THREAD: Mutex<Option<ThreadId>> = Mutex::new(None);
+
+    struct ProbePublisher;
+
+    impl Publisher for ProbePublisher {
+        fn publish(&self, event: TraceEvent) {
+            let current_thread = std::thread::current().id();
+            let capture_thread = TRACE_CAPTURE_THREAD.lock().unwrap().to_owned();
+            if TRACE_CAPTURE_ACTIVE.load(Ordering::SeqCst)
+                && capture_thread == Some(current_thread)
+            {
+                TRACE_EVENTS.lock().unwrap().push(event);
+            }
+        }
+
+        fn finish(&self) {}
+    }
+
+    fn capture_trace_events<F, T>(f: F) -> (T, Vec<TraceEvent>)
+    where
+        F: FnOnce() -> T,
+    {
+        let _guard = TRACE_CAPTURE_LOCK.lock().unwrap();
+        TRACE_INIT.call_once(|| raster::init_with(ProbePublisher));
+        TRACE_EVENTS.lock().unwrap().clear();
+        *TRACE_CAPTURE_THREAD.lock().unwrap() = Some(std::thread::current().id());
+        TRACE_CAPTURE_ACTIVE.store(true, Ordering::SeqCst);
+
+        let result = f();
+        let events = TRACE_EVENTS.lock().unwrap().clone();
+        TRACE_CAPTURE_ACTIVE.store(false, Ordering::SeqCst);
+        *TRACE_CAPTURE_THREAD.lock().unwrap() = None;
+        (result, events)
+    }
+
+    /// Per-iteration `RecurSequenceStart` records for one recur sequence.
+    fn sequence_start_records(events: &[TraceEvent], fn_name: &str) -> Vec<raster::prelude::FnCallRecord> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::RecurSequenceStart(record) if record.fn_name == fn_name => {
+                    Some(record.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tile_exec_records(events: &[TraceEvent], fn_name: &str) -> Vec<raster::prelude::FnCallRecord> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::TileExec(record) if record.fn_name == fn_name => Some(record.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn recur_tile_iteration_records(
+        events: &[TraceEvent],
+        fn_name: &str,
+    ) -> Vec<raster::prelude::FnCallRecord> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::RecurTileIterationExec(record) if record.fn_name == fn_name => {
+                    Some(record.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn inline_bytes(value: &FnInputValue) -> Vec<u8> {
+        match value {
+            FnInputValue::Inline(bytes) => bytes.clone(),
+            other => panic!("expected inline trace value, found {other:?}"),
+        }
+    }
+
+    fn seed_pieces(round: u32, pieces: Vec<&str>) -> ProbeRoundPieces {
+        ProbeRoundPieces {
+            round,
+            pieces: pieces.into_iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    // --- P1: round-boundary characterization ---
+
+    /// P1(c): the threaded state enters every iteration's
+    /// `RecurSequenceStart` record as a full inline postcard value — not a
+    /// binding — and its per-iteration byte size scales linearly with the
+    /// carried collection.
+    #[test]
+    fn p1_state_traces_inline_per_iteration_and_scales_with_pieces() {
+        let (final_state, events) = capture_trace_events(|| {
+            in_scope(|| {
+                let rounds =
+                    raster::store_internal_value(&vec![0u32, 1, 2]).expect("store round list");
+                raster::materialize_auth_return::<ProbeRoundPieces, _>(
+                    __raster_sequence_auth_probe_round_boundary(
+                        internal!(Vec<u32>, rounds),
+                        "x".to_string(),
+                    ),
+                )
+            })
+        });
+        assert_eq!(final_state.round, 3);
+        assert_eq!(final_state.pieces.len(), 4);
+
+        let records = sequence_start_records(&events, "probe_round_boundary_seq");
+        assert_eq!(records.len(), 3, "one start record per iteration");
+        let mut previous_len = 0usize;
+        for (iteration, record) in records.iter().enumerate() {
+            let input = record.input.as_ref().expect("iteration input trace");
+            // values[0] = input marker, values[1] = threaded state,
+            // values[2] = the `appended` arg.
+            let state_bytes = inline_bytes(&input.values[1]);
+            let state: ProbeRoundPieces =
+                raster::core::postcard::from_bytes(&state_bytes).expect("state should decode");
+            assert_eq!(state.round as usize, iteration);
+            assert_eq!(
+                state.pieces.len(),
+                iteration + 1,
+                "the full carried collection rides the record"
+            );
+            assert!(
+                input.internal.get("state").is_none(),
+                "state is inline, never an internal binding"
+            );
+            assert!(
+                state_bytes.len() > previous_len,
+                "state bytes grow with the carried pieces"
+            );
+            previous_len = state_bytes.len();
+        }
+
+        // Size scaling across runs: 64 seed pieces of 32 bytes each must
+        // inflate the first iteration's state record by at least the
+        // payload size.
+        let (_, big_events) = capture_trace_events(|| {
+            in_scope(|| {
+                let rounds = raster::store_internal_value(&vec![0u32]).expect("store round list");
+                raster::materialize_auth_return::<ProbeRoundPieces, _>(
+                    __raster_sequence_auth_probe_round_boundary_big(
+                        internal!(Vec<u32>, rounds),
+                        "x".to_string(),
+                    ),
+                )
+            })
+        });
+        let big_records = sequence_start_records(&big_events, "probe_round_boundary_seq");
+        let big_bytes =
+            inline_bytes(&big_records[0].input.as_ref().expect("input").values[1]);
+        assert!(
+            big_bytes.len() >= 64 * 32,
+            "inline state bytes scale with the collection ({} < {})",
+            big_bytes.len(),
+            64 * 32
+        );
+    }
+
+    /// P1(a)+(b): the body tile's returned state persists in internal
+    /// storage at the tile's output coordinates, and the re-entry resolve
+    /// validates the reference commitment (tamper rejected) before
+    /// rematerializing the value.
+    #[test]
+    fn p1_tile_output_persists_in_internal_storage_and_resolve_validates() {
+        in_scope(|| {
+            let reference = raster::materialize_auth_return::<InternalRef, _>(
+                __raster_sequence_auth_probe_tile_output_reference(
+                    seed_pieces(4, vec!["a", "b"]),
+                    "x".to_string(),
+                ),
+            );
+
+            // (a) The stored tile output resolves from internal storage.
+            let resolved = raster::resolve_internal_value::<ProbeRoundPieces>(reference.clone())
+                .expect("tile output should persist in internal storage");
+            assert_eq!(resolved.value.round, 5);
+            assert_eq!(
+                resolved.value.pieces,
+                vec!["a".to_string(), "b".to_string(), "x4".to_string()]
+            );
+
+            // (b) The resolve validates the commitment: a tampered
+            // reference is rejected, not silently rematerialized.
+            let mut tampered = reference;
+            tampered.commitment[0] ^= 0xFF;
+            let error = raster::resolve_internal_value::<ProbeRoundPieces>(tampered)
+                .expect_err("tampered commitment must fail the resolve");
+            assert!(
+                alloc::format!("{error}").contains("commitment mismatch"),
+                "unexpected resolve error: {error}"
+            );
+        });
+    }
+
+    // --- P2: fresh RecurOutput draft inside a recur-sequence body ---
+
+    /// P2 functional leg: per outer round, a fresh draft accumulates the
+    /// applied pieces; the finalized `AuthRef` feeds a `select!` projection
+    /// and a plain tile's selection-bound arg; the tile's return re-enters
+    /// the outer threaded state.
+    #[test]
+    fn p2_draft_accumulates_and_finalizes_inside_a_body_iteration() {
+        let final_state = in_scope(|| {
+            let rounds = raster::store_internal_value(&vec![0u32, 1]).expect("store round list");
+            raster::materialize_auth_return::<ProbeRoundPieces, _>(
+                __raster_sequence_auth_probe_apply_rounds(
+                    internal!(Vec<u32>, rounds),
+                    "M".to_string(),
+                ),
+            )
+        });
+        // Round 1: [a,b,c] → apply (merge at 0) → [M,c] → finalize appends
+        // select!-ed [0] → [M,c,M]. Round 2: [M,c,M] → [M,M] → [M,M,M].
+        assert_eq!(final_state.round, 2);
+        assert_eq!(
+            final_state.pieces,
+            vec!["M".to_string(), "M".to_string(), "M".to_string()]
+        );
+    }
+
+    /// P2 trace leg: the draft rides iteration records as an inline replay
+    /// handle (anchor + root, not payload); the input item and the
+    /// finalized-draft arg ride as internal bindings.
+    #[test]
+    fn p2_draft_rides_the_trace_as_replay_handle_and_bindings() {
+        let (_, events) = capture_trace_events(|| {
+            in_scope(|| {
+                let rounds = raster::store_internal_value(&vec![0u32]).expect("store round list");
+                raster::materialize_auth_return::<ProbeRoundPieces, _>(
+                    __raster_sequence_auth_probe_apply_rounds(
+                        internal!(Vec<u32>, rounds),
+                        "M".to_string(),
+                    ),
+                )
+            })
+        });
+
+        let inner_records = sequence_start_records(&events, "probe_apply_pieces_seq");
+        assert_eq!(inner_records.len(), 3, "one iteration per piece");
+        for record in &inner_records {
+            let input = record.input.as_ref().expect("iteration input trace");
+            // values: [input marker, cursor state, output draft, merged].
+            let handle_bytes = inline_bytes(&input.values[2]);
+            let handle: DraftReplayHandle = raster::core::postcard::from_bytes(&handle_bytes)
+                .expect("output draft should trace as a replay handle");
+            assert_eq!(handle.schema_hash, ProbePieces::schema_hash());
+            assert!(
+                raster::core::postcard::from_bytes::<Draft<ProbePieces>>(&handle_bytes).is_err(),
+                "trace bytes must not deserialize into a live draft"
+            );
+            assert!(
+                input.internal.contains_key("input"),
+                "the piece must reach the iteration as an internal binding"
+            );
+        }
+
+        let finalize_records = tile_exec_records(&events, "probe_finalize_apply_round");
+        assert_eq!(finalize_records.len(), 1);
+        let finalize_input = finalize_records[0]
+            .input
+            .as_ref()
+            .expect("finalize tile input trace");
+        assert_eq!(
+            finalize_input.values[0],
+            FnInputValue::InternalBinding,
+            "the finalized draft must reach the follow-up tile as a binding"
+        );
+        assert!(finalize_input.internal.contains_key("applied"));
+        assert_eq!(
+            finalize_input.values[1],
+            FnInputValue::InternalBinding,
+            "the select! projection out of the finalized draft is a binding"
+        );
+    }
+
+    // --- P3: Vec selection-bound arg on a plain tile in a recur-sequence
+    // body ---
+
+    /// P3: the arg traces as a binding on the iteration record and the
+    /// plain tile's own record, and the tile materializes the full value at
+    /// execution (it can check membership against every element).
+    #[test]
+    fn p3_vec_arg_traces_as_binding_and_materializes_at_execution() {
+        let (state, events) = capture_trace_events(|| {
+            in_scope(|| {
+                let items = raster::store_internal_value(&vec![
+                    "x".to_string(),
+                    "y".to_string(),
+                    "z".to_string(),
+                ])
+                .expect("store item list");
+                let haystack = raster::store_internal_value(&vec![
+                    "y".to_string(),
+                    "z".to_string(),
+                    "w".to_string(),
+                ])
+                .expect("store haystack");
+                raster::materialize_auth_return::<ProbeVecArgState, _>(
+                    __raster_sequence_auth_probe_vec_arg(
+                        internal!(Vec<String>, items),
+                        internal!(Vec<String>, haystack),
+                    ),
+                )
+            })
+        });
+        assert_eq!(state.seen, 3);
+        assert_eq!(state.hits, 2, "the tile materialized the full haystack");
+
+        let iteration_records = sequence_start_records(&events, "probe_vec_arg_seq");
+        assert_eq!(iteration_records.len(), 3);
+        for record in &iteration_records {
+            let input = record.input.as_ref().expect("iteration input trace");
+            // values: [input marker, state, haystack].
+            assert_eq!(
+                input.values[2],
+                FnInputValue::InternalBinding,
+                "the Vec arg must trace as a binding, never inline"
+            );
+            assert!(input.internal.contains_key("haystack"));
+        }
+
+        let tile_records = tile_exec_records(&events, "probe_note_haystack");
+        assert_eq!(tile_records.len(), 3);
+        for record in &tile_records {
+            let input = record.input.as_ref().expect("tile input trace");
+            // values: [state, item, haystack].
+            assert_eq!(
+                input.values[2],
+                FnInputValue::InternalBinding,
+                "the tile record keeps the Vec arg as a binding"
+            );
+        }
+    }
+
+    // --- P4: recur-tile per-iteration tracing scope (gap G7) ---
+
+    /// P4: recur-*tile* drivers trace the input item, the state, and the
+    /// args inline (full postcard payloads) in every
+    /// `RecurTileIterationExec` record — the reason recur-tile loops carry
+    /// scalars only.
+    #[test]
+    fn p4_recur_tile_iterations_trace_input_state_and_args_inline() {
+        let chunks = vec![
+            vec!["aa".to_string(), "bb".to_string()],
+            vec!["cc".to_string()],
+        ];
+        let extra = vec!["E1".to_string(), "E2".to_string()];
+        let (state, events) = capture_trace_events(|| {
+            in_scope(|| {
+                let chunk_source =
+                    raster::store_internal_value(&chunks).expect("store chunk list");
+                let extra_source = raster::store_internal_value(&extra).expect("store extra");
+                raster::materialize_auth_return::<ProbeInlineState, _>(
+                    __raster_sequence_auth_probe_inline_recur_tile(
+                        internal!(Vec<Vec<String>>, chunk_source),
+                        internal!(Vec<String>, extra_source),
+                    ),
+                )
+            })
+        });
+        assert_eq!(state.log, vec!["aabb+E1E2".to_string(), "cc+E1E2".to_string()]);
+
+        let records = recur_tile_iteration_records(&events, "probe_inline_recur");
+        assert_eq!(records.len(), 2, "one iteration record per chunk");
+        for (iteration, record) in records.iter().enumerate() {
+            let input = record.input.as_ref().expect("iteration input trace");
+            // values: [input, state, extra] — every one inline.
+            #[derive(Debug, Deserialize)]
+            struct RecurInputMirror {
+                value: Vec<String>,
+                index: u64,
+                len: u64,
+            }
+            let item_bytes = inline_bytes(&input.values[0]);
+            let item: RecurInputMirror = raster::core::postcard::from_bytes(&item_bytes)
+                .expect("recur input should trace inline with the full item");
+            assert_eq!(item.value, chunks[iteration]);
+            assert_eq!(item.index as usize, iteration);
+            assert_eq!(item.len, 2);
+
+            let state_bytes = inline_bytes(&input.values[1]);
+            let state: ProbeInlineState = raster::core::postcard::from_bytes(&state_bytes)
+                .expect("recur state should trace inline");
+            assert_eq!(state.log.len(), iteration, "prior-iteration state, in full");
+
+            let extra_bytes = inline_bytes(&input.values[2]);
+            let traced_extra: Vec<String> = raster::core::postcard::from_bytes(&extra_bytes)
+                .expect("recur args should trace inline");
+            assert_eq!(traced_extra, extra, "args re-traced inline per iteration");
+        }
     }
 
     #[test]

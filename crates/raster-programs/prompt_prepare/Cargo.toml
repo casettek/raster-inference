@@ -30,3 +30,9 @@ serde = { workspace = true }
 raster-program-gemma-externals = { path = "../gemma_externals", default-features = false }
 # Output-file convention (WS2 §4), host boundary only.
 raster-program-support = { path = "../_support", optional = true }
+
+[dev-dependencies]
+# Trace-event capture for the storage-refactor probes (P1–P4) and the
+# trace-shape guard: tests install a capturing Publisher via
+# `raster::init_with`.
+raster-runtime = { workspace = true }

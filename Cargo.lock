@@ -2726,6 +2726,7 @@ dependencies = [
  "raster",
  "raster-program-gemma-externals",
  "raster-program-support",
+ "raster-runtime",
  "serde",
 ]
 

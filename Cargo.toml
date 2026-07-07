@@ -9,6 +9,9 @@ members = ["crates/dsl-macros", "crates/raster-programs/*"]
 # declared as RASTER_PIN in .github/workflows/ci.yml. The pin-bump procedure
 # is documented in the migration ADR.
 raster = { path = "../raster/crates/raster", default-features = false }
+# Trace-capture surface (Publisher trait) for program-crate probe tests only;
+# never a build dependency of any crate.
+raster-runtime = { path = "../raster/crates/raster-runtime" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 
