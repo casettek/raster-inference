@@ -153,12 +153,17 @@ Committed-external encoders that **exist now**:
 
 | External | Crate | Consuming routines |
 |---|---|---|
-| Gemma tokenizer (`GemmaTokenizer` schema: metadata, decoder metadata, sorted token/merge lookups, dense id table, special tokens) | `crates/raster-programs/gemma_externals/` | `prompt.prepare` (WS3-consumed, schema unrevised), `output.finalize` |
+| Gemma tokenizer (`GemmaTokenizer` schema **v2**: metadata, decoder metadata, **chunked** sorted token lookup (`token_lookup_chunks`) and priority-ordered merge table (`merge_chunks`) — `Vec<Vec<Entry>>`, encode-time width 1024 — dense id table, special tokens) | `crates/raster-programs/gemma_externals/` | `prompt.prepare` (WS3-consumed), `output.finalize` |
 
 Schema provenance: the raster-tokenizer PoC shape, the idiom WS1 verified
-for exactly this data (C13). **Accepted risk (WS2 ruling):** `prompt.prepare`'s
-WS3 Phase A plan may revise the schema; a revision re-runs the determinism
-tests and the tokenizer-external round trip, and appends a note to §10.
+for exactly this data (C13), revised to v2 by the `prompt.prepare` storage
+refactor (2026-07-06, §11): model-scoped tables are pre-chunked so programs
+consume them as recur input lists, and the pair-keyed `merge_lookup` was
+deleted. **Accepted risk (WS2 ruling):** a consuming routine's WS3 plan may
+revise the schema; a revision re-runs the determinism tests and the
+tokenizer-external round trip, bumps the cache-kind segment (see §3 cache
+convention — schema revisions must never collide with stale cache entries),
+and appends a note to §11.
 
 **Deferred to "build when WS3 reaches them"** (per the add-a-routine
 checklist, §9): embedding table (`input.embedding`), PLE source
@@ -227,6 +232,22 @@ never happen silently there (`.github/workflows/ci.yml`).
 
 ## 11. Amendment log
 
+- **2026-07-06** — Tokenizer external schema revised to **v2** by the
+  `prompt.prepare` storage refactor — the first exercise of the §7
+  accepted-risk clause. `token_lookup` → `token_lookup_chunks` and
+  `merges` → `merge_chunks` (both `Vec<Vec<Entry>>`, encode-time chunk
+  width 1024, order preserved); the pair-keyed `merge_lookup` deleted (its
+  only consumer was the pre-refactor scan). Rationale: model-scoped tables
+  enter tiles only as chunked recur input lists (WS1 C13/C22 amendment;
+  PORT_PLAN deviations D10–D12). The cache-kind segment bumped
+  `gemma-tokenizer` → `gemma-tokenizer-v2` in both the encoder
+  (`encode::CACHE_KIND`) and the host adapter's
+  `encode_tokenizer_external_cached`, so v2 encodings never collide with
+  stale entries. Per the clause: determinism + tamper legs re-run green
+  (`tests/raster_core_gemma_tokenizer_external.rs`, real toolchain), smoke
+  program re-pointed through the chunked shape (nested `[0][0]`
+  selection), and the `prompt.prepare` dev-run trace-identity gate stayed
+  green.
 - **2026-07-06** — WS3 `prompt.prepare` landed as the first consumer of this
   surface. The §7 accepted-risk clause was not triggered: the tokenizer
   schema shipped unrevised. One convention addition: the routine's host

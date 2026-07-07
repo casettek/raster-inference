@@ -1,40 +1,38 @@
 //! BPE merge-round scan phase (sim `tiles.rs`: `init_bpe_merge_scan`,
 //! `scan_bpe_merge_candidates`, `finalize_bpe_merge_scan`).
 //!
-//! The sim's `auth_read(tokenizer, GemmaBpeMergeRequest)` becomes an in-tile
-//! binary search over the tokenizer external's `merge_lookup` (sorted by
-//! `(left, right)`) — port-plan deviation D7, the tokenizer-PoC idiom. The
-//! merged token is captured from the lookup entry at scan time (D7b), so the
-//! sim's separate `GemmaBpeMergedTokenRequest` read disappears.
+//! Trace-slimming shape (port-plan deviation D13, supersedes D10's
+//! recur-tile inputs): the chunk loop is a `#[sequence(kind = recur)]` over
+//! the model-scoped merge table (`merge_chunks`, pre-chunked in the
+//! tokenizer external, priority order preserved). Each iteration passes the
+//! opaque chunk handle into one plain tile, so the chunk crosses the tile
+//! ABI as an external-selection binding (~100B commitment + selector in the
+//! trace) and materializes only at tile execution. The scan visits rules in
+//! priority order; the first rule with an adjacent-pair occurrence in the
+//! round's pieces wins (lowest `merge_index` globally, leftmost pair).
+//! Recur sequences cannot break early (gap G1), so post-winner and skipped
+//! chunks no-op. Semantically equivalent to the sim's min-rank/earliest-pair
+//! selection over pairs (proven by the equivalence tests below).
+//!
+//! The prompt-scoped round context (pieces, flags) rides `args`.
 
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use raster::prelude::*;
-use raster_program_gemma_externals::types::GemmaBpeMergeLookupEntry;
+use raster_program_gemma_externals::types::GemmaBpeMerge;
 
 use crate::types::{
-    BpeConfig, GemmaBpeLoopState, GemmaBpeMergeDecision, GemmaBpeRoundContext,
-    GemmaBpeScanCandidate, GemmaBpeScanState,
+    GemmaBpeLoopState, GemmaBpeMergeDecision, GemmaBpeRoundContext, GemmaBpeScanCandidate,
+    GemmaBpeScanState,
 };
 
-/// Binary search of the sorted `(left, right)` merge table. Plain helper —
-/// only reachable from tile bodies.
-pub(crate) fn find_merge<'a>(
-    merge_lookup: &'a [GemmaBpeMergeLookupEntry],
-    left: &str,
-    right: &str,
-) -> Option<&'a GemmaBpeMergeLookupEntry> {
-    merge_lookup
-        .binary_search_by(|entry| {
-            entry
-                .left
-                .as_str()
-                .cmp(left)
-                .then_with(|| entry.right.as_str().cmp(right))
-        })
-        .ok()
-        .map(|idx| &merge_lookup[idx])
+/// Leftmost adjacent-pair occurrence of `(left, right)` in `pieces`. Plain
+/// helper — only reachable from tile bodies.
+pub(crate) fn find_leftmost_pair(pieces: &[String], left: &str, right: &str) -> Option<u32> {
+    pieces
+        .windows(2)
+        .position(|pair| pair[0] == left && pair[1] == right)
+        .map(|pair_idx| pair_idx as u32)
 }
 
 /// Opens one BPE merge round: resolves the round's working pieces (the
@@ -62,73 +60,59 @@ pub fn init_bpe_merge_scan(
     }
 }
 
-/// Chunked pair scan: each iteration inspects up to `bpe_pairs_per_tile`
-/// adjacent pairs and keeps the candidate with the lowest merge priority
-/// (`merge_index` — the sim's `rank`; ties keep the earlier candidate, sim
-/// `tiles.rs:320-329`). Bounded input list + `RecurControl::Break` per gap
-/// G1; infallible per port-plan constraint A1.
-#[tile(kind = recur)]
-pub fn scan_bpe_merge_candidates(
-    input: RecurInput<u32>,
-    state: RecurState<GemmaBpeScanState>,
+/// One merge-table chunk per execution: checks its rules, in order, for an
+/// adjacent-pair occurrence in the round's pieces. The first hit is the
+/// global winner — chunks preserve priority order — with the leftmost pair
+/// occurrence; it sets `best` + `done` and every later chunk no-ops (as do
+/// all chunks of a skipped round). Infallible per port-plan constraint A1.
+#[tile]
+pub fn scan_one_merge_chunk(
+    state: GemmaBpeScanState,
+    chunk: Vec<GemmaBpeMerge>,
     round: GemmaBpeRoundContext,
-    merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
-    config: BpeConfig,
-) -> RecurControl<RecurState<GemmaBpeScanState>> {
-    let _chunk_ordinal = input.value();
+) -> GemmaBpeScanState {
     let mut state = state;
     if round.skip || state.done {
-        state.done = true;
-        return RecurControl::Break(state);
+        return state;
     }
 
-    let end_pair_idx = state
-        .next_pair_idx
-        .saturating_add(config.bpe_pairs_per_tile)
-        .min(round.pair_count);
-    for pair_idx in state.next_pair_idx..end_pair_idx {
-        let left = &round.pieces[pair_idx as usize];
-        let right = &round.pieces[pair_idx as usize + 1];
-        if let Some(entry) = find_merge(&merge_lookup, left, right) {
-            let better = match &state.best {
-                Some(best) => entry.candidate.merge_index < best.merge_index,
-                None => true,
-            };
-            if better {
-                state.best = Some(GemmaBpeScanCandidate {
-                    pair_idx,
-                    merge_index: entry.candidate.merge_index,
-                    merged: entry.candidate.merged_token.clone(),
-                });
-            }
+    state.chunks_scanned += 1;
+    for rule in chunk {
+        if let Some(pair_idx) = find_leftmost_pair(&round.pieces, &rule.left, &rule.right) {
+            state.best = Some(GemmaBpeScanCandidate {
+                pair_idx,
+                merge_index: rule.merge_index,
+                merged: rule.merged_token,
+            });
+            state.done = true;
+            return state;
         }
     }
-
-    state.next_pair_idx = end_pair_idx;
-    if state.next_pair_idx >= round.pair_count {
-        state.done = true;
-        RecurControl::Break(state)
-    } else {
-        RecurControl::Continue(state)
-    }
+    state
 }
 
-/// Closes the scan phase: completion check (sim `tiles.rs:345-351`, error
-/// deferred per A1) and decision assembly. `selection: None` means the
-/// round converged (no merge candidate remains).
+/// Priority-order scan loop: a recur sequence over the chunked merge table.
+/// The chunk reaches `scan_one_merge_chunk` as an external-selection
+/// binding; only the tiny scan state and the prompt-scoped round context
+/// ride inline.
+#[sequence(kind = recur)]
+pub fn scan_merge_chunks(
+    input: RecurSequenceInput<Vec<GemmaBpeMerge>>,
+    state: RecurSequenceState<GemmaBpeScanState>,
+    round: GemmaBpeRoundContext,
+) -> RecurSequenceState<GemmaBpeScanState> {
+    call!(scan_one_merge_chunk, state, input, round)
+}
+
+/// Closes the scan phase: decision assembly. `selection: None` means the
+/// round converged (no merge rule matches any adjacent pair — the scan
+/// exhausted the table). Deferred round errors ride through (A1).
 #[tile]
 pub fn finalize_bpe_merge_scan(
     scan: GemmaBpeScanState,
     round: GemmaBpeRoundContext,
 ) -> GemmaBpeMergeDecision {
-    let mut error = round.error;
-    if error.is_none() && !round.skip && scan.next_pair_idx != round.pair_count {
-        error = Some(format!(
-            "BPE merge scan finalized at pair {}, expected {}",
-            scan.next_pair_idx, round.pair_count
-        ));
-    }
-    let selection = if round.skip || error.is_some() {
+    let selection = if round.skip || round.error.is_some() {
         None
     } else {
         scan.best
@@ -138,15 +122,15 @@ pub fn finalize_bpe_merge_scan(
         round: round.round,
         pieces: round.pieces,
         selection,
-        error,
+        error: round.error,
     }
 }
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
+    use alloc::format;
     use alloc::string::ToString;
     use alloc::vec;
-    use raster_program_gemma_externals::types::GemmaBpeMergeCandidate;
 
     use super::*;
 
@@ -155,64 +139,89 @@ mod tests {
         run()
     }
 
-    fn lookup_entry(left: &str, right: &str, merge_index: u32) -> GemmaBpeMergeLookupEntry {
-        GemmaBpeMergeLookupEntry {
+    fn merge_rule(merge_index: u32, left: &str, right: &str) -> GemmaBpeMerge {
+        GemmaBpeMerge {
+            merge_index,
             left: left.to_string(),
             right: right.to_string(),
-            candidate: GemmaBpeMergeCandidate {
-                merge_index,
-                merged_token: format!("{left}{right}"),
-                has_token_id: true,
-                token_id: 0,
-            },
+            merged_token: format!("{left}{right}"),
+            has_token_id: true,
+            token_id: merge_index,
         }
     }
 
-    fn sorted_lookup(mut entries: Vec<GemmaBpeMergeLookupEntry>) -> Vec<GemmaBpeMergeLookupEntry> {
-        entries.sort_by(|a, b| a.left.cmp(&b.left).then_with(|| a.right.cmp(&b.right)));
-        entries
-    }
-
-    fn config(pairs: u32) -> BpeConfig {
-        BpeConfig {
-            bpe_pairs_per_tile: pairs,
-            bpe_pieces_per_tile: 64,
+    /// Priority-ordered rules split into `width`-wide chunks (the encoder's
+    /// `chunk_table` shape).
+    fn chunked(rules: Vec<GemmaBpeMerge>, width: usize) -> Vec<Vec<GemmaBpeMerge>> {
+        let mut chunks: Vec<Vec<GemmaBpeMerge>> = Vec::new();
+        for rule in rules {
+            match chunks.last_mut() {
+                Some(chunk) if chunk.len() < width => chunk.push(rule),
+                _ => chunks.push(vec![rule]),
+            }
         }
+        chunks
     }
 
+    /// Drives the per-chunk tile over every chunk — the recur sequence's
+    /// full pass (no early break).
     fn run_scan(
         round: &GemmaBpeRoundContext,
-        merge_lookup: &[GemmaBpeMergeLookupEntry],
-        config: &BpeConfig,
+        merge_chunks: &[Vec<GemmaBpeMerge>],
     ) -> GemmaBpeScanState {
         let mut state = GemmaBpeScanState::initial();
-        for chunk in 0u32..16 {
-            let control = scan_bpe_merge_candidates(
-                RecurInput::new(chunk, chunk as u64, 16),
-                RecurState::new(state),
-                round.clone(),
-                merge_lookup.to_vec(),
-                config.clone(),
-            );
-            match control {
-                RecurControl::Continue(next) => state = next.into_inner(),
-                RecurControl::Break(done) => {
-                    state = done.into_inner();
-                    break;
-                }
-            }
+        for chunk in merge_chunks {
+            state = scan_one_merge_chunk(state, chunk.clone(), round.clone());
         }
         state
     }
 
-    #[test]
-    fn first_round_initializes_from_staged_pieces() {
-        let round = in_scope(|| {
+    /// The sim's selection rule, as specified by `tiles.rs:320-329`: lowest
+    /// rank (merge_index) wins; ties keep the earlier pair occurrence.
+    fn sim_reference_selection(
+        pieces: &[String],
+        rules: &[GemmaBpeMerge],
+    ) -> Option<GemmaBpeScanCandidate> {
+        let mut best: Option<GemmaBpeScanCandidate> = None;
+        for pair_idx in 0..pieces.len().saturating_sub(1) {
+            let left = &pieces[pair_idx];
+            let right = &pieces[pair_idx + 1];
+            let Some(rule) = rules
+                .iter()
+                .find(|rule| &rule.left == left && &rule.right == right)
+            else {
+                continue;
+            };
+            let better = match &best {
+                Some(candidate) => rule.merge_index < candidate.merge_index,
+                None => true,
+            };
+            if better {
+                best = Some(GemmaBpeScanCandidate {
+                    pair_idx: pair_idx as u32,
+                    merge_index: rule.merge_index,
+                    merged: rule.merged_token.clone(),
+                });
+            }
+        }
+        best
+    }
+
+    fn round_for(pieces: Vec<&str>) -> GemmaBpeRoundContext {
+        in_scope(|| {
             init_bpe_merge_scan(
                 GemmaBpeLoopState::initial(),
-                vec!["a".to_string(), "b".to_string()],
+                pieces
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
             )
-        });
+        })
+    }
+
+    #[test]
+    fn first_round_initializes_from_staged_pieces() {
+        let round = round_for(vec!["a", "b"]);
         assert!(!round.skip);
         assert_eq!(round.pieces, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(round.pair_count, 1);
@@ -230,62 +239,119 @@ mod tests {
     }
 
     #[test]
-    fn scan_keeps_the_lowest_merge_index_and_earlier_candidate_on_ties() {
-        let round = in_scope(|| {
-            init_bpe_merge_scan(
-                GemmaBpeLoopState::initial(),
-                vec![
-                    "a".to_string(),
-                    "b".to_string(),
-                    "a".to_string(),
-                    "b".to_string(),
-                ],
-            )
-        });
-        let lookup = sorted_lookup(vec![lookup_entry("a", "b", 0), lookup_entry("b", "a", 1)]);
-        // Chunk width 1 exercises multi-iteration scanning.
-        let state = in_scope(|| run_scan(&round, &lookup, &config(1)));
-        let best = state.best.expect("candidate should be found");
-        assert_eq!(best.pair_idx, 0, "ties keep the earlier candidate");
-        assert_eq!(best.merge_index, 0);
-        assert_eq!(best.merged, "ab");
-        assert!(state.done);
+    fn skipped_rounds_no_op_every_chunk() {
+        let mut state = GemmaBpeLoopState::initial();
+        state.initialized = true;
+        state.complete = true;
+        state.pieces = vec!["ab".to_string()];
+        let round = in_scope(|| init_bpe_merge_scan(state, vec![]));
+        let chunks = chunked(vec![merge_rule(0, "a", "b"), merge_rule(1, "b", "a")], 1);
+        let scan = in_scope(|| run_scan(&round, &chunks));
+        assert_eq!(scan.chunks_scanned, 0, "skip must not scan any rules");
+        assert!(scan.best.is_none());
+        assert!(!scan.done);
     }
 
     #[test]
-    fn scan_without_candidates_converges() {
-        let round = in_scope(|| {
-            init_bpe_merge_scan(
-                GemmaBpeLoopState::initial(),
-                vec!["x".to_string(), "y".to_string()],
-            )
-        });
-        let lookup = sorted_lookup(vec![lookup_entry("a", "b", 0)]);
-        let state = in_scope(|| run_scan(&round, &lookup, &config(8)));
-        assert!(state.best.is_none());
-        let decision = in_scope(|| finalize_bpe_merge_scan(state, round));
+    fn priority_order_wins_over_pair_position() {
+        // Rule 0 ("b","a") matches at pair 1; rule 1 ("a","b") matches at
+        // pair 0. Priority (merge_index 0) must win even though its pair
+        // occurs later in the pieces.
+        let round = round_for(vec!["a", "b", "a"]);
+        let rules = vec![merge_rule(0, "b", "a"), merge_rule(1, "a", "b")];
+        let chunks = chunked(rules.clone(), 1);
+        let scan = in_scope(|| run_scan(&round, &chunks));
+        let best = scan.best.clone().expect("candidate should be found");
+        assert_eq!(best.merge_index, 0);
+        assert_eq!(best.pair_idx, 1);
+        assert_eq!(best.merged, "ba");
+        assert!(scan.done, "the winning chunk must set done");
+        assert_eq!(
+            scan.chunks_scanned, 1,
+            "chunks after the winner must no-op"
+        );
+        assert_eq!(
+            Some(best),
+            sim_reference_selection(&round.pieces, &rules),
+            "priority scan must match the sim's min-rank selection"
+        );
+    }
+
+    #[test]
+    fn repeated_pairs_keep_the_leftmost_occurrence() {
+        // Sim tie case: the same rule matches at pairs 0 and 2; the earlier
+        // occurrence wins.
+        let round = round_for(vec!["a", "b", "a", "b"]);
+        let rules = vec![merge_rule(0, "a", "b"), merge_rule(1, "b", "a")];
+        let chunks = chunked(rules.clone(), 2);
+        let scan = in_scope(|| run_scan(&round, &chunks));
+        let best = scan.best.expect("candidate should be found");
+        assert_eq!(best.pair_idx, 0, "ties keep the earlier candidate");
+        assert_eq!(best.merge_index, 0);
+        assert_eq!(best.merged, "ab");
+        assert_eq!(
+            Some(best),
+            sim_reference_selection(&round.pieces, &rules),
+            "leftmost-occurrence rule must match the sim's tie handling"
+        );
+    }
+
+    #[test]
+    fn chunk_width_does_not_change_the_selection() {
+        let pieces = vec!["a", "b", "a", "c", "a", "b"];
+        let rules = vec![
+            merge_rule(0, "c", "a"),
+            merge_rule(1, "a", "b"),
+            merge_rule(2, "b", "a"),
+            merge_rule(3, "a", "c"),
+        ];
+        let reference = {
+            let round = round_for(pieces.clone());
+            sim_reference_selection(&round.pieces, &rules)
+        };
+        for width in 1..=4 {
+            let round = round_for(pieces.clone());
+            let chunks = chunked(rules.clone(), width);
+            let scan = in_scope(|| run_scan(&round, &chunks));
+            assert_eq!(
+                scan.best, reference,
+                "chunk width {width} must not change the winner"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_without_candidates_converges_after_a_full_pass() {
+        let round = round_for(vec!["x", "y"]);
+        let chunks = chunked(vec![merge_rule(0, "a", "b"), merge_rule(1, "b", "a")], 1);
+        let scan = in_scope(|| run_scan(&round, &chunks));
+        assert!(scan.best.is_none());
+        assert!(!scan.done, "no winner: done stays clear");
+        assert_eq!(
+            scan.chunks_scanned, 2,
+            "a converged round pays one full table pass"
+        );
+        let decision = in_scope(|| finalize_bpe_merge_scan(scan, round));
         assert!(decision.selection.is_none());
         assert!(decision.error.is_none());
     }
 
     #[test]
-    fn incomplete_scan_defers_the_sim_error() {
-        let round = in_scope(|| {
-            init_bpe_merge_scan(
-                GemmaBpeLoopState::initial(),
-                vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            )
+    fn deferred_round_errors_suppress_the_selection() {
+        let mut round = round_for(vec!["a", "b"]);
+        round.error = Some("BPE merge apply finalized with 0 pieces, expected 1".to_string());
+        let mut scan = GemmaBpeScanState::initial();
+        scan.best = Some(GemmaBpeScanCandidate {
+            pair_idx: 0,
+            merge_index: 0,
+            merged: "ab".to_string(),
         });
-        let stalled = GemmaBpeScanState {
-            next_pair_idx: 1,
-            best: None,
-            done: false,
-        };
-        let decision = in_scope(|| finalize_bpe_merge_scan(stalled, round));
+        scan.done = true;
+        let decision = in_scope(|| finalize_bpe_merge_scan(scan, round));
+        assert!(decision.selection.is_none());
         assert_eq!(
             decision.error.as_deref(),
-            Some("BPE merge scan finalized at pair 1, expected 2")
+            Some("BPE merge apply finalized with 0 pieces, expected 1")
         );
-        assert!(decision.selection.is_none());
     }
 }

@@ -7,9 +7,19 @@
 //! errors deferred through `error` fields because recur tiles are
 //! infallible at the pinned rev (port-plan constraint A1).
 //!
-//! Tokenizer-side schema types (`GemmaTokenIdEntry`,
-//! `GemmaBpeMergeLookupEntry`, …) come from the shared
-//! `raster-program-gemma-externals` crate.
+//! Tokenizer-side schema types (`GemmaTokenIdEntry`, `GemmaBpeMerge`, …)
+//! come from the shared `raster-program-gemma-externals` crate.
+//!
+//! Data-placement rules (the storage-refactor design contract, tightened
+//! by the trace-slimming refactor D13/D14):
+//! - **Model-scoped tables** (vocab, merges) are pre-chunked committed
+//!   externals consumed *only* as recur-sequence input lists — each chunk
+//!   crosses the tile ABI as an external-selection binding and
+//!   materializes only at tile execution; never in `args`, never in loop
+//!   state, never inline in the trace.
+//! - **Prompt-scoped data** (pieces, pairs, token ids) rides loop state or
+//!   small args — bounded by the prompt, not the model.
+//! - **Cursors/flags/candidates** are tiny loop-state structs.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -28,20 +38,18 @@ pub struct BpeConfig {
 /// Bounded iteration lists for every recur loop in the program (gap G1:
 /// real recur is list-driven; every sim until-done loop has a derivable
 /// bound at loop start). Derived in-program by `build_chunk_budgets`.
+/// The scan and token-id phases need no derived budgets anymore: the
+/// chunked model tables are their own bounded recur-sequence input lists
+/// (the scan loops over `merge_chunks`, the inverted vocab pass over
+/// `token_lookup_chunks` — D14).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
 pub struct ChunkBudgets {
     /// BPE merge rounds: `initial_piece_count − 1` ordinals (each merge
     /// removes one piece).
     pub rounds: Vec<u32>,
-    /// Pair-scan chunks per round: `ceil((initial_piece_count − 1) /
-    /// bpe_pairs_per_tile)` ordinals — an upper bound for every round.
-    pub scan_chunks: Vec<u32>,
     /// Merge-apply chunks per round: `ceil((initial_piece_count − 1) /
     /// bpe_pieces_per_tile)` ordinals.
     pub apply_chunks: Vec<u32>,
-    /// Token-id finalization chunks: `ceil(initial_piece_count /
-    /// bpe_pieces_per_tile)` ordinals (final count ≤ initial).
-    pub token_chunks: Vec<u32>,
 }
 
 /// Loop-carried state of the outer BPE merge-round sequence (sim
@@ -90,10 +98,10 @@ pub struct GemmaBpeRoundContext {
     pub error: Option<String>,
 }
 
-/// Best merge candidate found by the pair scan. `merge_index` is the merge
-/// priority (the external's `merges` are ordered by it — the sim's `rank`);
-/// the merged token is captured at scan time from the `merge_lookup` entry
-/// (port-plan deviation D7b).
+/// Winning merge candidate of the priority-order scan. `merge_index` is
+/// the merge priority (the external's `merge_chunks` are ordered by it —
+/// the sim's `rank`); the merged token is captured at scan time from the
+/// winning `GemmaBpeMerge` rule (port-plan deviation D11).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeScanCandidate {
     pub pair_idx: u32,
@@ -101,11 +109,15 @@ pub struct GemmaBpeScanCandidate {
     pub merged: String,
 }
 
-/// Loop-carried cursor of the chunked pair scan (sim `GemmaBpeScanState`
-/// minus the roots/pieces legs).
+/// Loop-carried state of the priority-order merge scan: one merge-table
+/// chunk per iteration; the first rule with an adjacent-pair occurrence
+/// wins (lowest `merge_index` globally — chunks preserve priority order)
+/// and sets `done`, after which the remaining chunks no-op (recur
+/// sequences cannot break early — gap G1).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeScanState {
-    pub next_pair_idx: u32,
+    /// Chunks visited (diagnostic; a converged round pays one full pass).
+    pub chunks_scanned: u32,
     pub best: Option<GemmaBpeScanCandidate>,
     pub done: bool,
 }
@@ -113,7 +125,7 @@ pub struct GemmaBpeScanState {
 impl GemmaBpeScanState {
     pub fn initial() -> Self {
         Self {
-            next_pair_idx: 0,
+            chunks_scanned: 0,
             best: None,
             done: false,
         }
@@ -167,31 +179,35 @@ impl GemmaBpeApplyState {
     }
 }
 
-/// Read-only context of the token-id finalization loop, produced by
+/// Read-only context of the token-id resolution loop, produced by
 /// `init_token_id_finalization` from the finished BPE loop state (sim
 /// `GemmaBpeOutput` + builder start, with the builder dissolved — D6/D6a).
+/// Prompt-scoped: rides the vocab pass as a small `args` context (nothing
+/// selects out of it anymore — D14).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GemmaTokenIdContext {
     pub pieces: Vec<String>,
     pub piece_count: u32,
+    /// Deferred BPE-loop error (A1); surfaced as the terminal `Err` by
+    /// `finalize_tokenize_prompt`.
     pub error: Option<String>,
 }
 
-/// Loop-carried state of the chunked token-id finalization: ids accumulate
-/// in state (sim appended to the `prompt-token-ids` builder — D6).
+/// Loop-carried state of the inverted vocab pass (D14): one slot per final
+/// piece, filled as the single pass over `token_lookup_chunks` encounters
+/// each piece's sorted position. Prompt-scoped; seeds from a literal (A2)
+/// and sizes itself from the context on the first executed iteration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GemmaTokenIdState {
-    pub token_ids: Vec<u32>,
-    pub next_piece_idx: u32,
-    pub error: Option<String>,
+pub struct GemmaTokenResolutionState {
+    pub initialized: bool,
+    pub resolved: Vec<Option<u32>>,
 }
 
-impl GemmaTokenIdState {
+impl GemmaTokenResolutionState {
     pub fn initial() -> Self {
         Self {
-            token_ids: Vec::new(),
-            next_piece_idx: 0,
-            error: None,
+            initialized: false,
+            resolved: Vec::new(),
         }
     }
 }

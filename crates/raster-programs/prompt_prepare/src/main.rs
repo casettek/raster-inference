@@ -7,6 +7,11 @@
 //!   BPE pieces (the sim's pre-staged `bpe-pieces-0`)
 //! - `bpe_config`     — postcard `BpeConfig` chunk widths
 //!
+//! The model-scoped tables are selected as chunked lists
+//! (`token_lookup_chunks`, `merge_chunks`) and consumed only as recur
+//! input lists — one chunk per tile execution (storage-refactor data
+//! placement).
+//!
 //! The materialized outcome goes back to the host through the WS2
 //! output-file convention (`raster-program-support`,
 //! `RASTER_CORE_OUTPUT_PATH`); a terminal `Err` is a committed result, not
@@ -14,17 +19,18 @@
 
 use raster::prelude::*;
 use raster::println;
-use raster_program_gemma_externals::types::{
-    GemmaBpeMergeLookupEntry, GemmaTokenIdEntry, GemmaTokenizer,
-};
+use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry, GemmaTokenizer};
 use raster_program_prompt_prepare::routine::*;
 use raster_program_prompt_prepare::types::{BpeConfig, PromptTokenization};
 
 #[sequence]
 fn main() {
     let tokenizer = external!(GemmaTokenizer, "tokenizer");
-    let token_lookup = select!(Vec<GemmaTokenIdEntry>, tokenizer.clone().token_lookup);
-    let merge_lookup = select!(Vec<GemmaBpeMergeLookupEntry>, tokenizer.merge_lookup);
+    let token_lookup_chunks = select!(
+        Vec<Vec<GemmaTokenIdEntry>>,
+        tokenizer.clone().token_lookup_chunks
+    );
+    let merge_chunks = select!(Vec<Vec<GemmaBpeMerge>>, tokenizer.merge_chunks);
     let initial_pieces = select!(Vec<String>, external!(Vec<String>, "initial_pieces"));
     let config = select!(BpeConfig, external!(BpeConfig, "bpe_config"));
 
@@ -32,8 +38,8 @@ fn main() {
         tokenize_prompt_pieces,
         initial_pieces,
         config,
-        token_lookup,
-        merge_lookup
+        token_lookup_chunks,
+        merge_chunks
     ));
     raster_program_support::write_program_output(&outcome);
     match &outcome {

@@ -12,11 +12,14 @@ use raster::prelude::*;
 
 use crate::types::{BpeConfig, ChunkBudgets};
 
-/// Bounds: rounds = `piece_count − 1` (each merge removes one piece); scan
-/// and apply chunks cover the worst (first) round; token chunks cover the
-/// initial count (final count ≤ initial). Shorter real iterations stop via
-/// `RecurControl::Break`; an empty list finalizes cleanly with the initial
-/// state (WS1 probe P1).
+/// Bounds: rounds = `piece_count − 1` (each merge removes one piece);
+/// apply chunks cover the worst (first) round. Shorter real iterations
+/// stop via `RecurControl::Break`; an empty list finalizes cleanly with
+/// the initial state (WS1 probe P1). The scan and token-id phases need no
+/// derived budgets (storage refactor): the chunked model tables and the
+/// final pieces list are their own bounded recur inputs. Both zero-width
+/// guards stay — the staged config is validated in one place with the
+/// sim's exact messages.
 #[tile]
 pub fn build_chunk_budgets(initial_pieces: Vec<String>, config: BpeConfig) -> Result<ChunkBudgets> {
     if config.bpe_pairs_per_tile == 0 {
@@ -35,9 +38,7 @@ pub fn build_chunk_budgets(initial_pieces: Vec<String>, config: BpeConfig) -> Re
 
     Ok(ChunkBudgets {
         rounds: ordinals(max_pairs),
-        scan_chunks: ordinals(div_ceil(max_pairs, config.bpe_pairs_per_tile)),
         apply_chunks: ordinals(div_ceil(max_pairs, config.bpe_pieces_per_tile)),
-        token_chunks: ordinals(div_ceil(piece_count, config.bpe_pieces_per_tile)),
     })
 }
 
@@ -78,25 +79,21 @@ mod tests {
     fn budgets_cover_the_worst_round() {
         let budgets = in_scope(|| build_chunk_budgets(pieces(5), config(2, 3))).expect("budgets");
         assert_eq!(budgets.rounds, vec![0, 1, 2, 3]);
-        assert_eq!(budgets.scan_chunks, vec![0, 1]); // ceil(4 / 2)
         assert_eq!(budgets.apply_chunks, vec![0, 1]); // ceil(4 / 3)
-        assert_eq!(budgets.token_chunks, vec![0, 1]); // ceil(5 / 3)
     }
 
     #[test]
     fn single_piece_needs_no_rounds() {
         let budgets = in_scope(|| build_chunk_budgets(pieces(1), config(64, 64))).expect("budgets");
         assert!(budgets.rounds.is_empty());
-        assert!(budgets.scan_chunks.is_empty());
         assert!(budgets.apply_chunks.is_empty());
-        assert_eq!(budgets.token_chunks, vec![0]);
     }
 
     #[test]
     fn empty_pieces_need_no_iterations() {
         let budgets = in_scope(|| build_chunk_budgets(pieces(0), config(64, 64))).expect("budgets");
         assert!(budgets.rounds.is_empty());
-        assert!(budgets.token_chunks.is_empty());
+        assert!(budgets.apply_chunks.is_empty());
     }
 
     #[test]

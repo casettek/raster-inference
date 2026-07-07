@@ -1,10 +1,12 @@
 //! The Gemma tokenizer committed-external schema.
 //!
-//! Mirrors the raster-tokenizer PoC's `GemmaTokenizer` shape — the verified
-//! authoring idiom for exactly this data (WS1 catalog C13, evidence: the
-//! PoC's end-to-end run). Sorted lookup vectors replace the sim path's
-//! hashed request keys: point lookups become binary search over a selected
-//! sub-list or index-computing tiles plus `select!` by index.
+//! Derived from the raster-tokenizer PoC's `GemmaTokenizer` shape (WS1
+//! catalog C13), revised for the prompt.prepare storage refactor: the
+//! model-scoped tables (vocab, merges) are **pre-chunked**
+//! (`Vec<Vec<Entry>>`, encode-time width `TOKENIZER_CHUNK_WIDTH` in
+//! `encode.rs`) so programs consume them only as recur input lists — one
+//! bite-sized chunk per tile execution, never as materialized tile
+//! arguments or loop state.
 //!
 //! Guest-visible integers are fixed-width (`u32`) per catalog C12.
 
@@ -54,14 +56,16 @@ pub struct GemmaDecodedToken {
     pub special: bool,
 }
 
-/// `token_lookup` entry; the vector is sorted by `token` for binary search.
+/// `token_lookup_chunks` entry; the flattened chunk list is sorted by
+/// `token`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
 pub struct GemmaTokenIdEntry {
     pub token: String,
     pub id: u32,
 }
 
-/// `merges` entry, ordered by merge priority (`merge_index`).
+/// `merge_chunks` entry; the flattened chunk list is ordered by merge
+/// priority (`merge_index`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
 pub struct GemmaBpeMerge {
     pub merge_index: u32,
@@ -72,37 +76,21 @@ pub struct GemmaBpeMerge {
     pub token_id: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
-pub struct GemmaBpeMergeCandidate {
-    pub merge_index: u32,
-    pub merged_token: String,
-    pub has_token_id: bool,
-    pub token_id: u32,
-}
-
-/// `merge_lookup` entry; the vector is sorted by `(left, right)` for binary
-/// search.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
-pub struct GemmaBpeMergeLookupEntry {
-    pub left: String,
-    pub right: String,
-    pub candidate: GemmaBpeMergeCandidate,
-}
-
 /// Root schema of the `tokenizer` committed external.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
 pub struct GemmaTokenizer {
     pub metadata: GemmaTokenizerMetadata,
     pub decoder: GemmaDecoderMetadata,
-    /// Sorted by `token` (binary search for token → id).
-    pub token_lookup: Vec<GemmaTokenIdEntry>,
+    /// Sorted by `token`, then chunked (`TOKENIZER_CHUNK_WIDTH` entries per
+    /// chunk) — consumed as a recur input list, one chunk per tile.
+    pub token_lookup_chunks: Vec<Vec<GemmaTokenIdEntry>>,
     /// Indexed by token id (dense; every id present).
     pub tokens_by_id: Vec<GemmaDecodedToken>,
     /// Sorted by content length (desc), then content (asc) — longest-match
     /// special-token scanning order.
     pub special_tokens: Vec<GemmaAddedToken>,
-    /// Ordered by merge priority.
-    pub merges: Vec<GemmaBpeMerge>,
-    /// Sorted by `(left, right)` (binary search for pair → candidate).
-    pub merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
+    /// Ordered by merge priority, then chunked (`TOKENIZER_CHUNK_WIDTH`
+    /// entries per chunk) — consumed as a recur input list for the
+    /// priority-order scan.
+    pub merge_chunks: Vec<Vec<GemmaBpeMerge>>,
 }

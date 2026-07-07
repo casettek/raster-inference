@@ -27,7 +27,7 @@ pub fn summarize_tokenizer(
 ) -> Result<TokenizerSmoke> {
     if first_entry.token.is_empty() {
         return Err(String::from(
-            "summarize_tokenizer: token_lookup[0] has an empty token",
+            "summarize_tokenizer: token_lookup_chunks[0][0] has an empty token",
         ));
     }
     Ok(TokenizerSmoke {

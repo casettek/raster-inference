@@ -3,12 +3,16 @@
 //!
 //! Loader provenance: the raster-tokenizer PoC's `encode_tokenizer` bin —
 //! same raw-JSON shape validation, same derived-table construction (sorted
-//! lookups, dense id table, longest-match special-token order), so an
-//! encoding of the same `tokenizer.json` is byte-identical to the PoC's.
+//! lookups, dense id table, longest-match special-token order) — revised
+//! for the prompt.prepare storage refactor: the model-scoped tables are
+//! pre-chunked at encode time ([`TOKENIZER_CHUNK_WIDTH`]) so programs read
+//! them one chunk per tile execution.
 //!
 //! Cache convention (WS2): entries live at
-//! `<cache_root>/gemma-tokenizer/<sha256(tokenizer.json)>/` containing
+//! `<cache_root>/gemma-tokenizer-v2/<sha256(tokenizer.json)>/` containing
 //! `tokenizer.rastered`, `tokenizer.rindex`, and `root_commitment.txt`.
+//! (The cache-kind segment is versioned with the schema — `-v2` for the
+//! chunked shape — so revised encodings never collide with stale entries.)
 //! Re-encoding an already cached source is a no-op that re-reports the
 //! stored commitment; encoding is deterministic (asserted by the main-crate
 //! tokenizer-external test).
@@ -22,10 +26,21 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::types::{
-    GemmaAddedToken, GemmaBpeMerge, GemmaBpeMergeCandidate, GemmaBpeMergeLookupEntry,
-    GemmaDecodedToken, GemmaDecoderMetadata, GemmaTokenIdEntry, GemmaTokenizer,
-    GemmaTokenizerMetadata,
+    GemmaAddedToken, GemmaBpeMerge, GemmaDecodedToken, GemmaDecoderMetadata, GemmaTokenIdEntry,
+    GemmaTokenizer, GemmaTokenizerMetadata,
 };
+
+/// Encode-time chunk width for the model-scoped tables
+/// (`token_lookup_chunks`, `merge_chunks`): the per-tile read unit of the
+/// consuming programs (~30–50KB of entries per chunk). WS8 retunes by
+/// re-encoding with a different width (the cache-kind segment must be
+/// bumped alongside).
+pub const TOKENIZER_CHUNK_WIDTH: usize = 1024;
+
+/// Cache-kind segment, versioned with the schema shape (`-v2`: chunked
+/// model-scoped tables). Must match the main-crate host adapter's
+/// `encode_tokenizer_external_cached`.
+pub const CACHE_KIND: &str = "gemma-tokenizer-v2";
 
 /// One encoded cache entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +63,7 @@ pub fn encode_tokenizer_to_cache(
         .with_context(|| format!("failed to read {}", tokenizer_json_path.display()))?;
     let source_sha256 = sha256_hex(&source_bytes);
 
-    let entry_dir = cache_root.join("gemma-tokenizer").join(&source_sha256);
+    let entry_dir = cache_root.join(CACHE_KIND).join(&source_sha256);
     let data_path = entry_dir.join("tokenizer.rastered");
     let index_path = entry_dir.join("tokenizer.rindex");
     let commitment_path = entry_dir.join("root_commitment.txt");
@@ -106,20 +121,35 @@ fn build_tokenizer(raw: RawTokenizer) -> Result<GemmaTokenizer> {
     } = raw;
 
     let special_tokens = build_special_tokens(added_tokens);
-    let token_lookup = build_token_lookup(&model.vocab);
+    let token_lookup_chunks = chunk_table(build_token_lookup(&model.vocab));
     let tokens_by_id = build_tokens_by_id(&model.vocab, &special_tokens)?;
-    let merges = build_merges(&model.vocab, model.merges);
-    let merge_lookup = build_merge_lookup(&merges);
+    let merge_chunks = chunk_table(build_merges(&model.vocab, model.merges));
 
     Ok(GemmaTokenizer {
         metadata,
         decoder,
-        token_lookup,
+        token_lookup_chunks,
         tokens_by_id,
         special_tokens,
-        merges,
-        merge_lookup,
+        merge_chunks,
     })
+}
+
+/// Splits an ordered table into `TOKENIZER_CHUNK_WIDTH`-wide chunks
+/// (order-preserving; the last chunk may be shorter).
+fn chunk_table<T>(entries: Vec<T>) -> Vec<Vec<T>> {
+    let mut chunks = Vec::with_capacity(entries.len().div_ceil(TOKENIZER_CHUNK_WIDTH).max(1));
+    let mut current = Vec::with_capacity(TOKENIZER_CHUNK_WIDTH.min(entries.len()));
+    for entry in entries {
+        current.push(entry);
+        if current.len() == TOKENIZER_CHUNK_WIDTH {
+            chunks.push(core::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn validate_raw_tokenizer(raw: &RawTokenizer) -> Result<()> {
@@ -268,28 +298,6 @@ fn build_merges(
             }
         })
         .collect()
-}
-
-fn build_merge_lookup(merges: &[GemmaBpeMerge]) -> Vec<GemmaBpeMergeLookupEntry> {
-    let mut merge_lookup: Vec<GemmaBpeMergeLookupEntry> = merges
-        .iter()
-        .map(|merge| GemmaBpeMergeLookupEntry {
-            left: merge.left.clone(),
-            right: merge.right.clone(),
-            candidate: GemmaBpeMergeCandidate {
-                merge_index: merge.merge_index,
-                merged_token: merge.merged_token.clone(),
-                has_token_id: merge.has_token_id,
-                token_id: merge.token_id,
-            },
-        })
-        .collect();
-    merge_lookup.sort_by(|left, right| {
-        left.left
-            .cmp(&right.left)
-            .then_with(|| left.right.cmp(&right.right))
-    });
-    merge_lookup
 }
 
 #[derive(Debug, Deserialize)]

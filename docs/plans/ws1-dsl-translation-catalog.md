@@ -259,8 +259,8 @@ visible in checkpoint payloads.
 | Real-raster mapping | Committed **external input** + `select!`: the source's entry set (request-key → payload, cf. `committed_source_entries()`, `tokenizer.rs:431-478`) becomes a committed external (rastered file + manifest sha256/commitment); each `auth_read(source, request)` becomes `select!(Output, external.entry[key-path])` or a tile-internal lookup on a selected sub-structure |
 | Status | mapped-unverified → **verified for the mechanism** (external + select with commitment verification, P3); per-source data layout is WS2 scope |
 | Evidence | P3 (run R1 + tamper run R2: byte-flipped external rejected); `raster-tokenizer` PoC (`src/tokenizer.rs` lookup tiles over selected `Vec<GemmaTokenIdEntry>`) |
-| Porting rule | Each authenticated source becomes one committed external with a `Selectable` schema. Point lookups (token id by string, merge by pair) that sim served via hashed request keys become either (a) `select!` by index after a tile computes the index (binary search over a sorted entry list — the tokenizer-PoC idiom), or (b) whole-substructure selection + in-tile scan for small tables (metadata, scalars). The choice is per-source and belongs to the routine's WS3 plan; the catalog constraint is only that every read is commitment-checked (external selection proof) — never ambient. |
-| Notes | The `raster-tokenizer` PoC demonstrates idiom (a) end-to-end for exactly the Gemma tokenizer data. WS2 owns producing the committed files; the in-tile residue is `select!` + lookup tiles. |
+| Porting rule | Each authenticated source becomes one committed external with a `Selectable` schema. Point lookups (token id by string, merge by pair) that sim served via hashed request keys become either (a) `select!` by index after a tile computes the index (binary search over a sorted entry list — the tokenizer-PoC idiom), or (b) whole-substructure selection + in-tile scan for small tables (metadata, scalars). The choice is per-source and belongs to the routine's WS3 plan; the catalog constraint is only that every read is commitment-checked (external selection proof) — never ambient. **Model-scoped data placement (2026-07-06 amendment, from the prompt.prepare storage refactor; refined the same day by the trace-slimming refactor):** model-scoped tables enter tiles *only* as pre-chunked lists consumed via **recur sequences** — the external stores `Vec<Vec<Entry>>` (encode-time chunk width), the loop is a `#[sequence(kind = recur)]` over the chunk list, and each iteration passes the opaque item handle plus the threaded state into one plain per-chunk tile, which receives the chunk as an external-selection binding (materialized only at tile execution; ~100B commitment + selector in the trace). Big tables must never ride recur `args` or loop state (the generated recur drivers materialize `args` inside the per-iteration closure), and chunk loops must not be recur *tiles* (their drivers trace each iteration's materialized input and args inline — gap G7). Idiom (a)'s whole-table selection is thereby restricted to prompt/request-scoped data; point lookups over chunked tables are linear chunk scans that no-op after resolution (recur sequences cannot `Break` — G1's bounded full pass is the accepted cost, G7's upstream request would restore `Break`). |
+| Notes | The `raster-tokenizer` PoC demonstrates idiom (a) end-to-end for exactly the Gemma tokenizer data. WS2 owns producing the committed files; the in-tile residue is `select!` + lookup tiles. Chunked-input evidence: `prompt_prepare` storage + trace-slimming refactors (schema v2 round-trip through the real toolchain; test-only probe module `crates/raster-programs/prompt_prepare/src/chunk_probes.rs` for nested `Vec<Vec<T>>` selection, chunked recur `Break`, recur-sequence chunk-handle + state into one tile, and nested recur sequences). See also G6 (select-by-computed-index would upgrade the linear chunk scan to a point read — an optimization, never a blocker) and G7. |
 
 ### C14. `impl AuthRead<…> for str` (root-string sources)
 
@@ -377,10 +377,10 @@ visible in checkpoint payloads.
 | Construct | `&T` params in tile/sequence signatures: `&AuthenticatedGemmaTokenizer`, `&RasterInputEmbeddingSource<'_>`, `&RasterPrefillLayerSource<'_>`, `&RasterInputEmbeddingRefs`, `Option<&str>` (139 signature sites) |
 | Sites | e.g. `prompt_prepare/raster/tiles.rs:24,70,152`, `input_embedding/raster/tiles.rs:20,47,87`, `prefill_range/raster/tiles.rs:52-54` |
 | Routines affected | all except `decode.select_token` (fully self-contained state), `prefill.range_finalize` |
-| Real-raster mapping | Owned committed externals + per-use `select!` (C13), with small selected sub-structures cloned into recur `args = (…)` where a loop needs them (tokenizer-PoC idiom) |
+| Real-raster mapping | Owned committed externals + per-use `select!` (C13), with small selected sub-structures cloned into recur `args = (…)` where a loop needs them (tokenizer-PoC idiom) — *small* meaning prompt/request-scoped; model-scoped tables are chunked lists consumed via recur sequences whose per-chunk tiles receive selection refs (C13 2026-07-06 amendment, trace-slimming refinement) |
 | Status | verified (mechanism, P3); per-source layout is WS2 |
-| Evidence | P3 (run R1); `raster-tokenizer/src/main.rs:8-9`, `src/tokenizer.rs:311-340` |
-| Porting rule | No borrows cross the tile ABI. For big sources (weights): keep them external and select rows per request — the per-row selection replaces `auth_read(source, RowRequest)` one-for-one. For small metadata: select once into an owned struct and pass by value through state/args. `Option<&str>` → `Option<String>`. |
+| Evidence | P3 (run R1); `raster-tokenizer/src/main.rs:8-9`, `src/tokenizer.rs:311-340`; `prompt_prepare` storage refactor (chunked recur inputs end-to-end) |
+| Porting rule | No borrows cross the tile ABI. For big sources (weights): keep them external and select rows per request — the per-row selection replaces `auth_read(source, RowRequest)` one-for-one. For small metadata: select once into an owned struct and pass by value through state/args. `Option<&str>` → `Option<String>`. **2026-07-06 amendment (prompt.prepare storage refactor, refined by the trace-slimming refactor):** "select rows per request" for loop-consumed model-scoped tables means *pre-chunked lists consumed via recur sequences* (`Vec<Vec<Entry>>`; the per-chunk plain tile receives each chunk as a selection ref, one chunk per tile execution) — never whole-table selection into recur `args` (the generated drivers re-materialize `args` on every iteration) and never recur-*tile* inputs (their drivers inline each iteration's input in the trace — G7). |
 | Notes | Directly shapes WS2's input-staging design; the mmap `load_preference` in `input.json` covers the large-weights case. |
 
 ### C23. Error contract (H4)
@@ -629,6 +629,51 @@ throughout. All three have named, verified shapes.
 - **Resolution path:** none needed for WS3/WS4; WS7 verifies single-tile replay
   in-guest (out of WS1 scope).
 
+### G6 — Dynamic select-by-computed-index (optimization request, never blocking)
+
+- **Missing behavior:** `select!` paths take *literal* indexes only
+  (`raster-macros` `split_selector_expr` panics on non-literal index
+  expressions), so a tile-computed index (e.g. binary-search position, or
+  `priority_index / chunk_width`) cannot drive a selection. A point read
+  addressed by computed position must instead be expressed as a recur scan
+  over a chunked list with `RecurControl::Break`.
+- **Affected routines:** none blocked. `prompt.prepare` (storage refactor,
+  2026-07-06) is the existence proof for the fallback: token-id lookup and
+  the BPE merge scan run as linear chunk scans over pre-chunked committed
+  externals (`Vec<Vec<Entry>>`, C13 amendment), with early `Break` on
+  match/sorted-position/priority-hit. Cost is bounded and honest-path
+  acceptable (one chunk per tile execution; see the routine's PORT_PLAN
+  cost model).
+- **Resolution path:** filed as a **raster optimization request**, not a
+  gap: "dynamic index selection" (select an element/chunk by a value
+  computed in a prior tile, with the selection proof binding the computed
+  index). Would turn O(table/chunk_width) scan iterations into one
+  selection per lookup. Linear chunk scans remain the always-available
+  fallback, so G6 never gates a port.
+
+### G7 — Recur-*tile* drivers inline per-iteration inputs/args in the trace
+
+- **Missing behavior:** the `#[tile(kind = recur)]` driver materializes each
+  list item into `RecurInput<T>` and traces it **inline** per iteration
+  (`RecurTileIterationExec`), and re-materializes every `args` value into
+  the same event. There is no way to keep a recur-tile input as a storage
+  ref: plain-tile `AuthRef` args and recur-*sequence* item handles trace as
+  `ExternalBinding`/`InternalBinding` (~100B commitment + selector), but
+  recur-tile iterations always carry the full bytes.
+- **Affected routines:** any loop consuming model-scoped chunked lists via
+  recur tiles. Measured on `prompt.prepare` with real Gemma before its
+  trace-slimming refactor: 94% of a 211MB trace was
+  `RecurTileIterationExec` inlining 86KB merge chunks / 34–50KB vocab
+  chunks per iteration.
+- **Resolution path (porting rule + upstream request):** ports route
+  model-scoped chunk loops through **recur sequences** whose bodies pass
+  the opaque item handle into one plain per-chunk tile (C13/C22 amendment;
+  evidence: `prompt_prepare` trace-slimming refactor, D13/D14, plus its
+  `chunk_probes.rs` mechanics probes — including nested recur sequences).
+  The trade is G1's no-`Break` full pass per loop. Filed upstream as
+  "trace recur-tile inputs as selection bindings" — that would make recur
+  tiles ref-clean *and* restore `Break` for chunked scans.
+
 ---
 
 ## 7. Probe crate index
@@ -733,6 +778,31 @@ Staged inputs and run artifacts are gitignored within the probe crate.
   a legal tile argument and `From<AuthRef<T>>` lets a tile's return re-enter
   it — the recur-sequence body idiom. §5 readiness row updated; G1's
   canonical case (the BPE merge loop) is now port-proven.
+- **2026-07-06** — `prompt.prepare` storage refactor. C13/C22 porting rules
+  amended with the model-scoped data-placement ruling: model-scoped tables
+  (vocab, merges, and by extension any table sized by the model rather than
+  the request) enter tiles **only as pre-chunked recur input lists**
+  (`Vec<Vec<Entry>>` in the committed external, one chunk per tile
+  execution) — never as recur `args` (the generated drivers materialize
+  `args` per iteration) and never as loop state. New gap-register entry
+  **G6** (dynamic select-by-computed-index) filed as an optimization
+  request; the linear chunk scan with `Break` is the verified,
+  always-available fallback (evidence: the refactored `prompt_prepare`
+  program + its `chunk_probes.rs` mechanics probes; schema-v2 round trip
+  through the real toolchain). Deviation register: PORT_PLAN D10–D12.
+- **2026-07-06** — `prompt.prepare` trace-slimming ref-based refactor
+  (PORT_PLAN D13/D14, superseding D10's loop mechanism and D12). The
+  C13/C22 model-scoped data-placement ruling refined: chunked lists are
+  consumed via **recur sequences** — the per-chunk plain tile receives
+  each chunk as a selection ref (external-selection binding, ~100B in the
+  trace), never via recur *tiles*, whose drivers inline each iteration's
+  materialized input and args (new gap-register entry **G7**, with the
+  upstream request "trace recur-tile inputs as selection bindings"; would
+  also restore `Break` for chunked scans — until then G1's bounded
+  full pass is the accepted cost). Real-model measurement (E4B): largest
+  inline value in any trace event fell from 86KB to 102B; model chunks
+  and cross-tile contexts now cross the ABI exclusively as
+  external/internal storage bindings. G6 unchanged.
 - **2026-07-06** — WS2 landed (`docs/plans/ws2-staging.md`); the rows that
   deferred to "WS2 scope" now have concrete owners. C13/C22 (per-source data
   layout, borrowed-source staging): `StagedInputs` +

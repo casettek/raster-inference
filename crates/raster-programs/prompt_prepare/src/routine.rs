@@ -5,6 +5,13 @@
 //! generated `__raster_sequence_auth_*` wrapper (catalog C25); the zero-arg
 //! program `main` binds the committed externals and delegates here.
 //!
+//! Data placement (trace-slimming refactor, D13/D14): the chunked
+//! model-scoped tables (`token_lookup_chunks`, `merge_chunks`) arrive as
+//! `AuthRef`s and flow untouched into recur-*sequence* input positions —
+//! each chunk crosses the tile ABI as a selection binding and materializes
+//! only at tile execution. Native tests stage them as internal values
+//! (recur input lists need a selectable list source, not an inline value).
+//!
 //! Not ported from the sim: the tokenizer root-equality guard (D1 — the
 //! runtime's manifest commitment check enforces source identity), the
 //! roots-collecting `finalize_raster_prompt_preparation` (D8 — checkpoint
@@ -14,7 +21,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use raster::prelude::*;
-use raster_program_gemma_externals::types::{GemmaBpeMergeLookupEntry, GemmaTokenIdEntry};
+use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry};
 
 // Glob imports: `call!`/`call_recur!`/`call_recur_seq!` resolve hidden
 // per-tile marker types and generated drivers, so the defining modules must
@@ -22,43 +29,35 @@ use raster_program_gemma_externals::types::{GemmaBpeMergeLookupEntry, GemmaToken
 use crate::bpe_round::*;
 use crate::budgets::*;
 use crate::token_ids::*;
-use crate::types::{BpeConfig, GemmaBpeLoopState, GemmaTokenIdState, PromptTokenization};
+use crate::types::{BpeConfig, GemmaBpeLoopState, GemmaTokenResolutionState, PromptTokenization};
 
-/// Staged pieces + tokenizer lookup tables → prompt token ids.
+/// Staged pieces + chunked tokenizer tables → prompt token ids.
 #[sequence]
 pub fn tokenize_prompt_pieces(
     initial_pieces: Vec<String>,
     config: BpeConfig,
-    token_lookup: Vec<GemmaTokenIdEntry>,
-    merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
+    token_lookup_chunks: Vec<Vec<GemmaTokenIdEntry>>,
+    merge_chunks: Vec<Vec<GemmaBpeMerge>>,
 ) -> Result<PromptTokenization> {
     let budgets = call!(build_chunk_budgets, initial_pieces.clone(), config.clone())?;
     let rounds = select!(Vec<u32>, budgets.clone().rounds);
-    let scan_chunks = select!(Vec<u32>, budgets.clone().scan_chunks);
-    let apply_chunks = select!(Vec<u32>, budgets.clone().apply_chunks);
-    let token_chunks = select!(Vec<u32>, budgets.token_chunks);
+    let apply_chunks = select!(Vec<u32>, budgets.apply_chunks);
 
     let bpe_state = call_recur_seq!(
         sequence = merge_bpe_round,
         input = rounds,
         state = GemmaBpeLoopState::initial(),
-        args = (
-            initial_pieces.clone(),
-            config.clone(),
-            merge_lookup,
-            scan_chunks,
-            apply_chunks,
-        )
+        args = (initial_pieces.clone(), config, merge_chunks, apply_chunks)
     );
 
     let token_ctx = call!(init_token_id_finalization, bpe_state, initial_pieces);
-    let ids_state = call_recur!(
-        tile = finalize_next_token_ids,
-        input = token_chunks,
-        state = GemmaTokenIdState::initial(),
-        args = (token_ctx.clone(), token_lookup, config)
+    let resolution = call_recur_seq!(
+        sequence = resolve_vocab_chunk,
+        input = token_lookup_chunks,
+        state = GemmaTokenResolutionState::initial(),
+        args = (token_ctx.clone(),)
     );
-    let tokenization = call!(finalize_tokenize_prompt, ids_state, token_ctx)?;
+    let tokenization = call!(finalize_tokenize_prompt, resolution, token_ctx)?;
     Ok(tokenization)
 }
 
@@ -67,14 +66,13 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
     use raster::materialize_auth_result;
-    use raster_program_gemma_externals::types::GemmaBpeMergeCandidate;
 
     use super::*;
 
     /// The sim test fixture (`raster/tests.rs::test_tokenizer_spec`) in the
-    /// committed-external shape: sorted token lookup, priority-ordered
-    /// merges in a sorted `(left, right)` lookup.
-    fn token_lookup() -> Vec<GemmaTokenIdEntry> {
+    /// chunked committed-external shape: sorted vocab chunks,
+    /// priority-ordered merge chunks.
+    fn token_lookup_chunks(width: usize) -> Vec<Vec<GemmaTokenIdEntry>> {
         let mut entries = vec![
             ("<unk>", 0u32),
             ("a", 1),
@@ -85,35 +83,46 @@ mod tests {
             ("<bos>", 5),
             ("<0xC3>", 10),
             ("<0xA9>", 11),
-        ]
-        .into_iter()
-        .map(|(token, id)| GemmaTokenIdEntry {
-            token: token.to_string(),
-            id,
-        })
-        .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.token.cmp(&right.token));
-        entries
+        ];
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        chunk(
+            entries
+                .into_iter()
+                .map(|(token, id)| GemmaTokenIdEntry {
+                    token: token.to_string(),
+                    id,
+                })
+                .collect(),
+            width,
+        )
     }
 
-    fn merge_lookup() -> Vec<GemmaBpeMergeLookupEntry> {
-        let mut entries = vec![("a", "b", 0u32, "ab", 3u32), ("ab", "a", 1, "aba", 12)]
+    fn merge_chunks(width: usize) -> Vec<Vec<GemmaBpeMerge>> {
+        let rules = vec![("a", "b", 0u32, "ab", 3u32), ("ab", "a", 1, "aba", 12)]
             .into_iter()
             .map(
-                |(left, right, merge_index, merged, token_id)| GemmaBpeMergeLookupEntry {
+                |(left, right, merge_index, merged, token_id)| GemmaBpeMerge {
+                    merge_index,
                     left: left.to_string(),
                     right: right.to_string(),
-                    candidate: GemmaBpeMergeCandidate {
-                        merge_index,
-                        merged_token: merged.to_string(),
-                        has_token_id: true,
-                        token_id,
-                    },
+                    merged_token: merged.to_string(),
+                    has_token_id: true,
+                    token_id,
                 },
             )
             .collect::<Vec<_>>();
-        entries.sort_by(|a, b| a.left.cmp(&b.left).then_with(|| a.right.cmp(&b.right)));
-        entries
+        chunk(rules, width)
+    }
+
+    fn chunk<T>(entries: Vec<T>, width: usize) -> Vec<Vec<T>> {
+        let mut chunks: Vec<Vec<T>> = Vec::new();
+        for entry in entries {
+            match chunks.last_mut() {
+                Some(chunk) if chunk.len() < width => chunk.push(entry),
+                _ => chunks.push(vec![entry]),
+            }
+        }
+        chunks
     }
 
     fn config(pairs: u32, pieces: u32) -> BpeConfig {
@@ -123,10 +132,21 @@ mod tests {
         }
     }
 
-    fn tokenize(
+    /// Drives the routine natively. The chunked tables are stored as
+    /// internal values first: recur input lists must be selectable
+    /// external/internal sources, exactly like the selections `main` makes
+    /// from the tokenizer external.
+    fn tokenize_chunked(
         pieces: Vec<&str>,
         config: BpeConfig,
+        table_width: usize,
     ) -> core::result::Result<PromptTokenization, String> {
+        let _guard =
+            raster::__private::SequenceScopeGuard::enter("prompt_prepare_routine_tests");
+        let vocab = raster::store_internal_value(&token_lookup_chunks(table_width))
+            .expect("store vocab chunks");
+        let merges =
+            raster::store_internal_value(&merge_chunks(table_width)).expect("store merge chunks");
         materialize_auth_result::<PromptTokenization, _>(
             __raster_sequence_auth_tokenize_prompt_pieces(
                 pieces
@@ -134,10 +154,17 @@ mod tests {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>(),
                 config,
-                token_lookup(),
-                merge_lookup(),
+                internal!(Vec<Vec<GemmaTokenIdEntry>>, vocab),
+                internal!(Vec<Vec<GemmaBpeMerge>>, merges),
             ),
         )
+    }
+
+    fn tokenize(
+        pieces: Vec<&str>,
+        config: BpeConfig,
+    ) -> core::result::Result<PromptTokenization, String> {
+        tokenize_chunked(pieces, config, 4)
     }
 
     #[test]
@@ -151,9 +178,10 @@ mod tests {
     #[test]
     fn chunk_sizes_do_not_change_results() {
         // Sim `tokenize_prompt_chunk_sizes_do_not_change_results`:
-        // "aba" → [12] under both tiny and large chunk widths.
-        let tiny = tokenize(vec!["a", "b", "a"], config(1, 1)).expect("tiny chunks");
-        let large = tokenize(vec!["a", "b", "a"], config(8, 8)).expect("large chunks");
+        // "aba" → [12] under both tiny and large chunk widths — for the
+        // staged apply width *and* the encode-time table chunk width.
+        let tiny = tokenize_chunked(vec!["a", "b", "a"], config(1, 1), 1).expect("tiny chunks");
+        let large = tokenize_chunked(vec!["a", "b", "a"], config(8, 8), 16).expect("large chunks");
         assert_eq!(tiny.token_ids, large.token_ids);
         assert_eq!(tiny.token_ids, vec![12]);
     }

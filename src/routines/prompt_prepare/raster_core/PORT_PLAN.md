@@ -163,10 +163,10 @@ Sim `types.rs` → program-crate `types.rs`, postcard-safe owned, fixed-width
 | — | `BpeConfig { bpe_pairs_per_tile: u32, bpe_pieces_per_tile: u32 }` (staged, `Selectable`) | C27: chunk widths staged by the host from `RasterSizingControls` (defaults 64), one obvious place for WS8 retune |
 | — | `ChunkBudgets { rounds: Vec<u32>, scan_chunks: Vec<u32>, apply_chunks: Vec<u32>, token_chunks: Vec<u32> }` (`Selectable`) | budget tile output, fields selected as recur inputs |
 
-Tokenizer-side types (`GemmaTokenizer`, `GemmaTokenIdEntry`,
-`GemmaBpeMergeLookupEntry`, …) come from `raster-program-gemma-externals`
-unchanged — no schema revision needed (WS2 §7 accepted-risk clause not
-triggered).
+Tokenizer-side types (`GemmaTokenizer`, `GemmaTokenIdEntry`, …) come from
+`raster-program-gemma-externals`. *(Phase A shipped the schema unrevised;
+the storage refactor later triggered the WS2 §7 accepted-risk clause — see
+"Storage refactor" below and deviations D10/D11.)*
 
 ## 3. I/O inventory
 
@@ -323,10 +323,15 @@ Added coverage:
 | D5 | `tokenize_bpe_state` sequence not ported | test-only entry; program tests drive the parameterized routine sequence natively (C25 idiom) |
 | D6 | Builder/read ladder (`bpe-pieces-N` artifacts, token-ids builder) → pieces and ids carried inline in loop state/args | C15/C16 note: the sim's pair of (small state + store artifacts) collapses to state once roots dissolve; every value still rides the trace (state serialized per iteration, args materialized per site). `Draft` reserved for select-from-finalized needs, which this routine no longer has — its sole output is the materialized token-id vector. Trace-size cost noted for WS8 (`[MEASUREMENT-PENDING]`) |
 | D6a | `finalize_bpe_tokenize_prompt` folded into `init_token_id_finalization` | the sim tile was a trivial state-to-output cast whose output type dissolves with D6 |
-| D7 | `auth_read(tokenizer, …Request)` → in-tile binary search over selected `token_lookup` / `merge_lookup` | C13 idiom (a), the tokenizer-PoC shape; per-source choice assigned to this plan by the catalog |
-| D7b | Merged token taken from the scan candidate instead of a separate `GemmaBpeMergedTokenRequest` read | the external's `merge_lookup` entry carries `merged_token`; a second dynamic-index read would need select-by-computed-index for data already commitment-checked in the same external |
+| D7 | `auth_read(tokenizer, …Request)` → in-tile binary search over selected `token_lookup` / `merge_lookup` | **superseded by D10/D11** (storage refactor): whole-table selection dragged the model-scoped tables through recur `args`, re-materializing ~262k entries per chunk iteration |
+| D7b | Merged token taken from the scan candidate instead of a separate `GemmaBpeMergedTokenRequest` read | **superseded by D11** (the merged token now comes from the winning `GemmaBpeMerge` rule itself) |
 | D8 | `finalize_raster_prompt_preparation` not ported | its output is the checkpoint payload, which is host-side by the backend-invariance rule (§4); the native formatter emits it on both legs |
-| D9 | New `build_chunk_budgets` tile (no sim analogue) | G1 bound-list obligation + hoisted zero-width guards (sim's per-tile `bail!`s), kept fallible in one place |
+| D9 | New `build_chunk_budgets` tile (no sim analogue) | G1 bound-list obligation + hoisted zero-width guards (sim's per-tile `bail!`s), kept fallible in one place. Storage refactor: only `rounds` and `apply_chunks` remain — the chunked model tables and the final pieces list are their own bounded recur inputs |
+| D10 | **Chunked-external idiom (storage refactor, supersedes D7's data placement).** Model-scoped tables enter tiles *only* as pre-chunked committed-external recur input lists: `token_lookup_chunks` / `merge_chunks` (`Vec<Vec<Entry>>`, encode-time width 1024), one chunk (~30–50KB) per tile execution — never materialized tile `args`, never loop state | ZKVM sizing for real Gemma: the generated recur drivers materialize `args` inside the per-iteration closure, so any table in `args` re-enters the tile ABI/trace on every iteration. Recur *input* items are per-iteration selections instead. WS1 C13/C22 amended with this rule. **Loop mechanism superseded by D13** (recur-tile inputs still traced inline per iteration; chunk loops became recur sequences) — the chunked-external schema and the "never args/state" rule stand |
+| D11 | **Priority-order scan (supersedes D7/D7b).** Per round, the scan recurs over `merge_chunks` in priority order; the first rule with an adjacent-pair occurrence in the round's pieces wins (lowest `merge_index` globally, leftmost pair) and breaks. The pair-keyed `merge_lookup` table is deleted from the external schema | equivalent to the sim's min-rank/earliest-pair selection (unit-proven against the sim fixture cases); dissolves the only consumer of `merge_lookup`, halving the external's derived data. A converged round pays one full table pass; the `complete` flag makes later rounds break on the first chunk |
+| D12 | **Draft-accumulated token ids (amends D6).** Token-id resolution is a nested loop — outer recur *sequence* over the final pieces (its own natural bound), inner recur *tile* over `token_lookup_chunks` (`Break` on match or past the sorted position) — with ids/misses accumulated in a `TokenIdsBundle` draft output, not loop state | **superseded by D14** (trace-slimming refactor): the recur-*tile* inner loop still inlined each vocab chunk per iteration (G7), and the per-piece nesting paid `pieces × chunks` iterations. D6's original rationale stands; the mechanism moved |
+| D13 | **Chunk loops are recur sequences (trace-slimming refactor, supersedes D10's recur-tile inputs).** Model-scoped chunk loops are `#[sequence(kind = recur)]` over the chunked table; each iteration passes the opaque item handle (`RecurSequenceInput<Vec<Entry>>`) plus the threaded state into one plain tile, so the chunk crosses the tile ABI as an external-selection binding (~100B commitment + selector) and materializes only at tile execution | recur-*tile* drivers trace each iteration's materialized input *and* re-materialized `args` inline (`RecurTileIterationExec` — gap G7): 86KB merge chunks / 34–50KB vocab chunks per iteration, 94% of the real-model trace. Plain-tile `AuthRef` args already trace as bindings; recur-sequence item handles are selection `AuthRef`s — combining the two is the fix. Cost: no `Break` in recur sequences (G1), so every round pays a full no-op pass after the winner (accepted; WS8 chunk-width retuning + the G7 upstream request are the mitigations) |
+| D14 | **Inverted single vocab pass (supersedes D12).** One recur sequence over `token_lookup_chunks`; per chunk, `resolve_pieces_in_vocab_chunk` binary-searches every still-unresolved piece against the chunk, filling a per-piece slot vector (`GemmaTokenResolutionState { initialized, resolved: Vec<Option<u32>> }` — prompt-scoped, seeds from a literal per A2, sizes itself from the context on the first iteration; no-ops once all pieces resolve). The per-piece machinery (`resolve_piece_token_ids`, `open_piece_lookup`, `lookup_piece_token_id`, `record_piece_token_id`, `TokenIdsBundle`, `GemmaVocabLookupState`) is deleted; `GemmaTokenIdContext` is no longer `Selectable` (nothing selects its pieces) and its deferred error reverts to `Option<String>` | one full pass over the vocab chunks for the whole prompt (256 iterations) replaces `pieces × chunks` nested iterations, and every chunk crosses as a selection binding (D13 rule). `finalize_tokenize_prompt` surfaces the first unresolved slot with the sim's exact missing-vocab message via `ctx.pieces[i]` (H4/A1 preserved) |
 
 ## Measurements
 
@@ -334,6 +339,15 @@ Added coverage:
   `[MEASUREMENT-PENDING]` until WS8 profiling on the migrated path. Chunk
   widths stage from `RasterSizingControls` defaults (64) — one obvious knob
   for WS8 retuning.
+- Post-refactor cost model (trace-slimming refactor, D13/D14 — see the
+  dated section below): per tile execution = one table chunk (~30–50KB,
+  materialized at execution from its selection binding) + KB-scale prompt
+  data. Iteration counts on real Gemma: scan = rounds × 503 merge chunks
+  (full pass — recur sequences cannot break, G1); token ids = one
+  256-chunk vocab pass for the whole prompt (D14 inversion). Measured
+  real-model numbers (prompt "Hello from Raster"): 35 rounds, 53,907
+  trace items, max inline value 102B, program wall time ≈ 1 minute — see
+  "Trace-slimming ref-based refactor (2026-07-06)".
 
 ## References
 
@@ -349,11 +363,12 @@ Added coverage:
 
 ## Port notes (Phase B outcome, 2026-07-06)
 
-Landed as planned; the deviation register above (D1–D9) is the final list —
-no additional deviations were needed during implementation. Catalog
-amendments A1/A2 were folded into WS1 rows C2/C4/C7 with a dated §9 entry.
-The tokenizer external schema shipped unrevised (WS2 §7 accepted-risk clause
-not triggered; §11 note added).
+Landed as planned; the deviation register at Phase B close was D1–D9.
+Catalog amendments A1/A2 were folded into WS1 rows C2/C4/C7 with a dated §9
+entry. The tokenizer external schema shipped unrevised at this point (the
+storage refactor later revised it to v2 — see "Storage refactor" below and
+deviations D10–D12, which supersede D7/D7b and amend D6/D9; the tile-map
+and types tables above describe the Phase B shape).
 
 **Verification results:**
 
@@ -399,6 +414,70 @@ not triggered; §11 note added).
    `raster_core/mod.rs` into `src/runtime/raster_core/` when that port
    starts (WS2 §11 note).
 
+---
+
+## Storage refactor (2026-07-06)
+
+Restructured after the Phase B landing (stage stays WS3): the original
+shape selected the whole `token_lookup` (~262k entries) and `merge_lookup`
+into recur-tile `args`, and the generated recur drivers materialize `args`
+inside the per-iteration closure — every chunk iteration re-deserialized
+the full table through the tile ABI/trace, violating the ZKVM-sizing goal
+for real Gemma. Deviations D10–D12 (register above) supersede D7/D7b and
+amend D6/D9. Behavior is unchanged; the dev-run trace-identity gate
+(`tests/raster_core_prompt_prepare_detour.rs`) is the acceptance criterion
+and stayed green.
+
+**Data-placement rules (this routine's design contract):**
+
+- **Model-scoped tables** (vocab, merges): committed external,
+  **pre-chunked** at encode time (`Vec<Vec<Entry>>`, width 1024 — WS8
+  retunes by re-encoding + cache-kind bump) — consumed *only* as recur
+  input lists, one chunk (~30–50KB) per tile execution. Never in `args`,
+  never in state.
+- **Prompt-scoped data** (pieces, pairs, token ids): loop state, small
+  args, or drafts — bounded by the prompt, not the model.
+- **Cursors/flags/candidates**: tiny recur state structs.
+
+**What moved:**
+
+- `gemma_externals` schema v2: `token_lookup` → `token_lookup_chunks`,
+  `merges` → `merge_chunks`, `merge_lookup` deleted (WS2 §7 accepted-risk
+  clause triggered; determinism + tamper legs re-run green). Cache kind
+  bumped `gemma-tokenizer` → `gemma-tokenizer-v2` in the encoder and the
+  host adapter, so revised encodings never collide with stale entries.
+- Scan phase: priority-order scan over `merge_chunks` (D11);
+  `find_merge` binary search and the merge-lookup arg plumbing deleted;
+  equivalence to the sim's min-rank/earliest-pair selection unit-proven
+  (`bpe_scan.rs` tests, including tie and chunk-width-invariance cases).
+- Token-id phase: nested loop with `TokenIdsBundle` draft output (D12);
+  `GemmaTokenIdState` deleted; `GemmaTokenIdContext` became `Selectable`
+  (its `pieces` list is the outer recur-sequence input), which forced the
+  deferred error into `has_error: bool` + `error: String` — `Option` is
+  not `Selectable`.
+- `build_chunk_budgets` shrank to `rounds` + `apply_chunks` (D9 note); the
+  apply phase kept its shape (prompt-scoped only; pieces still cross
+  rounds once per round in loop state — O(prompt), flagged for WS8).
+- Step-0 mechanics probes live as a test-only module
+  (`chunk_probes.rs`): nested `Vec<Vec<T>>` selection (whole list, one
+  chunk, nested entry) and chunked recur input with mid-list `Break`.
+- Native-test staging idiom: recur input lists must be selectable
+  external/*internal* sources — program tests store the chunked tables
+  via `store_internal_value` + `internal!` under a scope guard (an inline
+  `Vec` fails with "call_recur! requires a selectable external or
+  internal list source").
+
+**Catalog/G-register follow-through:** WS1 C13/C22 porting rules amended
+("model-scoped data enters tiles only as chunked recur input lists"); gap
+G6 filed as an *optimization* request (dynamic select-by-computed-index —
+linear chunk scans are the always-available fallback, so G6 never
+blocks).
+
+*(The chunk-loop mechanism of this refactor was superseded on the same day
+by the trace-slimming ref-based refactor below — D13/D14. The schema-v2
+chunked external, the cache-kind bump, and the data-placement rules all
+stand.)*
+
 **WS4 handoff.** `prompt.prepare` is ready for the parity-leg flip: append
 `("prompt.prepare", 1)` to `ENABLED_ROUTINES` in
 `tests/raster_core_detour_parity.rs`. The dev-run comparison the harness
@@ -407,3 +486,67 @@ mirrors the harness's trace-capture and identity-assertion helpers
 (divergence named by checkpoint id + occurrence) and adds final-output
 equality; once the harness leg is on, the standalone test can be folded in
 or retired at WS4's discretion.
+
+---
+
+## Trace-slimming ref-based refactor (2026-07-06)
+
+Second restructuring pass after the storage refactor (stage stays WS3):
+the storage refactor moved the model tables into recur *inputs*, but the
+`#[tile(kind = recur)]` driver still materialized each chunk into
+`RecurInput<T>` and traced it **inline per iteration**
+(`RecurTileIterationExec` — gap G7), along with re-materialized args.
+Deviations D13/D14 (register above) supersede D10's loop mechanism and
+D12. Behavior is unchanged; the dev-run trace-identity gate
+(`tests/raster_core_prompt_prepare_detour.rs`) is the acceptance
+criterion and stayed green, as did the full suite and the no_std surface.
+
+**Rule this refactor enforces:** data crosses the tile ABI as a storage
+ref — a committed-external selection or an internal-storage binding —
+and only cursors/flags/prompt-scoped values ride inline. Model chunks
+reach per-chunk plain tiles as external-selection bindings via
+recur-sequence item handles (D13); cross-tile contexts (round, decision,
+iteration) are internal-storage-backed `AuthRef` tile outputs, traced as
+`InternalBinding`.
+
+**Step-0 probes** (extended `chunk_probes.rs`): (3) a recur sequence over
+a chunked list whose body passes both the item handle and the threaded
+state into one plain tile, the tile's `AuthRef` return re-entering the
+state; (4) that recur sequence nested inside another recur-sequence
+iteration (the round-loop shape). Both green before the phases were
+rewritten.
+
+**Measurements (real Gemma `~/models/gemma-4-E4B-it`, prompt "Hello from
+Raster", 36 initial pieces → 35 rounds; 503 merge chunks / 256 vocab
+chunks at encode width 1024; manual
+`detour --raster-core-at prompt.prepare`, warm tokenizer cache):**
+
+| | before (recur-tile chunks) | after (ref-based) |
+|---|---|---|
+| events | 1,646 | 53,907 |
+| largest inline value in any event | 86KB merge chunk (`RecurTileIterationExec`, 94% of trace bytes) | **102B** (apply-phase cursors); `scan_one_merge_chunk` max inline = 18B state |
+| model chunks in trace | inline per iteration | `ExternalBinding` only (commitment + selector) |
+| cross-tile contexts | inline per iteration (re-materialized args) | `InternalBinding` only |
+| raw `trace.ndjson` | 211MB | 1.93GB |
+
+The raw-ndjson growth is expected and accepted: each trace item's
+`input.data` carries the materialized input witness for that step's
+commitment (the runtime hashes `input.data` per step, and the committed
+fingerprint projects each item to ~1 bit), so raw file size is a
+disk-side artifact of witness capture — not proof-size, and not data
+crossing the ABI. The item count grew because recur sequences cannot
+`Break` (G1): every round pays a full 503-chunk no-op pass after the
+winner (17,605 scan iterations vs 1,297 break-truncated ones), while the
+inverted vocab pass (D14) *shrank* its side from `pieces × chunks` to one
+256-chunk pass. Program wall time ≈ 1 minute. Mitigations for the
+full-pass cost stay as filed: WS8 chunk-width retuning and the G7
+upstream request (selection-binding recur-tile inputs would also restore
+`Break`).
+
+**Catalog/G-register follow-through:** WS1 C13/C22 amendment refined —
+chunked lists are consumed via **recur sequences** whose per-chunk plain
+tiles receive selection refs; new gap **G7** (recur-tile drivers inline
+per-iteration inputs/args in the trace) filed with the upstream request
+"trace recur-tile inputs as selection bindings"; G6 unchanged. WS2
+untouched (no schema/encoder change; cache kind stays
+`gemma-tokenizer-v2`).

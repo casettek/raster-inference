@@ -160,7 +160,9 @@ pub fn run_raster_core(
 }
 
 /// One encoded Gemma-tokenizer cache entry (WS2 cache convention:
-/// `<cache_root>/gemma-tokenizer/<sha256(tokenizer.json)>/`).
+/// `<cache_root>/gemma-tokenizer-v2/<sha256(tokenizer.json)>/`; the cache
+/// kind is versioned with the schema — `-v2` is the chunked shape — and
+/// must match the `gemma_externals` encoder's `CACHE_KIND`).
 #[derive(Debug)]
 struct EncodedTokenizerExternal {
     data_path: PathBuf,
@@ -195,7 +197,7 @@ fn encode_tokenizer_external_cached(tokenizer_json: &Path) -> Result<EncodedToke
     let source_sha256 = format!("{:x}", Sha256::digest(&source_bytes));
 
     let cache_root = external_cache_root();
-    let entry_dir = cache_root.join("gemma-tokenizer").join(&source_sha256);
+    let entry_dir = cache_root.join("gemma-tokenizer-v2").join(&source_sha256);
     let data_path = entry_dir.join("tokenizer.rastered");
     let index_path = entry_dir.join("tokenizer.rindex");
     let commitment_path = entry_dir.join("root_commitment.txt");

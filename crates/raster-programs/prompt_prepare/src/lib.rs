@@ -18,6 +18,8 @@ extern crate alloc;
 
 pub mod bpe_apply;
 pub mod bpe_round;
+#[cfg(all(test, feature = "std"))]
+pub mod chunk_probes;
 pub mod bpe_scan;
 pub mod budgets;
 pub mod routine;

@@ -2,8 +2,9 @@
 //!
 //! Committed input: `tokenizer` — raster-encoded `GemmaTokenizer`
 //! (mmap), pre-encoded by this crate's `encode` bin. Selects through the
-//! schema (scalar field, list index, whole sub-list), summarizes in a tile,
-//! and returns the result via the output-file convention.
+//! schema (scalar field, nested chunk-list index, whole sub-list),
+//! summarizes in a tile, and returns the result via the output-file
+//! convention.
 
 use raster::prelude::*;
 use raster::println;
@@ -19,7 +20,7 @@ fn tokenizer_smoke() -> Result<TokenizerSmoke> {
     );
     let first_entry = select!(
         GemmaTokenIdEntry,
-        external!(GemmaTokenizer, "tokenizer").token_lookup[0]
+        external!(GemmaTokenizer, "tokenizer").token_lookup_chunks[0][0]
     );
     let special_tokens = select!(
         Vec<GemmaAddedToken>,
