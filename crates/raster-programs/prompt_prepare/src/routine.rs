@@ -48,18 +48,17 @@ pub fn tokenize_prompt_pieces(
 ) -> Result<PromptTokenization> {
     let count = call!(count_pieces, initial_pieces.clone());
     let piece_count = select!(u32, count.piece_count);
-    let budgets = call!(build_chunk_budgets, piece_count, config.clone())?;
-    let rounds = select!(Vec<u32>, budgets.clone().rounds);
-    let apply_chunks = select!(Vec<u32>, budgets.apply_chunks);
+    let budgets = call!(build_chunk_budgets, piece_count, config)?;
+    let rounds = select!(Vec<u32>, budgets.rounds);
 
-    let staged_pieces = select!(Vec<String>, initial_pieces.clone().pieces);
     let bpe_state = call_recur_seq!(
         sequence = merge_bpe_round,
         input = rounds,
         state = GemmaBpeLoopState::initial(),
-        args = (staged_pieces.clone(), config, merge_chunks, apply_chunks)
+        args = (initial_pieces.clone(), merge_chunks)
     );
 
+    let staged_pieces = select!(Vec<String>, initial_pieces.pieces);
     let token_ctx = call!(init_token_id_finalization, bpe_state, staged_pieces);
     let resolution = call_recur_seq!(
         sequence = resolve_vocab_chunk,

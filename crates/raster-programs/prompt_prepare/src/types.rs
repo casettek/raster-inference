@@ -94,12 +94,22 @@ pub struct ChunkBudgets {
 }
 
 /// Loop-carried state of the outer BPE merge-round sequence (sim
-/// `GemmaBpeTokenizeSequenceState` with the roots leg deleted and the
-/// working pieces carried inline — port-plan deviation D6).
+/// `GemmaBpeTokenizeSequenceState` with the roots leg deleted).
+///
+/// `pieces` is the program's **single** loop-carried prompt-derived
+/// collection (invariant rule 4). The pinned rev keeps this crossing
+/// storage-backed between iterations — the round-finalize tile's output
+/// persists in internal storage (`bind_infallible_call` →
+/// `store_execution_output_value`) and re-enters through an authenticated
+/// resolve (`From<AuthRef<T>> for RecurSequenceState<T>` →
+/// `resolve_internal_value`) — while the trace records the state inline per
+/// iteration (probe P1, deviation D6 re-founding). Every other pieces
+/// crossing is a draft op, a selection handle, or a selection-bound
+/// binding.
 ///
 /// Real recur loops seed from a plain literal (port-plan constraint A2), so
 /// the state starts uninitialized and the first executed round populates
-/// `pieces` from the staged `initial_pieces` input.
+/// `pieces` from the staged `initial_pieces` external.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GemmaBpeLoopState {
     pub initialized: bool,
@@ -107,6 +117,7 @@ pub struct GemmaBpeLoopState {
     /// rounds no-op (G1: recur sequences cannot break early).
     pub complete: bool,
     pub round: u32,
+    pub piece_count: u32,
     pub pieces: Vec<String>,
     /// Deferred in-loop guard error (A1); surfaced as the terminal `Err` by
     /// the first fallible plain tile after the loop.
@@ -119,24 +130,50 @@ impl GemmaBpeLoopState {
             initialized: false,
             complete: false,
             round: 0,
+            piece_count: 0,
             pieces: Vec::new(),
             error: None,
         }
     }
 }
 
-/// Read-only context of one BPE merge round, produced by
-/// `init_bpe_merge_scan` and threaded to the round's recur tiles through
-/// `args = (…)` (A2: loop state seeds must be literals, heavy context rides
-/// the materialized-once args).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GemmaBpeRoundContext {
+/// One opened BPE merge round: the round scalars plus the round's working
+/// pieces behind the selectable `BpePieces` root. Produced once per round
+/// by `open_round`; everything downstream consumes it through authenticated
+/// reads — `select!` projections (the scan's `skip`, the apply loop's
+/// pieces list) and selection-bound args (`build_pairs`, `finalize_round`).
+///
+/// The deferred round error is flattened to `(has_error, error)` scalars
+/// because `Option` has no `Selectable` schema at the pinned rev (catalog
+/// G3: no enum payloads in selectable shapes); `GemmaBpeLoopState` keeps
+/// the `Option<String>` convention (A1) and `finalize_round` reconstructs
+/// it, message text untouched (H4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct GemmaBpeOpenedRound {
     /// The round is a no-op (loop already complete or errored).
     pub skip: bool,
     pub round: u32,
-    pub pieces: Vec<String>,
-    pub pair_count: u32,
-    pub error: Option<String>,
+    pub piece_count: u32,
+    pub has_error: bool,
+    /// Deferred error message when `has_error`; empty otherwise.
+    pub error: String,
+    pub pieces: BpePieces,
+}
+
+/// One adjacent pair of the round's pieces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct GemmaBpeAdjacentPair {
+    pub left: String,
+    pub right: String,
+}
+
+/// The round's adjacent-pair list, derived by `build_pairs` from the
+/// round's pieces and consumed by the scan as a selection-bound arg (the
+/// rule-2 whole-pairs authenticated read; G6 computed-key selection is the
+/// named unlock for the sim's keyed-lookup orientation — deviation D17).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
+pub struct GemmaBpeAdjacentPairs {
+    pub pairs: Vec<GemmaBpeAdjacentPair>,
 }
 
 /// Winning merge candidate of the priority-order scan. `merge_index` is
@@ -173,49 +210,39 @@ impl GemmaBpeScanState {
     }
 }
 
-/// Outcome of one round's scan phase (sim `GemmaBpeMergeDecision` with the
-/// selection candidate folded in).
+/// Outcome of one round's scan phase, scalars only (successor of the
+/// pieces-carrying `GemmaBpeMergeDecision` — deviation D15): `skip` covers
+/// skipped rounds, deferred errors, and no-selection convergence alike; the
+/// apply loop no-ops on it and `finalize_round` carries the incoming pieces
+/// forward.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GemmaBpeMergeDecision {
+pub struct GemmaBpeApplyDecision {
+    /// Nothing to apply this round (skipped round or no selection).
     pub skip: bool,
-    pub round: u32,
-    pub pieces: Vec<String>,
-    pub selection: Option<GemmaBpeScanCandidate>,
-    pub error: Option<String>,
-}
-
-/// Read-only context of one round's apply phase (sim
-/// `GemmaBpeMergeIterationState::Applying` payload; the `Complete` variant
-/// becomes the `complete` flag — catalog C28 branching stays in tiles).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GemmaBpeIterationContext {
-    /// Nothing to apply this round (no selection, skip, or error).
-    pub complete: bool,
-    pub round: u32,
-    pub pieces: Vec<String>,
+    /// Left index of the winning adjacent pair.
     pub merge_piece_idx: u32,
+    /// The winning rule's merged token (one bounded token — a scalar-sized
+    /// decision leg, not a prompt-derived collection).
     pub merged: String,
-    pub error: Option<String>,
 }
 
-/// Loop-carried state of the chunked merge apply: the next round's pieces
-/// accumulate in `output` (sim built them into a `bpe-pieces-{N+1}` store
-/// artifact — deviation D6).
+/// Cursor-only state of the per-piece apply loop (deviation D15): the next
+/// round's pieces accumulate in the `RecurOutput<BpePieces>` draft, never
+/// in this state. `emitted` doubles as the merge-point detector — before
+/// the merge every piece is pushed, so `emitted == merge_piece_idx` fires
+/// exactly at the winning pair's left piece; `skip_next` swallows the
+/// consumed right-hand piece.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GemmaBpeApplyState {
-    pub output: Vec<String>,
-    pub input_cursor: u32,
-    pub output_cursor: u32,
-    pub done: bool,
+pub struct GemmaBpeApplyCursor {
+    pub skip_next: bool,
+    pub emitted: u32,
 }
 
-impl GemmaBpeApplyState {
+impl GemmaBpeApplyCursor {
     pub fn initial() -> Self {
         Self {
-            output: Vec::new(),
-            input_cursor: 0,
-            output_cursor: 0,
-            done: false,
+            skip_next: false,
+            emitted: 0,
         }
     }
 }
