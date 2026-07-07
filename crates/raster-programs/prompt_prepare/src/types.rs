@@ -26,15 +26,6 @@ use alloc::vec::Vec;
 use raster::Selectable;
 use serde::{Deserialize, Serialize};
 
-/// Staged tokenizer chunk-width configuration (catalog C27: widths are
-/// staged by the host from `RasterSizingControls`, one obvious place for
-/// WS8 retuning).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
-pub struct BpeConfig {
-    pub bpe_pairs_per_tile: u32,
-    pub bpe_pieces_per_tile: u32,
-}
-
 /// Prompt-scoped pieces behind a selectable root (the storage-resident
 /// refactor's `BpePieces`): the staged `initial_pieces` external, every
 /// round's `open_round` output, and every round's finalized
@@ -79,18 +70,15 @@ pub struct PieceCount {
 /// Bounded iteration lists for every recur loop in the program (gap G1:
 /// real recur is list-driven; every sim until-done loop has a derivable
 /// bound at loop start). Derived in-program by `build_chunk_budgets`.
-/// The scan and token-id phases need no derived budgets anymore: the
-/// chunked model tables are their own bounded recur-sequence input lists
-/// (the scan loops over `merge_chunks`, the inverted vocab pass over
-/// `token_lookup_chunks` — D14).
+/// Only the round list remains (storage-resident refactor): the chunked
+/// model tables are their own bounded recur-sequence input lists (the scan
+/// loops over `merge_chunks`, the vocab pass over `token_lookup_chunks`)
+/// and the apply loop recurs over the round's own pieces.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Selectable)]
 pub struct ChunkBudgets {
     /// BPE merge rounds: `initial_piece_count − 1` ordinals (each merge
     /// removes one piece).
     pub rounds: Vec<u32>,
-    /// Merge-apply chunks per round: `ceil((initial_piece_count − 1) /
-    /// bpe_pieces_per_tile)` ordinals.
-    pub apply_chunks: Vec<u32>,
 }
 
 /// Loop-carried state of the outer BPE merge-round sequence (sim

@@ -116,13 +116,8 @@ pub fn run(
                         StepMode::RasterCore => true,
                         StepMode::Native => false,
                     };
-                    match native::run_prompt_prepare(
-                        request,
-                        model,
-                        controls,
-                        raster_core_detour,
-                        raster_sizing_controls.as_ref(),
-                    )? {
+                    match native::run_prompt_prepare(request, model, controls, raster_core_detour)?
+                    {
                         ControlFlow::Break(outcome) => return Ok(outcome),
                         ControlFlow::Continue(prepared) => (
                             prepared.prompt_preparation,

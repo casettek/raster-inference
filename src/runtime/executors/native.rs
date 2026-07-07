@@ -64,7 +64,6 @@ pub(crate) fn run_prompt_prepare(
     model: &LoadedModel,
     controls: &InferenceControls,
     raster_core_detour: bool,
-    raster_sizing_controls: Option<&RasterSizingControls>,
 ) -> Result<ControlFlow<InferenceRunOutcome, NativePromptPrepared>> {
     let model_spec = model.model_spec();
     let tokenizer = model.tokenizer();
@@ -72,14 +71,7 @@ pub(crate) fn run_prompt_prepare(
         let tokenizer_source = model.raster_tokenizer().context(
             "selective raster-core prompt.prepare detour requires raster tokenizer capability",
         )?;
-        let raster_sizing =
-            raster_sizing_controls.expect("raster sizing controls should be validated");
-        prompt_prepare::raster_core::run_raster_core(
-            request,
-            model_spec,
-            tokenizer_source,
-            raster_sizing,
-        )?
+        prompt_prepare::raster_core::run_raster_core(request, model_spec, tokenizer_source)?
     } else {
         prompt_prepare::run(request, model_spec, tokenizer)?
     };

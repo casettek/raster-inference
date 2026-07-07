@@ -6,7 +6,6 @@
 //! - `initial_pieces` — postcard `BpePieces`, the host-derived initial
 //!   BPE pieces behind a selectable root (the sim's pre-staged
 //!   `bpe-pieces-0`); byte-identical to the bare `Vec<String>`
-//! - `bpe_config`     — postcard `BpeConfig` chunk widths
 //!
 //! The model-scoped tables are selected as chunked lists
 //! (`token_lookup_chunks`, `merge_chunks`) and consumed only as recur
@@ -22,7 +21,7 @@ use raster::prelude::*;
 use raster::println;
 use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry, GemmaTokenizer};
 use raster_program_prompt_prepare::routine::*;
-use raster_program_prompt_prepare::types::{BpeConfig, BpePieces, PromptTokenization};
+use raster_program_prompt_prepare::types::{BpePieces, PromptTokenization};
 
 #[sequence]
 fn main() {
@@ -33,12 +32,10 @@ fn main() {
     );
     let merge_chunks = select!(Vec<Vec<GemmaBpeMerge>>, tokenizer.merge_chunks);
     let initial_pieces = external!(BpePieces, "initial_pieces");
-    let config = select!(BpeConfig, external!(BpeConfig, "bpe_config"));
 
     let outcome = materialize_auth_result::<PromptTokenization, _>(call_seq!(
         tokenize_prompt_pieces,
         initial_pieces,
-        config,
         token_lookup_chunks,
         merge_chunks
     ));

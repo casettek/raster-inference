@@ -28,7 +28,7 @@ use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry};
 use crate::bpe_round::*;
 use crate::budgets::*;
 use crate::token_ids::*;
-use crate::types::{BpeConfig, BpePieces, GemmaBpeLoopState, PromptTokenization, TokenIdMatches};
+use crate::types::{BpePieces, GemmaBpeLoopState, PromptTokenization, TokenIdMatches};
 
 /// Staged pieces + chunked tokenizer tables → prompt token ids.
 ///
@@ -39,13 +39,12 @@ use crate::types::{BpeConfig, BpePieces, GemmaBpeLoopState, PromptTokenization, 
 #[sequence]
 pub fn tokenize_prompt_pieces(
     initial_pieces: BpePieces,
-    config: BpeConfig,
     token_lookup_chunks: Vec<Vec<GemmaTokenIdEntry>>,
     merge_chunks: Vec<Vec<GemmaBpeMerge>>,
 ) -> Result<PromptTokenization> {
     let count = call!(count_pieces, initial_pieces.clone());
     let piece_count = select!(u32, count.piece_count);
-    let budgets = call!(build_chunk_budgets, piece_count, config)?;
+    let budgets = call!(build_chunk_budgets, piece_count);
     let rounds = select!(Vec<u32>, budgets.rounds);
 
     let bpe_state = call_recur_seq!(
@@ -130,20 +129,12 @@ mod tests {
         chunks
     }
 
-    fn config(pairs: u32, pieces: u32) -> BpeConfig {
-        BpeConfig {
-            bpe_pairs_per_tile: pairs,
-            bpe_pieces_per_tile: pieces,
-        }
-    }
-
     /// Drives the routine natively. The staged pieces and chunked tables
     /// are stored as internal values first: recur input lists and `select!`
     /// roots must be selectable external/internal sources, exactly like the
     /// bindings `main` makes from the committed externals.
     fn tokenize_chunked(
         pieces: Vec<&str>,
-        config: BpeConfig,
         table_width: usize,
     ) -> core::result::Result<PromptTokenization, String> {
         let _guard =
@@ -162,24 +153,20 @@ mod tests {
         materialize_auth_result::<PromptTokenization, _>(
             __raster_sequence_auth_tokenize_prompt_pieces(
                 internal!(BpePieces, staged_pieces),
-                config,
                 internal!(Vec<Vec<GemmaTokenIdEntry>>, vocab),
                 internal!(Vec<Vec<GemmaBpeMerge>>, merges),
             ),
         )
     }
 
-    fn tokenize(
-        pieces: Vec<&str>,
-        config: BpeConfig,
-    ) -> core::result::Result<PromptTokenization, String> {
-        tokenize_chunked(pieces, config, 4)
+    fn tokenize(pieces: Vec<&str>) -> core::result::Result<PromptTokenization, String> {
+        tokenize_chunked(pieces, 4)
     }
 
     #[test]
     fn recursive_bpe_merges_apply() {
         // Sim `tokenize_prompt_applies_recursive_bpe_merges`: "ab" → [3].
-        let tokenization = tokenize(vec!["a", "b"], config(1, 1)).expect("tokenize");
+        let tokenization = tokenize(vec!["a", "b"]).expect("tokenize");
         assert_eq!(tokenization.token_ids, vec![3]);
         assert_eq!(tokenization.token_count, 1);
     }
@@ -187,10 +174,11 @@ mod tests {
     #[test]
     fn chunk_sizes_do_not_change_results() {
         // Sim `tokenize_prompt_chunk_sizes_do_not_change_results`:
-        // "aba" → [12] under both tiny and large chunk widths — for the
-        // staged apply width *and* the encode-time table chunk width.
-        let tiny = tokenize_chunked(vec!["a", "b", "a"], config(1, 1), 1).expect("tiny chunks");
-        let large = tokenize_chunked(vec!["a", "b", "a"], config(8, 8), 16).expect("large chunks");
+        // "aba" → [12] under both tiny and large encode-time table chunk
+        // widths (the only remaining width — per-tile apply widths died
+        // with the storage-resident refactor).
+        let tiny = tokenize_chunked(vec!["a", "b", "a"], 1).expect("tiny chunks");
+        let large = tokenize_chunked(vec!["a", "b", "a"], 16).expect("large chunks");
         assert_eq!(tiny.token_ids, large.token_ids);
         assert_eq!(tiny.token_ids, vec![12]);
     }
@@ -200,35 +188,26 @@ mod tests {
         // Sim `tokenize_prompt_uses_byte_fallback_for_unknown_chars`: the
         // host derives "é" into byte-fallback pieces; the program resolves
         // them to [10, 11].
-        let tokenization = tokenize(vec!["<0xC3>", "<0xA9>"], config(2, 2)).expect("tokenize");
+        let tokenization = tokenize(vec!["<0xC3>", "<0xA9>"]).expect("tokenize");
         assert_eq!(tokenization.token_ids, vec![10, 11]);
     }
 
     #[test]
     fn single_piece_needs_no_merge_rounds() {
-        let tokenization = tokenize(vec!["ab"], config(64, 64)).expect("tokenize");
+        let tokenization = tokenize(vec!["ab"]).expect("tokenize");
         assert_eq!(tokenization.token_ids, vec![3]);
     }
 
     #[test]
     fn empty_pieces_tokenize_to_nothing() {
-        let tokenization = tokenize(vec![], config(64, 64)).expect("tokenize");
+        let tokenization = tokenize(vec![]).expect("tokenize");
         assert!(tokenization.token_ids.is_empty());
         assert_eq!(tokenization.token_count, 0);
     }
 
     #[test]
     fn missing_vocab_piece_is_a_committed_terminal_error() {
-        let error = tokenize(vec!["z"], config(64, 64)).expect_err("missing piece");
+        let error = tokenize(vec!["z"]).expect_err("missing piece");
         assert_eq!(error, "Gemma tokenizer piece \"z\" is missing from vocab");
-    }
-
-    #[test]
-    fn zero_chunk_width_is_a_committed_terminal_error() {
-        let error = tokenize(vec!["a", "b"], config(0, 1)).expect_err("zero width");
-        assert_eq!(
-            error,
-            "raster tokenizer BPE pairs per tile must be greater than zero"
-        );
     }
 }

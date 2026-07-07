@@ -8,8 +8,7 @@
 //!    render → normalize → split → initial BPE pieces) and its outputs are
 //!    staged as committed inputs: the raster-encoded Gemma tokenizer
 //!    external (content-addressed cache, `gemma_externals` encoder) plus
-//!    postcard `initial_pieces` (the selectable `BpePieces` root) and
-//!    `bpe_config`.
+//!    the postcard `initial_pieces` (the selectable `BpePieces` root).
 //! 2. `cargo raster run` executes the routine's program crate against the
 //!    committed inputs, producing `output.bin` and `commit.bin`.
 //! 3. Ingestion validates the artifacts (never the CLI exit code) and
@@ -36,7 +35,6 @@ use crate::shared::model::gemma::tokenizer::{
     AuthenticatedGemmaTokenizer, GemmaTokenizerMetadataRequest,
 };
 use crate::trace::routine_scope;
-use crate::RasterSizingControls;
 
 use super::native::{
     build_gemma4_messages, build_prompt_commitment, decode_prompt_bytes, render_prompt,
@@ -45,42 +43,15 @@ use super::raster::utils::{
     init_tokenize_prompt, initial_bpe_pieces, normalize_tokenize_prompt, split_tokenize_prompt,
 };
 
-/// Field-order mirror of the program crate's staged `BpeConfig` (postcard
+/// Field-order mirror of the program crate's staged `BpePieces` (postcard
 /// layout contract, WS2 §9.6: the main crate must not depend on program
-/// crates that carry the real `raster` dependency).
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-struct StagedBpeConfig {
-    bpe_pairs_per_tile: u32,
-    bpe_pieces_per_tile: u32,
-}
-
-/// Field-order mirror of the program crate's staged `BpePieces` (WS2 §9.6).
-/// A single-field postcard struct encodes identically to the bare
-/// `Vec<String>` it wraps (`staged_pieces_keep_the_bare_vec_byte_layout`),
-/// so the selectable-root shape costs nothing at the staging boundary.
+/// crates that carry the real `raster` dependency). A single-field postcard
+/// struct encodes identically to the bare `Vec<String>` it wraps
+/// (`staged_pieces_keep_the_bare_vec_byte_layout`), so the selectable-root
+/// shape costs nothing at the staging boundary.
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct StagedBpePieces {
     pieces: Vec<String>,
-}
-
-impl StagedBpeConfig {
-    fn from_sizing(raster_sizing: &RasterSizingControls) -> Result<Self> {
-        let width = |value: usize, label: &str| {
-            u32::try_from(value).with_context(|| {
-                format!("raster-core prompt.prepare {label} {value} exceeds the staged u32 width")
-            })
-        };
-        Ok(Self {
-            bpe_pairs_per_tile: width(
-                raster_sizing.tokenizer_bpe_pairs_per_tile,
-                "tokenizer BPE pairs per tile",
-            )?,
-            bpe_pieces_per_tile: width(
-                raster_sizing.tokenizer_bpe_pieces_per_tile,
-                "tokenizer BPE pieces per tile",
-            )?,
-        })
-    }
 }
 
 /// Field-order mirror of the program crate's `PromptTokenization` output.
@@ -98,7 +69,6 @@ pub fn run_raster_core(
     request: &InferenceRequest,
     model: &ModelSpec,
     tokenizer: &AuthenticatedGemmaTokenizer,
-    raster_sizing: &RasterSizingControls,
 ) -> Result<PromptPreparationState> {
     let _routine = routine_scope(RoutineId::PromptPrepare, "mode=raster_core");
 
@@ -117,7 +87,6 @@ pub fn run_raster_core(
     for segment in &pre_tokenized.segments {
         initial_pieces.extend(initial_bpe_pieces(segment, tokenizer, &metadata)?);
     }
-    let bpe_config = StagedBpeConfig::from_sizing(raster_sizing)?;
 
     // Committed-input staging (WS2 §2/§3).
     let tokenizer_external = encode_tokenizer_external_cached(&model.tokenizer_path)
@@ -137,7 +106,6 @@ pub fn run_raster_core(
             pieces: initial_pieces,
         },
     )?;
-    staged.add_postcard("bpe_config", &bpe_config)?;
     let input_commitments = staged
         .write(&run_dir)
         .map_err(RasterCoreError::Infrastructure)
@@ -268,39 +236,6 @@ fn encode_tokenizer_external_cached(tokenizer_json: &Path) -> Result<EncodedToke
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sizing(pairs: usize, pieces: usize) -> RasterSizingControls {
-        RasterSizingControls {
-            projection_rows_per_tile: 1,
-            attention_kv_rows_per_tile: 1,
-            sequence_rows_per_tile: 1,
-            head_rows_per_tile: 1,
-            prefill_token_range_width: usize::MAX,
-            decode_layer_range_width: usize::MAX,
-            tokenizer_bpe_pairs_per_tile: pairs,
-            tokenizer_bpe_pieces_per_tile: pieces,
-            output_byte_flush_bytes_per_tile: 1,
-        }
-    }
-
-    #[test]
-    fn staged_config_mirrors_sizing_controls() {
-        let config = StagedBpeConfig::from_sizing(&sizing(3, 5)).expect("config");
-        assert_eq!(
-            config,
-            StagedBpeConfig {
-                bpe_pairs_per_tile: 3,
-                bpe_pieces_per_tile: 5,
-            }
-        );
-    }
-
-    #[test]
-    fn oversized_sizing_controls_are_rejected_at_staging() {
-        let error = StagedBpeConfig::from_sizing(&sizing(usize::MAX, 1))
-            .expect_err("usize::MAX cannot stage as u32");
-        assert!(error.to_string().contains("exceeds the staged u32 width"));
-    }
 
     #[test]
     fn staged_pieces_keep_the_bare_vec_byte_layout() {
