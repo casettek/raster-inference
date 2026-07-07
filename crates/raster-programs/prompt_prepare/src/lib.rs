@@ -22,6 +22,10 @@ pub mod bpe_round;
 pub mod chunk_probes;
 pub mod bpe_scan;
 pub mod budgets;
+#[cfg(all(test, feature = "std"))]
+pub mod guards;
 pub mod routine;
+#[cfg(all(test, feature = "std"))]
+pub mod test_trace;
 pub mod token_ids;
 pub mod types;
