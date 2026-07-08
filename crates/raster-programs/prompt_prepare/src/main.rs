@@ -7,10 +7,10 @@
 //!   BPE pieces behind a selectable root (the sim's pre-staged
 //!   `bpe-pieces-0`); byte-identical to the bare `Vec<String>`
 //!
-//! The model-scoped tables are selected as chunked lists
-//! (`token_lookup_chunks`, `merge_chunks`) and consumed only as recur
-//! input lists — one chunk per tile execution (storage-refactor data
-//! placement).
+//! The model-scoped tokenizer tables stay behind the committed `tokenizer`
+//! external. The program threads small source descriptors and chunk
+//! ordinals; tiles resolve the selected chunks from raster storage inside
+//! tile execution.
 //!
 //! The materialized outcome goes back to the host through the WS2
 //! output-file convention (`raster-program-support`,
@@ -19,25 +19,20 @@
 
 use raster::prelude::*;
 use raster::println;
-use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry, GemmaTokenizer};
+use raster_program_gemma_externals::types::GemmaTokenizer;
 use raster_program_prompt_prepare::routine::*;
-use raster_program_prompt_prepare::types::{BpePieces, PromptTokenization};
+use raster_program_prompt_prepare::types::{BpePieces, PromptTokenization, TokenizerTables};
 
 #[sequence]
 fn main() {
-    let tokenizer = external!(GemmaTokenizer, "tokenizer");
-    let token_lookup_chunks = select!(
-        Vec<Vec<GemmaTokenIdEntry>>,
-        tokenizer.clone().token_lookup_chunks
-    );
-    let merge_chunks = select!(Vec<Vec<GemmaBpeMerge>>, tokenizer.merge_chunks);
+    let _tokenizer = external!(GemmaTokenizer, "tokenizer");
+    let tokenizer_tables = TokenizerTables::external("tokenizer");
     let initial_pieces = external!(BpePieces, "initial_pieces");
 
     let outcome = materialize_auth_result::<PromptTokenization, _>(call_seq!(
         tokenize_prompt_pieces,
         initial_pieces,
-        token_lookup_chunks,
-        merge_chunks
+        tokenizer_tables
     ));
     raster_program_support::write_program_output(&outcome);
     match &outcome {

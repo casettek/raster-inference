@@ -244,10 +244,7 @@ pub fn probe_round_seq(
 /// Drives mechanic 4: outer recur sequence over the round list, inner
 /// recur sequence over the chunked table.
 #[sequence]
-pub fn probe_nested_recur_seq(
-    fixture: ProbeNestedFixture,
-    needle_left: String,
-) -> ProbeRoundState {
+pub fn probe_nested_recur_seq(fixture: ProbeNestedFixture, needle_left: String) -> ProbeRoundState {
     let chunks = select!(Vec<Vec<GemmaBpeMerge>>, fixture.clone().chunks);
     let rounds = select!(Vec<u32>, fixture.rounds);
     call_recur_seq!(
@@ -359,6 +356,33 @@ pub struct ProbePieces {
     pub pieces: Vec<String>,
 }
 
+/// Handle-only round state: the refactored `GemmaBpeLoopState` analog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeRoundPieceHandle {
+    pub round: u32,
+    pub pieces_ref: InternalRef,
+}
+
+/// Publishes pieces as a tile output so the driver can thread only its
+/// internal ref through recur state.
+#[tile]
+pub fn probe_publish_pieces(pieces: ProbePieces) -> ProbePieces {
+    pieces
+}
+
+/// Rehydrates handle-carried pieces inside a plain tile and republishes the
+/// value behind a selectable round output.
+#[tile]
+pub fn probe_open_handle_round(state: ProbeRoundPieceHandle) -> ProbeOpenedRound {
+    let pieces = raster::resolve_internal_value::<ProbePieces>(state.pieces_ref)
+        .unwrap_or_else(|error| panic!("failed to resolve probe pieces: {error}"))
+        .value;
+    ProbeOpenedRound {
+        round: state.round,
+        pieces,
+    }
+}
+
 /// P2 cursor-only inner-loop state (the `GemmaBpeApplyCursor` analog).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProbeApplyCursor {
@@ -425,6 +449,63 @@ pub fn probe_apply_pieces_seq(
     (cursor, output)
 }
 
+/// Handle-state finalizer: the next pieces are already finalized into
+/// internal storage, so the outer state only keeps the new ref.
+#[tile]
+pub fn probe_finalize_handle_round(
+    state: ProbeRoundPieceHandle,
+    next_pieces_ref: InternalRef,
+) -> ProbeRoundPieceHandle {
+    ProbeRoundPieceHandle {
+        round: state.round + 1,
+        pieces_ref: next_pieces_ref,
+    }
+}
+
+/// Handle-only outer round body: open ref → select pieces → draft apply →
+/// carry the finalized draft ref into the next round.
+#[sequence(kind = recur)]
+pub fn probe_handle_round_seq(
+    input: RecurSequenceInput<u32>,
+    state: RecurSequenceState<ProbeRoundPieceHandle>,
+    merged: String,
+) -> RecurSequenceState<ProbeRoundPieceHandle> {
+    let _round_ordinal = &input;
+    let opened = call!(probe_open_handle_round, state.clone());
+    let items = select!(Vec<String>, opened.pieces.pieces);
+    let applied = call_recur_seq!(
+        sequence = probe_apply_pieces_seq,
+        input = items,
+        state = ProbeApplyCursor {
+            skip_next: false,
+            emitted: 0,
+        },
+        output = new!(ProbePieces),
+        args = (merged,)
+    );
+    let next_ref = applied.reference().clone();
+    call!(probe_finalize_handle_round, state, next_ref)
+}
+
+/// Driver for the handle-only storage-resident round-boundary probe.
+#[sequence]
+pub fn probe_handle_rounds(
+    rounds: Vec<u32>,
+    initial: ProbePieces,
+    merged: String,
+) -> ProbeRoundPieceHandle {
+    let initial = call!(probe_publish_pieces, initial);
+    call_recur_seq!(
+        sequence = probe_handle_round_seq,
+        input = rounds,
+        state = ProbeRoundPieceHandle {
+            round: 0,
+            pieces_ref: initial.reference().clone(),
+        },
+        args = (merged,)
+    )
+}
+
 /// P2 finalize tile: consumes the finalized draft whole (selection-bound
 /// arg), plus a `select!` projection out of it, and returns the next outer
 /// loop state (re-entering the threaded state).
@@ -478,11 +559,7 @@ pub fn probe_apply_rounds(rounds: Vec<u32>, merged: String) -> ProbeRoundPieces 
         input = rounds,
         state = ProbeRoundPieces {
             round: 0,
-            pieces: alloc::vec![
-                String::from("a"),
-                String::from("b"),
-                String::from("c"),
-            ],
+            pieces: alloc::vec![String::from("a"), String::from("b"), String::from("c"),],
         },
         args = (merged,)
     )
@@ -552,11 +629,9 @@ pub fn probe_inline_recur(
 ) -> RecurState<ProbeInlineState> {
     let mut state = state;
     let chunk = input.into_value();
-    state.log.push(alloc::format!(
-        "{}+{}",
-        chunk.join(""),
-        extra.join("")
-    ));
+    state
+        .log
+        .push(alloc::format!("{}+{}", chunk.join(""), extra.join("")));
     state
 }
 
@@ -708,6 +783,18 @@ mod tests {
         }
     }
 
+    fn probe_pieces(pieces: Vec<&str>) -> ProbePieces {
+        ProbePieces {
+            pieces: pieces.into_iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn bytes_contain(bytes: &[u8], marker: &str) -> bool {
+        bytes
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+    }
+
     // --- P1: round-boundary characterization ---
 
     /// P1(c): the threaded state enters every iteration's
@@ -773,8 +860,7 @@ mod tests {
             })
         });
         let big_records = sequence_start_records(&big_events, "probe_round_boundary_seq");
-        let big_bytes =
-            inline_bytes(&big_records[0].input.as_ref().expect("input").values[1]);
+        let big_bytes = inline_bytes(&big_records[0].input.as_ref().expect("input").values[1]);
         assert!(
             big_bytes.len() >= 64 * 32,
             "inline state bytes scale with the collection ({} < {})",
@@ -817,6 +903,65 @@ mod tests {
                 "unexpected resolve error: {error}"
             );
         });
+    }
+
+    /// Handle-state feasibility leg: the outer recur state carries only an
+    /// `InternalRef`; pieces rehydrate inside a plain tile and do not appear
+    /// in the recur state trace.
+    #[test]
+    fn handle_state_threads_piece_refs_without_inline_piece_payloads() {
+        const LEFT: &str = "HANDLE_LEFT_SENTINEL_0123456789";
+        const RIGHT: &str = "HANDLE_RIGHT_SENTINEL_0123456789";
+        const THIRD: &str = "HANDLE_THIRD_SENTINEL_0123456789";
+        let merged = "HANDLE_MERGED".to_string();
+
+        let (final_state, events) = capture_trace_events(|| {
+            in_scope(|| {
+                let rounds =
+                    raster::store_internal_value(&vec![0u32, 1]).expect("store round list");
+                let initial = raster::store_internal_value(&probe_pieces(vec![LEFT, RIGHT, THIRD]))
+                    .expect("store initial pieces");
+                raster::materialize_auth_return::<ProbeRoundPieceHandle, _>(
+                    __raster_sequence_auth_probe_handle_rounds(
+                        internal!(Vec<u32>, rounds),
+                        internal!(ProbePieces, initial),
+                        merged.clone(),
+                    ),
+                )
+            })
+        });
+
+        assert_eq!(final_state.round, 2);
+        let final_pieces =
+            raster::resolve_internal_value::<ProbePieces>(final_state.pieces_ref.clone())
+                .expect("final probe pieces should resolve")
+                .value;
+        assert_eq!(final_pieces.pieces, vec![merged]);
+
+        let records = sequence_start_records(&events, "probe_handle_round_seq");
+        assert_eq!(records.len(), 2, "one start record per iteration");
+        for (iteration, record) in records.iter().enumerate() {
+            let input = record.input.as_ref().expect("iteration input trace");
+            let state_bytes = inline_bytes(&input.values[1]);
+            let state: ProbeRoundPieceHandle =
+                raster::core::postcard::from_bytes(&state_bytes).expect("state should decode");
+            assert_eq!(state.round as usize, iteration);
+            for marker in [LEFT, RIGHT, THIRD] {
+                assert!(
+                    !bytes_contain(&state_bytes, marker),
+                    "handle-only state must not inline prompt piece marker {marker}"
+                );
+            }
+        }
+
+        let mut tampered = final_state.pieces_ref;
+        tampered.commitment[0] ^= 0xFF;
+        let error = raster::resolve_internal_value::<ProbePieces>(tampered)
+            .expect_err("tampered piece ref must fail");
+        assert!(
+            alloc::format!("{error}").contains("commitment mismatch"),
+            "unexpected resolve error: {error}"
+        );
     }
 
     // --- P2: fresh RecurOutput draft inside a recur-sequence body ---
@@ -974,8 +1119,7 @@ mod tests {
         let extra = vec!["E1".to_string(), "E2".to_string()];
         let (state, events) = capture_trace_events(|| {
             in_scope(|| {
-                let chunk_source =
-                    raster::store_internal_value(&chunks).expect("store chunk list");
+                let chunk_source = raster::store_internal_value(&chunks).expect("store chunk list");
                 let extra_source = raster::store_internal_value(&extra).expect("store extra");
                 raster::materialize_auth_return::<ProbeInlineState, _>(
                     __raster_sequence_auth_probe_inline_recur_tile(
@@ -985,7 +1129,10 @@ mod tests {
                 )
             })
         });
-        assert_eq!(state.log, vec!["aabb+E1E2".to_string(), "cc+E1E2".to_string()]);
+        assert_eq!(
+            state.log,
+            vec!["aabb+E1E2".to_string(), "cc+E1E2".to_string()]
+        );
 
         let records = recur_tile_iteration_records(&events, "probe_inline_recur");
         assert_eq!(records.len(), 2, "one iteration record per chunk");
@@ -1034,7 +1181,10 @@ mod tests {
             )
         });
         assert_eq!(state.rounds_run, 2, "every round ordinal must execute");
-        assert_eq!(state.found_rounds, 2, "each round's inner scan must find the rule");
+        assert_eq!(
+            state.found_rounds, 2,
+            "each round's inner scan must find the rule"
+        );
         assert_eq!(state.found_merge_index, 3);
         assert_eq!(
             state.total_visited_chunks, 4,

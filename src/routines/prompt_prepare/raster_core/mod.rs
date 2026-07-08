@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use crate::runtime::checkpoints::RoutineId;
 use crate::runtime::raster_core::ingest::{ingest, RasterCoreError};
 use crate::runtime::raster_core::staging::StagedInputs;
-use crate::runtime::raster_core::{CargoRasterRunner, RasterCoreRunDir};
+use crate::runtime::raster_core::{CargoRasterRunner, RasterCoreRunDir, COMMIT_FILE_NAME};
 use crate::shared::api::input::{InferenceRequest, ModelSpec, PromptPreparationState};
 use crate::shared::artifacts::artifact_io::ArtifactIo;
 use crate::shared::model::gemma::tokenizer::{
@@ -133,6 +133,12 @@ pub fn run_raster_core(
 
     let prompt_token_ids = tokenization.token_ids;
     let prompt_token_ids_sha256 = build_prompt_commitment(&prompt_token_ids)?;
+    // Preserve the trace commitment next to the CLI's persistent run
+    // artifacts (`target/raster/runs/<run-id>/`, alongside `trace.ndjson`)
+    // before the temp staging dir is cleaned up.
+    if let Some(artifacts_dir) = run_result.trace_path.parent() {
+        std::fs::copy(&run_result.commit_path, artifacts_dir.join(COMMIT_FILE_NAME)).ok();
+    }
     std::fs::remove_dir_all(run_dir.root()).ok();
 
     Ok(PromptPreparationState {

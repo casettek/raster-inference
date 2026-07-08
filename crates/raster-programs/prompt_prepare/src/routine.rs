@@ -20,7 +20,6 @@
 
 use alloc::vec::Vec;
 use raster::prelude::*;
-use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry};
 
 // Glob imports: `call!`/`call_recur!`/`call_recur_seq!` resolve hidden
 // per-tile marker types and generated drivers, so the defining modules must
@@ -28,7 +27,9 @@ use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry};
 use crate::bpe_round::*;
 use crate::budgets::*;
 use crate::token_ids::*;
-use crate::types::{BpePieces, GemmaBpeLoopState, PromptTokenization, TokenIdMatches};
+use crate::types::{
+    BpePieces, GemmaBpeLoopState, PromptTokenization, TokenIdMatches, TokenizerTables,
+};
 
 /// Staged pieces + chunked tokenizer tables → prompt token ids.
 ///
@@ -39,27 +40,29 @@ use crate::types::{BpePieces, GemmaBpeLoopState, PromptTokenization, TokenIdMatc
 #[sequence]
 pub fn tokenize_prompt_pieces(
     initial_pieces: BpePieces,
-    token_lookup_chunks: Vec<Vec<GemmaTokenIdEntry>>,
-    merge_chunks: Vec<Vec<GemmaBpeMerge>>,
+    tokenizer: TokenizerTables,
 ) -> Result<PromptTokenization> {
-    let count = call!(count_pieces, initial_pieces.clone());
+    let current_pieces = call!(publish_initial_pieces, initial_pieces);
+    let count = call!(count_pieces, current_pieces.reference().clone());
     let piece_count = select!(u32, count.piece_count);
-    let budgets = call!(build_chunk_budgets, piece_count);
-    let rounds = select!(Vec<u32>, budgets.rounds);
+    let budgets = call!(build_chunk_budgets, piece_count, tokenizer.clone());
+    let rounds = select!(Vec<u32>, budgets.clone().rounds);
+    let merge_chunk_ordinals = select!(Vec<u32>, budgets.clone().merge_chunk_ordinals);
+    let token_lookup_chunk_ordinals = select!(Vec<u32>, budgets.token_lookup_chunk_ordinals);
 
     let bpe_state = call_recur_seq!(
         sequence = merge_bpe_round,
         input = rounds,
-        state = GemmaBpeLoopState::initial(),
-        args = (initial_pieces.clone(), merge_chunks)
+        state = GemmaBpeLoopState::initial(current_pieces.reference().clone()),
+        args = (tokenizer.clone(), merge_chunk_ordinals)
     );
 
-    let final_pieces = call!(init_token_id_finalization, bpe_state, initial_pieces)?;
+    let final_pieces = call!(init_token_id_finalization, bpe_state)?;
     let matches = call_recur_seq!(
         sequence = resolve_vocab_chunks,
-        input = token_lookup_chunks,
+        input = token_lookup_chunk_ordinals,
         output = new!(TokenIdMatches),
-        args = (final_pieces.clone(),)
+        args = (final_pieces.clone(), tokenizer)
     );
     let tokenization = call!(finalize_tokenize_prompt, matches, final_pieces)?;
     Ok(tokenization)
@@ -70,6 +73,10 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
     use raster::materialize_auth_result;
+    use raster_program_gemma_externals::types::{
+        GemmaBpeMerge, GemmaDecoderMetadata, GemmaTokenIdEntry, GemmaTokenizer,
+        GemmaTokenizerMetadata,
+    };
 
     use super::*;
 
@@ -129,6 +136,30 @@ mod tests {
         chunks
     }
 
+    fn tokenizer(width: usize) -> GemmaTokenizer {
+        GemmaTokenizer {
+            metadata: GemmaTokenizerMetadata {
+                space_replacement: "\u{2581}".to_string(),
+                split_delimiter: " ".to_string(),
+                split_behavior: "merged_with_previous".to_string(),
+                invert: false,
+                unk_token: "<unk>".to_string(),
+                fuse_unk: false,
+                byte_fallback: true,
+                ignore_merges: false,
+            },
+            decoder: GemmaDecoderMetadata {
+                space_replacement: "\u{2581}".to_string(),
+                byte_fallback: true,
+                fuse_decoder: false,
+            },
+            token_lookup_chunks: token_lookup_chunks(width),
+            tokens_by_id: Vec::new(),
+            special_tokens: Vec::new(),
+            merge_chunks: merge_chunks(width),
+        }
+    }
+
     /// Drives the routine natively. The staged pieces and chunked tables
     /// are stored as internal values first: recur input lists and `select!`
     /// roots must be selectable external/internal sources, exactly like the
@@ -137,8 +168,7 @@ mod tests {
         pieces: Vec<&str>,
         table_width: usize,
     ) -> core::result::Result<PromptTokenization, String> {
-        let _guard =
-            raster::__private::SequenceScopeGuard::enter("prompt_prepare_routine_tests");
+        let _guard = raster::__private::SequenceScopeGuard::enter("prompt_prepare_routine_tests");
         let staged_pieces = raster::store_internal_value(&BpePieces {
             pieces: pieces
                 .into_iter()
@@ -146,15 +176,12 @@ mod tests {
                 .collect::<Vec<_>>(),
         })
         .expect("store staged pieces");
-        let vocab = raster::store_internal_value(&token_lookup_chunks(table_width))
-            .expect("store vocab chunks");
-        let merges =
-            raster::store_internal_value(&merge_chunks(table_width)).expect("store merge chunks");
+        let tokenizer =
+            raster::store_internal_value(&tokenizer(table_width)).expect("store tokenizer");
         materialize_auth_result::<PromptTokenization, _>(
             __raster_sequence_auth_tokenize_prompt_pieces(
                 internal!(BpePieces, staged_pieces),
-                internal!(Vec<Vec<GemmaTokenIdEntry>>, vocab),
-                internal!(Vec<Vec<GemmaBpeMerge>>, merges),
+                TokenizerTables::internal(tokenizer),
             ),
         )
     }

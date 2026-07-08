@@ -5,14 +5,12 @@
 //! 1. **Source-scan guard**: fails compilation-adjacent (test time) on any
 //!    regression that adds an accumulating collection to a recur state
 //!    type or a pieces-carrying field to a per-chunk/per-item decision
-//!    struct. `GemmaBpeLoopState.pieces` is the single allowed exception
-//!    (invariant rule 4, probe P1); the guard asserts it stays the only
-//!    one.
+//!    struct. Prompt-derived collections must stay behind storage roots,
+//!    selection bindings, and drafts.
 //! 2. **Trace-shape assertion**: a native routine run with sentinel pieces
 //!    must show prompt-derived collections only as draft ops, bindings,
-//!    the staged external, and the P1-characterized round-boundary state
-//!    records — never inline in recur-tile iteration records (none may
-//!    exist) or context args.
+//!    and the staged external — never inline in recur-sequence state,
+//!    recur-tile iteration records (none may exist), or context args.
 //! 3. **Functional matrix**: the cases not already covered by the
 //!    module-level tests (`routine.rs` covers empty prompt, single piece /
 //!    zero-round fallback, byte fallback, and the missing-piece error;
@@ -29,11 +27,13 @@ use alloc::vec::Vec;
 use raster::core::trace::{FnInput, FnInputValue, TraceEvent};
 use raster::materialize_auth_result;
 use raster::prelude::*;
-use raster_program_gemma_externals::types::{GemmaBpeMerge, GemmaTokenIdEntry};
+use raster_program_gemma_externals::types::{
+    GemmaBpeMerge, GemmaDecoderMetadata, GemmaTokenIdEntry, GemmaTokenizer, GemmaTokenizerMetadata,
+};
 
 use crate::routine::*;
 use crate::test_trace::capture_trace_events;
-use crate::types::{BpePieces, PromptTokenization};
+use crate::types::{BpePieces, PromptTokenization, TokenizerTables};
 
 // --- 1. Source-scan guard -------------------------------------------------
 
@@ -53,9 +53,8 @@ const PROGRAM_SOURCES: &[(&str, &str)] = &[
     ("token_ids.rs", include_str!("token_ids.rs")),
 ];
 
-/// The program's recur state types. `GemmaBpeLoopState` carries the single
-/// allowed loop-carried collection; the other two are cursor/candidate
-/// state.
+/// The program's recur state types. All are scalar or handle state; none may
+/// carry prompt-derived collections.
 const RECUR_STATE_TYPES: &[&str] = &[
     "GemmaBpeLoopState",
     "GemmaBpeScanState",
@@ -63,9 +62,7 @@ const RECUR_STATE_TYPES: &[&str] = &[
 ];
 
 /// Scalar decision/context structs threaded to per-chunk or per-item
-/// tiles: never a pieces field, never a collection (invariant rule 2 — the
-/// selectable roots `BpePieces`/`GemmaBpeAdjacentPairs` cross as bindings
-/// instead).
+/// tiles: never a pieces field, never a collection.
 const PER_ITEM_CONTEXT_TYPES: &[&str] = &["GemmaBpeApplyDecision", "GemmaBpeScanCandidate"];
 
 /// Extracts `(field_name, field_type)` pairs of one struct in `src`.
@@ -93,7 +90,7 @@ fn struct_fields(src: &str, struct_name: &str) -> Vec<(String, String)> {
 /// A collection for the guard's purposes: a growable container or one of
 /// the crate's collection-carrying selectable roots.
 fn is_collection_type(ty: &str) -> bool {
-    ["Vec<", "Map<", "BpePieces", "TokenIdMatches", "GemmaBpeAdjacentPairs"]
+    ["Vec<", "Map<", "BpePieces", "TokenIdMatches"]
         .iter()
         .any(|marker| ty.contains(marker))
 }
@@ -130,10 +127,7 @@ fn recur_state_idents() -> Vec<String> {
 
 #[test]
 fn recur_state_types_are_exactly_the_known_set() {
-    let mut expected: Vec<String> = RECUR_STATE_TYPES
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+    let mut expected: Vec<String> = RECUR_STATE_TYPES.iter().map(ToString::to_string).collect();
     expected.sort();
     assert_eq!(
         recur_state_idents(),
@@ -144,26 +138,17 @@ fn recur_state_types_are_exactly_the_known_set() {
 }
 
 #[test]
-fn loop_state_pieces_is_the_only_recur_state_collection() {
+fn recur_state_types_carry_no_collections() {
     for state_type in RECUR_STATE_TYPES {
         let collections: Vec<_> = struct_fields(TYPES_SRC, state_type)
             .into_iter()
             .filter(|(_, ty)| is_collection_type(ty))
             .collect();
-        if *state_type == "GemmaBpeLoopState" {
-            assert_eq!(
-                collections,
-                vec![("pieces".to_string(), "Vec<String>".to_string())],
-                "GemmaBpeLoopState.pieces is the single allowed loop-carried \
-                 collection (invariant rule 4, probe P1)"
-            );
-        } else {
-            assert!(
-                collections.is_empty(),
-                "recur state {state_type} must not accumulate collections, \
-                 found {collections:?}"
-            );
-        }
+        assert!(
+            collections.is_empty(),
+            "recur state {state_type} must not accumulate collections, \
+             found {collections:?}"
+        );
     }
 }
 
@@ -184,14 +169,33 @@ fn per_item_context_structs_carry_no_pieces_or_collections() {
     }
 }
 
+#[test]
+fn phase_tiles_do_not_accept_large_eager_collections() {
+    let forbidden = [
+        "chunk: Vec<GemmaBpeMerge>",
+        "chunk: Vec<GemmaTokenIdEntry>",
+        "input: RecurSequenceInput<Vec<GemmaBpeMerge>>",
+        "input: RecurSequenceInput<Vec<GemmaTokenIdEntry>>",
+        "input: RecurSequenceInput<String>",
+        "pairs: GemmaBpeAdjacentPairs",
+        "final_pieces: BpePieces",
+    ];
+    for (name, src) in PROGRAM_SOURCES {
+        for needle in forbidden {
+            assert!(
+                !src.contains(needle),
+                "{name} must not use eager large prompt/tokenizer parameter `{needle}`"
+            );
+        }
+    }
+}
+
 // --- 2. Trace-shape assertion ----------------------------------------------
 
 /// Long unique sentinels so a byte scan over trace payloads cannot false
 /// positive. The merged token is deliberately unrelated text: a candidate's
 /// merged token is a permitted scalar decision leg and may ride inline in
-/// the scan state, so the scan targets only the piece sentinels. The third
-/// piece survives the merge, so round 2's threaded loop state carries it —
-/// the P1 boundary the test must observe.
+/// the scan state, so the scan targets only the piece sentinels.
 const LEFT_PIECE: &str = "SENTINEL_LEFT_PIECE_0123456789";
 const RIGHT_PIECE: &str = "SENTINEL_RIGHT_PIECE_0123456789";
 const THIRD_PIECE: &str = "SENTINEL_THIRD_PIECE_0123456789";
@@ -212,17 +216,10 @@ fn inline_piece_marker(input: &FnInput) -> bool {
     })
 }
 
-/// The P1-characterized crossings where the loop-carried pieces are
-/// expected inline: the round loop's threaded state records and that
-/// state's entry into the round's first tile.
-fn p1_boundary(fn_name: &str, event: &TraceEvent) -> bool {
-    match event {
-        TraceEvent::RecurSequenceStart(_) | TraceEvent::RecurSequenceEnd(_) => {
-            fn_name == "merge_bpe_round"
-        }
-        TraceEvent::TileExec(_) => fn_name == "open_round",
-        _ => false,
-    }
+fn input_data_piece_marker(input: &FnInput) -> bool {
+    [LEFT_PIECE, RIGHT_PIECE, THIRD_PIECE]
+        .iter()
+        .any(|marker| contains_marker(&input.data, marker))
 }
 
 fn event_record(event: &TraceEvent) -> &raster::prelude::FnCallRecord {
@@ -256,37 +253,47 @@ fn prompt_collections_cross_the_abi_only_as_authenticated_reads() {
     let tokenization = outcome.expect("sentinel prompt should tokenize");
     assert_eq!(tokenization.token_ids, vec![42, 3]);
 
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, TraceEvent::RecurTileIterationExec(_))),
-        "the program must contain no recur tiles (G7: their iterations \
-         trace inputs, state, and args inline)"
-    );
+    for event in &events {
+        if let TraceEvent::RecurTileIterationExec(record) = event {
+            assert_eq!(
+                record.fn_name, "scan_one_merge_chunk",
+                "only the scalar/ref scan recur tile may appear"
+            );
+            let input = record.input.as_ref().expect("recur tile input");
+            assert!(
+                input.data.len() < 512,
+                "scan recur-tile input must stay scalar/ref sized, got {} bytes",
+                input.data.len()
+            );
+            assert!(
+                !input_data_piece_marker(input),
+                "scan recur-tile input must not inline prompt pieces"
+            );
+        }
+    }
 
-    let mut p1_crossings = 0usize;
     for event in &events {
         let record = event_record(event);
         let Some(input) = record.input.as_ref() else {
             continue;
         };
         if !inline_piece_marker(input) {
+            if input_data_piece_marker(input) {
+                assert_eq!(
+                    record.fn_name, "publish_initial_pieces",
+                    "prompt-derived pieces rode in FnInput.data for '{}' ({event:?}); \
+                     only the initial publish tile may materialize the staged root",
+                    record.fn_name
+                );
+            }
             continue;
         }
-        assert!(
-            p1_boundary(&record.fn_name, event),
-            "prompt-derived pieces rode inline into '{}' ({event:?}); only \
-             the P1-characterized round-boundary state records may carry \
-             them",
+        panic!(
+            "prompt-derived pieces rode inline into '{}' ({event:?}); \
+             collections must cross as storage bindings or draft ops",
             record.fn_name
         );
-        p1_crossings += 1;
     }
-    assert!(
-        p1_crossings > 0,
-        "the P1 boundary itself must appear (the loop-carried state is \
-         traced inline per round)"
-    );
 }
 
 // --- 3. Functional matrix ---------------------------------------------------
@@ -345,15 +352,32 @@ fn tokenize_with(
         pieces: pieces.into_iter().map(ToString::to_string).collect(),
     })
     .expect("store staged pieces");
-    let vocab_source = raster::store_internal_value(&vocab_chunks).expect("store vocab chunks");
-    let merge_source = raster::store_internal_value(&merge_chunks).expect("store merge chunks");
-    materialize_auth_result::<PromptTokenization, _>(
-        __raster_sequence_auth_tokenize_prompt_pieces(
-            internal!(BpePieces, staged_pieces),
-            internal!(Vec<Vec<GemmaTokenIdEntry>>, vocab_source),
-            internal!(Vec<Vec<GemmaBpeMerge>>, merge_source),
-        ),
-    )
+    let tokenizer = GemmaTokenizer {
+        metadata: GemmaTokenizerMetadata {
+            space_replacement: "\u{2581}".to_string(),
+            split_delimiter: " ".to_string(),
+            split_behavior: "merged_with_previous".to_string(),
+            invert: false,
+            unk_token: "<unk>".to_string(),
+            fuse_unk: false,
+            byte_fallback: true,
+            ignore_merges: false,
+        },
+        decoder: GemmaDecoderMetadata {
+            space_replacement: "\u{2581}".to_string(),
+            byte_fallback: true,
+            fuse_decoder: false,
+        },
+        token_lookup_chunks: vocab_chunks,
+        tokens_by_id: Vec::new(),
+        special_tokens: Vec::new(),
+        merge_chunks,
+    };
+    let tokenizer = raster::store_internal_value(&tokenizer).expect("store tokenizer");
+    materialize_auth_result::<PromptTokenization, _>(__raster_sequence_auth_tokenize_prompt_pieces(
+        internal!(BpePieces, staged_pieces),
+        TokenizerTables::internal(tokenizer),
+    ))
 }
 
 #[test]

@@ -14,9 +14,9 @@
 //! `select!` projection of the round's pieces, accumulating the next
 //! round's pieces in a fresh `RecurOutput<BpePieces>` draft; and
 //! `finalize_round` re-enters the threaded state (`From<AuthRef<T>> for
-//! RecurSequenceState<T>`). The loop state's `pieces` is the program's
-//! single loop-carried collection — storage-backed between iterations at
-//! the pinned rev, trace form characterized by probe P1 (D6 re-founding).
+//! RecurSequenceState<T>`). The loop state carries the current pieces'
+//! internal-storage handle plus scalars; the prompt pieces themselves no
+//! longer ride the inline recur state.
 //!
 //! Value-flow idiom (port-plan constraint A2): the opaque threaded state
 //! enters tiles as an ordinary argument (`RecurSequenceState<T>:
@@ -28,17 +28,18 @@
 //! tile receives each chunk as an external-selection binding — the chunk
 //! bytes never ride the trace inline.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 use raster::prelude::*;
-use raster_program_gemma_externals::types::GemmaBpeMerge;
 
 // Glob imports: `call!`/`call_recur_seq!` resolve hidden per-tile marker
 // types generated next to each tile fn, so the whole defining module must
 // be in scope (same convention as the WS1 probe crate).
 use crate::bpe_apply::*;
 use crate::bpe_scan::*;
-use crate::types::{BpePieces, GemmaBpeApplyCursor, GemmaBpeLoopState, GemmaBpeScanState};
+use crate::budgets::*;
+use crate::types::{
+    BpePieces, GemmaBpeApplyCursor, GemmaBpeLoopState, GemmaBpeScanState, TokenizerTables,
+};
 
 /// One BPE merge round: open (pieces behind the selectable root) →
 /// priority-order merge scan → scalar apply decision → per-piece draft
@@ -47,31 +48,30 @@ use crate::types::{BpePieces, GemmaBpeApplyCursor, GemmaBpeLoopState, GemmaBpeSc
 pub fn merge_bpe_round(
     input: RecurSequenceInput<u32>,
     state: RecurSequenceState<GemmaBpeLoopState>,
-    staged_pieces: BpePieces,
-    merge_chunks: Vec<Vec<GemmaBpeMerge>>,
+    tokenizer: TokenizerTables,
+    merge_chunk_ordinals: Vec<u32>,
 ) -> RecurSequenceState<GemmaBpeLoopState> {
     // The input item is only the round budget ordinal (G1 bounded list).
     let _round_ordinal = &input;
-    let opened = call!(open_round, state, staged_pieces);
-    let round_pieces = select!(BpePieces, opened.clone().pieces);
-    let skip = select!(bool, opened.clone().skip);
-    let pairs = call!(build_pairs, round_pieces.clone());
-    let scan = call_recur_seq!(
-        sequence = scan_merge_chunks,
-        input = merge_chunks,
+    let opened = call!(open_round, state.clone());
+    let scan = call_recur!(
+        tile = scan_one_merge_chunk,
+        input = merge_chunk_ordinals,
         state = GemmaBpeScanState::initial(),
-        args = (skip.clone(), pairs)
+        args = (tokenizer.clone(), opened.clone())
     );
-    let decision = call!(finalize_bpe_merge_scan, scan, skip);
-    let piece_items = select!(Vec<String>, round_pieces.pieces);
+    let decision = call!(finalize_bpe_merge_scan, scan, opened.clone());
+    let apply_ordinals = call!(build_round_piece_ordinals, opened.clone());
+    let piece_items = select!(Vec<u32>, apply_ordinals.ordinals);
     let applied = call_recur_seq!(
         sequence = apply_round_pieces,
         input = piece_items,
         state = GemmaBpeApplyCursor::initial(),
         output = new!(BpePieces),
-        args = (decision.clone(),)
+        args = (decision.clone(), opened.clone())
     );
+    let applied_ref = applied.reference().clone();
     // The tile's `AuthRef` return re-enters the threaded state through the
     // generated wrapper's `Into<RecurSequenceState<_>>` conversion.
-    call!(finalize_round, applied, decision, opened)
+    call!(finalize_round, decision, opened, state, applied_ref)
 }
