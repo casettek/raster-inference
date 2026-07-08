@@ -137,7 +137,11 @@ pub fn run_raster_core(
     // artifacts (`target/raster/runs/<run-id>/`, alongside `trace.ndjson`)
     // before the temp staging dir is cleaned up.
     if let Some(artifacts_dir) = run_result.trace_path.parent() {
-        std::fs::copy(&run_result.commit_path, artifacts_dir.join(COMMIT_FILE_NAME)).ok();
+        std::fs::copy(
+            &run_result.commit_path,
+            artifacts_dir.join(COMMIT_FILE_NAME),
+        )
+        .ok();
     }
     std::fs::remove_dir_all(run_dir.root()).ok();
 

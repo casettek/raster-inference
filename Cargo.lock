@@ -2708,6 +2708,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "raster-program-decode-select-token"
+version = "0.1.0"
+dependencies = [
+ "raster",
+ "raster-program-support",
+ "raster-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "raster-program-gemma-externals"
 version = "0.1.0"
 dependencies = [

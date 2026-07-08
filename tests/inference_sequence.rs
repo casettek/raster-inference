@@ -836,7 +836,10 @@ fn run_inference_rejects_raster_core_detours_for_unmigrated_routines() {
         // Migrated routines (WS3) dispatch to their raster-core host
         // adapters instead of rejecting; their detour behavior is covered
         // by the per-routine dev-run verification tests.
-        if routine_id == RoutineId::PromptPrepare {
+        if matches!(
+            routine_id,
+            RoutineId::PromptPrepare | RoutineId::SelectOutputToken
+        ) {
             continue;
         }
         raster_inference::shared::artifacts::artifact_io::ArtifactIo::reset_store();

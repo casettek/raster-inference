@@ -66,9 +66,9 @@ offers — and resolves relative paths against the program crate directory.
 
 | | `postcard` | `raster` |
 |---|---|---|
-| For | request-scoped values (prompt bytes, config, chunk lists, prior-routine outputs) | model-scoped data (tokenizer tables, weights) |
-| Encoded by | the main crate, at staging time (`add_postcard`) — postcard + sha2 are existing deps; no `raster` dependency (charter invariant 6) | a program crate's `encode`-feature bin, offline, once per model (`add_raster_encoded`) |
-| Files | `<name>.bin` in the run dir | `.rastered` + `.rindex` in a content-addressed cache, referenced by absolute path |
+| For | small request/control values (prompt bytes, config, chunk lists, small prior-routine outputs) | model-scoped data (tokenizer tables, weights) and large request-scoped collections that tiles select repeatedly (`decode.select_token` logits/token ids) |
+| Encoded by | the main crate, at staging time (`add_postcard`) — postcard + sha2 are existing deps; no `raster` dependency (charter invariant 6) | a program crate's `encode`-feature bin (`add_raster_encoded`); offline/content-addressed for model data, run-local for hot request data |
+| Files | `<name>.bin` in the run dir | `.rastered` + `.rindex` in a content-addressed cache or run-local encoded-input directory, referenced by absolute path |
 | `load_preference` | `read` | `mmap` |
 | Manifest commitment | SHA-256 of the payload file bytes | the raster index root commitment, reported by the encoder |
 
@@ -77,6 +77,13 @@ offers — and resolves relative paths against the program crate directory.
 `root_commitment.txt`; re-encoding an already cached source reuses the entry.
 Encoding is deterministic (same source → same commitment; test-asserted).
 See `gemma_externals/src/encode.rs` for the reference implementation.
+
+**Run-local raster convention:** request-scoped collections that are large and
+selected many times may also use raster encoding. `decode.select_token` stages
+`logits`, `full_token_ids`, and `generated_token_ids` this way so repeated
+selector reads use the `.rindex` path instead of rebuilding postcard selection
+proofs over the full root. Small controls for the same run (`config`,
+`loop_drivers`) remain postcard-backed.
 
 **Commitment capture:** `StagedInputs::write` returns the commitment map
 (name → `{encoding, commitment}`); host adapters pass it into `ingest` so

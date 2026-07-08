@@ -321,23 +321,34 @@ pub(crate) fn run_output_decode(
             return Ok(output_decode_state);
         }
 
-        let detour_select_token = match detour_controller.as_deref_mut() {
-            Some(controller) => controller.should_detour_sim(RoutineId::SelectOutputToken)?,
-            None => false,
+        let detour_select_token_backend = match detour_controller.as_deref_mut() {
+            Some(controller) => controller.detour_backend_for(RoutineId::SelectOutputToken),
+            None => None,
         };
         trace_event("decode.select_token");
-        let next_token = if detour_select_token {
-            let raster_sizing = raster_sizing.context(
-                "selective raster decode.select_token detour requires raster sizing controls",
-            )?;
-            crate::routines::decode_select_token::run_selected_raster_detour_from_native_boundary(
-                &mut decode_state,
-                max_new_tokens,
-                raster_sizing,
-            )?
-        } else {
-            crate::routines::decode_select_token::run(&mut decode_state, max_new_tokens)?
-                .expect("stop condition should have returned earlier")
+        let next_token = match detour_select_token_backend {
+            Some(DetourBackend::Sim) => {
+                let raster_sizing = raster_sizing.context(
+                    "selective raster decode.select_token detour requires raster sizing controls",
+                )?;
+                crate::routines::decode_select_token::run_selected_raster_detour_from_native_boundary(
+                    &mut decode_state,
+                    max_new_tokens,
+                    raster_sizing,
+                )?
+            }
+            Some(DetourBackend::RasterCore) => {
+                let raster_sizing = raster_sizing.context(
+                    "selective raster-core decode.select_token detour requires raster sizing controls",
+                )?;
+                crate::routines::decode_select_token::raster_core::run_raster_core(
+                    &mut decode_state,
+                    max_new_tokens,
+                    raster_sizing,
+                )?
+            }
+            None => crate::routines::decode_select_token::run(&mut decode_state, max_new_tokens)?
+                .expect("stop condition should have returned earlier"),
         };
 
         trace_event("decode.step");

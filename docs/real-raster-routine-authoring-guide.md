@@ -183,6 +183,8 @@ Do not accumulate these collections in recur state.
 Materialization is acceptable at clear boundaries:
 
 - staging initial committed inputs
+- run-local raster-encoding of large request-scoped inputs that will be
+  selected repeatedly by tiles
 - publishing an initial tile output to get an internal ref
 - validating a finalized draft
 - producing the final host-visible output
@@ -198,6 +200,9 @@ After authoring a routine, inspect trace shape:
 
 - Nonterminal tile `FnInput.data` should be scalar/ref-sized.
 - Large model chunks should not appear in tile inputs.
+- Large request-scoped collections should not use postcard external selection
+  when tiles repeatedly read small parts of them; stage them as raster-encoded
+  externals or internal refs so reads use indexed storage selection.
 - Prompt strings/pieces should not appear in recur state or nonterminal tile
   inputs.
 - Recur tile iterations are allowed only when their input/state/args are
@@ -223,6 +228,8 @@ The most important patterns to copy are:
 
 - compact source descriptors instead of selected model-table values
 - `InternalRef`-carried prompt collections
+- raster-encoded externals for large repeatedly selected request/model
+  collections
 - ordinal-driven loops
 - in-tile storage reads
 - drafts for append-only outputs
@@ -235,7 +242,8 @@ Before writing an implementation plan for another routine, answer these:
 1. What are the simulator roots/builders/cursors?
 2. Which collections are model-scoped, prompt/request-scoped, or output-scoped?
 3. Which values are too large to appear in tile parameters?
-4. What compact source descriptors and refs will replace those values?
+4. What compact source descriptors, raster-encoded externals, and refs will
+   replace those values?
 5. What ordinal lists bound every recur loop?
 6. Which loops need `Break`, and can they be scalar/ref-sized recur tiles?
 7. Which append-only outputs should be drafts?
@@ -253,6 +261,8 @@ Avoid these, even if they are easy to write:
 - Building derived prompt collections just to pass them into the next tile.
 - Threading collections through recur state.
 - Using a recur tile while its args contain large selected values.
+- Reading large repeatedly selected request collections through postcard
+  externals one scalar at a time.
 - Treating test-size trace success as proof that real-model trace shape is
   acceptable.
 
@@ -265,6 +275,7 @@ A routine follows this guide when:
 - `--no-default-features` still compiles;
 - detour parity passes;
 - nonterminal tile signatures are small and serde-safe;
+- large repeatedly selected externals are raster-encoded or otherwise indexed;
 - trace guards reject large eager params and prompt/model payloads in
   `FnInput.data`;
 - a real-model smoke trace is within the expected size budget for the routine.

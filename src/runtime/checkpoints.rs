@@ -270,6 +270,19 @@ impl RasterDetourController {
         }
     }
 
+    /// Counts an occurrence of `routine_id` and returns the selected backend
+    /// when this call site matches the active detour spec.
+    pub fn detour_backend_for(&mut self, routine_id: RoutineId) -> Option<DetourBackend> {
+        if !self.should_detour(routine_id) {
+            return None;
+        }
+        Some(
+            self.spec
+                .expect("matched raster detour controller should carry a spec")
+                .backend(),
+        )
+    }
+
     pub fn ensure_matched_if_active(&self) -> anyhow::Result<()> {
         if let Some(spec) = self.spec {
             if !self.matched {
