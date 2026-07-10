@@ -838,7 +838,7 @@ fn run_inference_rejects_raster_core_detours_for_unmigrated_routines() {
         // by the per-routine dev-run verification tests.
         if matches!(
             routine_id,
-            RoutineId::PromptPrepare | RoutineId::SelectOutputToken
+            RoutineId::PromptPrepare | RoutineId::InputEmbedding | RoutineId::SelectOutputToken
         ) {
             continue;
         }

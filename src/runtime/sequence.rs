@@ -27,7 +27,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::routines::input_embedding;
-use crate::runtime::checkpoints::{PhaseId, RoutineId};
+use crate::runtime::checkpoints::{DetourBackend, PhaseId, RoutineId};
 use crate::runtime::executors::{native, raster, ExecutionPolicy, StepMode};
 use crate::runtime::inference::{
     InferenceControls, InferenceRunOutcome, InferenceState, InputEmbeddingState,
@@ -145,13 +145,20 @@ pub fn run(
                             )?;
                             (token_embeddings, Some(output))
                         }
-                        StepMode::RasterCore => {
-                            return Err(policy.selected_detour_unimplemented_error());
-                        }
-                        StepMode::Native => native::run_input_embedding(
-                            &prompt_preparation.prompt_token_ids,
+                        StepMode::RasterCore => native::run_input_embedding(
+                            &prompt_preparation,
                             model,
                             raster_prompt_preparation_for_embedding.as_ref(),
+                            native::InputEmbeddingExecution::RasterCore(
+                                raster_sizing_controls
+                                    .expect("raster sizing controls should be validated"),
+                            ),
+                        )?,
+                        StepMode::Native => native::run_input_embedding(
+                            &prompt_preparation,
+                            model,
+                            raster_prompt_preparation_for_embedding.as_ref(),
+                            native::InputEmbeddingExecution::Native,
                         )?,
                     }
                 };
@@ -163,7 +170,10 @@ pub fn run(
                         .clone(),
                 };
                 let input_embedding_raster_refs_for_checkpoint = if policy.is_full_raster()
-                    || selected_raster_detour_routine == Some(RoutineId::InputEmbedding)
+                    || (selected_raster_detour_routine == Some(RoutineId::InputEmbedding)
+                        && policy
+                            .selected_detour_spec()
+                            .is_some_and(|spec| spec.backend() != DetourBackend::RasterCore))
                 {
                     raster_input_embedding_refs
                         .as_ref()

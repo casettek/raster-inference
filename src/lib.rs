@@ -30,6 +30,12 @@ pub use runtime::inference::{
 };
 pub use runtime::sequence;
 
+// Pre-encoded model externals (encode-externals warm-up; raster-core runs
+// are strict lookup-only consumers of the directory).
+pub use runtime::raster_core::externals::{
+    warm_model_externals, WarmedExternal, WarmedExternals, EXTERNAL_CACHE_ENV,
+};
+
 // Checkpoint taxonomy and trace artifact layer.
 pub use runtime::checkpoints;
 pub use runtime::checkpoints::{

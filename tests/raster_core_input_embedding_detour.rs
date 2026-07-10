@@ -1,28 +1,9 @@
-//! Raster-core detour parity harness (WS4 scaffolding).
+//! WS3 dev-run verification for the `input.embedding` raster-core port.
 //!
-//! Mirrors the detour-smoke leg of the main parity gate
-//! (`tests/e2e_checkpoint_parity.rs`) for the raster-core (real toolchain)
-//! backend: for every enabled `routine-id:occurrence`, a
-//! `--raster-core-at`-equivalent run must commit a checkpoint trace identical
-//! to the full-native run of the same request, with any divergence named by
-//! checkpoint id + occurrence.
-//!
-//! **WS0 ships this harness with zero enabled routines.** WS4 flips routines
-//! on one at a time by appending to [`ENABLED_ROUTINES`] in the same change
-//! that lands the routine's WS3 migration. Enablement is deliberately an
-//! explicit const list — no discovery magic — so a reviewer can see exactly
-//! which legs the gate enforces.
-//!
-//! The identity assertion is strict (no allowed-divergence labels): committed
-//! checkpoints are backend-invariant. If WS5 rules that a boundary
-//! checkpoint's raster-core payload legitimately takes artifact-root form,
-//! the affected label is added to the routine's entry alongside that ruling —
-//! never silently.
-//!
-//! Hermetic like the main gate: runs against `assets/tiny-gemma-dev` in the
-//! default Verified integrity mode, capturing the same serialized trace
-//! artifact a claimer would commit. Existing goldens in `tests/goldens/` are
-//! the baseline and are never regenerated.
+//! Runs the same hermetic tiny-gemma-dev request natively and with
+//! `--raster-core-at input.embedding:1`. The committed checkpoint traces must
+//! be identical, and final inference outcomes must match apart from execution
+//! count metadata.
 
 use std::{
     collections::HashMap,
@@ -50,19 +31,30 @@ use raster_inference::{
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-/// Routine occurrences with raster-core parity enabled, as
-/// `(routine-id, occurrence)` — the same selector grammar as
-/// `detour --raster-core-at <routine-id[:occurrence]>`.
-///
-/// WS4 appends one entry per migrated routine.
-const ENABLED_ROUTINES: &[(&str, usize)] = &[("input.embedding", 1), ("decode.select_token", 1)];
-
-/// Prompt restricted to tokens of the tiny-gemma-dev tokenizer vocabulary
-/// (same constraint as the main parity gate).
+const DEV_RUN_SELECTOR: &str = "input.embedding:1";
 const SHORT_PROMPT: &str = "hello";
 
-/// Serializes all tests in this binary: the trace collector and the artifact
-/// stores are process-wide state.
+fn require_or_skip() -> bool {
+    let available = process::Command::new("cargo-raster")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if available {
+        return true;
+    }
+    if env::var_os("REQUIRE_CARGO_RASTER").is_some_and(|v| v == "1") {
+        panic!(
+            "REQUIRE_CARGO_RASTER=1 but cargo-raster is not on PATH; install it from the \
+             pinned raster checkout (cargo install --path ../raster/crates/raster-cli)"
+        );
+    }
+    eprintln!(
+        "SKIPPED: raster_core_input_embedding_detour requires the cargo-raster CLI on PATH. \
+         CI runs this test with REQUIRE_CARGO_RASTER=1."
+    );
+    false
+}
+
 fn suite_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -111,6 +103,20 @@ impl Fixture {
     }
 }
 
+/// Points raster-core runs at a test-local pre-encoded externals directory
+/// and warms it (mandatory pre-encode contract: model externals are strict
+/// lookup-only at run time).
+fn warm_externals(fixture: &Fixture) -> PathBuf {
+    let externals_dir = env::temp_dir().join(format!(
+        "raster-core-input-embedding-externals-{}",
+        process::id()
+    ));
+    env::set_var(EXTERNAL_CACHE_ENV, &externals_dir);
+    warm_model_externals(&fixture.loaded_model(), &externals_dir)
+        .expect("model externals warm-up should succeed");
+    externals_dir
+}
+
 fn deterministic_request(prompt: &str, max_new_tokens: usize) -> InferenceRequest {
     InferenceRequest {
         prompt_bytes: prompt.as_bytes().to_vec(),
@@ -126,22 +132,16 @@ fn deterministic_request(prompt: &str, max_new_tokens: usize) -> InferenceReques
     }
 }
 
-/// Runs one inference with fresh per-run stores and a fresh trace directory,
-/// returning the parsed committed checkpoint trace (an array of single-key
-/// `{checkpoint_id: sha256-hex}` objects in commit order).
-///
-/// The caller must hold [`suite_lock`] for the duration of all runs it
-/// intends to compare.
-fn run_and_capture_checkpoints(
+fn run_and_capture(
     fixture: &Fixture,
     request: &InferenceRequest,
     controls: &InferenceControls,
     description: &str,
-) -> Value {
+) -> (Value, InferenceRunOutcome) {
     static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
     let run_id = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let trace_dir = env::temp_dir().join(format!(
-        "raster-core-detour-parity-{}-{run_id}",
+        "raster-core-input-embedding-dev-run-{}-{run_id}",
         process::id()
     ));
     fs::create_dir_all(&trace_dir).expect("trace dir should be created");
@@ -178,7 +178,7 @@ fn run_and_capture_checkpoints(
             .is_some_and(|array| !array.is_empty()),
         "trace artifact should be a non-empty checkpoint array"
     );
-    checkpoints
+    (checkpoints, outcome)
 }
 
 fn checkpoint_entry_name_and_commitment(entry: &Value, idx: usize) -> (&str, &str) {
@@ -202,10 +202,6 @@ fn checkpoint_entry_name_and_commitment(entry: &Value, idx: usize) -> (&str, &st
     )
 }
 
-/// Asserts the two committed checkpoint traces are identical — same ordered
-/// checkpoint id sequence, same commitment at every entry. On divergence,
-/// panics naming the first divergent checkpoint id and 1-based occurrence
-/// (e.g. `prefill.range:2`).
 fn assert_traces_identical(left_label: &str, left: &Value, right_label: &str, right: &Value) {
     let left_entries = left
         .as_array()
@@ -247,31 +243,16 @@ fn assert_traces_identical(left_label: &str, left: &Value, right_label: &str, ri
     );
 }
 
-/// For every enabled routine occurrence: a raster-core detour run of that
-/// occurrence must commit a checkpoint trace identical to the full-native run
-/// of the same request. Enabled legs are listed in [`ENABLED_ROUTINES`];
-/// WS0 ships zero.
 #[test]
-fn raster_core_detours_preserve_the_native_checkpoint_trace() {
-    let _guard = suite_lock();
-    if ENABLED_ROUTINES.is_empty() {
-        // WS0: no routine has a raster-core implementation yet. The harness
-        // still compiles and runs so WS4 only has to append list entries.
+fn raster_core_input_embedding_detour_preserves_checkpoint_trace() {
+    if !require_or_skip() {
         return;
     }
+    let _guard = suite_lock();
     let fixture = Fixture::load();
-    // Mandatory pre-encode contract: point raster-core runs at a
-    // test-local externals directory and warm it before any detour.
-    let externals_dir = env::temp_dir().join(format!(
-        "raster-core-detour-parity-externals-{}",
-        process::id()
-    ));
-    env::set_var(EXTERNAL_CACHE_ENV, &externals_dir);
-    warm_model_externals(&fixture.loaded_model(), &externals_dir)
-        .expect("model externals warm-up should succeed");
+    let _externals_dir = warm_externals(&fixture);
     let request = deterministic_request(SHORT_PROMPT, 2);
-
-    let native = run_and_capture_checkpoints(
+    let (native_trace, native_outcome) = run_and_capture(
         &fixture,
         &request,
         &InferenceControls {
@@ -282,26 +263,127 @@ fn raster_core_detours_preserve_the_native_checkpoint_trace() {
         "native deterministic run",
     );
 
-    for (routine_id, occurrence) in ENABLED_ROUTINES {
-        let selector = format!("{routine_id}:{occurrence}");
-        let spec = RasterDetourSpec::parse_raster_core(&selector)
-            .expect("enabled raster-core selector should parse");
-        let detour = run_and_capture_checkpoints(
-            &fixture,
-            &request,
-            &InferenceControls {
-                commit_checkpoints: true,
-                raster_detour: Some(spec),
-                raster_tokenizer_enabled: true,
-                ..Default::default()
-            },
-            &format!("raster-core detour run at {selector}"),
-        );
-        assert_traces_identical(
-            "native",
-            &native,
-            &format!("raster-core detour at {selector}"),
-            &detour,
-        );
+    let spec = RasterDetourSpec::parse_raster_core(DEV_RUN_SELECTOR)
+        .expect("dev-run selector should parse");
+    let (detour_trace, detour_outcome) = run_and_capture(
+        &fixture,
+        &request,
+        &InferenceControls {
+            commit_checkpoints: true,
+            raster_detour: Some(spec),
+            raster_tokenizer_enabled: true,
+            ..Default::default()
+        },
+        &format!("raster-core detour run at {DEV_RUN_SELECTOR}"),
+    );
+
+    assert_traces_identical(
+        "native",
+        &native_trace,
+        &format!("raster-core detour at {DEV_RUN_SELECTOR}"),
+        &detour_trace,
+    );
+
+    let (
+        InferenceRunOutcome::Completed(mut native_state),
+        InferenceRunOutcome::Completed(mut detour_state),
+    ) = (native_outcome, detour_outcome)
+    else {
+        unreachable!("both runs were asserted completed");
+    };
+    native_state.raster_tile_invocations = None;
+    detour_state.raster_tile_invocations = None;
+    assert_eq!(
+        native_state, detour_state,
+        "native and raster-core detour final inference states must be equal"
+    );
+}
+
+/// Runs one raster-core detour expected to fail before staging, returning
+/// the rendered error chain.
+fn run_detour_expect_error(fixture: &Fixture, description: &str) -> String {
+    ArtifactIo::reset_store();
+    reset_external_source_store();
+    let spec = RasterDetourSpec::parse_raster_core(DEV_RUN_SELECTOR)
+        .expect("dev-run selector should parse");
+    let error = sequence::run(
+        &deterministic_request(SHORT_PROMPT, 2),
+        &fixture.loaded_model(),
+        &InferenceControls {
+            raster_detour: Some(spec),
+            raster_tokenizer_enabled: true,
+            ..Default::default()
+        },
+    )
+    .expect_err(description);
+    format!("{error:#}")
+}
+
+/// Strict-resolution contract: a raster-core detour with the externals
+/// variable unset fails up front with the remediation guidance (no lazy
+/// encode, no temp-dir fallback). Needs no toolchain — the failure happens
+/// before anything is staged or run.
+#[test]
+fn raster_core_detour_without_externals_dir_fails_with_guidance() {
+    let _guard = suite_lock();
+    let fixture = Fixture::load();
+    let saved = env::var_os(EXTERNAL_CACHE_ENV);
+    env::remove_var(EXTERNAL_CACHE_ENV);
+
+    let message = run_detour_expect_error(
+        &fixture,
+        "raster-core detour without an externals directory must fail",
+    );
+    if let Some(saved) = saved {
+        env::set_var(EXTERNAL_CACHE_ENV, saved);
     }
+    assert!(
+        message.contains(EXTERNAL_CACHE_ENV) && message.contains("--externals-dir"),
+        "error should name the externals-directory knobs: {message}"
+    );
+    assert!(
+        message.contains("encode-externals"),
+        "error should carry the encode-externals remediation command: {message}"
+    );
+}
+
+/// Strict-lookup contract: a raster-core detour against an empty externals
+/// directory fails naming the missing kind, the directory, and the
+/// encode-externals command.
+#[test]
+fn raster_core_detour_with_empty_externals_dir_names_the_missing_kind() {
+    let _guard = suite_lock();
+    let fixture = Fixture::load();
+    let saved = env::var_os(EXTERNAL_CACHE_ENV);
+    let empty_dir = env::temp_dir().join(format!(
+        "raster-core-input-embedding-empty-externals-{}",
+        process::id()
+    ));
+    fs::create_dir_all(&empty_dir).expect("empty externals dir should be created");
+    env::set_var(EXTERNAL_CACHE_ENV, &empty_dir);
+
+    let message = run_detour_expect_error(
+        &fixture,
+        "raster-core detour against an empty externals directory must fail",
+    );
+    match saved {
+        Some(saved) => env::set_var(EXTERNAL_CACHE_ENV, saved),
+        None => env::remove_var(EXTERNAL_CACHE_ENV),
+    }
+    fs::remove_dir_all(&empty_dir).ok();
+
+    // The detour targets input.embedding (prompt.prepare runs natively),
+    // so the miss is the embedding kind.
+    assert!(
+        message.contains("gemma-input-embedding-v3"),
+        "error should name the missing external kind: {message}"
+    );
+    assert!(
+        message.contains(&empty_dir.display().to_string()),
+        "error should name the resolved externals directory: {message}"
+    );
+    assert!(
+        message.contains("encode-externals"),
+        "error should carry the encode-externals remediation command: {message}"
+    );
 }

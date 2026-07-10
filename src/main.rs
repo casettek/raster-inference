@@ -9,9 +9,9 @@ use raster_inference::shared::model::runtime::LoadedModel;
 use raster_inference::{
     challenger, claimer, detour, load_chat_template, load_gemma_tokenizer_spec_from_path,
     load_tokenizer_from_path, load_transformer_state_model_from_det_num_wgt_path, protocol, trace,
-    AuditOutcome, AuthenticatedGemmaTokenizer, ClaimerOptions, ClaimerRunOutcome, DetourBackend,
-    ExecutionTuning, InferenceRequest, ModelSpec, RasterDetourSpec, SamplingConfig,
-    TextDecodingPolicy,
+    warm_model_externals, AuditOutcome, AuthenticatedGemmaTokenizer, ClaimerOptions,
+    ClaimerRunOutcome, DetourBackend, ExecutionTuning, InferenceRequest, ModelSpec,
+    RasterDetourSpec, SamplingConfig, TextDecodingPolicy, EXTERNAL_CACHE_ENV,
 };
 use serde::Deserialize;
 
@@ -39,6 +39,10 @@ enum Command {
     Detour(DetourArgs),
     /// Replay a claimed trace, report the first divergence, and detour at it
     Audit(AuditArgs),
+    /// Pre-encode all model externals (tokenizer, embedding table) into a
+    /// persistent directory consumed by raster-core runs (one-time,
+    /// mandatory before any raster-core detour)
+    EncodeExternals(EncodeExternalsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -63,6 +67,12 @@ struct CommonArgs {
     /// Directory for trace artifacts (overrides RASTER_TRACE_DIR)
     #[arg(long, value_name = "DIR")]
     trace_dir: Option<PathBuf>,
+
+    /// Directory of pre-encoded model externals (sets
+    /// RASTER_CORE_EXTERNAL_CACHE; required for raster-core detours;
+    /// prepare it once with `encode-externals`)
+    #[arg(long, value_name = "DIR")]
+    externals_dir: Option<PathBuf>,
 
     /// Read the prompt from a file instead of trailing arguments
     #[arg(long, value_name = "FILE", conflicts_with = "prompt")]
@@ -111,6 +121,23 @@ struct DetourArgs {
 }
 
 #[derive(Debug, Args)]
+struct EncodeExternalsArgs {
+    /// Model directory containing tokenizer.json, chat_template.jinja and
+    /// model.detwgt
+    #[arg(long, value_name = "DIR")]
+    model: PathBuf,
+
+    /// Model id (defaults to the model directory name)
+    #[arg(long, value_name = "ID")]
+    model_id: Option<String>,
+
+    /// Output directory for the pre-encoded externals (the external cache
+    /// root raster-core runs point at via --externals-dir)
+    #[arg(long, value_name = "DIR")]
+    externals_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct AuditArgs {
     #[command(flatten)]
     common: CommonArgs,
@@ -141,6 +168,7 @@ fn run() -> Result<ExitCode> {
         Command::Claim(args) => run_claim(args),
         Command::Detour(args) => run_detour(args),
         Command::Audit(args) => run_audit(args),
+        Command::EncodeExternals(args) => run_encode_externals(args),
     }
 }
 
@@ -180,6 +208,19 @@ fn run_detour(args: DetourArgs) -> Result<ExitCode> {
         (None, Some(at)) => RasterDetourSpec::parse_raster_core(at)?,
         _ => unreachable!("clap enforces exactly one of --at and --raster-core-at"),
     };
+    // Raster-core runs are strict consumers of a pre-encoded externals
+    // directory: fail before model loading when it is not resolvable.
+    if matches!(spec.backend(), DetourBackend::RasterCore)
+        && args.common.externals_dir.is_none()
+        && env::var_os(EXTERNAL_CACHE_ENV).is_none()
+    {
+        anyhow::bail!(
+            "raster-core detours require a pre-encoded model externals directory: pass \
+             --externals-dir <DIR> (or set {EXTERNAL_CACHE_ENV}) pointing at a directory \
+             prepared with: raster-inference encode-externals --model {} --externals-dir <DIR>",
+            args.common.model.display()
+        );
+    }
     let ctx = RunContext::prepare(&args.common)?;
     eprintln!(
         "detour: model {}, {} routine {}:{}",
@@ -287,26 +328,13 @@ impl RunContext {
         if let Some(trace_dir) = &common.trace_dir {
             env::set_var("RASTER_TRACE_DIR", trace_dir);
         }
+        if let Some(externals_dir) = &common.externals_dir {
+            env::set_var(EXTERNAL_CACHE_ENV, externals_dir);
+        }
         let assets = resolve_model_dir(&common.model, common.model_id.clone())?;
         let tuning = load_tuning(common.config.as_deref())?;
         let prompt = resolve_prompt(common)?;
 
-        let chat_template = load_chat_template(&assets.template_path)?;
-        let tokenizer = load_tokenizer_from_path(&assets.tokenizer_path)?;
-        let raster_tokenizer_source = AuthenticatedGemmaTokenizer::new(
-            load_gemma_tokenizer_spec_from_path(&assets.tokenizer_path)?,
-        );
-        let transformer_model =
-            load_transformer_state_model_from_det_num_wgt_path(&assets.weights_path)?;
-
-        let model_spec = ModelSpec {
-            model_id: assets.model_id,
-            tokenizer_path: assets.tokenizer_path,
-            chat_template,
-            bos_token: None,
-            eos_token: None,
-            unk_token: None,
-        };
         let request = InferenceRequest {
             prompt_bytes: prompt.into_bytes(),
             text_decoding_policy: TextDecodingPolicy::Utf8,
@@ -321,15 +349,50 @@ impl RunContext {
         };
         Ok(Self {
             request,
-            model: LoadedModel::Gemma(GemmaModelBundle::new(
-                model_spec,
-                tokenizer,
-                transformer_model,
-                Some(raster_tokenizer_source),
-            )),
+            model: load_model(assets)?,
             tuning,
         })
     }
+}
+
+/// Loads the full model bundle from resolved assets (shared by the role
+/// entry points and `encode-externals`, which has no prompt).
+fn load_model(assets: ModelAssets) -> Result<LoadedModel> {
+    let chat_template = load_chat_template(&assets.template_path)?;
+    let tokenizer = load_tokenizer_from_path(&assets.tokenizer_path)?;
+    let raster_tokenizer_source = AuthenticatedGemmaTokenizer::new(
+        load_gemma_tokenizer_spec_from_path(&assets.tokenizer_path)?,
+    );
+    let transformer_model =
+        load_transformer_state_model_from_det_num_wgt_path(&assets.weights_path)?;
+
+    let model_spec = ModelSpec {
+        model_id: assets.model_id,
+        tokenizer_path: assets.tokenizer_path,
+        chat_template,
+        bos_token: None,
+        eos_token: None,
+        unk_token: None,
+    };
+    Ok(LoadedModel::Gemma(GemmaModelBundle::new(
+        model_spec,
+        tokenizer,
+        transformer_model,
+        Some(raster_tokenizer_source),
+    )))
+}
+
+fn run_encode_externals(args: EncodeExternalsArgs) -> Result<ExitCode> {
+    let assets = resolve_model_dir(&args.model, args.model_id)?;
+    let model = load_model(assets)?;
+    eprintln!(
+        "encode-externals: model {}, externals dir {}",
+        model.model_spec().model_id,
+        args.externals_dir.display()
+    );
+    let summary = warm_model_externals(&model, &args.externals_dir)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Asset paths resolved from a model directory by convention.
@@ -647,6 +710,85 @@ mod tests {
         ])
         .expect_err("detour without a target should fail");
         assert!(error.to_string().contains("--at"));
+    }
+
+    #[test]
+    fn externals_dir_is_accepted_on_role_subcommands() {
+        for subcommand in ["claim", "detour", "audit"] {
+            let mut args = vec![
+                "raster-inference",
+                subcommand,
+                "--model",
+                "assets/tiny-gemma-dev",
+                "--externals-dir",
+                "/tmp/raster-models",
+            ];
+            match subcommand {
+                "detour" => args.extend(["--at", "prefill.range:2"]),
+                "audit" => args.extend(["--claimed", "trace.json"]),
+                _ => {}
+            }
+            args.push("hello");
+            let cli = Cli::try_parse_from(&args)
+                .unwrap_or_else(|error| panic!("{subcommand} should accept --externals-dir: {error}"));
+            let externals_dir = match cli.command {
+                Command::Claim(args) => args.common.externals_dir,
+                Command::Detour(args) => args.common.externals_dir,
+                Command::Audit(args) => args.common.externals_dir,
+                Command::EncodeExternals(_) => unreachable!("role subcommands only"),
+            };
+            assert_eq!(
+                externals_dir,
+                Some(std::path::PathBuf::from("/tmp/raster-models"))
+            );
+        }
+    }
+
+    #[test]
+    fn encode_externals_parses_model_and_externals_dir() {
+        let cli = parse(&[
+            "raster-inference",
+            "encode-externals",
+            "--model",
+            "assets/tiny-gemma-dev",
+            "--externals-dir",
+            "/tmp/raster-models",
+        ]);
+        let Command::EncodeExternals(args) = cli.command else {
+            panic!("expected encode-externals subcommand");
+        };
+        assert_eq!(args.model, std::path::PathBuf::from("assets/tiny-gemma-dev"));
+        assert_eq!(
+            args.externals_dir,
+            std::path::PathBuf::from("/tmp/raster-models")
+        );
+        assert!(args.model_id.is_none());
+    }
+
+    #[test]
+    fn encode_externals_requires_externals_dir() {
+        let error = Cli::try_parse_from([
+            "raster-inference",
+            "encode-externals",
+            "--model",
+            "assets/tiny-gemma-dev",
+        ])
+        .expect_err("encode-externals without --externals-dir should fail");
+        assert!(error.to_string().contains("--externals-dir"));
+    }
+
+    #[test]
+    fn encode_externals_rejects_a_prompt_argument() {
+        Cli::try_parse_from([
+            "raster-inference",
+            "encode-externals",
+            "--model",
+            "assets/tiny-gemma-dev",
+            "--externals-dir",
+            "/tmp/raster-models",
+            "hello",
+        ])
+        .expect_err("encode-externals should not accept a prompt");
     }
 
     #[test]

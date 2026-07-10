@@ -36,9 +36,9 @@ use raster_inference::shared::model::runtime::LoadedModel;
 use raster_inference::shared::model::transformer::Gemma4TransformerModel;
 use raster_inference::{
     load_chat_template, load_gemma_tokenizer_spec_from_path, load_tokenizer_from_path,
-    load_transformer_state_model_from_det_num_wgt_path, sequence, InferenceControls,
-    InferenceRequest, InferenceRunOutcome, ModelSpec, RasterDetourSpec, SamplingConfig,
-    TextDecodingPolicy,
+    load_transformer_state_model_from_det_num_wgt_path, sequence, warm_model_externals,
+    InferenceControls, InferenceRequest, InferenceRunOutcome, ModelSpec, RasterDetourSpec,
+    SamplingConfig, TextDecodingPolicy, EXTERNAL_CACHE_ENV,
 };
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -119,6 +119,20 @@ impl Fixture {
             )),
         ))
     }
+}
+
+/// Points raster-core runs at a test-local pre-encoded externals directory
+/// and warms it (mandatory pre-encode contract: model externals are strict
+/// lookup-only at run time).
+fn warm_externals(fixture: &Fixture) -> PathBuf {
+    let externals_dir = env::temp_dir().join(format!(
+        "raster-core-prompt-prepare-externals-{}",
+        process::id()
+    ));
+    env::set_var(EXTERNAL_CACHE_ENV, &externals_dir);
+    warm_model_externals(&fixture.loaded_model(), &externals_dir)
+        .expect("model externals warm-up should succeed");
+    externals_dir
 }
 
 fn deterministic_request(prompt: &str, max_new_tokens: usize) -> InferenceRequest {
@@ -268,6 +282,7 @@ fn prompt_prepare_raster_core_dev_run_matches_native() {
     }
     let _guard = suite_lock();
     let fixture = Fixture::load();
+    let _externals_dir = warm_externals(&fixture);
     let request = deterministic_request(SHORT_PROMPT, 2);
 
     let (native_trace, native_outcome) = run_and_capture(

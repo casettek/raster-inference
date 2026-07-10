@@ -121,15 +121,30 @@ pub(crate) fn run_prompt_prepare(
 /// (deterministic mode with tokenizer source), the equivalent raster
 /// checkpoint payload is formatted for the trace alongside the native
 /// activations.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InputEmbeddingExecution {
+    Native,
+    RasterCore(RasterSizingControls),
+}
+
 pub(crate) fn run_input_embedding(
-    prompt_token_ids: &[u32],
+    prompt_preparation: &PromptPreparationState,
     model: &LoadedModel,
     raster_prompt_preparation: Option<&RasterPromptPreparationState>,
+    execution: InputEmbeddingExecution,
 ) -> Result<(
     ActivationSequence,
     Option<input_embedding::raster::RasterInputEmbeddingOutput>,
 )> {
-    let token_embeddings = input_embedding::run(prompt_token_ids, model.transformer_model())?;
+    let token_embeddings = match execution {
+        InputEmbeddingExecution::Native => input_embedding::run(
+            &prompt_preparation.prompt_token_ids,
+            model.transformer_model(),
+        )?,
+        InputEmbeddingExecution::RasterCore(raster_sizing) => {
+            input_embedding::raster_core::run_raster_core(prompt_preparation, model, raster_sizing)?
+        }
+    };
     let input_embedding_output = raster_prompt_preparation
         .map(|raster_prompt_preparation| {
             let embedding_source = model.input_embedding_source()?;

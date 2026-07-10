@@ -1,6 +1,8 @@
+use std::fs::File;
 use std::marker::PhantomData;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::shared::artifacts::artifact_io::AuthRead;
 use crate::shared::artifacts::external_artifacts::{
@@ -21,6 +23,12 @@ const GEMMA_INPUT_EMBEDDING_SOURCE_DOMAIN: &str =
     "raster-external-source-gemma-input-embedding-merkle-v1";
 const INPUT_EMBEDDING_METADATA_REQUEST: &str = "gemma_input_embedding.metadata";
 const INPUT_EMBEDDING_ROW_REQUEST: &str = "gemma_input_embedding.row";
+
+/// Domain prefix for [`AuthenticatedDecoderEmbeddingSource::cache_fingerprint`].
+/// Versioned with the fingerprint construction: any change to the hashed
+/// fields must bump this string (and the external cache kind).
+const INPUT_EMBEDDING_FINGERPRINT_DOMAIN: &str =
+    "raster-inference-gemma-input-embedding-cache-fingerprint-v2";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthenticatedDecoderEmbeddingSource {
@@ -170,6 +178,73 @@ impl AuthenticatedDecoderEmbeddingSource {
             hidden_size: self.hidden_size,
             scale_bits: self.scale.to_bits(),
         }
+    }
+
+    /// Cheap model-identity fingerprint addressing this table's entry in
+    /// the pre-encoded externals directory (cache kind
+    /// `gemma-input-embedding-v2`).
+    ///
+    /// For model-backed sources this hashes the raw deterministic tensor
+    /// byte region (mmap slice — no row decoding, no scaling) together with
+    /// the source identity: domain prefix, identifier, shape, scale bits,
+    /// and storage element width. Content-addressed, so moving or renaming
+    /// the weights file does not change the fingerprint. Owned-rows sources
+    /// (test fixtures) hash the row bits directly — those tables are tiny.
+    pub(crate) fn cache_fingerprint(&self) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(INPUT_EMBEDDING_FINGERPRINT_DOMAIN.as_bytes());
+        hasher.update((self.identifier.len() as u64).to_le_bytes());
+        hasher.update(self.identifier.as_bytes());
+        hasher.update((self.vocab_size as u64).to_le_bytes());
+        hasher.update((self.hidden_size as u64).to_le_bytes());
+        hasher.update(self.scale.to_bits().to_le_bytes());
+        match &self.backing {
+            GemmaInputEmbeddingBacking::Owned(rows) => {
+                hasher.update(b"owned");
+                for row in rows {
+                    for value in row {
+                        hasher.update(value.to_bits().to_le_bytes());
+                    }
+                }
+            }
+            GemmaInputEmbeddingBacking::Model(source) => {
+                hasher.update(b"model");
+                hasher.update(source.element_width.tag().to_le_bytes());
+                // The source is validated to reference the full embedding
+                // matrix, so the region is one contiguous byte range.
+                let elem_bytes = source.element_width.byte_width();
+                let byte_len = source
+                    .total_rows
+                    .checked_mul(source.total_cols)
+                    .and_then(|elements| elements.checked_mul(elem_bytes))
+                    .ok_or_else(|| anyhow!("embedding tensor byte size overflowed"))?;
+                let end = source
+                    .data_offset
+                    .checked_add(byte_len)
+                    .ok_or_else(|| anyhow!("embedding tensor byte range overflowed"))?;
+                let file = File::open(&source.weights_path).with_context(|| {
+                    format!(
+                        "failed to open deterministic artifact {}",
+                        source.weights_path.display()
+                    )
+                })?;
+                let mmap = unsafe { memmap2::Mmap::map(&file) }.with_context(|| {
+                    format!(
+                        "failed to mmap deterministic artifact {}",
+                        source.weights_path.display()
+                    )
+                })?;
+                let region = mmap.get(source.data_offset..end).ok_or_else(|| {
+                    anyhow!(
+                        "embedding tensor byte range {}..{end} is out of bounds for {}",
+                        source.data_offset,
+                        source.weights_path.display()
+                    )
+                })?;
+                hasher.update(region);
+            }
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     pub fn committed_source_ref(&self) -> Result<ExternalSourceRef> {
@@ -350,4 +425,113 @@ fn validate_identifier(identifier: String) -> Result<String> {
         bail!("Gemma input embedding source identifier must not be empty");
     }
     Ok(identifier)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::shared::numerics::det_num::DetWgtElementWidth;
+
+    fn owned_source(identifier: &str, rows: Vec<Vec<Act>>) -> AuthenticatedDecoderEmbeddingSource {
+        AuthenticatedDecoderEmbeddingSource::from_canonical_rows(
+            identifier,
+            rows,
+            Act::from_bits(1),
+        )
+        .expect("owned source should build")
+    }
+
+    fn act_rows(seed: i32) -> Vec<Vec<Act>> {
+        vec![
+            vec![Act::from_bits(seed), Act::from_bits(seed + 1)],
+            vec![Act::from_bits(seed + 2), Act::from_bits(seed + 3)],
+        ]
+    }
+
+    #[test]
+    fn owned_rows_fingerprint_is_stable_and_distinct_per_table() {
+        let source = owned_source("fixture", act_rows(10));
+        let first = source.cache_fingerprint().expect("fingerprint");
+        let second = source.cache_fingerprint().expect("fingerprint");
+        assert_eq!(first, second, "fingerprint must be stable across calls");
+
+        let other_table = owned_source("fixture", act_rows(11));
+        assert_ne!(
+            first,
+            other_table.cache_fingerprint().expect("fingerprint"),
+            "different row bits must fingerprint differently"
+        );
+
+        let other_id = owned_source("fixture-b", act_rows(10));
+        assert_ne!(
+            first,
+            other_id.cache_fingerprint().expect("fingerprint"),
+            "different identifiers must fingerprint differently"
+        );
+    }
+
+    fn model_source(weights_path: PathBuf) -> AuthenticatedDecoderEmbeddingSource {
+        AuthenticatedDecoderEmbeddingSource {
+            identifier: "model-fixture".to_string(),
+            vocab_size: 2,
+            hidden_size: 3,
+            scale: Act::from_bits(7),
+            backing: GemmaInputEmbeddingBacking::Model(DetNumTensorSliceSource {
+                weights_path,
+                total_rows: 2,
+                total_cols: 3,
+                data_offset: 4,
+                element_width: DetWgtElementWidth::I16,
+                row_offset: 0,
+                row_count: 2,
+                col_offset: 0,
+                col_count: 3,
+            }),
+        }
+    }
+
+    #[test]
+    fn model_fingerprint_tracks_the_tensor_byte_region() {
+        let dir = std::env::temp_dir().join(format!(
+            "raster-embedding-fingerprint-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // 4-byte header + 2x3 i16 payload.
+        let mut bytes = vec![0xAAu8; 4];
+        bytes.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
+        let path = dir.join("model.detwgt");
+        std::fs::write(&path, &bytes).expect("write fixture weights");
+
+        let source = model_source(path.clone());
+        let first = source.cache_fingerprint().expect("fingerprint");
+        assert_eq!(
+            first,
+            source.cache_fingerprint().expect("fingerprint"),
+            "same tensor bytes must fingerprint identically across calls"
+        );
+
+        // Moving the file must not change the fingerprint (content-addressed).
+        let moved = dir.join("renamed.detwgt");
+        std::fs::rename(&path, &moved).expect("rename fixture weights");
+        assert_eq!(
+            first,
+            model_source(moved.clone()).cache_fingerprint().expect("fingerprint"),
+            "renaming the weights file must not change the fingerprint"
+        );
+
+        // Flipping one byte inside the tensor region must change it.
+        let mut tampered = bytes.clone();
+        tampered[5] ^= 0xff;
+        std::fs::write(&moved, &tampered).expect("write tampered weights");
+        assert_ne!(
+            first,
+            model_source(moved).cache_fingerprint().expect("fingerprint"),
+            "a byte flip in the tensor region must change the fingerprint"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -26,6 +26,9 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::runtime::checkpoints::RoutineId;
+use crate::runtime::raster_core::externals::{
+    lookup_external_entry, missing_external_error, resolve_run_externals_dir, EncodedExternal,
+};
 use crate::runtime::raster_core::ingest::{ingest, RasterCoreError};
 use crate::runtime::raster_core::staging::StagedInputs;
 use crate::runtime::raster_core::{CargoRasterRunner, RasterCoreRunDir, COMMIT_FILE_NAME};
@@ -88,8 +91,22 @@ pub fn run_raster_core(
         initial_pieces.extend(initial_bpe_pieces(segment, tokenizer, &metadata)?);
     }
 
-    // Committed-input staging (WS2 §2/§3).
-    let tokenizer_external = encode_tokenizer_external_cached(&model.tokenizer_path)
+    // Committed-input staging (WS2 §2/§3). Model externals are strict
+    // lookup-only at run time: the tokenizer entry must have been
+    // pre-encoded via `encode-externals` into the resolved directory.
+    let externals_dir = resolve_run_externals_dir(RoutineId::PromptPrepare)
+        .map_err(RasterCoreError::Infrastructure)
+        .map_err(anyhow::Error::new)?;
+    let tokenizer_external = lookup_tokenizer_external(&model.tokenizer_path, &externals_dir)
+        .and_then(|entry| {
+            entry.ok_or_else(|| {
+                missing_external_error(
+                    RoutineId::PromptPrepare,
+                    TOKENIZER_CACHE_KIND,
+                    &externals_dir,
+                )
+            })
+        })
         .map_err(RasterCoreError::Infrastructure)
         .map_err(anyhow::Error::new)?;
     let run_dir = RasterCoreRunDir::create(RoutineId::PromptPrepare, 1)?;
@@ -152,24 +169,11 @@ pub fn run_raster_core(
     })
 }
 
-/// One encoded Gemma-tokenizer cache entry (WS2 cache convention:
-/// `<cache_root>/gemma-tokenizer-v2/<sha256(tokenizer.json)>/`; the cache
-/// kind is versioned with the schema — `-v2` is the chunked shape — and
-/// must match the `gemma_externals` encoder's `CACHE_KIND`).
-#[derive(Debug)]
-struct EncodedTokenizerExternal {
-    data_path: PathBuf,
-    index_path: PathBuf,
-    root_commitment: String,
-}
-
-/// Cache root for raster-encoded externals. Overridable for hermetic tests
-/// via `RASTER_CORE_EXTERNAL_CACHE`.
-fn external_cache_root() -> PathBuf {
-    std::env::var_os("RASTER_CORE_EXTERNAL_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("raster-inference-gemma-external-cache"))
-}
+/// Gemma-tokenizer cache kind (WS2 cache convention:
+/// `<externals_dir>/gemma-tokenizer-v2/<sha256(tokenizer.json)>/`; the
+/// cache kind is versioned with the schema — `-v2` is the chunked shape —
+/// and must match the `gemma_externals` encoder's `CACHE_KIND`).
+pub(crate) const TOKENIZER_CACHE_KIND: &str = "gemma-tokenizer-v2";
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -179,36 +183,39 @@ fn program_crate_dir() -> PathBuf {
     workspace_root().join("crates/raster-programs/prompt_prepare")
 }
 
-/// Resolves the tokenizer committed external from the content-addressed
-/// cache, invoking the `gemma_externals` offline encoder on a miss.
-/// Encoding stays out of the main crate's dependency graph (charter
-/// invariant 6): the encoder runs as a `cargo run` subprocess, exactly like
-/// the WS2 tokenizer-external test drives it.
-fn encode_tokenizer_external_cached(tokenizer_json: &Path) -> Result<EncodedTokenizerExternal> {
+/// Pure filesystem lookup of the pre-encoded tokenizer external — the only
+/// resolution the run path performs (strict lookup-only contract; no lazy
+/// encode).
+pub(crate) fn lookup_tokenizer_external(
+    tokenizer_json: &Path,
+    externals_dir: &Path,
+) -> Result<Option<EncodedExternal>> {
     let source_bytes = std::fs::read(tokenizer_json)
         .with_context(|| format!("failed to read {}", tokenizer_json.display()))?;
     let source_sha256 = format!("{:x}", Sha256::digest(&source_bytes));
+    lookup_external_entry(externals_dir, TOKENIZER_CACHE_KIND, &source_sha256, "tokenizer")
+}
 
-    let cache_root = external_cache_root();
-    let entry_dir = cache_root.join("gemma-tokenizer-v2").join(&source_sha256);
-    let data_path = entry_dir.join("tokenizer.rastered");
-    let index_path = entry_dir.join("tokenizer.rindex");
-    let commitment_path = entry_dir.join("root_commitment.txt");
-    if data_path.is_file() && index_path.is_file() && commitment_path.is_file() {
-        let root_commitment = std::fs::read_to_string(&commitment_path)
-            .with_context(|| format!("failed to read {}", commitment_path.display()))?
-            .trim()
-            .to_string();
-        return Ok(EncodedTokenizerExternal {
-            data_path,
-            index_path,
-            root_commitment,
-        });
+/// Encodes the tokenizer committed external into `externals_dir` (warm-up
+/// path only), reusing an existing entry when present. Encoding stays out
+/// of the main crate's dependency graph (charter invariant 6): the
+/// `gemma_externals` encoder runs as a `cargo run` subprocess and manages
+/// the content-addressed entry layout itself. Returns the entry plus
+/// whether it was reused.
+pub(crate) fn encode_tokenizer_external(
+    tokenizer_json: &Path,
+    externals_dir: &Path,
+) -> Result<(EncodedExternal, bool)> {
+    if let Some(entry) = lookup_tokenizer_external(tokenizer_json, externals_dir)? {
+        return Ok((entry, true));
     }
 
+    // --release: a real model's tokenizer carries a ~262k-entry vocab; the
+    // one-time encode is compute-bound and painfully slow in debug.
     let output = Command::new(env!("CARGO"))
         .args([
             "run",
+            "--release",
             "-p",
             "raster-program-gemma-externals",
             "--features",
@@ -218,29 +225,25 @@ fn encode_tokenizer_external_cached(tokenizer_json: &Path) -> Result<EncodedToke
             "--",
         ])
         .arg(tokenizer_json)
-        .arg(&cache_root)
+        .arg(externals_dir)
         .current_dir(workspace_root())
         .output()
         .context("failed to launch the gemma_externals tokenizer encoder")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         bail!(
-            "gemma_externals tokenizer encoder failed\nstdout:\n{stdout}\nstderr:\n{}",
+            "gemma_externals tokenizer encoder failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let field = |prefix: &str| -> Result<String> {
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(prefix))
-            .map(|rest| rest.trim().to_string())
-            .with_context(|| format!("tokenizer encoder printed no '{prefix}' line"))
-    };
-    Ok(EncodedTokenizerExternal {
-        data_path: PathBuf::from(field("data_path: ")?),
-        index_path: PathBuf::from(field("index_path: ")?),
-        root_commitment: field("root_commitment: ")?,
-    })
+
+    let entry = lookup_tokenizer_external(tokenizer_json, externals_dir)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "tokenizer encoder reported success but no cache entry appeared under {}",
+            externals_dir.join(TOKENIZER_CACHE_KIND).display()
+        )
+    })?;
+    Ok((entry, false))
 }
 
 #[cfg(test)]
@@ -263,8 +266,26 @@ mod tests {
 
     #[test]
     fn missing_tokenizer_json_is_reported_with_its_path() {
-        let error = encode_tokenizer_external_cached(Path::new("/nonexistent/tokenizer.json"))
-            .expect_err("missing source must fail");
+        let error = lookup_tokenizer_external(
+            Path::new("/nonexistent/tokenizer.json"),
+            Path::new("/nonexistent/externals"),
+        )
+        .expect_err("missing source must fail");
         assert!(error.to_string().contains("/nonexistent/tokenizer.json"));
+    }
+
+    #[test]
+    fn lookup_misses_in_an_empty_externals_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "raster-tokenizer-lookup-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let tokenizer_json = dir.join("tokenizer.json");
+        std::fs::write(&tokenizer_json, b"{}").expect("tokenizer fixture");
+        let entry = lookup_tokenizer_external(&tokenizer_json, &dir)
+            .expect("lookup should not error against an empty dir");
+        assert!(entry.is_none(), "empty externals dir must be a miss");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

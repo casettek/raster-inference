@@ -2731,6 +2731,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "raster-program-input-embedding"
+version = "0.1.0"
+dependencies = [
+ "raster",
+ "raster-program-support",
+ "raster-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "raster-program-prompt-prepare"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,38 @@
+# Program crate for the `input.embedding` routine (WS3).
+#
+# Program crates under crates/raster-programs/ hold real raster tiles and
+# sequences (charter invariant 6: real raster never enters the main crate).
+[package]
+name = "raster-program-input-embedding"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "raster-program-input-embedding"
+path = "src/main.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "encode"
+path = "bin/encode.rs"
+required-features = ["encode"]
+
+[features]
+default = ["std"]
+std = [
+    "raster/std",
+    "dep:raster-program-support",
+]
+encode = [
+    "std",
+    "dep:serde_json",
+]
+
+[dependencies]
+raster = { workspace = true }
+serde = { workspace = true }
+raster-program-support = { path = "../_support", optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+raster-runtime = { workspace = true }

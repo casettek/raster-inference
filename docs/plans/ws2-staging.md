@@ -239,6 +239,43 @@ never happen silently there (`.github/workflows/ci.yml`).
 
 ## 11. Amendment log
 
+- **2026-07-09** — Input-embedding staged schema revised: `rows` changed
+  from `Vec<Vec<i32>>` to hex-packed `Vec<String>` (one selectable leaf per
+  row, 8 lowercase hex chars per Act bit pattern; `pack_embedding_row_hex`
+  in the program crate, byte-identical host mirror in the routine's
+  raster_core adapter). Rationale: the raster index materializes one node
+  per tree value on both encode and load, so per-value leaves for a real
+  model (Gemma E4B: 262k × 2048 ≈ 537M nodes) produce a ~55–60 GB index
+  that OOMs encode *and* every run-time load — observed as a jetsam kill
+  during `encode-externals`. One leaf per row keeps the index O(vocab)
+  (~tens of MB). Tiles decode the selected leaf in-tile
+  (`unpack_embedding_row_hex`); malformed packed rows are committed `Err`
+  outcomes. Cache kind bumped `gemma-input-embedding-v2` →
+  `gemma-input-embedding-v3` (fingerprint key construction unchanged).
+  Encoder subprocesses now run `--release`, the host streams the staging
+  JSON to disk instead of buffering it, and a failed embedding encode
+  removes its temp scratch directory. Per the §7 clause: dev-run
+  trace-identity and guard tests re-verified.
+- **2026-07-08** — Model externals are now pre-encoded via the
+  `encode-externals` CLI subcommand (library entry point:
+  `warm_model_externals`) into a persistent, user-chosen directory; the
+  raster-core run path is strict lookup-only — on a missing entry (or an
+  unset directory) the run fails up front with an error naming the external
+  kind, the resolved directory, and the exact `encode-externals` command.
+  There is no lazy encode and no temp-dir fallback on the run path. The
+  directory is set per run via `--externals-dir` (which sets
+  `RASTER_CORE_EXTERNAL_CACHE`); hermetic tests point the variable at a
+  test-local directory and warm it first. The input-embedding cache key
+  changed from sha256-of-materialized-JSON to a cheap tensor-region
+  fingerprint (domain prefix + identifier + shape + scale bits + element
+  width + raw `.detwgt` byte region via mmap; cache kind bumped
+  `gemma-input-embedding-v1` → `gemma-input-embedding-v2`), so cache
+  lookups never materialize the table; embedding encodes write into a temp
+  sibling directory and atomically rename into place. Run-local encodes
+  (prompt token ids, decode logits) are unchanged — they are request-scoped
+  commitments, not model externals. Shared machinery lives in
+  `src/runtime/raster_core/externals.rs` (this lifts the "shared cache
+  helper" note from 2026-07-06 into place).
 - **2026-07-07** — `prompt.prepare` staged-input set revised by the
   storage-resident refactor (PORT_PLAN deviations D15–D17). The
   `initial_pieces` postcard input is now the program crate's selectable

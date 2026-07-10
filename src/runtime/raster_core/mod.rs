@@ -23,6 +23,7 @@
 //! Ingestion (WS2+) must validate the produced artifacts instead of trusting
 //! the CLI exit code.
 
+pub mod externals;
 pub mod ingest;
 pub mod staging;
 
